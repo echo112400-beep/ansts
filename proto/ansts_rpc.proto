@@ -1,0 +1,141 @@
+syntax = "proto3";
+package ansts.v2.rpc;
+
+// Dual-Tuple Fencing Token enforced across Storage, Cognitive Router, and Saga Tool Gateway
+message FenceToken {
+  string task_id = 1;
+  uint64 epoch = 2;
+  uint32 turn_seq = 3;
+}
+
+// 5D Phase & Effort-Aware Normalized Resource Vector
+message ResourceVector5D {
+  double expected_steady_cpu_cores = 1;
+  double burst_cpu_limit_cores = 2;
+  uint64 expected_memory_mb = 3;
+  uint32 concurrent_sessions = 4;
+  uint32 effective_tps = 5;
+}
+
+service SandboxNodeService {
+  rpc DispatchSandbox(DispatchSandboxRequest) returns (DispatchSandboxResponse);
+  rpc HibernateSandbox(HibernateSandboxRequest) returns (HibernateSandboxResponse);
+  rpc ResumeSandboxFromWal(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+  rpc BacktrackSandbox(BacktrackSandboxRequest) returns (BacktrackSandboxResponse);
+}
+
+message DispatchSandboxRequest {
+  FenceToken fence = 1;
+  string tenant_id = 2;
+  string warm_pool_id = 3;
+  string isolation_driver = 4;
+  ResourceVector5D allocated_quota = 5;
+  string assigned_model_pool = 6;
+  map<string, string> custom_metadata = 7;
+}
+
+message DispatchSandboxResponse {
+  bool accepted = 1;
+  string node_id = 2;
+  uint32 boot_latency_ms = 3;
+}
+
+message HibernateSandboxRequest {
+  FenceToken fence = 1;
+  string reason = 2;
+}
+
+message HibernateSandboxResponse {
+  bool hibernated = 1;
+}
+
+message ResumeSandboxRequest {
+  FenceToken new_fence = 1;
+  string wal_snapshot_uri = 2;
+}
+
+message ResumeSandboxResponse {
+  bool resumed = 1;
+  uint32 restored_turn_seq = 2;
+}
+
+message BacktrackSandboxRequest {
+  FenceToken fence = 1;
+  uint32 target_turn_seq = 2;
+  string negative_reflexion_note = 3;
+}
+
+message BacktrackSandboxResponse {
+  bool rolled_back = 1;
+  uint32 compensated_tool_calls = 2;
+}
+
+service CognitiveRouterService {
+  rpc StreamTurnCompletion(TurnCompletionRequest) returns (stream TurnCompletionChunk);
+}
+
+message TurnCompletionRequest {
+  FenceToken fence = 1;
+  string tenant_id = 2;
+  string primary_model = 3;
+  string fast_utility_model = 4;
+  repeated string fallback_models = 5;
+  string requested_effort = 6;
+  bool is_read_only_utility_turn = 7;
+  uint32 consecutive_tool_errors = 8;
+  bytes serialized_messages = 9;
+}
+
+message TurnCompletionChunk {
+  string routed_model_pool = 1;
+  string effective_effort = 2;
+  string delta_text = 3;
+  uint32 tokens_used = 4;
+}
+
+service SagaToolGatewayService {
+  rpc ExecuteTransactionalTool(ToolCallRequest) returns (ToolCallResponse);
+  rpc CompensateTurns(CompensateTurnsRequest) returns (CompensateTurnsResponse);
+  rpc FlushStagedCommits(FlushStagedRequest) returns (FlushStagedResponse);
+}
+
+enum ToolEffectClass {
+  PURE_READ = 0;
+  IDEMPOTENT_WRITE = 1;
+  SAGA_COMPENSATABLE = 2;
+  STAGED_COMMIT = 3;
+}
+
+message ToolCallRequest {
+  FenceToken fence = 1;
+  string tool_call_id = 2;
+  string tool_name = 3;
+  ToolEffectClass effect_class = 4;
+  string compensation_tool_name = 5;
+  bytes arguments_json = 6;
+}
+
+message ToolCallResponse {
+  bool allowed = 1;
+  bool staged = 2;
+  string idempotency_key = 3;
+  string output_json = 4;
+}
+
+message CompensateTurnsRequest {
+  FenceToken fence = 1;
+  uint32 from_turn_exclusive = 2;
+}
+
+message CompensateTurnsResponse {
+  repeated string compensated_calls = 1;
+}
+
+message FlushStagedRequest {
+  FenceToken fence = 1;
+  bool human_approved = 2;
+}
+
+message FlushStagedResponse {
+  uint32 flushed_count = 1;
+}

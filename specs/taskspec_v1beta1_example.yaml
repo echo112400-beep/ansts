@@ -1,0 +1,77 @@
+apiVersion: scheduler.agent.io/v1beta1
+kind: AgentTask
+metadata:
+  task_id: "tsk_01j9z8k7m6n5p4q3r2s1t0u9v8"
+  idempotency_key: "fin-audit-20261029-v2-001"
+  tenant_id: "tnt_enterprise_fin_01"
+  namespace: "prod-risk-analysis"
+  priority_class: "P1"
+  priority_score: 860
+  custom_metadata:
+    business_unit: "global-settlement"
+    cost_center: "CC-9042"
+spec:
+  scheduling_policy:
+    queue_name: "fin-audit-dedicated"
+    max_queue_wait_sec: 300
+    sla_deadline_sec: 600
+    preemption_policy: "PreemptToHibernate"
+    auto_sizing:
+      enabled: true
+      fingerprint_key: "fin-csv-audit-v3"
+  cognitive_policy:
+    primary_model: "DeepSeek"
+    fast_utility_model: "GLM-5.3"
+    fallback_models:
+      - "Qwen-3.8"
+      - "GLM-5.3"
+    default_reasoning_effort: "high"
+    adaptive_turn_routing:
+      enabled: true
+      downgrade_to_fast_on_read_only_turns: true
+      upgrade_to_max_on_tool_error_streak: 2
+  quota_and_dag_policy:
+    max_total_tokens: 600000
+    reserved_tps: 150
+    max_burst_tps: 500
+    max_concurrent_sessions: 4
+    dag_coordination:
+      quota_escrow_delegation: true
+      parent_yield_on_blocking_join: true
+      straggler_acceleration:
+        enabled: true
+        completion_ratio_trigger: 0.75
+        boost_tps_multiplier: 2.0
+      speculative_race_mode: "cancel-losers"
+  execution_and_sandbox:
+    max_wall_clock_sec: 1800
+    max_turns: 20
+    isolation_driver: "firecracker"
+    warm_pool_id: "pool-py312-ds"
+    phase_elastic_resources:
+      cognitive_phase:
+        cpu_cores: 0.1
+        memory_active_mb: 256
+      execution_phase:
+        cpu_request_cores: 2.0
+        cpu_burst_limit_cores: 8.0
+        memory_limit_mb: 4096
+  tools_and_saga_config:
+    transactional_policies:
+      - tool_name: "postgres_readonly_query"
+        effect_class: "PURE_READ"
+      - tool_name: "s3_report_upload"
+        effect_class: "IDEMPOTENT_WRITE"
+      - tool_name: "git_branch_push"
+        effect_class: "SAGA_COMPENSATABLE"
+        compensation_tool: "git_branch_delete"
+      - tool_name: "settlement_ledger_post"
+        effect_class: "STAGED_COMMIT"
+        require_human_approval: true
+  harness_and_resilience:
+    harness_type: "react-plan-execute-v2"
+    semantic_circuit_breaker:
+      ast_identical_call_limit: 3
+      progress_velocity_window_turns: 4
+      min_progress_velocity_threshold: 0.10
+      max_backtrack_attempts: 2

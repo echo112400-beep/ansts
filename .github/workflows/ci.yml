@@ -1,0 +1,71 @@
+name: ANSTS v2.0 TypeScript CI — Lint, Build & Integration Tests
+
+on:
+  push:
+    branches: [ "main", "master", "release/*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-schema-check:
+    name: "1. TypeScript AST Lint, Protobuf & TaskSpec Schema Verification"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run TypeScript AST, Schema & Proto Lint
+        run: node scripts/ci_check.mjs --stage lint
+
+  build-typescript:
+    name: "2. TypeScript Microservices Compilation & Bundle Verification"
+    needs: lint-and-schema-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build TypeScript to dist/
+        run: node scripts/ci_check.mjs --stage build
+
+  integration-and-chaos-tests:
+    name: "3. Full M1~M6 Unit, Integration & Chaos Benchmark Suite"
+    needs: build-typescript
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ["18", "20"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Execute Full Integration & Chaos Test Suite
+        run: node scripts/ci_check.mjs --stage all

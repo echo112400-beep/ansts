@@ -1,0 +1,25 @@
+{
+  "name": "@ansts/scheduler-v2",
+  "version": "2.0.0",
+  "description": "Agent-Native Sandbox Task Scheduler (ANSTS v2.0) — Full TypeScript Microservices Implementation (M1~M6)",
+  "license": "Apache-2.0",
+  "main": "dist/src/index.js",
+  "types": "src/index.ts",
+  "scripts": {
+    "lint": "NODE_PATH=/usr/share/nodejs node scripts/ci_check.mjs --stage lint",
+    "build": "NODE_PATH=/usr/share/nodejs node scripts/ci_check.mjs --stage build",
+    "test": "NODE_PATH=/usr/share/nodejs node scripts/ci_check.mjs --stage test",
+    "ci": "NODE_PATH=/usr/share/nodejs node scripts/ci_check.mjs --stage all"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.20.0",
+    "@babel/parser": "^7.20.0",
+    "@babel/plugin-transform-modules-commonjs": "^7.20.0",
+    "@babel/preset-typescript": "^7.20.0",
+    "@types/node": "^18.0.0",
+    "typescript": "^5.3.0"
+  }
+}
