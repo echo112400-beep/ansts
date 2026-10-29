@@ -1,0 +1,47 @@
+name = "ansts-scheduler-v2"
+main = "src/cloudflare/worker.ts"
+compatibility_date = "2026-10-01"
+
+[vars]
+PRIMARY_MODEL_POOL = "DeepSeek"
+FAST_UTILITY_POOL = "GLM-5.3"
+FALLBACK_MODEL_POOL = "Qwen-3.8"
+
+[[durable_objects.bindings]]
+name = "SCHEDULER_CELL"
+class_name = "AnstsSchedulerCell"
+
+[[durable_objects.bindings]]
+name = "AGENT_HARNESS_CELL"
+class_name = "AgentTaskHarnessCell"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AnstsSchedulerCell", "AgentTaskHarnessCell"]
+
+[[d1_databases]]
+binding = "ANSTS_D1"
+database_name = "ansts-audit-ledger"
+database_id = "ansts-d1-prod-01"
+migrations_dir = "migrations"
+
+[[kv_namespaces]]
+binding = "ANSTS_KV"
+id = "ansts-idempotency-kv-01"
+
+[[r2_buckets]]
+binding = "ANSTS_CHECKPOINTS_R2"
+bucket_name = "ansts-checkpoints"
+
+[[queues.producers]]
+binding = "ANSTS_EVENTS_QUEUE"
+queue = "ansts-cloudevents-outbox"
+
+[[queues.consumers]]
+queue = "ansts-cloudevents-outbox"
+max_batch_size = 10
+max_batch_timeout = 2
+max_retries = 5
+
+[triggers]
+crons = ["* * * * *"]

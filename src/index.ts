@@ -33,3 +33,7 @@ export * from "./telemetry/outbox_webhook";
 export * from "./cluster/backpressure_loop";
 export * from "./cli/anstsctl";
 export * from "./dashboard/server";
+export * from "./cloudflare/env";
+export * from "./cloudflare/scheduler_cell";
+export * from "./cloudflare/harness_cell";
+export { default as cloudflareCelldWorker } from "./cloudflare/worker";

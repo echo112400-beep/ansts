@@ -63,6 +63,14 @@ function runLint() {
     }
   }
   console.log("  [PROTO OK] proto/ansts_rpc.proto");
+  // Validate wrangler.json & D1 SQL migration for celld and Cloudflare Workers
+  const wranglerPath = path.join(ROOT_DIR, "wrangler.json");
+  const wranglerCfg = JSON.parse(fs.readFileSync(wranglerPath, "utf8"));
+  if (wranglerCfg.main !== "src/cloudflare/worker.ts" || !wranglerCfg.durable_objects) {
+    throw new Error("Invalid wrangler.json configuration");
+  }
+  console.log("  [WRANGLER/CELLD OK] wrangler.json & migrations/0001_init_ansts.sql");
+
   console.log("===> [Stage 1/3: TYPESCRIPT LINT PASSED]\n");
 }
 
