@@ -3,10 +3,10 @@
 | 文档属性 (Document Metadata) | 详细内容 (Specification Details) |
 | :--- | :--- |
 | **文档标题 (Title)** | **Agent-Native Sandbox Task Scheduler (ANSTS): 多租户、双相脉冲与认知强度感知的分布式沙箱任务调度系统** |
-| **文档状态 (Status)** | **APPROVED / FINAL FULL SPECIFICATION (v2.0)** |
+| **文档状态 (Status)** | **APPROVED / SYNCHRONIZED PRODUCTION SPECIFICATION (v2.1 — TypeScript + celld/Cloudflare + RustFS Edition)** |
 | **作者 (Authors)** | 分布式 Agent 基础设施与沙箱运行时架构组 |
 | **评审人 (Reviewers)** | 计算调度组 (Compute Scheduling)、模型网关组 (LLM Gateway)、安全隔离组 (Sandbox Security)、SRE 韧性工程组 |
-| **最后更新 (Last Updated)** | 2026-10-28 |
+| **最后更新 (Last Updated)** | 2026-10-30 (全量同步 TypeScript 实现、celld/Cloudflare 脑体分离架构、RustFS 启动标本与 5 项代码走查加固) |
 | **核心模型池 (Target Model Pools)** | `DeepSeek` (旗舰深度推理池)、`GLM-5.3` (高速轻量/只读轮次分流池)、`Qwen-3.8` (高可用热备与弹性容灾池) |
 | **隔离运行时 (Isolation Drivers)** | Firecracker MicroVM (默认生产级隔离)、Kata Containers (重型/GPU 负载)、gVisor (`runsc`)、瞬态重型执行器池 |
 
@@ -704,3 +704,71 @@ $$\mathcal{V}_k = w_{\text{test}} \cdot \Delta \text{PassRate}_k + w_{\text{err}
 | **3. 网络分区恢复后的僵尸节点非法写请求** | 隔离旧节点网络 30s 后重放过期 Turn 快照与外部工具写请求 | 对象存储与 MCP 工具网关 **100% 拒绝** 并返回 `HTTP 409 StaleFenceRejected`；旧节点收到 409 后在 `< 50ms` 内自毁本地僵尸 MicroVM。 |
 | **4. 同节点 20 个沙箱同时触发编译突发脉冲** | 在单台 32 核物理机上同时触发 20 个沙箱执行 `cargo build --release` | 节点 `Burst Semaphore` 自动对超出并发上限的突发请求实施 `150~400ms` 微排队削峰；宿主机 PSI 内存压力 `< 45%`，**宿主机 OOM 次数 = 0**。 |
 | **5. 恶意/失控 Agent 语义死循环与外部写操作** | 注入模拟工具持续返回循环报错并尝试写入 `settlement_ledger_post` | 暂存提交（`STAGED_COMMIT`）被宿主机网关拦截未发往生产库；第 4 轮触发进展率树回滚并执行 Saga 逆向补偿；连续 2 次回滚无进展后精准置为 `CIRCUIT_BROKEN`。 |
+---
+
+## 12. Production Implementation & Deployment Synchronization (v2.1 工程实现与生产部署同步规范)
+
+本章节同步了 **ANSTS v2.1 全量 TypeScript 代码仓（40 个模块 / 20 项自动化集成与审计测试）**、**`denoland/celld` 与 Cloudflare Workers 脑体分离协同架构**、**`RustFS` S3 存储底座启动标本** 以及 **5 项关键代码走查加固机制**。
+
+### 12.1 “脑体分离（Brain-Body Disaggregation）”协同架构
+
+在生产部署中，ANSTS 将智能体任务的 **有状态认知控制脑（Brain）** 与 **重算力相变沙箱躯干（Body）** 进行物理与运行时解耦：
+
+1. **轻量有状态控制脑（`AgentTaskHarnessCell` & `AnstsSchedulerCell` — `~0.47 MB / Cell`）**：
+   * 基于 `denoland/celld`（或 Cloudflare Durable Objects）的单线程 V8 Isolate + 私有嵌入式 SQLite 构建。
+   * 在占任务总时长 60%~85% 的 **认知思考期（Cognitive Phase，等待 `DeepSeek` / `GLM-5.3` / `Qwen-3.8` 流式 Token）** 与 **人工审批等待期（Human Approval Gate）**，任务完全驻留在 `0.47 MB` 的 V8 Cell 中（WebSocket 休眠态仅 `~0.03 MB`，唤醒耗时 `~4 ms`），**无需占用任何 Linux MicroVM 内存与 vCPU**。
+2. **按需突发算力躯干（Companion Container / Phase-Elastic MicroVM — `0.1C <-> 8.0C`）**：
+   * 仅当大模型输出需要执行 Bash、代码编译、测试或无头浏览器的工具调用时，`AgentTaskHarnessCell` 才通过 `this.ctx.container` 或 `ansts-node-daemon` gRPC 接口按需唤醒预热池中的 Firecracker / Kata / gVisor 沙箱（`~62 ms` CoW 克隆，受宿主机 `Burst Semaphore` 与 Linux PSI 内存守卫保护），执行完毕后立即停止或休眠算力容器。
+
+### 12.2 代码走查加固的五大核心生产机制 (Production Hardening Mechanisms)
+
+| 加固编号与机制名称 | 对应源码实现 (`src/**/*.ts`) | 解决的分布式边界问题 | 核心状态流转与数学不变量 |
+| :--- | :--- | :--- | :--- |
+| **1. Cell 冷启动与休眠唤醒 SQLite 状态重水化 (`rehydrateFromSql`)** | `src/cloudflare/harness_cell.ts` | `celld` / Durable Object 从 `Hibernated` 或 `Inactive` 唤醒时会重新执行构造函数，纯内存变量会丢失 | 构造函数自动扫描私有 SQLite 的 `turn_wal_frames` 与 `saga_journal` 表，原子还原最新 `FenceToken(epoch, turnSeq + 1)`、累计 `usedTokens`、历史快照链及待补偿 Saga 栈，保障休眠唤醒 **零状态丢失** |
+| **2. 抢占/PSI 休眠任务自动唤醒队列 (`hibernatedResumeQueue`)** | `src/scheduler.ts`<br>`src/models.ts` | 被 `P0/P1` 抢占或因宿主机 PSI `>40%` 紧急休眠的 `P3/P4` 任务若不重新纳入调度环会导致永久挂起 | 引入 `HibernationReason`（区分 `PREEMPTED` / `PSI_MEMORY_PRESSURE` 与 `HUMAN_APPROVAL_WAIT`）；在 `scheduleTick()` 中一旦节点释放出 CPU 余量，按 Aging+EDF 紧迫度自动唤醒被抢占沙箱，以 `(epoch + 1, prevTurnSeq)` 原地续跑 |
+| **3. 全链路组件组合装配 (Unified Component Composition)** | `src/cognitive_router.ts`<br>`src/saga_gateway.ts`<br>`src/node_daemon.ts` | 避免顶层路由/网关与底层限流器、熔断器、补偿器状态割裂 | `CognitiveRouter` 内聚驱动三态熔断器（含 `10s` 冷却期转 `HALF_OPEN` 探测）、滑动窗口令牌桶 Pacing 与流式计量；`SagaToolGateway` 组合 `SagaCompensatorEngine`（3 次重试 LIFO 补偿）与 `StagingCommitAndApprovalGate` |
+| **4. 双时钟独立计量与优雅排水 (`advanceClocks` & `GRACEFUL_DRAINING`)** | `src/models.ts` | 任务在休眠等待人工审批期间不应消耗活跃 CPU 计算时限（`maxActiveComputeSec`） | 严格分离挂钟用时（`wallClockSec`）与活跃计算用时（`activeComputeSec`，仅在 `RUNNING` 态累加）；当触及时间或 Token 硬上限时进入 `GRACEFUL_DRAINING` 状态输出阶段性总结报告 |
+| **5. V8 Isolate 纯边缘序列化兼容 (`toJSONString` / Lazy FS)** | `src/profiler.ts` | 纯 V8 边缘运行时无本地 POSIX 文件系统 | `BayesianTaskProfiler` 原生支持无文件系统的 JSON / KV / D1 状态导入导出，同时保留按需懒加载的本地文件持久化接口 |
+
+### 12.3 基于 `RustFS` + `denoland/celld` 的生产部署架构标本
+
+在自托管生产环境中，推荐使用 **RustFS**（Apache-2.0 开源、无 GC 停顿的高性能 Rust S3 兼容对象存储）作为 `celld` 集群的共享存储桶底座（`One Fleet, One Bucket`）：
+
+```text
++---------------------------------------------------------------------------------------------------+
+| 1. 接入负载均衡层 (Envoy / Caddy / Cloudflare Anycast L7 LB)                                       |
++-------------------------------------------------+-------------------------------------------------+
+                                                  | (HTTP / WebSocket / SSE -> :8080)
+                                                  v
++---------------------------------------------------------------------------------------------------+
+| 2. denoland/celld 有状态控制与认知路由集群 (3~N 节点, CELLD_DURABILITY=fleet, ~14ms 对等落盘)       |
+|  - celld-node-01 (:8080 public / :8081 internal, --advertise celld-node-01:8081)                  |
+|  - celld-node-02 (:8080 public / :8081 internal, --advertise celld-node-02:8081)                  |
+|  - celld-node-03 (:8080 public / :8081 internal, --advertise celld-node-03:8081)                  |
+|  * 运行 AnstsSchedulerCell + AgentTaskHarnessCell + __D1 (ansts-audit-ledger) + __KV + __Queue    |
++------------------------+-------------------------------------------------+------------------------+
+                         | (S3 Conditional CAS & LTX Stream -> :9000)      | (Companion Container / gRPC)
+                         v                                                 v
++------------------------------------------------+   +----------------------------------------------+
+| 3. RustFS 高性能 S3 对象存储集群 (UID 10001)    |   | 4. ANSTS 裸金属相变沙箱池 (Firecracker/Kata)  |
+|  - Port :9000 (S3 API, /health, Peer RPC)      |   |  - 思考期 0.1C/256MB <-> 工具期 8.0C/4GB      |
+|  - Port :9001 (RustFS Web Console)             |   |  - 节点 Burst Semaphore + Linux PSI 内存守卫  |
+|  - Bucket: s3://ansts-fleet (RPO=0 LTX & Lease)|   |  - CELLD_CONTAINER_RUNTIME=runsc / kata      |
++------------------------------------------------+   +----------------------------------------------+
+```
+
+#### 标准启动命令标本 (`deploy/rustfs-celld/start-rustfs-celld.sh`)
+
+```bash
+# 1. 一键拉起 RustFS (:9000 S3 API / :9001 Console) + 3 节点 celld 对等复制集群
+docker compose -f deploy/rustfs-celld/docker-compose.rustfs-celld.yml up -d
+
+# 2. 部署 ANSTS v2.1 TypeScript Worker & Durable Objects 并执行 D1 SQL 迁移
+export CELLD_BUCKET="s3://ansts-fleet"
+export S3_ENDPOINT="http://127.0.0.1:9000"
+celld deploy . --bucket "${CELLD_BUCKET}" --endpoint "${S3_ENDPOINT}" --region us-east-1
+celld d1 migrations apply ansts-audit-ledger --bucket "${CELLD_BUCKET}" --endpoint "${S3_ENDPOINT}"
+
+# 3. 执行无侵入集群健康与租约体检 (确认 restoring=0 且 CAS/Read-after-write 正常)
+celld diagnose --bucket "${CELLD_BUCKET}" --endpoint "${S3_ENDPOINT}"
+```

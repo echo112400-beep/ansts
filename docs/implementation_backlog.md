@@ -6,7 +6,7 @@
 | **当前代码仓基线 (Baseline)** | `main @ 0bb837f`（已完成项目脚手架、Protobuf 契约、核心算法内存原型与 6 项基础集成测试） |
 | **规划范围 (Scope)** | 覆盖 5 大领域限界上下文、11 个核心微服务组件，从内存原型演进至生产级分布式高可用系统的全部研发任务 |
 | **核心模型池 (Model Pools)** | `DeepSeek`（旗舰深度推理池）、`GLM-5.3`（轻量高速/只读轮次分流池）、`Qwen-3.8`（高可用热备容灾池） |
-| **审核状态 (Review Status)** | **ALL M1 ~ M6 COMPLETED & VERIFIED IN CI (main @ aa5f03f)** |
+| **审核状态 (Review Status)** | **ALL M1 ~ M7 (TASK-01 ~ TASK-40) COMPLETED & 20/20 TESTS VERIFIED IN TYPESCRIPT CI** |
 
 ---
 
@@ -121,3 +121,17 @@
 2. **启动执行方式**：审核通过后，你可以选择：
    * **方式 A（按阶段逐一交付）**：从 **M1（`TASK-01` ~ `TASK-05`：接入网关、严格校验器、SSE 流控与贝叶斯画像持久化）** 开始，每完成一个阶段运行 CI 并由你检视；
    * **方式 B（核心链路优先冲刺）**：优先实现你最关注的核心模块（例如直接推进 **M2 + M3 的核心调度与认知路由/Saga 网关完整实现**）。
+---
+
+### 阶段七（M7）：TypeScript 全量迁移、`celld`/Cloudflare 集成、`RustFS` 启动标本与代码走查加固 (`TASK-33` ~ `TASK-40`)
+
+| 任务 ID | 任务名称 | 目标代码路径 | 状态 | 核心实现内容与 CI 验收结果 |
+| :--- | :--- | :--- | :--- | :--- |
+| **`TASK-33`** | **M1 ~ M6 全量模块 TypeScript 重写与 AST/CommonJS 构建流水线** | `src/**/*.ts`<br>`scripts/ci_check.mjs`<br>`tsconfig.json` | ✅ **已完成** | 40 个 TypeScript 模块通过 `@babel/parser` AST 语法校验并编译至 `dist/`，GitHub Actions Node 18/20 矩阵就绪 |
+| **`TASK-34`** | **`denoland/celld` & Cloudflare Workers 统一入口与 Durable Objects 封装** | `src/cloudflare/worker.ts`<br>`src/cloudflare/scheduler_cell.ts`<br>`src/cloudflare/harness_cell.ts` | ✅ **已完成** | 实现边缘 KV 幂等去重、`AnstsSchedulerCell`、脑体分离 `AgentTaskHarnessCell`（含 `ctx.storage.sql`、`ctx.container`、WebSocket Hibernation 与 `alarm()`） |
+| **`TASK-35`** | **`wrangler.json` / `wrangler.toml` 与 D1 SQL 数据库迁移脚本** | `wrangler.json`<br>`migrations/0001_init_ansts.sql` | ✅ **已完成** | 同时兼容 `celld deploy` / `celld d1 migrations apply` 与 `wrangler deploy` |
+| **`TASK-36`** | **`RustFS` S3 对象存储 + `celld --bucket` 生产启动标本与 Compose 集群** | `deploy/rustfs-celld/start-rustfs-celld.sh`<br>`deploy/rustfs-celld/docker-compose.rustfs-celld.yml` | ✅ **已完成** | 完整配置 UID `10001` 权限初始化、`:9000` S3 端点、`--internal-listen` 与 `--advertise` 3 节点对等复制集群 |
+| **`TASK-37`** | **Audit Fix #1：Cell 冷启动与休眠唤醒 SQLite 状态自动重水化 (`rehydrateFromSql`)** | `src/cloudflare/harness_cell.ts` | ✅ **已完成** | 解决 Cell 休眠销毁 V8 实例后唤醒丢失内存 `fence`、`walStore` 与 `sagaJournal` 的问题（`test 10` 通过） |
+| **`TASK-38`** | **Audit Fix #2：被抢占/PSI 休眠沙箱在算力释放后自动唤醒续跑 (`hibernatedResumeQueue`)** | `src/scheduler.ts`<br>`src/models.ts` | ✅ **已完成** | 区分 `PREEMPTED` 与 `HUMAN_APPROVAL_WAIT`，节点 CPU 释放后自动按 `(epoch + 1, prevTurnSeq)` 唤醒续跑（`test 11` 通过） |
+| **`TASK-39`** | **Audit Fix #3：顶层路由器、Saga 网关与节点守护进程全组件统一装配** | `src/cognitive_router.ts`<br>`src/saga_gateway.ts`<br>`src/node_daemon.ts` | ✅ **已完成** | 串联三态熔断器（含 `HALF_OPEN` 冷却探测）、滑动令牌桶、LIFO 补偿器与相变控制器（`test 12` 通过） |
+| **`TASK-40`** | **Audit Fix #4 & #5：挂钟/活跃算力双时钟计量、`GRACEFUL_DRAINING` 与 V8 纯 JSON 序列化** | `src/models.ts`<br>`src/profiler.ts` | ✅ **已完成** | 休眠期零活跃算力扣减、超限平滑排水摘要及无文件系统依赖的贝叶斯画像序列化（`test 13, 14` 通过，全仓 **20/20 测试全部通过**） |

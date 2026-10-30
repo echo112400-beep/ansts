@@ -312,3 +312,19 @@ Zombie Node-01         ansts-lease-coordinator         Healthy Node-02         a
 | **`ansts-cognitive-router`** | 无状态多活（$\ge 8$ 副本） | `< 100ms`（下一轮自动重连） | 主池 `DeepSeek` 异常时自动降级至 `Qwen-3.8` 或 `GLM-5.3`；令牌桶中心失联时退化为单实例本地限流 |
 | **`ansts-saga-tool-gateway`** | 无状态多活（$\ge 6$ 副本） | `< 200ms` | 依靠 `Idempotency-Key` 与持久层 Saga 日志安全重试 |
 | **`ansts-node-daemon`** | 每台宿主机单进程（状态持久化于本地磁盘） | 进程重启 `< 1s`（不杀沙箱） | Daemon 采用 **Live-Upgrade 无损热重启** 设计：重启期间已有 Firecracker 进程保持运行，重连 `AF_VSOCK` 即可恢复接管 |
+---
+
+## 7. TypeScript 代码仓模块映射与 `celld` / Cloudflare / `RustFS` 部署同步 (v2.1)
+
+本章节同步展示当前已完成全量编码闭环并通过 20 项 CI 测试的 **TypeScript 源码模块映射关系**：
+
+| 领域层 / 子系统 | TypeScript 源码文件 (`src/**/*.ts`) | 核心类 / 接口名称 | 关联测试文件 (`tests/*.test.ts`) |
+| :--- | :--- | :--- | :--- |
+| **核心领域模型与双时钟预算** | `src/models.ts` | `FenceToken`, `ResourceVector5D`, `AgentTask` (`advanceClocks`, `GRACEFUL_DRAINING`), `EscrowVoucher`, `TurnWalFrame` | `integration_suite.test.ts`<br>`code_audit_improvements.test.ts` |
+| **接入网关与贝叶斯画像** | `src/gateway/validator.ts`<br>`src/gateway/server.ts`<br>`src/gateway/backpressure.ts`<br>`src/gateway/sse_stream.ts`<br>`src/profiler.ts` | `TaskSpecValidator`, `ApiGatewayServer`, `IngressBackpressureController`, `SseEventStreamGateway`, `BayesianTaskProfiler` (`toJSONString`) | `chaos_benchmarks.test.ts`<br>`code_audit_improvements.test.ts` |
+| **多租队列、DAG 支票与 5D 调度** | `src/queue_manager.ts`<br>`src/dag/escrow.ts`<br>`src/scheduler.ts`<br>`src/lease_coordinator.ts` | `MultiTenantQueueManager`, `DagEscrowCoordinator`, `CoreScheduler5D` (`hibernatedResumeQueue`), `LeaseCoordinator` | `integration_suite.test.ts`<br>`code_audit_improvements.test.ts` |
+| **认知动态路由与四级 Saga 网关** | `src/cognitive_router.ts`<br>`src/router/pool_client.ts`<br>`src/router/breaker_limiter.ts`<br>`src/saga_gateway.ts`<br>`src/saga/compensator.ts`<br>`src/saga/staging.ts` | `CognitiveRouter` (`DeepSeek`/`GLM-5.3`/`Qwen-3.8`), `ModelPoolClientAdapter`, `ThreeStateCircuitBreaker`, `SlidingWindowTokenBucket`, `SagaToolGateway`, `SagaCompensatorEngine`, `StagingCommitAndApprovalGate` | `chaos_benchmarks.test.ts`<br>`code_audit_improvements.test.ts` |
+| **相变沙箱守护与 PID 1 Harness** | `src/node_daemon.ts`<br>`src/runtime/warm_pool.ts`<br>`src/runtime/phase_controller.ts`<br>`src/runtime/psi_guard.ts`<br>`src/runtime/vsock_bridge.ts`<br>`src/harness/runner.ts`<br>`src/harness/velocity_breaker.ts` | `NodeDaemon`, `WarmSandboxPoolManager`, `CgroupPhaseController`, `LinuxPsiMemoryGuard`, `ZeroTrustVsockBridge`, `AgentHarnessRunner`, `SyntacticAndVelocityBreaker` | `integration_suite.test.ts`<br>`chaos_benchmarks.test.ts` |
+| **增量快照、时光机重放与通知** | `src/checkpoint/wal_engine.ts`<br>`src/checkpoint/compactor.ts`<br>`src/checkpoint/time_travel.ts`<br>`src/telemetry/cloudevents.ts`<br>`src/telemetry/outbox_webhook.ts` | `TurnWalEngine`, `WalCompactorAndPagedRestorer`, `DeterministicTimeTravelReplayer`, `CloudEventsBus`, `TransactionalOutboxDispatcher` | `chaos_benchmarks.test.ts` |
+| **`celld` & Cloudflare 边缘协同层** | `src/cloudflare/worker.ts`<br>`src/cloudflare/scheduler_cell.ts`<br>`src/cloudflare/harness_cell.ts`<br>`src/cloudflare/env.ts`<br>`wrangler.json` / `migrations/0001_init_ansts.sql` | `cloudflareCelldWorker`, `AnstsSchedulerCell`, `AgentTaskHarnessCell` (`rehydrateFromSql`), `CloudflareCelldEnv` | `celld_cloudflare.test.ts`<br>`code_audit_improvements.test.ts` |
+| **`RustFS` + `celld` 生产部署标本** | `deploy/rustfs-celld/start-rustfs-celld.sh`<br>`deploy/rustfs-celld/docker-compose.rustfs-celld.yml`<br>`deploy/rustfs-celld/systemd/celld.service` | RustFS (`:9000` S3 API / `:9001` Console, UID `10001`) + 3 节点 `celld` (`--bucket s3://ansts-fleet --endpoint http://rustfs:9000`) | `celld_cloudflare.test.ts` |
