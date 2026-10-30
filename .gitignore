@@ -11,3 +11,6 @@ coverage/
 
 # Windows / WSL alternate-data-stream junk
 *:Zone.Identifier
+
+# Local credentials (never commit; see .env.example)
+.env

@@ -15,9 +15,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
+# 本地凭据从仓库根的 .env 读取 (.gitignore 已忽略, 不入库)
+# 参见 .env.example; 也支持直接 export 到当前 shell。
+if [ -f "${REPO_ROOT}/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "${REPO_ROOT}/.env"
+  set +a
+fi
+
 # ------------------------- 1. 核心环境变量标本配置 ----------------------------
-export RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-ansts_rustfs_ak_9f8e7d6c5b4a}"
-export RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-ansts_rustfs_sk_1a2b3c4d5e6f7g8h9i0j}"
+# 凭据故意不设默认值: 硬编码的默认密钥会随仓库公开发布。
+# 未设置时立即失败并提示, 而不是静默使用一个公开的密钥。
+export RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is unset — export it or add it to .env (see .env.example)}"
+export RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is unset — export it or add it to .env (see .env.example)}"
 export RUSTFS_DATA_DIR="${RUSTFS_DATA_DIR:-/var/lib/rustfs/data}"
 export RUSTFS_LOG_DIR="${RUSTFS_LOG_DIR:-/var/log/rustfs}"
 export RUSTFS_API_ADDR="${RUSTFS_API_ADDR:-0.0.0.0:9000}"
