@@ -3,3 +3,11 @@ dist/
 coverage/
 *.log
 .DS_Store
+
+# RustFS CLI binary + release tarballs (do not commit large binaries)
+/rc
+*.tar.gz
+*.tgz
+
+# Windows / WSL alternate-data-stream junk
+*:Zone.Identifier
