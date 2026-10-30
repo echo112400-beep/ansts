@@ -37,3 +37,4 @@ export * from "./cloudflare/env";
 export * from "./cloudflare/scheduler_cell";
 export * from "./cloudflare/harness_cell";
 export { default as cloudflareCelldWorker } from "./cloudflare/worker";
+export * from "./cloudflare/celld_ha_engine";
