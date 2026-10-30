@@ -3,6 +3,8 @@
  * - Implements `rehydrateFromSql()` in constructor so waking from HIBERNATED / INACTIVE
  *   in `celld` or Cloudflare Durable Objects restores `fence`, `walStore`, and `sagaJournal`
  *   with zero state loss.
+ * - TASK-49: Wires `RpoZeroDurabilityEngine` (`commitAndProveRpoZero` / `claimCellOwnershipCas`)
+ *   and `DurableWorkflowContext` (`do`, `waitForEvent`, `sleep`) directly into the Cell hot path.
  */
 
 import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel";
@@ -20,6 +22,10 @@ import {
 } from "../models";
 import { NodeDaemon } from "../node_daemon";
 import { SagaToolGateway } from "../saga_gateway";
+import {
+  DurableWorkflowContext,
+  RpoZeroDurabilityEngine,
+} from "./celld_ha_engine";
 import { CloudflareCelldEnv, DurableObjectState, WebSocketLike } from "./env";
 
 export class AgentTaskHarnessCell {
@@ -28,6 +34,9 @@ export class AgentTaskHarnessCell {
   public readonly sagaGw = new SagaToolGateway(this.leaseCoord);
   public readonly nodeDaemon = new NodeDaemon(this.leaseCoord, this.cogRouter, this.sagaGw);
   public readonly replayer = new DeterministicTimeTravelReplayer();
+  public readonly durabilityEngine = new RpoZeroDurabilityEngine("bucket", 10000);
+  public readonly workflowCtx: DurableWorkflowContext;
+  public currentOwnerNodeId: string = "celld-node-01";
   public task: AgentTask;
   public clientCreditWindow: number = 100;
 
@@ -48,6 +57,7 @@ export class AgentTaskHarnessCell {
       state: TaskState.RUNNING,
       phase: SandboxPhase.COGNITIVE,
     });
+    this.workflowCtx = new DurableWorkflowContext(`wf-${taskId}`, 3600_000);
 
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS turn_wal_frames (turn_seq INTEGER, epoch INTEGER, routed_model TEXT, effective_effort TEXT, tokens_used INTEGER, workspace_hash TEXT, pass_rate REAL, error_count INTEGER, diff_entropy REAL)",
@@ -60,19 +70,16 @@ export class AgentTaskHarnessCell {
     this.rehydrateFromSql();
   }
 
-  /**
-   * Reconstructs in-memory FenceToken, TurnWAL frames, and Saga compensation records
-   * from the Cell's persistent SQLite database across cold starts and WebSocket hibernation wakeups.
-   */
   public rehydrateFromSql(): void {
     const taskId = this.task.taskId;
     const walRows = this.ctx.storage.sql.exec("SELECT * FROM turn_wal_frames").toArray();
     if (walRows.length === 0) {
       this.task.fence = this.leaseCoord.acquireOrIncrementEpoch(
         taskId,
-        "celld-node-01",
+        this.currentOwnerNodeId,
         this.task.primaryModel,
       );
+      this.durabilityEngine.claimCellOwnershipCas(taskId, this.currentOwnerNodeId, Date.now());
       return;
     }
 
@@ -99,10 +106,11 @@ export class AgentTaskHarnessCell {
 
     const lastFrame = frames[frames.length - 1];
     const nextFence = new FenceToken(lastFrame.fence.epoch, lastFrame.fence.turnSeq + 1, taskId);
-    this.leaseCoord.acquireOrIncrementEpoch(taskId, "celld-node-01", this.task.primaryModel);
-    // Advance coordinator fence to match rehydrated epoch & next turn_seq
+    this.leaseCoord.acquireOrIncrementEpoch(taskId, this.currentOwnerNodeId, this.task.primaryModel);
+    this.durabilityEngine.claimCellOwnershipCas(taskId, this.currentOwnerNodeId, Date.now());
     for (let ep = 1; ep < nextFence.epoch; ep++) {
-      this.leaseCoord.acquireOrIncrementEpoch(taskId, "celld-node-01", this.task.primaryModel);
+      this.leaseCoord.acquireOrIncrementEpoch(taskId, this.currentOwnerNodeId, this.task.primaryModel);
+      this.durabilityEngine.claimCellOwnershipCas(taskId, this.currentOwnerNodeId, Date.now() + 20000 * ep);
     }
     this.leaseCoord.verifyAndAdvanceFence(nextFence);
     this.task.fence = nextFence;
@@ -212,6 +220,16 @@ export class AgentTaskHarnessCell {
           diffEntropy,
         );
 
+        // TASK-49: Enforce RPO=0 Durability Proof before emitting output to caller
+        const rpoProof = this.durabilityEngine.commitAndProveRpoZero({
+          cellScope: this.task.taskId,
+          nodeId: this.currentOwnerNodeId,
+          fence: incomingFence,
+          ltxPayload: JSON.stringify({ wsHash, tokens: routeRes.tokensConsumed }),
+          peerFollowerIds: [],
+          writeCursorConsumed: true,
+        });
+
         const audit = this.nodeDaemon.recordTurnAndAuditVelocity({
           task: this.task,
           routedModel: routeRes.routedModel,
@@ -241,6 +259,7 @@ export class AgentTaskHarnessCell {
             container_burst_triggered: containerBurstTriggered,
             tool_result: toolResult,
             velocity_audit: audit,
+            rpo_zero_proof: rpoProof,
             sqlite_wal_rows: this.ctx.storage.sql.exec("SELECT * FROM turn_wal_frames").toArray().length,
           }),
           { status: 200, headers: { "content-type": "application/json" } },
@@ -254,6 +273,40 @@ export class AgentTaskHarnessCell {
         }
         throw err;
       }
+    }
+
+    // TASK-49: Multi-step Durable Workflow execution on AgentTaskHarnessCell
+    if (request.method === "POST" && url.pathname.endsWith("/workflow")) {
+      const body = (await request.json()) as {
+        event_to_deliver?: { type: string; payload: any };
+        sleep_duration_ms?: number;
+      };
+      if (body.event_to_deliver) {
+        this.workflowCtx.sendEvent(body.event_to_deliver.type, body.event_to_deliver.payload);
+      }
+
+      const step1 = await this.workflowCtx.do("allocate-sandbox", async () => {
+        return { sandboxId: `sbx-${this.task.taskId}`, allocatedAtEpoch: this.task.fence.epoch };
+      });
+      const step2 = await this.workflowCtx.waitForEvent("sandbox.ready");
+      const step3 = await this.workflowCtx.do("execute-agent-turn", async () => {
+        return { executed: true, model: this.task.primaryModel };
+      });
+      await this.workflowCtx.sleep("post-turn-cooldown", body.sleep_duration_ms ?? 5_000);
+
+      return new Response(
+        JSON.stringify({
+          task_id: this.task.taskId,
+          workflow_steps: {
+            step1,
+            step2,
+            step3,
+            sleepInfo: { hibernatedIsolate: this.workflowCtx.isolateHibernated },
+          },
+          cached_step_count: this.workflowCtx.completedSteps.size,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
     }
 
     if (request.method === "POST" && url.pathname.endsWith("/replay")) {
@@ -274,6 +327,13 @@ export class AgentTaskHarnessCell {
     if (request.method === "POST" && url.pathname.endsWith("/failover")) {
       const body = (await request.json()) as { new_node_id: string };
       const newFence = this.nodeDaemon.failoverTaskToNode(this.task, body.new_node_id);
+      this.currentOwnerNodeId = body.new_node_id;
+      // Advance CAS ownership epoch & seal prior node session (simulating expired lease takeover)
+      this.durabilityEngine.claimCellOwnershipCas(
+        this.task.taskId,
+        body.new_node_id,
+        Date.now() + 20000 * newFence.epoch,
+      );
       return new Response(
         JSON.stringify({
           task_id: this.task.taskId,

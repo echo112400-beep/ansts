@@ -1,10 +1,12 @@
 /**
- * TASK-30: Unified Cluster Facade (AnstsClusterRuntime) and anstsctl CLI Tool.
+ * TASK-30 & TASK-51: Unified Cluster Facade (AnstsClusterRuntime) and anstsctl CLI Tool
+ * including `anstsctl fleet status | rebalance | rolling-restart`.
  */
 
 import { WalCompactorAndPagedRestorer } from "../checkpoint/compactor";
 import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel";
 import { TurnWalEngine } from "../checkpoint/wal_engine";
+import { FleetHaAndAutoscalerController } from "../cloudflare/celld_ha_engine";
 import { BidirectionalBackpressureController } from "../cluster/backpressure_loop";
 import { CognitiveRouter } from "../cognitive_router";
 import { ApiGatewayServer } from "../gateway/server";
@@ -35,6 +37,7 @@ export class AnstsClusterRuntime {
   public readonly replayer = new DeterministicTimeTravelReplayer();
   public readonly eventsBus = new CloudEventsBus();
   public readonly bpController = new BidirectionalBackpressureController();
+  public readonly fleetController = new FleetHaAndAutoscalerController();
 
   constructor() {
     this.scheduler.registerTenant("fin-enterprise", 4.0);
@@ -43,6 +46,40 @@ export class AnstsClusterRuntime {
     for (const idx of [1, 2, 3]) {
       this.scheduler.registerNode({ nodeId: `worker-us-west-0${idx}`, driver: "firecracker" });
     }
+    this.fleetController.registerOrUpdateNodeLoad({
+      node_id: "celld-node-01",
+      sampled_ms: Date.now(),
+      owned_cells: 420,
+      placement_weight: 100,
+      resident_cells: 85,
+      host_websockets: 12,
+      rss_bytes: 256 * 1024 * 1024,
+      in_use_bytes: 128 * 1024 * 1024,
+      cpu_percent_x100: 2500,
+      open_fds: 64,
+      pressured: false,
+      memory_headroom: true,
+      shed_cells: 0,
+      restoring: 0,
+      draining: false,
+    });
+    this.fleetController.registerOrUpdateNodeLoad({
+      node_id: "celld-node-02",
+      sampled_ms: Date.now(),
+      owned_cells: 180,
+      placement_weight: 100,
+      resident_cells: 40,
+      host_websockets: 8,
+      rss_bytes: 192 * 1024 * 1024,
+      in_use_bytes: 96 * 1024 * 1024,
+      cpu_percent_x100: 1500,
+      open_fds: 48,
+      pressured: false,
+      memory_headroom: true,
+      shed_cells: 0,
+      restoring: 0,
+      draining: false,
+    });
   }
 
   public clusterTopSnapshot(): Record<string, any> {
@@ -81,6 +118,27 @@ export function runCli(argv: string[]): Record<string, any> {
       Array.from(cluster.scheduler.tasks.values()),
     );
     return { chaos: "deepseek-429", breaker: "OPEN", backpressure_stage: stage };
+  }
+  if (argv[0] === "fleet") {
+    const sub = argv[1] ?? "status";
+    if (sub === "status") {
+      const totalOwnedCells = Array.from(cluster.fleetController.nodes.values()).reduce(
+        (acc, n) => acc + n.owned_cells,
+        0,
+      );
+      return {
+        totalOwnedCells,
+        ...cluster.fleetController.evaluateFleetAutoscalingAndRollout(),
+      };
+    }
+    if (sub === "rebalance") {
+      return cluster.fleetController.computeRebalanceBatch() ?? { movedCells: 0 };
+    }
+    if (sub === "rolling-restart") {
+      const gate = cluster.fleetController.evaluateFleetAutoscalingAndRollout();
+      const handoff = cluster.fleetController.prepareShutdownHandoff("celld-node-01", true);
+      return { rolling_gate: gate, preserve_handoff: handoff };
+    }
   }
   return {};
 }
