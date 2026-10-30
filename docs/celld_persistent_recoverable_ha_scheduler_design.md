@@ -149,3 +149,70 @@
 | `HA-06` | `SafeEpochGarbageCollector` 写入 `retired.json` 并严格保留 `current`、`current-1` 及保留期内纪元 | **PASS** |
 | `HA-07` | `FleetHaAndAutoscalerController` 32-Cell 限速重平衡、`handoff=preserve` 原地保留升级与 `restoring=0` 滚动门禁 | **PASS** |
 | **总计** | **全量 43 个 TypeScript 模块编译 + 30 项单元/集成/混沌/高可用测试** | **30 / 30 PASS** |
+
+---
+
+## 8. 任务并发处理横向扩容架构（Horizontal Scale-Out Architecture）
+
+为了消除单点序列化瓶颈，系统在以下 **5 个水平扩展平面**（对应 `src/cloudflare/horizontal_scaler.ts` 与 `tests/horizontal_scaleout.test.ts`）构建了可线性扩展的并发处理能力：
+
+### 8.1 五层横向扩容拓扑
+
+```
+  [100k+ Concurrent Agent Requests]
+                 │
+                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 1. 边缘接入层 (Stateless Edge Worker Fleet)                              │
+  │    - 零状态水平扩容，执行 JSON Schema 校验、KV 幂等去重与 P2C 分片路由     │
+  └──────────────┬──────────────────────────────────────────────────────────┘
+                 │ (Consistent Hash + Hot-Tenant Virtual Sub-Sharding + P2C)
+                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 2. 分片调度控制层 (Partitioned AnstsSchedulerCell Shards 00..K)          │
+  │    - 突破单 Cell 串行瓶颈：常态租户亲和路由，热点大租户自动分裂为 M 个子分片 │
+  │    - 无锁配额 Gossip 同步：各分片本地高速扣减配额，异步汇总全局 W-DRF 份额  │
+  └──────────────┬──────────────────────────────────────────────────────────┘
+                 │ (Dynamic Queue Auto-Sharding: N * 256 Producer Concurrency)
+                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 3. 动态分片队列缓冲层 (DynamicQueueAutoSharder: q-shard-00..N)           │
+  │    - 突破单 Queue Cell 256 并发写上限，水位超 75% 自动翻倍扩容活跃队列分片  │
+  └──────────────┬──────────────────────────────────────────────────────────┘
+                 │ (1 Task = 1 Dedicated Cell: idFromName(task_id))
+                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 4. 任务级细粒度大脑层 (Cell-Per-Task AgentTaskHarnessCell Fleet)         │
+  │    - 每个任务独占 1 个 V8 Isolate + 独立嵌入式 SQLite，跨任务零锁竞争       │
+  │    - LLM 思考期 (90% 时长) 触发 WebSocket Hibernation，单机可驻留 10,000+ │
+  └──────────────┬──────────────────────────────────────────────────────────┘
+                 │ (Brain-Body Disaggregation: ~30:1 Multiplexing Ratio)
+                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 5. 脑体分离沙箱执行池 + RustFS 分布式存储层 (Container Hosts & RustFS)    │
+  │    - 仅在 Tool 执行脉冲期按需借用 8.0C 容器槽位（每宿主机 20 并发 Semaphore）│
+  │    - 基于 Linux PSI 与 Warm Pool 水位自动横向扩容沙箱宿主机与 RustFS 节点   │
+  └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 五大横向扩容关键设计
+
+1. **一任务一单元（Cell-Per-Task 零锁并发模型）**：
+   - 遵循 [`denoland/celld` 架构设计 (`docs/README.md`)](https://github.com/denoland/celld/blob/main/docs/README.md)，每个任务通过 `idFromName(task_id)` 映射为独立的 `AgentTaskHarnessCell`，拥有专属 V8 Isolate 与私有 SQLite（`cells/<namespace>/<cell_id>/`）。
+   - **效果**：100,000 个并发任务对应 100,000 个互不干扰的微状态机，彻底消除传统集中式关系型数据库的行锁与连接池耗尽问题。
+2. **双层分片调度器 + 热点租户自适应分裂（`PartitionedSchedulerRouter`）**：
+   - 若所有任务都经过单一全局 `SchedulerCell`，单线程 V8 Isolate 会在约 `1,000 RPS` 达到吞吐上限。
+   - 系统将全局调度拆分为 $K$ 个 `scheduler-cell-shard-{00..K}` 分片，并支持在线动态追加分片（`scaleOutSchedulerShards`）：
+     - **常态租户亲和（Affinity）**：中小租户按 `FNV-1a(tenantId)` 固定路由至主分片，保证租户内 5D W-DRF 精确排序；
+     - **热点租户自适应分裂 + 二选一负载均衡（Hot-Tenant Sub-Sharding & P2C）**：当单租户并发超过阈值（如 `64` 路并发）时，自动将该租户分裂到 $M$ 个虚拟子分片，由边缘网关通过 **Power-of-Two-Choices (`P2C`)** 采样两个候选分片并路由至队列更短、EWMA 延迟更低的分片；
+     - **无锁配额 Gossip 同步（`syncTenantQuotaGossip`）**：各分片持有本地配额切片（Local Quota Slice），通过异步 Gossip 汇总全局并发水位，无需跨分片分布式锁即可执行毫秒级准入控制。
+3. **动态队列自动分片扩容（`DynamicQueueAutoSharder`）**：
+   - 针对 [`docs/services/queues.md`](https://github.com/denoland/celld/blob/main/docs/services/queues.md) 中**单个 Queue Cell 最多接收 `256` 路并发生产者调用**的硬限制，`DynamicQueueAutoSharder` 实时监控各队列分片的在途并发数（`inFlightProducers`）。
+   - 当聚合并发水位超过总容量（$N \times 256$）的 **`75%`** 时，自动成倍扩充活跃队列分片数（如从 4 分片 `1,024` 并发自动扩至 8 分片 `2,048` 并发、最高 64 分片 `16,384` 并发），消费者侧通过多组无状态 Worker 并行拉取消费。
+4. **脑体分离（Brain-Body Disaggregation）与 30:1 沙箱复用扩容（`BrainBodyContainerPoolScaler`）**：
+   - 结合 [`docs/services/containers.md`](https://github.com/denoland/celld/blob/main/docs/services/containers.md)，Agent 任务 85%~95% 的生命周期处于等待 `DeepSeek` / `GLM-5.3` / `Qwen-3.8` 模型流式输出（I/O 密集），仅 5%~15% 的时间处于代码编译或命令执行（CPU 密集）。
+   - **大脑层（`AgentTaskHarnessCell`）**：在模型思考期挂起并通过 WebSocket Hibernation 释放内存，单台 `celld` 节点即可承载 **10,000+ 并发任务状态机**；
+   - **躯体层（重型沙箱容器池）**：仅在进入 `PHASE_TOOL_BURST` 时从共享 Warm Pool 租借容器槽位（单宿主机通过 `node_burst_semaphore = 20` 限制最大 8.0C 脉冲并发），实现约 **`30:1` 的脑体复用比**。`BrainBodyContainerPoolScaler` 根据活跃脉冲数、Warm Pool 余量以及宿主机 Linux PSI（`cpu.pressure >= 0.40` 或 `memory.pressure >= 0.15`）自动计算需横向扩容的沙箱宿主机数量。
+5. **`celld` 节点集群与 `RustFS` 存储层水平扩展**：
+   - 新增 `celld` 节点通过 `--peer` 加入集群后，`FleetHaAndAutoscalerController` 每 `5s` 自动将高负载节点上的休眠 Cell 平滑迁移至新节点（每轮最多 `32` 个 Cell，保持 `2%` 均衡裕度）；
+   - 底层 `RustFS` 存储桶天然按 `cells/<namespace>/<cell_id>/` 前缀散列，可通过增加 NVMe 节点与纠删码（Erasure Coding）组实现对象读写带宽的线性水平扩展。
