@@ -292,3 +292,26 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
   await cell.alarm();
   assert.equal(cell.task.state, "HIBERNATED");
 });
+
+
+test("10. RustFS + celld --bucket startup specimen & Docker Compose manifest verification", () => {
+  const rootDir = path.join(__dirname, "..", "..");
+  const scriptPath = path.join(rootDir, "deploy", "rustfs-celld", "start-rustfs-celld.sh");
+  const composePath = path.join(rootDir, "deploy", "rustfs-celld", "docker-compose.rustfs-celld.yml");
+  const systemdPath = path.join(rootDir, "deploy", "rustfs-celld", "systemd", "celld.service");
+
+  const scriptText = fs.readFileSync(scriptPath, "utf8");
+  assert.ok(scriptText.includes('CELLD_BUCKET="${CELLD_BUCKET:-s3://ansts-fleet}"'));
+  assert.ok(scriptText.includes('--bucket "${CELLD_BUCKET}"'));
+  assert.ok(scriptText.includes('--endpoint "${S3_ENDPOINT}"'));
+  assert.ok(scriptText.includes("--internal-listen"));
+  assert.ok(scriptText.includes("--advertise"));
+
+  const composeObj = yaml.load(fs.readFileSync(composePath, "utf8")) as Record<string, any>;
+  assert.equal(composeObj.services.rustfs.image, "rustfs/rustfs:latest");
+  assert.equal(composeObj.services["celld-node-01"].image, "ghcr.io/denoland/celld:latest");
+  assert.ok(composeObj.services["celld-node-01"].command.includes("http://rustfs:9000"));
+
+  const systemdText = fs.readFileSync(systemdPath, "utf8");
+  assert.ok(systemdText.includes("CELLD_DURABILITY=fleet"));
+});

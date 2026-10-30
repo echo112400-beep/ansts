@@ -1,0 +1,36 @@
+[Unit]
+Description=ANSTS v2.0 — denoland/celld Stateful Runtime Node (Backed by RustFS S3)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=celld
+Group=celld
+Environment="CELLD_BUCKET=s3://ansts-fleet"
+Environment="S3_ENDPOINT=http://10.0.0.10:9000"
+Environment="AWS_ACCESS_KEY_ID=ansts_rustfs_ak_9f8e7d6c5b4a"
+Environment="AWS_SECRET_ACCESS_KEY=ansts_rustfs_sk_1a2b3c4d5e6f7g8h9i0j"
+Environment="AWS_REGION=us-east-1"
+Environment="CELLD_DURABILITY=fleet"
+Environment="CELLD_IDLE_EVICT_S=300"
+Environment="CELLD_LTX_RETENTION_SECS=86400"
+Environment="CELLD_CONTAINER_RUNTIME=runsc"
+Environment="DOCKER_HOST=unix:///var/run/docker.sock"
+
+ExecStart=/usr/local/bin/celld \
+  --bucket "${CELLD_BUCKET}" \
+  --endpoint "${S3_ENDPOINT}" \
+  --listen 0.0.0.0:8080 \
+  --internal-listen 0.0.0.0:8081 \
+  --advertise 10.0.0.11:8081
+
+# Graceful handoff on rolling restart (SIGTERM triggers lease & LTX upload)
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

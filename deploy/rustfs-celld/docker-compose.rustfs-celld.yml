@@ -1,0 +1,158 @@
+version: "3.9"
+
+# ==============================================================================
+# ANSTS v2.0 — RustFS + 3-Node celld Fleet Docker Compose 生产标本
+# 启动方式:
+#   docker compose -f deploy/rustfs-celld/docker-compose.rustfs-celld.yml up -d
+# ==============================================================================
+
+x-celld-common-env: &celld-common-env
+  CELLD_BUCKET: "s3://ansts-fleet"
+  S3_ENDPOINT: "http://rustfs:9000"
+  AWS_ACCESS_KEY_ID: "${RUSTFS_ACCESS_KEY:-ansts_rustfs_ak_9f8e7d6c5b4a}"
+  AWS_SECRET_ACCESS_KEY: "${RUSTFS_SECRET_KEY:-ansts_rustfs_sk_1a2b3c4d5e6f7g8h9i0j}"
+  AWS_REGION: "us-east-1"
+  CELLD_DURABILITY: "fleet"
+  CELLD_IDLE_EVICT_S: "300"
+  CELLD_LTX_RETENTION_SECS: "86400"
+  CELLD_DEPLOY_POLL_S: "30"
+  CELLD_REBALANCE_INTERVAL_MS: "5000"
+
+services:
+  # 1. 初始化容器：确保宿主机挂载目录归属 RustFS 非 root 用户 (UID 10001:10001)
+  rustfs_perms:
+    image: alpine:3.20
+    user: root
+    volumes:
+      - rustfs_data:/fix_data
+      - rustfs_logs:/fix_logs
+    command: ["sh", "-c", "chown -R 10001:10001 /fix_data /fix_logs"]
+
+  # 2. RustFS 高性能 S3 对象存储服务 (Port 9000: S3 API, Port 9001: Web Console)
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: ansts-rustfs
+    depends_on:
+      rustfs_perms:
+        condition: service_completed_successfully
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - rustfs_data:/data
+      - rustfs_logs:/var/log/rustfs/
+    environment:
+      RUSTFS_VOLUMES: "/data"
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: "error"
+      RUSTFS_OBS_LOG_DIRECTORY: "/var/log/rustfs/"
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-ansts_rustfs_ak_9f8e7d6c5b4a}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-ansts_rustfs_sk_1a2b3c4d5e6f7g8h9i0j}"
+    command: ["/data"]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # 3. 自动创建 s3://ansts-fleet 存储桶并推送首次部署
+  rustfs_bucket_init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: "${RUSTFS_ACCESS_KEY:-ansts_rustfs_ak_9f8e7d6c5b4a}"
+      AWS_SECRET_ACCESS_KEY: "${RUSTFS_SECRET_KEY:-ansts_rustfs_sk_1a2b3c4d5e6f7g8h9i0j}"
+      AWS_DEFAULT_REGION: "us-east-1"
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      - |
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://ansts-fleet || true
+        echo "Bucket s3://ansts-fleet is ready on RustFS."
+
+  # 4. celld 计算节点 01 (支持 CELLD_DURABILITY=fleet 对等复制)
+  celld-node-01:
+    image: ghcr.io/denoland/celld:latest
+    container_name: ansts-celld-01
+    depends_on:
+      rustfs_bucket_init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *celld-common-env
+    command:
+      - "--bucket"
+      - "s3://ansts-fleet"
+      - "--endpoint"
+      - "http://rustfs:9000"
+      - "--listen"
+      - "0.0.0.0:8080"
+      - "--internal-listen"
+      - "0.0.0.0:8081"
+      - "--advertise"
+      - "celld-node-01:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/.well-known/celld/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # 5. celld 计算节点 02 (Peer Follower / Owner)
+  celld-node-02:
+    image: ghcr.io/denoland/celld:latest
+    container_name: ansts-celld-02
+    depends_on:
+      rustfs_bucket_init:
+        condition: service_completed_successfully
+    ports:
+      - "8082:8080"
+    environment:
+      <<: *celld-common-env
+    command:
+      - "--bucket"
+      - "s3://ansts-fleet"
+      - "--endpoint"
+      - "http://rustfs:9000"
+      - "--listen"
+      - "0.0.0.0:8080"
+      - "--internal-listen"
+      - "0.0.0.0:8081"
+      - "--advertise"
+      - "celld-node-02:8081"
+    restart: unless-stopped
+
+  # 6. celld 计算节点 03 (Peer Follower / Owner)
+  celld-node-03:
+    image: ghcr.io/denoland/celld:latest
+    container_name: ansts-celld-03
+    depends_on:
+      rustfs_bucket_init:
+        condition: service_completed_successfully
+    ports:
+      - "8083:8080"
+    environment:
+      <<: *celld-common-env
+    command:
+      - "--bucket"
+      - "s3://ansts-fleet"
+      - "--endpoint"
+      - "http://rustfs:9000"
+      - "--listen"
+      - "0.0.0.0:8080"
+      - "--internal-listen"
+      - "0.0.0.0:8081"
+      - "--advertise"
+      - "celld-node-03:8081"
+    restart: unless-stopped
+
+volumes:
+  rustfs_data:
+  rustfs_logs:
