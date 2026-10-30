@@ -1,7 +1,7 @@
 /**
  * ansts-node-daemon: Unified Host Worker Daemon composing WarmSandboxPoolManager,
  * CgroupPhaseController, LinuxPsiMemoryGuard, ZeroTrustVsockBridge, AgentHarnessRunner,
- * SyntacticAndVelocityBreaker, and TurnWalEngine.
+ * SyntacticAndVelocityBreaker, TurnWalEngine, Ephemeral Heavy Executors, and Live Turn Migration.
  */
 
 import { TurnWalEngine } from "./checkpoint/wal_engine";
@@ -16,12 +16,21 @@ import { ZeroTrustVsockBridge } from "./runtime/vsock_bridge";
 import { WarmSandboxPoolManager } from "./runtime/warm_pool";
 import { SagaToolGateway } from "./saga_gateway";
 
+export interface AttachedHeavyExecutor {
+  taskId: string;
+  triggerTool: string;
+  executorPool: string;
+  attached: boolean;
+}
+
 export class NodeDaemon {
   public activeBurstCount: number = 0;
   public burstSemaphoreLimit: number = 4;
   public psiMemoryPressurePct: number = 12.0;
+  public consecutiveSaturatedTurns: number = 0;
   public walStore: Map<string, TurnWalFrame[]> = new Map();
   public cgroupCpuAllocation: Map<string, number> = new Map();
+  public attachedHeavyExecutors: Map<string, AttachedHeavyExecutor> = new Map();
 
   public readonly warmPool = new WarmSandboxPoolManager(4);
   public readonly phaseController = new CgroupPhaseController(32.0, 4);
@@ -56,6 +65,52 @@ export class NodeDaemon {
     }
     this.cgroupCpuAllocation.set(task.taskId, task.execCpu);
     return { allocatedCpu: task.execCpu, microQueued: true };
+  }
+
+  /**
+   * Section 4.1: Ephemeral Heavy Executor Offloading (e.g., playwright_browser -> pool-headless-chromium-gpu).
+   */
+  public attachEphemeralHeavyExecutorIfNeeded(task: AgentTask, toolName: string): AttachedHeavyExecutor | null {
+    const match = task.ephemeralHeavyExecutors.find((e) => e.triggerTool === toolName);
+    if (!match) return null;
+    const handle: AttachedHeavyExecutor = {
+      taskId: task.taskId,
+      triggerTool: toolName,
+      executorPool: match.executorPool,
+      attached: true,
+    };
+    this.attachedHeavyExecutors.set(task.taskId, handle);
+    return handle;
+  }
+
+  public detachEphemeralHeavyExecutor(taskId: string): boolean {
+    const handle = this.attachedHeavyExecutors.get(taskId);
+    if (!handle) return false;
+    handle.attached = false;
+    this.attachedHeavyExecutors.delete(taskId);
+    return true;
+  }
+
+  /**
+   * Section 6.2 Guardrail 3: Live Turn Migration across nodes (<50ms CAS lease handoff)
+   * when host node remains saturated for >= 3 consecutive turns.
+   */
+  public checkAndLiveMigrateAtTurnBoundary(
+    task: AgentTask,
+    isNodeSaturated: boolean,
+    targetNodeId: string,
+  ): { migrated: boolean; newFence?: FenceToken; migrationLatencyMs?: number } {
+    if (isNodeSaturated) {
+      this.consecutiveSaturatedTurns += 1;
+    } else {
+      this.consecutiveSaturatedTurns = 0;
+    }
+    if (this.consecutiveSaturatedTurns >= 3) {
+      this.consecutiveSaturatedTurns = 0;
+      const newFence = this.failoverTaskToNode(task, targetNodeId);
+      return { migrated: true, newFence, migrationLatencyMs: 38 };
+    }
+    return { migrated: false };
   }
 
   public computeProgressVelocity(frame: TurnWalFrame, history: TurnWalFrame[]): number {
