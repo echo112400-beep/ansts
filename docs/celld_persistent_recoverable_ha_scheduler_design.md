@@ -216,3 +216,136 @@
 5. **`celld` 节点集群与 `RustFS` 存储层水平扩展**：
    - 新增 `celld` 节点通过 `--peer` 加入集群后，`FleetHaAndAutoscalerController` 每 `5s` 自动将高负载节点上的休眠 Cell 平滑迁移至新节点（每轮最多 `32` 个 Cell，保持 `2%` 均衡裕度）；
    - 底层 `RustFS` 存储桶天然按 `cells/<namespace>/<cell_id>/` 前缀散列，可通过增加 NVMe 节点与纠删码（Erasure Coding）组实现对象读写带宽的线性水平扩展。
+
+---
+
+## 9. 生产环境整体部署架构图（End-to-End Production Deployment Architecture）
+
+以下为 **ANSTS v2.2 + `denoland/celld` + `RustFS` + 脑体分离沙箱集群** 的全链路生产级部署拓扑图（涵盖边缘接入、分片调度、队列缓冲、高可用 `celld` 脑集群、弹性沙箱躯体集群、认知模型路由池以及分布式 `RustFS` S3 持久化基座）：
+
+```
+========================================================================================================================
+                        ANSTS v2.2 + celld + RustFS 高可用横向扩容整体部署架构图 (Production Topology)
+========================================================================================================================
+
+                                  [ SDK / CLI (anstsctl) / Web Dashboard / Webhook ]
+                                                           │
+                                                           ▼ (HTTPS / WSS / SSE Credit Flow)
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ L1: 全球无状态边缘接入层 (Stateless Edge Worker Fleet / Anycast Ingress)                                             │
+│  ┌─────────────────────────┐  ┌──────────────────────────┐  ┌───────────────────────────┐  ┌──────────────────────┐  │
+│  │ TaskSpec v1beta1 校验器 │  │ KV 幂等去重 (Idempotency)│  │ L3 429 令牌桶背压门控      │  │ P2C + 热点租户路由器 │  │
+│  └─────────────────────────┘  └──────────────────────────┘  └───────────────────────────┘  └──────────┬───────────┘  │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────┘
+                                                                                                        │
+                  ┌─────────────────────────────────────────┬───────────────────────────────────────────┘
+                  │ (FNV-1a Affinity / Hot-Tenant P2C)      │ (Dynamic Queue Sharding: N * 256 Concurrency)
+                  ▼                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ L2: 高可用 celld 状态机集群 (HA celld Fleet — Multi-AZ Nodes with --peer & --bucket s3://rustfs/ansts)               │
+│                                                                                                                      │
+│  ┌─────────────────────────────────────────────────────┐   ┌──────────────────────────────────────────────────────┐  │
+│  │ 2A. 分片调度控制平面 (Partitioned Scheduler Shards) │   │ 2B. 动态分片异步队列池 (Sharded Queue Cell Brokers)   │  │
+│  │  • scheduler-cell-shard-00 .. shard-K               │   │  • ansts-dispatch-q-00 .. q-63 (单分片上限 256 并发) │  │
+│  │  • 5D W-DRF 公平算法 + Aging/EDF 反饥饿             │   │  • 水位 >75% 自动倍增分片 (DynamicQueueAutoSharder)  │  │
+│  │  • DAG 配额托管凭据 (Quota Escrow) + 慢节点提速     │   │  • 显式指数退避 (delaySeconds) + 持久化死信队列 DLQ  │  │
+│  │  • 跨分片无锁配额 Gossip 同步 (Quota Gossip Sync)   │   │  • 多消费者组无状态并行拉取消费                      │  │
+│  └──────────────────────────┬──────────────────────────┘   └───────────────────────────┬──────────────────────────┘  │
+│                             │                                                          │                             │
+│                             └─────────────────────────────┬────────────────────────────┘                             │
+│                                                           ▼ (idFromName(task_id) — 1 Task = 1 Dedicated Cell)        │
+│  ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ 2C. 任务级细粒度“大脑”集群 (AgentTaskHarnessCell + DurableWorkflowContext — 10,000+ Cells / Node)             │  │
+│  │  ┌───────────────────────────────┐  ┌─────────────────────────────────┐  ┌──────────────────────────────────┐  │  │
+│  │  │ 嵌入式 SQLite + TurnWAL       │  │ Durable Workflow (step.do 缓存  │  │ 进展速度断路器 (V_k < 0.10 回溯) │  │  │
+│  │  │ 写游标完整性保护 + 双时钟计费 │  │ Early Event 缓冲 / >1h 休眠卸载)│  │ AST 循环检测 + 4 级 Saga 补偿    │  │  │
+│  │  └───────────────┬───────────────┘  └────────────────┬────────────────┘  └─────────────────┬────────────────┘  │  │
+│  │                  └───────────────────────────────────┼─────────────────────────────────────┘                   │  │
+│  │                                                      │                                                         │  │
+│  │   [RPO = 0 持久化引擎 (RpoZeroDurabilityEngine)]     │   [集群自愈与弹性控制 (FleetHaAndAutoscalerController)] │  │
+│  │   • Fleet 模式: 1~2 Peer 节点 fsync 复制 + 接管封存   │   • GET /state & fleet/capacity-v1.json 实时容量探针   │  │
+│  │   • Bucket 模式: 上传 LTX 后二次复核 ownership.json  │   • 每 5s 平滑迁移 <=32 休眠 Cell / handoff=preserve   │  │
+│  └──────────────────────────┬───────────────────────────┴──────────────────────────────┬──────────────────────────┘  │
+└─────────────────────────────┼──────────────────────────────────────────────────────────┼─────────────────────────────┘
+                              │                                                          │
+        (LLM 思考期: 0.1C + WebSocket Hibernation)                 (工具脉冲期: 0.1C -> 8.0C, ~30:1 脑体复用比)
+                              ▼                                                          ▼
+┌──────────────────────────────────────────────────────────┐ ┌─────────────────────────────────────────────────────────┐
+│ L3-A: 认知模型路由池 (CognitiveRouter Pool)              │ │ L3-B: 脑体分离重型沙箱“躯体”池 (Sandbox Container Fleet)│
+│  • 3 态断路器 (CLOSED / OPEN / HALF-OPEN) + 令牌桶限速   │ │  • Warm Pool 预热微容器池 (<10ms 极速挂载)              │
+│  • 429 自动故障转移与按 Turn 认知复杂度动态选型：        │ │  • 双模弹性 Cgroups v2 (0.1C 思考 <-> 8.0C 工具脉冲)    │
+│    ├─ DeepSeek Pool (深度代码推理 / 复杂架构规划)        │ │  • 单宿主机 Burst Semaphore (并发上限 20) + VSOCK 桥接  │
+│    ├─ GLM-5.3 Pool  (多步工具编排 / 状态机协同)          │ │  • Linux PSI 守护 (cpu>=0.40 / mem>=0.15 自动限流扩容)  │
+│    └─ Qwen-3.8 Pool (高频快速语法修复 / 轻量级摘要)      │ │  • Ephemeral Heavy Executor (<50ms 跨机实时迁移卸载)    │
+└──────────────────────────────────────────────────────────┘ └─────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼ (S3 CAS Conditional Put + Bottomless LTX WAL Stream)
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ L4: 分布式持久化存储与元数据基座 (RustFS Distributed S3 Cluster + D1 Global Read Replica)                            │
+│  ┌──────────────────────────────────────────────────────────────────────┐  ┌──────────────────────────────────────┐  │
+│  │ RustFS S3 Bucket (s3://ansts-cells/cells/<namespace>/<cell_id>/)     │  │ 归档审计与可观测层 (D1 & Telemetry)  │  │
+│  │  • ownership.json : S3 If-Match CAS 租约 (TTL=10s, 3.33s 续期, Epoch)│  │  • 0001_init_ansts.sql (租户/账单表) │  │
+│  │  • 000001..N.ltx  : LiteFS LTX 增量事务帧 (冷启动按需分页拉取恢复)   │  │  • 贝叶斯画像 (BayesianTaskProfiler) │  │
+│  │  • retired.json   : SafeEpochGarbageCollector 纪元安全回收基座标记   │  │  • CloudEvents 1.0 + Outbox Webhook  │  │
+│  │  • fleet/capacity-v1.json : 全集群节点负载与内存水位共享视图         │  │  • 极简实时监控台 (Dashboard Server) │  │
+│  └──────────────────────────────────────────────────────────────────────┘  └──────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.1 Mermaid 拓扑定义（可直接粘贴至 Markdown / Notion / GitHub 渲染）
+
+```mermaid
+flowchart TB
+    subgraph Client["客户端与控制入口 (Clients & CLI)"]
+        CLI["anstsctl CLI / SDK / Web Dashboard"]
+    end
+
+    subgraph L1["L1: 全球无状态边缘接入层 (Stateless Edge Worker Fleet)"]
+        GW["Edge Gateway Worker<br/>JSON Schema 校验 + KV 幂等 + L3 429 门控"]
+        P2C["PartitionedSchedulerRouter<br/>FNV-1a 亲和 + 热点租户虚拟子分片 + P2C 路由"]
+        GW --> P2C
+    end
+
+    subgraph L2["L2: 高可用 celld 状态机集群 (HA celld Fleet with --peer & --bucket)"]
+        subgraph SchedPool["2A. 分片调度控制面 (Scheduler Shards)"]
+            S0["AnstsSchedulerCell Shard 00..K<br/>5D W-DRF + Aging/EDF + DAG Escrow + Gossip 配额同步"]
+        end
+
+        subgraph QueuePool["2B. 动态分片队列层 (Sharded Queue Cells)"]
+            Q0["DynamicQueueAutoSharder (q-00..q-63)<br/>突破单队列 256 并发上限 + 指数退避 + DLQ"]
+        end
+
+        subgraph BrainPool["2C. 任务级细粒度大脑池 (Cell-Per-Task Harness Fleet)"]
+            H0["AgentTaskHarnessCell + DurableWorkflowContext<br/>独立 SQLite + TurnWAL + step.do 缓存 + 速度断路器"]
+            RPO["RpoZeroDurabilityEngine<br/>Fleet 双副本 fsync 封存 / Bucket 二次复核 ownership.json"]
+            HA["FleetHaAndAutoscalerController<br/>每 5s 迁移 <=32 休眠 Cell + handoff=preserve 原地热升级"]
+            H0 --> RPO
+            H0 -.-> HA
+        end
+    end
+
+    subgraph L3A["L3-A: 认知模型路由池 (CognitiveRouter)"]
+        LLM_DS["DeepSeek Pool<br/>(深度推理/重构)"]
+        LLM_GLM["GLM-5.3 Pool<br/>(多步工具编排)"]
+        LLM_QWEN["Qwen-3.8 Pool<br/>(高频轻量任务)"]
+    end
+
+    subgraph L3B["L3-B: 脑体分离重型沙箱执行集群 (Companion Container Fleet)"]
+        BODY["BrainBodyContainerPoolScaler (~30:1 复用比)<br/>Warm Pool 预热 + Cgroups v2 (0.1C↔8.0C)<br/>单机 20 并发 Semaphore + Linux PSI 守护 + <50ms 跨机卸载"]
+    end
+
+    subgraph L4["L4: 分布式持久化存储基座 (RustFS S3 + D1 + Telemetry)"]
+        RUSTFS["RustFS S3 Cluster (cells/<ns>/<id>/)<br/>ownership.json (CAS 租约) + LTX 增量帧 + retired.json (Epoch GC)"]
+        D1["D1 / SQLite 归档与 CloudEvents Outbox<br/>贝叶斯画像持久化 + 实时监控面板"]
+    end
+
+    CLI ==>|HTTPS / SSE| GW
+    P2C ==> S0
+    S0 ==> Q0
+    Q0 ==>|"idFromName(task_id)"| H0
+    H0 ==>|"PHASE_LLM_WAIT (0.1C + Hibernation)"| LLM_DS & LLM_GLM & LLM_QWEN
+    H0 ==>|"PHASE_TOOL_BURST (8.0C VSOCK)"| BODY
+    RPO ==>|"S3 If-Match CAS & LTX Stream"| RUSTFS
+    BODY -.->|"Workspace Snapshot"| RUSTFS
+    H0 -.->|"Async Outbox"| D1
+```
