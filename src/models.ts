@@ -1,10 +1,11 @@
 /**
- * Core Domain Models, 5D Resource Vectors, Dual-Tuple Fencing & Turn-WAL Structures.
+ * Core Domain Models, 5D Resource Vectors, Dual-Tuple Fencing, Dual-Clock Budgets & Turn-WAL Structures.
  */
 
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "max";
 export type ModelPoolName = "DeepSeek" | "GLM-5.3" | "Qwen-3.8";
 export type IsolationDriver = "firecracker" | "kata" | "gvisor" | "runc";
+export type HibernationReason = "NONE" | "PREEMPTED" | "PSI_MEMORY_PRESSURE" | "HUMAN_APPROVAL_WAIT" | "IDLE_TIMEOUT" | "DAG_PARENT_YIELD";
 
 export const EFFORT_MULTIPLIERS: Record<ReasoningEffort, number> = {
   minimal: 1.0,
@@ -19,6 +20,7 @@ export enum TaskState {
   QUEUED = "QUEUED",
   PROVISIONING = "PROVISIONING",
   RUNNING = "RUNNING",
+  GRACEFUL_DRAINING = "GRACEFUL_DRAINING",
   HIBERNATED = "HIBERNATED",
   HIBERNATED_YIELD = "HIBERNATED_YIELD",
   BACKTRACKING = "BACKTRACKING",
@@ -147,6 +149,8 @@ export interface AgentTaskInit {
   isolationDriver?: IsolationDriver;
   warmPoolId?: string;
   maxTurns?: number;
+  maxWallClockSec?: number;
+  maxActiveComputeSec?: number;
   state?: TaskState;
   phase?: SandboxPhase;
   customMetadata?: Record<string, string>;
@@ -177,6 +181,12 @@ export class AgentTask {
   public isolationDriver: IsolationDriver;
   public warmPoolId: string;
   public maxTurns: number;
+  public maxWallClockSec: number;
+  public maxActiveComputeSec: number;
+  public activeComputeSec: number = 0.0;
+  public wallClockSec: number = 0.0;
+  public hibernationReason: HibernationReason = "NONE";
+  public drainSummary: string | null = null;
   public state: TaskState;
   public phase: SandboxPhase;
   public fence: FenceToken;
@@ -211,6 +221,8 @@ export class AgentTask {
     this.isolationDriver = init.isolationDriver ?? "firecracker";
     this.warmPoolId = init.warmPoolId ?? "pool-py312-ds";
     this.maxTurns = init.maxTurns ?? 15;
+    this.maxWallClockSec = init.maxWallClockSec ?? 1800;
+    this.maxActiveComputeSec = init.maxActiveComputeSec ?? 600;
     this.state = init.state ?? TaskState.QUEUED;
     this.phase = init.phase ?? SandboxPhase.IDLE;
     this.fence = new FenceToken(0, 0, init.taskId);
@@ -229,5 +241,26 @@ export class AgentTask {
       effort: this.effort,
       rhoCog,
     });
+  }
+
+  /**
+   * Dual-Timer Accounting: Advance wall clock and (only when RUNNING) active compute clock.
+   * Triggers GRACEFUL_DRAINING if active compute or wall clock budget is exhausted.
+   */
+  public advanceClocks(deltaWallSec: number, deltaActiveComputeSec: number): boolean {
+    this.wallClockSec = Number((this.wallClockSec + deltaWallSec).toFixed(3));
+    if (this.state === TaskState.RUNNING) {
+      this.activeComputeSec = Number((this.activeComputeSec + deltaActiveComputeSec).toFixed(3));
+    }
+    if (
+      this.activeComputeSec >= this.maxActiveComputeSec ||
+      this.wallClockSec >= this.maxWallClockSec ||
+      this.usedTokens >= this.maxTotalTokens
+    ) {
+      this.state = TaskState.GRACEFUL_DRAINING;
+      this.drainSummary = `Graceful drain triggered at turn=${this.fence.turnSeq} (activeCompute=${this.activeComputeSec}s, tokens=${this.usedTokens})`;
+      return true;
+    }
+    return false;
   }
 }

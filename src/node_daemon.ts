@@ -1,10 +1,19 @@
 /**
- * ansts-node-daemon: Bi-Modal Phase-Elastic Runtime, TurnWAL Checkpointing & Velocity Backtracking.
+ * ansts-node-daemon: Unified Host Worker Daemon composing WarmSandboxPoolManager,
+ * CgroupPhaseController, LinuxPsiMemoryGuard, ZeroTrustVsockBridge, AgentHarnessRunner,
+ * SyntacticAndVelocityBreaker, and TurnWalEngine.
  */
 
+import { TurnWalEngine } from "./checkpoint/wal_engine";
 import { CognitiveRouter } from "./cognitive_router";
+import { AgentHarnessRunner } from "./harness/runner";
+import { SyntacticAndVelocityBreaker } from "./harness/velocity_breaker";
 import { LeaseCoordinator } from "./lease_coordinator";
 import { AgentTask, FenceToken, ReasoningEffort, SandboxPhase, TaskState, TurnWalFrame } from "./models";
+import { CgroupPhaseController } from "./runtime/phase_controller";
+import { LinuxPsiMemoryGuard } from "./runtime/psi_guard";
+import { ZeroTrustVsockBridge } from "./runtime/vsock_bridge";
+import { WarmSandboxPoolManager } from "./runtime/warm_pool";
 import { SagaToolGateway } from "./saga_gateway";
 
 export class NodeDaemon {
@@ -14,13 +23,24 @@ export class NodeDaemon {
   public walStore: Map<string, TurnWalFrame[]> = new Map();
   public cgroupCpuAllocation: Map<string, number> = new Map();
 
+  public readonly warmPool = new WarmSandboxPoolManager(4);
+  public readonly phaseController = new CgroupPhaseController(32.0, 4);
+  public readonly psiGuard = new LinuxPsiMemoryGuard(40.0);
+  public readonly vsockBridge: ZeroTrustVsockBridge;
+  public readonly harnessRunner = new AgentHarnessRunner(0.80, 6);
+  public readonly astBreaker = new SyntacticAndVelocityBreaker(3);
+  public readonly walEngine = new TurnWalEngine();
+
   constructor(
     public readonly leaseCoordinator: LeaseCoordinator,
     public readonly cognitiveRouter: CognitiveRouter,
     public readonly sagaGateway: SagaToolGateway,
-  ) {}
+  ) {
+    this.vsockBridge = new ZeroTrustVsockBridge(leaseCoordinator);
+  }
 
   public transitionToCognitivePhase(task: AgentTask): number {
+    this.phaseController.enterCognitivePhase(task);
     task.phase = SandboxPhase.COGNITIVE;
     this.cgroupCpuAllocation.set(task.taskId, task.cogCpu);
     return task.cogCpu;
@@ -28,6 +48,7 @@ export class NodeDaemon {
 
   public transitionToExecutionPhase(task: AgentTask): { allocatedCpu: number; microQueued: boolean } {
     task.phase = SandboxPhase.EXECUTION;
+    this.phaseController.maxConcurrentBursts = this.burstSemaphoreLimit;
     if (this.activeBurstCount < this.burstSemaphoreLimit) {
       this.activeBurstCount += 1;
       this.cgroupCpuAllocation.set(task.taskId, task.burstCpu);

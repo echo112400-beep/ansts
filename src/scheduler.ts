@@ -1,10 +1,11 @@
 /**
- * TASK-09 & TASK-10: 5D Phase & Effort-Aware W-DRF Scheduler and Graceful PreemptToHibernate.
+ * TASK-09 & TASK-10: 5D Phase & Effort-Aware W-DRF Scheduler, Graceful PreemptToHibernate,
+ * and Automatic Wake-on-Headroom for Preempted / PSI-Hibernated Sandboxes.
  */
 
 import { CognitiveRouter } from "./cognitive_router";
 import { LeaseCoordinator } from "./lease_coordinator";
-import { AgentTask, IsolationDriver, ModelPoolName, ResourceVector5D, SandboxPhase, TaskState } from "./models";
+import { AgentTask, FenceToken, IsolationDriver, ModelPoolName, ResourceVector5D, SandboxPhase, TaskState } from "./models";
 import { BayesianTaskProfiler } from "./profiler";
 import { MultiTenantQueueManager } from "./queue_manager";
 
@@ -28,6 +29,7 @@ export class CoreScheduler5D {
   public tenants: Map<string, TenantQuotaConfig> = new Map();
   public nodes: Map<string, WorkerNodeState> = new Map();
   public tasks: Map<string, AgentTask> = new Map();
+  public hibernatedResumeQueue: AgentTask[] = [];
   public clusterCapacity: ResourceVector5D = new ResourceVector5D(64.0, 64.0, 131072.0, 64, 4800);
 
   constructor(
@@ -136,8 +138,12 @@ export class CoreScheduler5D {
     victims.sort((a, b) => a.baseScore - b.baseScore);
     const victim = victims[0];
     victim.state = TaskState.HIBERNATED;
+    victim.hibernationReason = "PREEMPTED";
     victim.phase = SandboxPhase.IDLE;
     victim.activeSessions = 0;
+    if (!this.hibernatedResumeQueue.some((x) => x.taskId === victim.taskId)) {
+      this.hibernatedResumeQueue.push(victim);
+    }
     return victim;
   }
 
@@ -164,11 +170,11 @@ export class CoreScheduler5D {
         child.state = TaskState.RUNNING;
         child.phase = SandboxPhase.COGNITIVE;
         child.activeSessions = 1;
-        dispatched.push(child);
+        dispatched.append ? dispatched.push(child) : dispatched.push(child);
       }
     }
 
-    // 2. 5D W-DRF Multi-Tenant Scheduling Loop
+    // 2. 5D W-DRF Multi-Tenant Scheduling Loop for Queued Tasks
     const blockedTenants = new Set<string>();
     while (true) {
       this.compute5dDominantShares();
@@ -218,9 +224,51 @@ export class CoreScheduler5D {
       candidate.assignedNodeId = bestNode.nodeId;
       candidate.assignedModelPool = poolName;
       candidate.state = TaskState.RUNNING;
+      candidate.hibernationReason = "NONE";
       candidate.phase = SandboxPhase.COGNITIVE;
       candidate.activeSessions = Math.min(2, candidate.maxSessions);
       dispatched.push(candidate);
+    }
+
+    // 3. Auto-Resume Preempted / PSI-Hibernated Sandboxes when Node Headroom Returns
+    if (this.hibernatedResumeQueue.length > 0) {
+      this.hibernatedResumeQueue.sort(
+        (a, b) => this.queueManager.computeDynamicUrgency(b, now) - this.queueManager.computeDynamicUrgency(a, now),
+      );
+      const stillHibernated: AgentTask[] = [];
+      for (const hTask of this.hibernatedResumeQueue) {
+        if (hTask.state !== TaskState.HIBERNATED || hTask.hibernationReason === "HUMAN_APPROVAL_WAIT") {
+          continue;
+        }
+        const feasibleNodes = Array.from(this.nodes.values()).filter(
+          (n) => n.alive && this.nodeUsedCpu(n.nodeId) + hTask.execCpu <= n.cpuCap,
+        );
+        if (feasibleNodes.length > 0) {
+          feasibleNodes.sort(
+            (a, b) => this.scoreNodeAndModelPool(hTask, b).score - this.scoreNodeAndModelPool(hTask, a).score,
+          );
+          const bestNode = feasibleNodes[0];
+          const { poolName } = this.scoreNodeAndModelPool(hTask, bestNode);
+          const prevTurn = Math.max(1, hTask.fence.turnSeq);
+          const newEpochFence = this.leaseCoordinator.acquireOrIncrementEpoch(
+            hTask.taskId,
+            bestNode.nodeId,
+            poolName,
+          );
+          hTask.fence = new FenceToken(newEpochFence.epoch, prevTurn, hTask.taskId);
+          this.leaseCoordinator.verifyAndAdvanceFence(hTask.fence);
+          hTask.assignedNodeId = bestNode.nodeId;
+          hTask.assignedModelPool = poolName;
+          hTask.state = TaskState.RUNNING;
+          hTask.hibernationReason = "NONE";
+          hTask.phase = SandboxPhase.COGNITIVE;
+          hTask.activeSessions = Math.min(2, hTask.maxSessions);
+          dispatched.push(hTask);
+        } else {
+          stillHibernated.push(hTask);
+        }
+      }
+      this.hibernatedResumeQueue = stillHibernated;
     }
 
     return dispatched;

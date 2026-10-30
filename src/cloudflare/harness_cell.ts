@@ -1,9 +1,8 @@
 /**
  * AgentTaskHarnessCell: Brain-Body Disaggregated Durable Object / celld Cell (~0.47 MB RAM).
- * - Stores Turn-WAL frames and 4-Tier Saga Journal in private SQLite (`ctx.storage.sql`, LTX RPO=0).
- * - Stays in V8 Isolate during Cognitive Phase (0 MicroVM overhead) and bursts companion container
- *   (`ctx.container`) only during Execution Phase.
- * - Supports Hibernatable WebSockets (`acceptWebSocket`, `webSocketMessage`) & `alarm()`.
+ * - Implements `rehydrateFromSql()` in constructor so waking from HIBERNATED / INACTIVE
+ *   in `celld` or Cloudflare Durable Objects restores `fence`, `walStore`, and `sagaJournal`
+ *   with zero state loss.
  */
 
 import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel";
@@ -49,21 +48,82 @@ export class AgentTaskHarnessCell {
       state: TaskState.RUNNING,
       phase: SandboxPhase.COGNITIVE,
     });
-    this.task.fence = this.leaseCoord.acquireOrIncrementEpoch(taskId, "celld-node-01", this.task.primaryModel);
 
-    // Initialize private SQLite tables replicated by celld LTX
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS turn_wal_frames (turn_seq INTEGER, epoch INTEGER, routed_model TEXT, effective_effort TEXT, tokens_used INTEGER, workspace_hash TEXT, pass_rate REAL, error_count INTEGER, diff_entropy REAL)",
     );
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS saga_journal (turn_seq INTEGER, epoch INTEGER, tool_name TEXT, effect_class TEXT, compensation_tool TEXT, payload TEXT)",
     );
+
+    // Rehydrate state from private SQLite if waking from HIBERNATED or INACTIVE
+    this.rehydrateFromSql();
+  }
+
+  /**
+   * Reconstructs in-memory FenceToken, TurnWAL frames, and Saga compensation records
+   * from the Cell's persistent SQLite database across cold starts and WebSocket hibernation wakeups.
+   */
+  public rehydrateFromSql(): void {
+    const taskId = this.task.taskId;
+    const walRows = this.ctx.storage.sql.exec("SELECT * FROM turn_wal_frames").toArray();
+    if (walRows.length === 0) {
+      this.task.fence = this.leaseCoord.acquireOrIncrementEpoch(
+        taskId,
+        "celld-node-01",
+        this.task.primaryModel,
+      );
+      return;
+    }
+
+    const frames: TurnWalFrame[] = [];
+    let totalUsedTokens = 0;
+    for (const r of walRows) {
+      const f = new FenceToken(Number(r.epoch), Number(r.turn_seq), taskId);
+      totalUsedTokens += Number(r.tokens_used ?? 0);
+      frames.push({
+        taskId,
+        fence: f,
+        routedModel: String(r.routed_model),
+        effectiveEffort: (r.effective_effort as ReasoningEffort) ?? "high",
+        tokensUsed: Number(r.tokens_used ?? 0),
+        workspaceMerkleHash: String(r.workspace_hash),
+        passRate: Number(r.pass_rate ?? 0.5),
+        errorCount: Number(r.error_count ?? 0),
+        diffEntropy: Number(r.diff_entropy ?? 0.5),
+        contextMessages: [`turn_${r.turn_seq}`],
+      });
+    }
+    this.nodeDaemon.walStore.set(taskId, frames);
+    this.task.usedTokens = totalUsedTokens;
+
+    const lastFrame = frames[frames.length - 1];
+    const nextFence = new FenceToken(lastFrame.fence.epoch, lastFrame.fence.turnSeq + 1, taskId);
+    this.leaseCoord.acquireOrIncrementEpoch(taskId, "celld-node-01", this.task.primaryModel);
+    // Advance coordinator fence to match rehydrated epoch & next turn_seq
+    for (let ep = 1; ep < nextFence.epoch; ep++) {
+      this.leaseCoord.acquireOrIncrementEpoch(taskId, "celld-node-01", this.task.primaryModel);
+    }
+    this.leaseCoord.verifyAndAdvanceFence(nextFence);
+    this.task.fence = nextFence;
+
+    const sagaRows = this.ctx.storage.sql.exec("SELECT * FROM saga_journal").toArray();
+    for (const sr of sagaRows) {
+      if (sr.effect_class === ToolEffectClass.SAGA_COMPENSATABLE && sr.compensation_tool) {
+        this.sagaGw.compensator.registerForwardAction(
+          taskId,
+          new FenceToken(Number(sr.epoch), Number(sr.turn_seq), taskId),
+          String(sr.tool_name),
+          String(sr.compensation_tool),
+          String(sr.payload),
+        );
+      }
+    }
   }
 
   public async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // 1. Execute a Cognitive + Tool Turn inside the Cell (Brain-Body Disaggregation)
     if (request.method === "POST" && url.pathname.endsWith("/turn")) {
       const body = (await request.json()) as {
         epoch?: number;
@@ -96,7 +156,6 @@ export class AgentTaskHarnessCell {
           this.cogRouter.tripPoolBreaker("DeepSeek", 0.48);
         }
 
-        // Cognitive Phase: Runs purely inside the 0.47MB V8 Cell (Companion container stopped/idle)
         this.nodeDaemon.transitionToCognitivePhase(this.task);
         const routeRes = this.cogRouter.routeTurn(
           this.task,
@@ -108,7 +167,6 @@ export class AgentTaskHarnessCell {
         let containerBurstTriggered = false;
         let toolResult: Record<string, any> | null = null;
 
-        // Execution Phase: Only start/burst companion container if heavy tool execution is requested
         if (body.tool_call) {
           if (body.tool_call.requires_heavy_container && this.ctx.container) {
             await this.ctx.container.start();
@@ -136,7 +194,6 @@ export class AgentTaskHarnessCell {
           }
         }
 
-        // Persist Turn-WAL to private SQLite & audit Progress Velocity V_k
         const wsHash = body.workspace_merkle_hash ?? `merkle_t${incomingFence.turnSeq}`;
         const passRate = body.pass_rate ?? 0.75;
         const errCount = body.error_count ?? 0;
@@ -173,7 +230,6 @@ export class AgentTaskHarnessCell {
           );
         }
 
-        // Schedule idle hibernation alarm 20s in the future
         await this.ctx.storage.setAlarm(Date.now() + 20000);
 
         return new Response(
@@ -200,7 +256,6 @@ export class AgentTaskHarnessCell {
       }
     }
 
-    // 2. Zero-Token Deterministic Time-Travel Replay from Cell SQLite WAL
     if (request.method === "POST" && url.pathname.endsWith("/replay")) {
       const body = (await request.json()) as { target_turn_seq: number };
       const history = this.nodeDaemon.walStore.get(this.task.taskId) ?? [];
@@ -216,7 +271,6 @@ export class AgentTaskHarnessCell {
       );
     }
 
-    // 3. Failover / Epoch Bump
     if (request.method === "POST" && url.pathname.endsWith("/failover")) {
       const body = (await request.json()) as { new_node_id: string };
       const newFence = this.nodeDaemon.failoverTaskToNode(this.task, body.new_node_id);
@@ -234,10 +288,6 @@ export class AgentTaskHarnessCell {
     return new Response(JSON.stringify({ error: "NotFound" }), { status: 404 });
   }
 
-  /**
-   * Hibernatable WebSocket handler (`celld` & Cloudflare Workers standard API).
-   * Wakes up the Cell in ~4ms when client sends a credit ACK or command frame.
-   */
   public async webSocketMessage(ws: WebSocketLike, message: string): Promise<void> {
     const parsed = JSON.parse(message) as { type: string; credits?: number };
     if (parsed.type === "CREDIT_ACK" && typeof parsed.credits === "number") {
@@ -252,9 +302,6 @@ export class AgentTaskHarnessCell {
     }
   }
 
-  /**
-   * Durable Object Persistent Alarm handler for idle hibernation & companion container teardown.
-   */
   public async alarm(): Promise<void> {
     this.task.state = TaskState.HIBERNATED;
     this.task.phase = SandboxPhase.IDLE;

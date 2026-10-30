@@ -1,10 +1,13 @@
 /**
- * TASK-15: 4-Tier Transactional Tool Governance, Staging Buffer & LIFO Saga Compensation.
+ * TASK-15, TASK-16, TASK-17 Unified: 4-Tier Transactional Tool Gateway
+ * Composing SagaCompensatorEngine and StagingCommitAndApprovalGate.
  */
 
 import * as crypto from "crypto";
 import { LeaseCoordinator } from "./lease_coordinator";
-import { FenceToken, ToolEffectClass } from "./models";
+import { AgentTask, FenceToken, ToolEffectClass } from "./models";
+import { SagaCompensatorEngine } from "./saga/compensator";
+import { StagingCommitAndApprovalGate } from "./saga/staging";
 
 export interface SagaLogEntry {
   taskId: string;
@@ -22,6 +25,8 @@ export class SagaToolGateway {
   public sagaJournal: Map<string, SagaLogEntry[]> = new Map();
   public stagingBuffer: Map<string, SagaLogEntry[]> = new Map();
   public flushedProductionWrites: SagaLogEntry[] = [];
+  public readonly compensator = new SagaCompensatorEngine(3);
+  public readonly approvalGate = new StagingCommitAndApprovalGate();
 
   constructor(public readonly leaseCoordinator: LeaseCoordinator) {}
 
@@ -32,6 +37,8 @@ export class SagaToolGateway {
     effectClass: ToolEffectClass;
     payload: string;
     compensationTool?: string;
+    task?: AgentTask;
+    requireHumanApproval?: boolean;
   }): { status: string; staged: boolean; idempotencyKey: string; result: string } {
     this.leaseCoordinator.verifyAndAdvanceFence(params.fence);
 
@@ -71,12 +78,30 @@ export class SagaToolGateway {
       const list = this.sagaJournal.get(params.fence.taskId) ?? [];
       list.push(entry);
       this.sagaJournal.set(params.fence.taskId, list);
+      if (params.compensationTool) {
+        this.compensator.registerForwardAction(
+          params.fence.taskId,
+          params.fence,
+          params.toolName,
+          params.compensationTool,
+          params.payload,
+        );
+      }
       return { status: "OK", staged: false, idempotencyKey: idemKey, result: "SAGA_LOGGED" };
     }
 
     const stagedList = this.stagingBuffer.get(params.fence.taskId) ?? [];
     stagedList.push(entry);
     this.stagingBuffer.set(params.fence.taskId, stagedList);
+    if (params.task) {
+      this.approvalGate.stageWrite(
+        params.task,
+        params.fence,
+        params.toolName,
+        params.payload,
+        params.requireHumanApproval ?? true,
+      );
+    }
     return { status: "STAGED", staged: true, idempotencyKey: idemKey, result: "HELD_IN_STAGING_BUFFER" };
   }
 
@@ -91,18 +116,8 @@ export class SagaToolGateway {
       this.stagingBuffer.set(taskId, keptStaged);
     }
 
+    const compensated = this.compensator.compensateLifo(taskId, targetTurnSeq);
     const entries = this.sagaJournal.get(taskId) ?? [];
-    const toCompensate = entries.filter(
-      (e) =>
-        e.fence.turnSeq > targetTurnSeq &&
-        e.effectClass === ToolEffectClass.SAGA_COMPENSATABLE &&
-        Boolean(e.compensationTool),
-    );
-    const compensated: string[] = [];
-    for (let i = toCompensate.length - 1; i >= 0; i--) {
-      const entry = toCompensate[i];
-      compensated.push(`${entry.compensationTool}(${entry.payload})`);
-    }
     this.sagaJournal.set(
       taskId,
       entries.filter((e) => e.fence.turnSeq <= targetTurnSeq),

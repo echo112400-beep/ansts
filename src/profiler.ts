@@ -1,9 +1,8 @@
 /**
- * TASK-05: Online Conjugate Bayesian Task Profiler with Log-Normal/Beta Updates & JSON Persistence.
+ * TASK-05: Online Conjugate Bayesian Task Profiler with V8-Portable JSON Serialization & Lazy Node FS.
  */
 
 import * as crypto from "crypto";
-import * as fs from "fs";
 import { AgentTask } from "./models";
 
 export interface FingerprintStatsData {
@@ -104,7 +103,7 @@ export class BayesianTaskProfiler {
     return stats;
   }
 
-  public saveToFile(filePath: string): void {
+  public toJSONString(): string {
     const obj: Record<string, FingerprintStatsData> = {};
     for (const [k, v] of this.profiles.entries()) {
       obj[k] = {
@@ -115,14 +114,25 @@ export class BayesianTaskProfiler {
         betaExec: v.betaExec,
       };
     }
-    fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf8");
+    return JSON.stringify(obj, null, 2);
   }
 
-  public loadFromFile(filePath: string): void {
-    const raw = JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, FingerprintStatsData>;
+  public loadFromJSONString(jsonStr: string): void {
+    const raw = JSON.parse(jsonStr) as Record<string, FingerprintStatsData>;
     this.profiles.clear();
     for (const [k, v] of Object.entries(raw)) {
       this.profiles.set(k, new FingerprintStats(v));
     }
+  }
+
+  public saveToFile(filePath: string): void {
+    // Lazy require of node:fs so V8 Isolate bundles never fail at module import time
+    const fs = require("fs");
+    fs.writeFileSync(filePath, this.toJSONString(), "utf8");
+  }
+
+  public loadFromFile(filePath: string): void {
+    const fs = require("fs");
+    this.loadFromJSONString(fs.readFileSync(filePath, "utf8"));
   }
 }
