@@ -24,6 +24,7 @@ import { FederationRegionId, MultiRegionFederationRouter } from "./federation_ro
 import { AgentTaskHarnessCell } from "./harness_cell";
 import { DynamicQueueAutoSharder, PartitionedSchedulerRouter } from "./horizontal_scaler";
 import { AnstsSchedulerCell } from "./scheduler_cell";
+import { persistenceCellStub } from "../persistence/registry";
 
 export { AnstsSchedulerCell, AgentTaskHarnessCell };
 
@@ -118,8 +119,7 @@ export default {
       globalSchedulerRouter.recordShardDispatchStart(routeDecision.targetShardId);
 
       const startMs = performance.now();
-      const schedId = env.SCHEDULER_CELL.idFromName(routeDecision.targetShardId);
-      const schedStub = env.SCHEDULER_CELL.get(schedId);
+      const schedStub = persistenceCellStub(env, "scheduler-pool", routeDecision.targetShardId);
       const resp = await schedStub.fetch("http://scheduler.internal/tasks/submit", {
         method: "POST",
         body: JSON.stringify(rawSpec),
@@ -278,8 +278,7 @@ export default {
       url.pathname === "/v1beta1/dag/spawn-escrow"
     ) {
       const targetShard = url.searchParams.get("shard") ?? "global-5d-scheduler";
-      const schedId = env.SCHEDULER_CELL.idFromName(targetShard);
-      const schedStub = env.SCHEDULER_CELL.get(schedId);
+        const schedStub = persistenceCellStub(env, "scheduler-pool", targetShard);
       const internalPath = url.pathname.replace("/v1beta1", "");
       return schedStub.fetch(`http://scheduler.internal${internalPath}`, {
         method: request.method,
@@ -291,8 +290,7 @@ export default {
     const taskMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)\/(turn|workflow|replay|failover)$/);
     if (taskMatch) {
       const [, taskId, action] = taskMatch;
-      const cellId = env.AGENT_HARNESS_CELL.idFromName(taskId);
-      const cellStub = env.AGENT_HARNESS_CELL.get(cellId);
+        const cellStub = persistenceCellStub(env, "task", taskId);
       const resp = await cellStub.fetch(`http://harness.internal/${action}`, {
         method: request.method,
         body: await request.text(),
@@ -344,8 +342,7 @@ export default {
     _controller: { scheduledTime: number; cron: string },
     env: CloudflareCelldEnv,
   ): Promise<void> {
-    const schedId = env.SCHEDULER_CELL.idFromName("global-5d-scheduler");
-    const schedStub = env.SCHEDULER_CELL.get(schedId);
+    const schedStub = persistenceCellStub(env, "scheduler-pool", "global-5d-scheduler");
     await schedStub.fetch("http://scheduler.internal/scheduler/tick", { method: "POST" });
   },
 };

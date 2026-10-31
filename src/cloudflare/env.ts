@@ -3,14 +3,16 @@
  * and In-Process Simulator Mocks for Local CI Verification.
  */
 
-export interface SqlStorageCursor<T = Record<string, any>> {
-  toArray(): T[];
-  one(): T | null;
-}
+import {
+  PersistenceCellBindings,
+  PersistenceObjectStorage,
+  PersistenceSqlCursor,
+  PersistenceSqlStorage,
+} from "../persistence/contracts";
 
-export interface SqlStorage {
-  exec<T = Record<string, any>>(query: string, ...bindings: any[]): SqlStorageCursor<T>;
-}
+export interface SqlStorageCursor<T = Record<string, any>> extends PersistenceSqlCursor<T> {}
+
+export interface SqlStorage extends PersistenceSqlStorage {}
 
 export interface CompanionContainer {
   running: boolean;
@@ -20,7 +22,7 @@ export interface CompanionContainer {
   fetch(req: RequestInfo, init?: RequestInit): Promise<Response>;
 }
 
-export interface DurableObjectStorage {
+export interface DurableObjectStorage extends PersistenceObjectStorage {
   sql: SqlStorage;
   get<T = any>(key: string): Promise<T | undefined>;
   put<T = any>(key: string, value: T): Promise<void>;
@@ -104,7 +106,7 @@ export interface QueueBinding {
   send(message: any): Promise<void>;
 }
 
-export interface CloudflareCelldEnv {
+export interface CloudflareCelldEnv extends PersistenceCellBindings {
   SCHEDULER_CELL: DurableObjectNamespace;
   AGENT_HARNESS_CELL: DurableObjectNamespace;
   ANSTS_D1: D1DatabaseBinding;
@@ -118,11 +120,29 @@ export interface CloudflareCelldEnv {
 }
 
 /**
- * Lightweight SQLite/KV/R2/Container simulator for testing Durable Objects & Workers
- * in Node.js CI while remaining 100% API-compatible with `celld` and Cloudflare Workers.
+ * Lightweight in-memory subset for request and protocol tests. Its transaction rollback and
+ * sync counter are simulations only; they do not model SQLite recovery, Celld replication,
+ * bucket confirmation, or the durability proof used by a real fleet.
  */
 export class InMemoryCellSqlStorage implements SqlStorage {
   public tables: Map<string, Array<Record<string, any>>> = new Map();
+
+  public transactionSync<T>(callback: () => T): T {
+    const before = new Map(
+      Array.from(this.tables.entries(), ([name, rows]) => [name, rows.map((row) => ({ ...row }))]),
+    );
+    try {
+      const result = callback();
+      if (result && (typeof result === "object" || typeof result === "function") && "then" in result) {
+        throw new TypeError("InMemoryCellSqlStorage.transactionSync callback cannot return a Promise.");
+      }
+      return result;
+    } catch (error) {
+      this.tables.clear();
+      for (const [name, rows] of before) this.tables.set(name, rows);
+      throw error;
+    }
+  }
 
   public exec<T = Record<string, any>>(query: string, ...bindings: any[]): SqlStorageCursor<T> {
     const q = query.trim();
@@ -173,17 +193,97 @@ export class InMemoryCellSqlStorage implements SqlStorage {
       return { toArray: () => [], one: () => null };
     }
 
+    if (upper.startsWith("UPDATE")) {
+      const match = q.match(/^UPDATE\s+([a-zA-Z0-9_]+)\s+SET\s+(.+?)\s+WHERE\s+(.+)$/i);
+      if (match) {
+        const [, tableName, setSql, whereSql] = match;
+        const setFields = setSql.split(",").map((part) => part.trim().match(/^([a-zA-Z0-9_]+)\s*=\s*\?$/));
+        if (setFields.every(Boolean)) {
+          const setValues = bindings.slice(0, setFields.length);
+          const whereBindings = bindings.slice(setFields.length);
+          const rows = this.tables.get(tableName) ?? [];
+          for (const row of rows) {
+            if (!this.matchesWhere(row, whereSql, whereBindings)) continue;
+            setFields.forEach((field, index) => {
+              row[field![1]] = setValues[index];
+            });
+          }
+        }
+      }
+      return { toArray: () => [], one: () => null };
+    }
+
     if (upper.startsWith("SELECT")) {
-      const match = q.match(/FROM\s+([a-zA-Z0-9_]+)/i);
-      const tableName = match ? match[1] : "";
-      const rows = (this.tables.get(tableName) ?? []) as T[];
+      const match = q.match(
+        /^SELECT\s+(.+?)\s+FROM\s+([a-zA-Z0-9_]+)(?:\s+WHERE\s+(.+?))?(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+(\?|[0-9]+))?$/i,
+      );
+      if (!match) return { toArray: () => [], one: () => null };
+      const [, columns, tableName, whereSql, orderSql, limitSql] = match;
+      let rows = [...(this.tables.get(tableName) ?? [])];
+      let whereBindings = bindings;
+      if (whereSql) {
+        const conditionCount = whereSql.split(/\s+AND\s+/i).length;
+        whereBindings = bindings.slice(0, conditionCount);
+        rows = rows.filter((row) => this.matchesWhere(row, whereSql, whereBindings));
+      }
+      if (orderSql) {
+        const orderFields = orderSql.split(",").map((field) => {
+          const parsed = field.trim().match(/^([a-zA-Z0-9_]+)(?:\s+(ASC|DESC))?$/i);
+          return parsed ? { column: parsed[1], descending: parsed[2]?.toUpperCase() === "DESC" } : null;
+        });
+        if (orderFields.every(Boolean)) {
+          rows.sort((left, right) => {
+            for (const field of orderFields) {
+              const column = field!.column;
+              if (left[column] === right[column]) continue;
+              const order = left[column] < right[column] ? -1 : 1;
+              return field!.descending ? -order : order;
+            }
+            return 0;
+          });
+        }
+      }
+      if (limitSql) {
+        const limit = limitSql === "?" ? Number(bindings[whereBindings.length]) : Number(limitSql);
+        rows = rows.slice(0, limit);
+      }
+      if (columns.trim() !== "*") {
+        const selected = columns.split(",").map((col) => col.trim().match(/^([a-zA-Z0-9_]+)(?:\s+AS\s+([a-zA-Z0-9_]+))?$/i));
+        if (selected.every(Boolean)) {
+          rows = rows.map((row) => {
+            const result: Record<string, any> = {};
+            for (const column of selected) result[column![2] ?? column![1]] = row[column![1]];
+            return result;
+          });
+        }
+      }
+      const resultRows = rows as T[];
       return {
-        toArray: () => [...rows],
-        one: () => (rows.length > 0 ? rows[rows.length - 1] : null),
+        toArray: () => [...resultRows],
+        one: () => (resultRows.length > 0 ? resultRows[resultRows.length - 1] : null),
       };
     }
 
     return { toArray: () => [], one: () => null };
+  }
+
+  private matchesWhere(row: Record<string, any>, whereSql: string, bindings: any[]): boolean {
+    const clauses = whereSql.split(/\s+AND\s+/i);
+    let bindingIndex = 0;
+    for (const clause of clauses) {
+      const match = clause.trim().match(/^([a-zA-Z0-9_]+)\s*(=|<=|>=|<>|<|>)\s*\?$/i);
+      if (!match) return false;
+      const [, column, operator] = match;
+      const left = row[column];
+      const right = bindings[bindingIndex++];
+      if (operator === "=" && left !== right) return false;
+      if (operator === "<>" && left === right) return false;
+      if (operator === "<" && !(left < right)) return false;
+      if (operator === ">" && !(left > right)) return false;
+      if (operator === "<=" && !(left <= right)) return false;
+      if (operator === ">=" && !(left >= right)) return false;
+    }
+    return true;
   }
 }
 
@@ -191,6 +291,7 @@ export class MockDurableObjectState implements DurableObjectState {
   public id: { toString(): string; name?: string };
   public storage: DurableObjectStorage;
   public container: CompanionContainer;
+  public durableSyncCalls = 0;
   private kv: Map<string, any> = new Map();
   private sqlStore = new InMemoryCellSqlStorage();
   private alarmTs: number | null = null;
@@ -200,6 +301,10 @@ export class MockDurableObjectState implements DurableObjectState {
     this.id = { toString: () => `cell_${name}`, name };
     this.storage = {
       sql: this.sqlStore,
+      // This is a no-op proof counter in the simulator; it does not model Celld replication or bucket durability.
+      sync: async () => {
+        this.durableSyncCalls += 1;
+      },
       get: async <T = any>(key: string) => this.kv.get(key) as T | undefined,
       put: async <T = any>(key: string, value: T) => {
         this.kv.set(key, value);

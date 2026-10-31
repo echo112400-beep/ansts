@@ -198,6 +198,34 @@ test("08. Stateless Edge Worker + KV Idempotency + AnstsSchedulerCell 5D W-DRF &
   assert.equal(d1Rows.length, 1);
 });
 
+test("08B. Public task route resolves the logical TaskCell binding by stable task key", async () => {
+  const { env } = createMockCloudflareCelldEnv();
+  const routedNames: string[] = [];
+  env.TASK_CELL = {
+    idFromName: (name: string) => ({ toString: () => `task_${name}`, name }),
+    get: (id: { toString(): string; name?: string }) => ({
+      fetch: async (input: RequestInfo, init?: RequestInit) => {
+        routedNames.push(id.name ?? id.toString());
+        return new Response(JSON.stringify({ accepted_route: String(input), method: init?.method }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    }),
+  };
+
+  const response = await cloudflareCelldWorker.fetch(
+    new Request("https://ansts.edge/v1beta1/tasks/task-registry-7/turn", {
+      method: "POST",
+      body: JSON.stringify({ turn_seq: 1 }),
+    }),
+    env,
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(routedNames, ["task-registry-7"]);
+});
+
 test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Burst, SQLite WAL & Fencing", async () => {
   const { env, harnessCells } = createMockCloudflareCelldEnv();
   const taskId = "tsk_celld_agent_01";
