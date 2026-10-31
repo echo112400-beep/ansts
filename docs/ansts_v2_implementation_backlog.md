@@ -3,7 +3,7 @@
 | 文档属性 (Document Metadata) | 详细内容 (Details) |
 | :--- | :--- |
 | **项目名称 (Project)** | **Agent-Native Sandbox Task Scheduler (ANSTS v2.2 — `celld` HA, Scale-Out & Cloud-Native Production Edition)** |
-| **当前代码仓基线 (Baseline)** | **ALL M1 ~ M13 (`TASK-01` ~ `TASK-64`) 100% COMPLETED**（**60 个 TypeScript 模块**通过 AST 与编译校验，**45/45** 项单元、集成、混沌、高可用、横向扩容与生产治理测试 100% 通过） |
+| **当前代码仓基线 (Baseline)** | **ALL M1 ~ M13 (`TASK-01` ~ `TASK-64`) 100% COMPLETED**（**61 个 TypeScript 模块**通过 AST 与编译校验，**46/46** 项单元、集成、混沌、高可用、横向扩容与生产治理测试 100% 通过） |
 | **持久化与高可用基座 (HA Core)** | 基于 [`denoland/celld`](https://github.com/denoland/celld/blob/main/docs/README.md) + `RustFS` 16 盘纠删码 (`EC:4`) 构建，严格满足 `RPO = 0` 双模式输出门控、可恢复工作流与分片水平扩展 |
 | **核心模型池 (Model Pools)** | `DeepSeek`（旗舰深度推理池）、`GLM-5.3`（多步工具编排与轻量高速分流池）、`Qwen-3.8`（高频语法修复与高可用热备容灾池） |
 

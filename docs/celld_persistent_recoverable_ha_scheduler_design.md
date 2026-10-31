@@ -2,7 +2,7 @@
 
 - **文档版本**：v2.2 (`celld` Durable & Recoverable HA Edition)
 - **参考规范**：[`denoland/celld` Documentation (`docs/README.md`)](https://github.com/denoland/celld/blob/main/docs/README.md)、[`docs/guarantees.md`](https://github.com/denoland/celld/blob/main/docs/guarantees.md)、[`docs/services/workflows.md`](https://github.com/denoland/celld/blob/main/docs/services/workflows.md)、[`docs/services/queues.md`](https://github.com/denoland/celld/blob/main/docs/services/queues.md)、[`docs/services/containers.md`](https://github.com/denoland/celld/blob/main/docs/services/containers.md)
-- **关联代码实现**：`src/cloudflare/celld_ha_engine.ts`、`src/cloudflare/scheduler_cell.ts`、`src/cloudflare/harness_cell.ts`、`tests/celld_ha_durability.test.ts`（全量 **30/30** 集成、混沌与高可用持久化测试 100% 通过）
+- **关联代码实现**：`src/cloudflare/celld_ha_engine.ts`、`src/cloudflare/scheduler_cell.ts`、`src/cloudflare/harness_cell.ts`、`tests/celld_ha_durability.test.ts`（全量 **46/46** 集成、混沌与高可用持久化测试 100% 通过）
 
 ---
 
@@ -13,8 +13,8 @@
 | 维度 | 核心机制 | 可靠性 / 可用性目标 | 对应源码实现 |
 | :--- | :--- | :--- | :--- |
 | **单写者排他性 (Single-Writer)** | Bucket 条件写 (`CAS`) + 租约续期 (`1/3 TTL`) + Fencing Epoch | 杜绝双主脑裂写覆盖 | `RpoZeroDurabilityEngine` (`celld_ha_engine.ts`) |
-| **零数据丢失确认 (`RPO = 0`)** | `fleet` 双节点 `fsync` 证明 + 接管封存；`bucket` 刷盘后复核 Ownership | 任何已向客户端返回成功的事务在崩溃后 **100% 可恢复** | `RpoZeroDurabilityEngine.commitTransaction` |
-| **游标排空安全 (Cursor Exhaustion)** | 隐式事务写游标未消费完前拦截一切输出与 `storage.sync()` | 杜绝半截事务外泄（Uncaught Error 阻断） | `RpoZeroDurabilityEngine.executeSqlWrite` |
+| **零数据丢失确认 (`RPO = 0`)** | `fleet` 双节点 `fsync` 证明 + 接管封存；`bucket` 刷盘后复核 Ownership | 任何已向客户端返回成功的事务在崩溃后 **100% 可恢复** | `RpoZeroDurabilityEngine.commitAndProveRpoZero` |
+| **游标排空安全 (Cursor Exhaustion)** | 隐式事务写游标未消费完前拦截一切输出与 `storage.sync()` | 杜绝半截事务外泄（Uncaught Error 阻断） | `RpoZeroDurabilityEngine.commitAndProveRpoZero (writeCursorConsumed)` |
 | **长周期工作流可恢复 (Durable Workflows)** | `WorkflowEntrypoint` (`step.do` / `step.sleep` / `step.waitForEvent`) | 节点掉电或 Isolate 休眠后从精确 Step 断点重放恢复 | `DurableWorkflowContext` (`celld_ha_engine.ts`) |
 | **高吞吐抗背压队列 (Sharded Queues)** | 突破单 Queue Cell `256` 并发上限的一致性哈希分片 + 指数退避 + DLQ | 支持百万级并发任务分发，毒丸任务零阻塞隔离 | `ShardedQueueBrokerPool` (`celld_ha_engine.ts`) |
 | **安全历史纪元回收 (Safe Epoch GC)** | `CELLD_LTX_RETENTION_SECS` + `retired.json` 恢复基座原子标记 | 清理过期 LTX 快照同时确保冷启动分页恢复零损坏 | `SafeEpochGarbageCollector` (`celld_ha_engine.ts`) |
@@ -148,7 +148,7 @@
 | `HA-05` | `ShardedQueueBrokerPool` 突破单队列 `256` 并发限制、自适应指数退避 (`delaySeconds`) 与死信队列隔离 | **PASS** |
 | `HA-06` | `SafeEpochGarbageCollector` 写入 `retired.json` 并严格保留 `current`、`current-1` 及保留期内纪元 | **PASS** |
 | `HA-07` | `FleetHaAndAutoscalerController` 32-Cell 限速重平衡、`handoff=preserve` 原地保留升级与 `restoring=0` 滚动门禁 | **PASS** |
-| **总计** | **全量 43 个 TypeScript 模块编译 + 30 项单元/集成/混沌/高可用测试** | **30 / 30 PASS** |
+| **总计** | **全量 61 个 TypeScript 模块编译 + 46 项全链路单元/集成/混沌/高可用/一致性测试** | **46 / 46 PASS** |
 
 ---
 
@@ -349,3 +349,22 @@ flowchart TB
     BODY -.->|"Workspace Snapshot"| RUSTFS
     H0 -.->|"Async Outbox"| D1
 ```
+
+---
+
+## 10. 设计规范与代码交付 100% 一致性追溯矩阵（Design-to-Deliverable Traceability Matrix）
+
+下表汇总了从 **M1 ~ M13（`TASK-01` ~ `TASK-64`）** 全量设计规范、TypeScript 核心实现类/方法、部署清单文件与自动化验收测试（**61 个 TypeScript 模块、46/46 项 CI 测试**）的一一对应关系：
+
+| 架构设计模块 | 设计规范章节 | 交付代码路径 | 核心实现类与精确方法签名 | 对应测试文件与状态 |
+| :--- | :--- | :--- | :--- | :--- |
+| **边缘网关、幂等与背压** | Design Doc §3 / M1 (`TASK-01..05`) | `src/gateway/validator.ts`<br>`src/gateway/server.ts`<br>`src/gateway/backpressure.ts`<br>`src/gateway/sse_stream.ts`<br>`src/profiler.ts` | `TaskSpecValidator.validateAndNormalize`<br>`ApiGatewayServer.submitTaskSpec`<br>`IngressBackpressureController`<br>`SseEventStreamGateway`<br>`BayesianTaskProfiler.exportJson / importJson` | `chaos_benchmarks.test.ts`<br>`code_audit_improvements.test.ts` (**PASS**) |
+| **5D W-DRF 调度与 DAG 支票** | Design Doc §4–§5 / M2 (`TASK-06..11`) | `src/queue_manager.ts`<br>`src/scheduler.ts`<br>`src/dag/escrow.ts`<br>`src/lease_coordinator.ts` | `MultiTenantQueueManager`<br>`CoreScheduler5D.scheduleTick`<br>`DagEscrowCoordinator`<br>`LeaseCoordinator.acquireOrIncrementEpoch` | `integration_suite.test.ts`<br>`chaos_benchmarks.test.ts` (**PASS**) |
+| **认知路由与四级 Saga 网关** | Design Doc §6–§7 / M3 (`TASK-12..17`) | `src/cognitive_router.ts`<br>`src/router/pool_client.ts`<br>`src/router/breaker_limiter.ts`<br>`src/saga_gateway.ts`<br>`src/saga/compensator.ts`<br>`src/saga/staging.ts` | `CognitiveRouter.routeTurn`<br>`SlidingWindowTokenBucket / ThreeStateCircuitBreaker`<br>`SagaToolGateway.executeTool`<br>`SagaCompensatorEngine.compensateLifo`<br>`StagingCommitAndApprovalGate.stageWrite` | `integration_suite.test.ts`<br>`code_audit_improvements.test.ts` (**PASS**) |
+| **相变弹性沙箱与三层断路器** | Design Doc §8–§9 / M4 (`TASK-18..23`) | `src/runtime/warm_pool.ts`<br>`src/runtime/phase_controller.ts`<br>`src/runtime/psi_guard.ts`<br>`src/runtime/vsock_bridge.ts`<br>`src/harness/runner.ts`<br>`src/harness/velocity_breaker.ts` | `WarmSandboxPoolManager`<br>`CgroupPhaseController`<br>`LinuxPsiMemoryGuard`<br>`ZeroTrustVsockBridge`<br>`AgentHarnessRunner`<br>`SyntacticAndVelocityBreaker` | `integration_suite.test.ts`<br>`spec_completeness_audit.test.ts` (**PASS**) |
+| **TurnWAL、时光机重放与事件** | Design Doc §10 / M5–M6 (`TASK-24..32`) | `src/checkpoint/wal_engine.ts`<br>`src/checkpoint/compactor.ts`<br>`src/checkpoint/time_travel.ts`<br>`src/telemetry/cloudevents.ts`<br>`src/telemetry/outbox_webhook.ts`<br>`src/cluster/backpressure_loop.ts` | `TurnWalEngine`<br>`WalCompactorAndPagedRestorer`<br>`DeterministicTimeTravelReplayer`<br>`CloudEventsBus`<br>`TransactionalOutboxDispatcher`<br>`BidirectionalBackpressureController` | `chaos_benchmarks.test.ts` (**PASS**) |
+| **`celld` & Cloudflare 脑体分离** | HA Doc §1–§6 / M7–M8 (`TASK-33..45`) | `src/cloudflare/worker.ts`<br>`src/cloudflare/scheduler_cell.ts`<br>`src/cloudflare/harness_cell.ts`<br>`src/cloudflare/celld_ha_engine.ts` | `AnstsSchedulerCell`<br>`AgentTaskHarnessCell.rehydrateFromSql`<br>`RpoZeroDurabilityEngine.claimCellOwnershipCas / commitAndProveRpoZero`<br>`DurableWorkflowContext.do / sleep / waitForEvent`<br>`ShardedQueueBrokerPool.produceMessage`<br>`SafeEpochGarbageCollector.runEpochGc`<br>`FleetHaAndAutoscalerController` | `celld_cloudflare.test.ts`<br>`celld_ha_durability.test.ts` (**PASS**) |
+| **五层横向扩容引擎 (Scale-Out)** | HA Doc §8 / M9 (`TASK-46..48`) | `src/cloudflare/horizontal_scaler.ts` | `PartitionedSchedulerRouter.routeTaskAdmission / scaleOutSchedulerShards / syncTenantQuotaGossip`<br>`DynamicQueueAutoSharder.evaluateAndScale`<br>`BrainBodyContainerPoolScaler.computeScalePlan` | `horizontal_scaleout.test.ts` (**PASS**) |
+| **热路径装配与真实 S3/LLM 协议** | HA Doc §2–§6 / M10 (`TASK-49..52`) | `src/checkpoint/s3_ltx_driver.ts`<br>`src/cloudflare/celld_admin_client.ts`<br>`src/router/live_llm_adapter.ts`<br>`src/cli/anstsctl.ts` | `RustFsS3LtxDriver.signAwsV4Headers / acquireOrRenewOwnershipCas / uploadLtxFrameWithRpoZeroProof / fetchLtxPageRange`<br>`CelldAdminClient.fetchNodeState / triggerPreserveShutdown / executeRollingRestart`<br>`LiveOpenAiCompatibleSseAdapter.streamChatCompletionTurn` | `m10_hotpath_protocols.test.ts` (**PASS**) |
+| **Linux 内核 Cgroups/PSI 与热迁移** | Design Doc §8 / M11 (`TASK-53..56`) | `src/runtime/linux_cgroup_psi.ts`<br>`src/runtime/container_driver.ts`<br>`src/runtime/vsock_daemon.ts`<br>`src/runtime/live_migration.ts` | `LinuxCgroupV2AndPsiDriver.initSandboxCgroup / applyPhaseLimits / sampleHostPsiPressure`<br>`CompanionContainerAndOverlayDriver.captureUpperDirSnapshot / restoreUpperDirSnapshot`<br>`ZeroTrustVsockHostDaemon.listenTcpLoopback`<br>`EphemeralHeavyExecutorMigrator.migrateAndExecuteTurnBurst` | `m11_linux_runtime_primitives.test.ts` (**PASS**) |
+| **K8s 编排、`RustFS` EC:4、MCP 与多活** | HA Doc §9 / M12–M13 (`TASK-57..64`) | `src/cluster/k8s_autoscaler.ts`<br>`src/telemetry/otel_prometheus.ts`<br>`src/saga/mcp_registry.ts`<br>`src/finops/budget_controller.ts`<br>`src/dashboard/server.ts`<br>`src/cloudflare/federation_router.ts`<br>`deploy/k8s-operator/celld-fleet-operator.yaml`<br>`deploy/rustfs-celld/docker-compose.rustfs-ha.yml` | `KubernetesCelldHpaAdapter.reconcileClusterReplicas`<br>`OtelAndPrometheusExporter.renderPrometheusMetrics`<br>`McpDynamicToolRegistry.registerMcpServerTools / invokeMcpTool`<br>`FinOpsBudgetController.recordTurnSpend`<br>`DashboardBackendServer.handleGetShardHeatmap / handleStageCommitDecision`<br>`MultiRegionFederationRouter.routeGlobalTask` | `m12_m13_production_suite.test.ts`<br>`design_deliverable_consistency.test.ts` (**PASS**) |

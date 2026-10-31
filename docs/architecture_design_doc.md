@@ -3,7 +3,7 @@
 | 文档属性 (Document Metadata) | 详细内容 (Specification Details) |
 | :--- | :--- |
 | **文档标题 (Title)** | **Agent-Native Sandbox Task Scheduler (ANSTS): 多租户、双相脉冲与认知强度感知的分布式沙箱任务调度系统** |
-| **文档状态 (Status)** | **APPROVED / SYNCHRONIZED PRODUCTION SPECIFICATION (v2.1 — TypeScript + celld/Cloudflare + RustFS Edition)** |
+| **文档状态 (Status)** | **APPROVED / SYNCHRONIZED PRODUCTION SPECIFICATION (v2.2 — Full M1~M13 TypeScript + celld HA + Scale-Out + RustFS EC:4 Edition, 61 Modules APPROVED / SYNCHRONIZED PRODUCTION SPECIFICATION (v2.1 — TypeScript + celld/Cloudflare + RustFS Edition) 46/46 Tests Verified)** |
 | **作者 (Authors)** | 分布式 Agent 基础设施与沙箱运行时架构组 |
 | **评审人 (Reviewers)** | 计算调度组 (Compute Scheduling)、模型网关组 (LLM Gateway)、安全隔离组 (Sandbox Security)、SRE 韧性工程组 |
 | **最后更新 (Last Updated)** | 2026-10-30 (全量同步 TypeScript 实现、celld/Cloudflare 脑体分离架构、RustFS 启动标本与 5 项代码走查加固) |

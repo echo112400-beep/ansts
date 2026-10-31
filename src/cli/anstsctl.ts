@@ -1,22 +1,28 @@
 /**
- * TASK-30 & TASK-51: Unified Cluster Facade (AnstsClusterRuntime) and anstsctl CLI Tool
- * including `anstsctl fleet status | rebalance | rolling-restart`.
+ * TASK-30, TASK-51 & M12-M13 Unified Cluster Facade (`AnstsClusterRuntime`) and `anstsctl` CLI Tool.
+ * Composes all M1 ~ M13 subsystems into a single cohesive runtime.
  */
 
 import { WalCompactorAndPagedRestorer } from "../checkpoint/compactor";
 import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel";
 import { TurnWalEngine } from "../checkpoint/wal_engine";
 import { FleetHaAndAutoscalerController } from "../cloudflare/celld_ha_engine";
+import { MultiRegionFederationRouter } from "../cloudflare/federation_router";
+import { PartitionedSchedulerRouter } from "../cloudflare/horizontal_scaler";
 import { BidirectionalBackpressureController } from "../cluster/backpressure_loop";
+import { KubernetesCelldHpaAdapter } from "../cluster/k8s_autoscaler";
 import { CognitiveRouter } from "../cognitive_router";
+import { FinOpsBudgetController } from "../finops/budget_controller";
 import { ApiGatewayServer } from "../gateway/server";
 import { LeaseCoordinator } from "../lease_coordinator";
 import { NodeDaemon } from "../node_daemon";
 import { BayesianTaskProfiler } from "../profiler";
 import { MultiTenantQueueManager } from "../queue_manager";
+import { McpDynamicToolRegistry } from "../saga/mcp_registry";
 import { SagaToolGateway } from "../saga_gateway";
 import { CoreScheduler5D } from "../scheduler";
 import { CloudEventsBus } from "../telemetry/cloudevents";
+import { OtelAndPrometheusExporter } from "../telemetry/otel_prometheus";
 
 export class AnstsClusterRuntime {
   public readonly profiler = new BayesianTaskProfiler();
@@ -24,6 +30,12 @@ export class AnstsClusterRuntime {
   public readonly leaseCoord = new LeaseCoordinator();
   public readonly cogRouter = new CognitiveRouter(this.leaseCoord);
   public readonly sagaGw = new SagaToolGateway(this.leaseCoord);
+  public readonly mcpRegistry = new McpDynamicToolRegistry(this.sagaGw);
+  public readonly finopsController = new FinOpsBudgetController();
+  public readonly otelExporter = new OtelAndPrometheusExporter();
+  public readonly federationRouter = new MultiRegionFederationRouter();
+  public readonly k8sAutoscaler = new KubernetesCelldHpaAdapter();
+  public readonly schedulerRouter = new PartitionedSchedulerRouter({ initialShardCount: 8 });
   public readonly scheduler = new CoreScheduler5D(
     this.queueMgr,
     this.profiler,
@@ -43,6 +55,10 @@ export class AnstsClusterRuntime {
     this.scheduler.registerTenant("fin-enterprise", 4.0);
     this.scheduler.registerTenant("codegen-pro", 2.0);
     this.scheduler.registerTenant("research-lab", 1.0);
+    this.finopsController.registerTenantBudget("fin-enterprise", 500.0);
+    this.finopsController.registerTenantBudget("codegen-pro", 250.0);
+    this.finopsController.registerTenantBudget("research-lab", 100.0);
+
     for (const idx of [1, 2, 3]) {
       this.scheduler.registerNode({ nodeId: `worker-us-west-0${idx}`, driver: "firecracker" });
     }
@@ -88,6 +104,7 @@ export class AnstsClusterRuntime {
       tenants_dominant_share: shares,
       active_tasks: this.scheduler.tasks.size,
       backpressure_stage: this.bpController.currentStage,
+      scheduler_shards_count: this.schedulerRouter.getShardStates().length,
       model_pools: {
         DeepSeek: {
           state: this.cogRouter.pools.DeepSeek.breakerState,
@@ -104,12 +121,38 @@ export class AnstsClusterRuntime {
       },
     };
   }
+
+  public exportPrometheusMetricsText(): string {
+    const snap = this.clusterTopSnapshot();
+    return this.otelExporter.renderPrometheusMetrics({
+      tenantDominantShares: snap.tenants_dominant_share,
+      schedulerShards: this.schedulerRouter.getShardStates(),
+      activeQueueShards: 8,
+      modelPools: {
+        DeepSeek: {
+          state: snap.model_pools.DeepSeek.state,
+          ttftSec: snap.model_pools.DeepSeek.ttft_sec,
+        },
+        "GLM-5.3": {
+          state: snap.model_pools["GLM-5.3"].state,
+          ttftSec: snap.model_pools["GLM-5.3"].ttft_sec,
+        },
+        "Qwen-3.8": {
+          state: snap.model_pools["Qwen-3.8"].state,
+          ttftSec: snap.model_pools["Qwen-3.8"].ttft_sec,
+        },
+      },
+    });
+  }
 }
 
 export function runCli(argv: string[]): Record<string, any> {
   const cluster = new AnstsClusterRuntime();
   if (argv[0] === "top") {
     return cluster.clusterTopSnapshot();
+  }
+  if (argv[0] === "metrics") {
+    return { prometheus_text: cluster.exportPrometheusMetricsText() };
   }
   if (argv[0] === "chaos") {
     cluster.cogRouter.tripPoolBreaker("DeepSeek", 0.50);

@@ -1,0 +1,1663 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent 沙箱任务调度系统 — 极简交互式算法仿真</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background-color: #fafafa;
+      color: #18181b;
+      -webkit-font-smoothing: antialiased;
+    }
+    .glass-panel {
+      background: #ffffff;
+      border: 1px solid #e4e4e7;
+    }
+    .custom-scrollbar::-webkit-scrollbar {
+      width: 4px;
+      height: 4px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+      background: #d4d4d8;
+      border-radius: 2px;
+    }
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    .live-dot {
+      animation: pulse-dot 2s ease-in-out infinite;
+    }
+    @keyframes dash-flow {
+      to {
+        stroke-dashoffset: -36;
+      }
+    }
+    .flow-path-active {
+      stroke-dasharray: 6 6;
+      animation: dash-flow 1.2s linear infinite;
+    }
+    .flow-path-fast {
+      stroke-dasharray: 4 4;
+      animation: dash-flow 0.7s linear infinite;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col selection:bg-zinc-900 selection:text-white">
+
+  <!-- Minimal Toast -->
+  <div id="toast-box" class="fixed bottom-5 right-5 z-50 hidden transition-all duration-200">
+    <div class="bg-zinc-900 text-white px-3.5 py-2 rounded-lg shadow-lg flex items-center gap-2 text-xs font-medium">
+      <span id="toast-dot" class="w-2 h-2 rounded-full bg-emerald-400"></span>
+      <span id="toast-text">系统通知</span>
+    </div>
+  </div>
+
+  <!-- Minimal Task Inspector Modal -->
+  <div id="task-modal" class="fixed inset-0 z-50 bg-zinc-900/25 backdrop-blur-[2px] hidden items-center justify-center p-4">
+    <div class="bg-white rounded-xl max-w-xl w-full p-5 border border-zinc-200 shadow-xl space-y-4 max-h-[85vh] flex flex-col">
+      <div class="flex items-center justify-between border-b border-zinc-100 pb-3">
+        <div class="flex items-center gap-2.5">
+          <span id="modal-task-id" class="font-mono text-sm font-semibold text-zinc-900">tsk_01j8x</span>
+          <span id="modal-task-state" class="text-[11px] font-mono px-2 py-0.5 rounded bg-zinc-100 text-zinc-800">RUNNING</span>
+        </div>
+        <button id="btn-close-modal" class="px-2.5 py-1 rounded-md bg-zinc-100 hover:bg-zinc-200 text-zinc-700 text-xs">关闭 ✕</button>
+      </div>
+      <p id="modal-task-desc" class="text-xs text-zinc-500"></p>
+      <div id="modal-task-body" class="overflow-y-auto custom-scrollbar space-y-3 text-xs flex-1"></div>
+    </div>
+  </div>
+
+  <!-- Minimal Header -->
+  <header class="border-b border-zinc-200 bg-white sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <div class="w-7 h-7 rounded-md bg-zinc-900 text-white flex items-center justify-center font-mono text-xs font-semibold">
+          AS
+        </div>
+        <div class="flex items-center gap-2.5">
+          <h1 class="text-sm sm:text-base font-semibold text-zinc-900 tracking-tight">ANSTS v2.0 · Agent 沙箱任务调度极简仿真</h1>
+          <span id="sim-clock-badge" class="text-xs font-mono px-2 py-0.5 rounded bg-zinc-100 text-zinc-700 border border-zinc-200">Tick #0</span>
+        </div>
+      </div>
+
+      <!-- Playback Controls -->
+      <div class="flex flex-wrap items-center gap-2">
+        <div class="flex items-center bg-zinc-100 rounded-lg p-0.5 gap-0.5 border border-zinc-200">
+          <button id="btn-sim-toggle" class="px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-900 text-white transition flex items-center gap-1">
+            <span id="sim-toggle-icon">⏸️</span> <span id="sim-toggle-text">运行中</span>
+          </button>
+          <button id="btn-sim-step" class="px-2.5 py-1 rounded-md text-xs font-medium text-zinc-700 hover:bg-white transition">
+            ⏭️ 单步 Tick
+          </button>
+          <select id="select-sim-speed" class="bg-transparent text-zinc-700 text-xs font-mono px-2 py-1 focus:outline-none">
+            <option value="1800">1.0x 速度</option>
+            <option value="1000" selected>1.8x 速度</option>
+            <option value="500">3.5x 极速</option>
+          </select>
+        </div>
+
+        <button id="btn-burst-submit" class="px-2.5 py-1.5 rounded-lg bg-white hover:bg-zinc-50 border border-zinc-200 text-zinc-800 text-xs font-medium transition">
+          ➕ 突发注入 4 个异构任务
+        </button>
+        <button id="btn-reset-all" class="px-2.5 py-1.5 rounded-lg bg-white hover:bg-zinc-50 text-zinc-600 border border-zinc-200 text-xs transition">
+          🔄 重置
+        </button>
+      </div>
+    </div>
+
+    <!-- Minimal KPI Bar -->
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 py-2 border-t border-zinc-100 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 text-xs bg-zinc-50/60">
+      <div>
+        <span class="text-zinc-400 text-[11px] block">物理算力 (vCPU)</span>
+        <span id="kpi-compute" class="font-mono font-semibold text-zinc-900">14.0 / 32 C · 44%</span>
+      </div>
+      <div>
+        <span class="text-zinc-400 text-[11px] block">有效吞吐 (TPS)</span>
+        <span id="kpi-tps" class="font-mono font-semibold text-zinc-900">1,120 / 2,400 TPS</span>
+      </div>
+      <div>
+        <span class="text-zinc-400 text-[11px] block">实例状态</span>
+        <span id="kpi-sandboxes" class="font-mono font-semibold text-zinc-900">5 运行 · 2 休眠 · 4 排队</span>
+      </div>
+      <div>
+        <span class="text-zinc-400 text-[11px] block">并发子会话</span>
+        <span id="kpi-sessions" class="font-mono font-semibold text-zinc-900">14 / 32 Slots</span>
+      </div>
+      <div>
+        <span class="text-zinc-400 text-[11px] block">背压状态</span>
+        <div class="flex items-center gap-1">
+          <span id="kpi-bp-icon" class="text-[10px]">🟢</span>
+          <span id="kpi-backpressure" class="font-mono font-semibold text-zinc-900">NORMAL</span>
+        </div>
+      </div>
+      <div>
+        <span class="text-zinc-400 text-[11px] block">韧性统计</span>
+        <span id="kpi-dfx-count" class="font-mono font-semibold text-zinc-900">0 熔断 · 1 断点恢复</span>
+      </div>
+    </div>
+
+    <!-- Minimal Navigation Tabs -->
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 overflow-x-auto custom-scrollbar border-t border-zinc-200 bg-white">
+      <nav class="flex space-x-1 py-1.5 min-w-max">
+        <button data-tab="overview" class="main-tab-btn px-3 py-1.5 rounded-md text-xs font-medium bg-zinc-900 text-white flex items-center gap-1.5 transition">
+          <span>🎛️</span> 实时调度与沙箱集群全景
+        </button>
+        <button data-tab="builder" class="main-tab-btn px-3 py-1.5 rounded-md text-xs font-medium text-zinc-600 hover:text-zinc-900 hover:bg-zinc-100 flex items-center gap-1.5 transition">
+          <span>📝</span> TaskSpec 声明式构建与任务投递
+        </button>
+        <button data-tab="telemetry" class="main-tab-btn px-3 py-1.5 rounded-md text-xs font-medium text-zinc-600 hover:text-zinc-900 hover:bg-zinc-100 flex items-center gap-1.5 transition">
+          <span>📊</span> 双向背压控制与多维资源监控
+        </button>
+        <button data-tab="dfx" class="main-tab-btn px-3 py-1.5 rounded-md text-xs font-medium text-zinc-600 hover:text-zinc-900 hover:bg-zinc-100 flex items-center gap-1.5 transition">
+          <span>🛡️</span> DFX 演练场 (Epoch防脑裂 / 断点恢复 / 双层熔断)
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <!-- Main Workspace -->
+  <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-5">
+
+    <!-- ==================== TAB 1: MINIMALIST PIPELINE + FLEET OVERVIEW ==================== -->
+    <section id="tab-overview" class="tab-view space-y-5">
+
+      <!-- Clean Minimalist Animated Flow Diagram -->
+      <div class="glass-panel rounded-xl p-4 sm:p-5 space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-zinc-100">
+          <div>
+            <h2 class="text-sm font-semibold text-zinc-900">多租队列 · 5D W-DRF 选主 · Turn 级认知路由 · 相变沙箱分配 实时动效</h2>
+            <p id="anim-pipeline-desc" class="text-xs text-zinc-500 mt-0.5">
+              展示任务从多租队列出队，经 5D W-DRF 选主、P50 贝叶斯预留、Turn 级认知路由（DeepSeek / GLM-5.3 / Qwen-3.8）与相变沙箱分配的实时流转路径
+            </p>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-1.5">
+            <button data-anim-mode="normal" class="anim-mode-btn px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-900 text-white transition">
+              🎬 1. 标准 5D W-DRF + 预热池分配
+            </button>
+            <button data-anim-mode="escrow" class="anim-mode-btn px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition">
+              ⚡ 2. DAG 父子配额支票免排队直通
+            </button>
+            <button data-anim-mode="cognitive" class="anim-mode-btn px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition">
+              🔀 3. Turn 级轻重模型动态认知路由
+            </button>
+            <button data-anim-mode="fallback" class="anim-mode-btn px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition">
+              🛡️ 4. 429 熔断 Fallback 备用路由重分配
+            </button>
+          </div>
+        </div>
+
+        <!-- Minimalist Geometric SVG Flow -->
+        <div class="w-full overflow-x-auto custom-scrollbar py-1">
+          <svg id="pipeline-svg" viewBox="0 0 1120 220" class="w-full min-w-[860px] h-auto select-none">
+            <defs>
+              <linearGradient id="grad-indigo" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#18181b"/><stop offset="100%" stop-color="#3f3f46"/></linearGradient>
+              <linearGradient id="grad-emerald" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#10b981"/></linearGradient>
+              <linearGradient id="grad-amber" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#d97706"/><stop offset="100%" stop-color="#f59e0b"/></linearGradient>
+              <filter id="soft-shadow" x="-5%" y="-5%" width="110%" height="110%"><feDropShadow dx="0" dy="1" stdDeviation="1" flood-opacity="0.04"/></filter>
+            </defs>
+            <!-- Column Labels -->
+            <g font-family="Inter, sans-serif" font-size="10.5" font-weight="600" fill="#71717a">
+              <text x="16" y="18">01 / 多租队列 (H-WFQ)</text>
+              <text x="306" y="18">02 / 联合调度器 (5D W-DRF)</text>
+              <text x="576" y="18">03 / 动态认知路由池 (Model Pools)</text>
+              <text x="866" y="18">04 / 相变弹性沙箱节点 (MicroVM)</text>
+            </g>
+
+            <!-- Col 1: 3 Minimal Queue Boxes -->
+            <g>
+              <rect x="16" y="30" width="215" height="50" rx="8" fill="#ffffff" stroke="#18181b" stroke-width="1.5" />
+              <text x="28" y="49" font-size="11" font-weight="600" fill="#18181b">FinTech (w=4)</text>
+              <text id="svg-q1-share" x="165" y="49" font-family="JetBrains Mono" font-size="10" fill="#059669">D_t=0.11</text>
+              <text x="28" y="68" font-family="JetBrains Mono" font-size="9.5" fill="#52525b">[P0·tsk_912] [P1·tsk_915] [🎫Escrow]</text>
+
+              <rect x="16" y="92" width="215" height="50" rx="8" fill="#ffffff" stroke="#e4e4e7" stroke-width="1.2" />
+              <text x="28" y="111" font-size="11" font-weight="500" fill="#3f3f46">CodeGen (w=2)</text>
+              <text id="svg-q2-share" x="165" y="111" font-family="JetBrains Mono" font-size="10" fill="#71717a">D_t=0.18</text>
+              <text x="28" y="130" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">[P1·tsk_415] [P2·tsk_418] +Aging</text>
+
+              <rect x="16" y="154" width="215" height="50" rx="8" fill="#ffffff" stroke="#e4e4e7" stroke-width="1.2" />
+              <text x="28" y="173" font-size="11" font-weight="500" fill="#3f3f46">Research (w=1)</text>
+              <text id="svg-q3-share" x="165" y="173" font-family="JetBrains Mono" font-size="10" fill="#71717a">D_t=0.25</text>
+              <text x="28" y="192" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">[P2·tsk_718] +EDF截止提权</text>
+            </g>
+
+            <!-- Flow Lines: Col 1 -> Col 2 -->
+            <path id="path-q1-sched" d="M 231 55 C 268 55, 268 105, 306 105" fill="none" stroke="#18181b" stroke-width="1.8" class="flow-path-active" />
+            <path id="path-q2-sched" d="M 231 117 L 306 117" fill="none" stroke="#d4d4d8" stroke-width="1.2" stroke-dasharray="4 4" />
+            <path id="path-q3-sched" d="M 231 179 C 268 179, 268 129, 306 129" fill="none" stroke="#d4d4d8" stroke-width="1.2" stroke-dasharray="4 4" />
+            <circle r="4.5" fill="#18181b">
+              <animateMotion dur="1.4s" repeatCount="indefinite" path="M 231 55 C 268 55, 268 105, 306 105" />
+            </circle>
+
+            <!-- Col 2: Central Scheduler Box -->
+            <g>
+              <rect x="306" y="55" width="195" height="124" rx="10" fill="#fafafa" stroke="#18181b" stroke-width="1.5" />
+              <text id="svg-sched-headline" x="320" y="78" font-family="JetBrains Mono" font-size="10.5" font-weight="600" fill="#18181b">选中: FinTech (min D_t)</text>
+              <text id="svg-sched-sub1" x="320" y="98" font-family="JetBrains Mono" font-size="9.5" fill="#52525b">P50 预留: 240k Tokens</text>
+              <text id="svg-sched-sub2" x="320" y="116" font-family="JetBrains Mono" font-size="9.5" fill="#52525b">双相算力: 0.1C ⇄ 2.0C</text>
+              <text id="svg-sched-sub3" x="320" y="134" font-family="JetBrains Mono" font-size="9.5" fill="#52525b">栅栏: Fence (Ep=2, T=1)</text>
+              <rect x="320" y="146" width="167" height="22" rx="5" fill="#ffffff" stroke="#e4e4e7" />
+              <text id="svg-sched-badge" x="328" y="160" font-family="JetBrains Mono" font-size="9.5" font-weight="500" fill="#059669">✓ 配额余量92% · 预热65ms</text>
+            </g>
+
+            <!-- Flow Lines: Col 2 -> Col 3 -->
+            <path id="path-sched-m1" d="M 501 105 C 538 105, 538 55, 576 55" fill="none" stroke="#10b981" stroke-width="2" class="flow-path-fast" />
+            <path id="path-sched-m2" d="M 501 117 L 576 117" fill="none" stroke="#d4d4d8" stroke-width="1.2" stroke-dasharray="4 4" />
+            <path id="path-sched-m3" d="M 501 129 C 538 129, 538 179, 576 179" fill="none" stroke="#d4d4d8" stroke-width="1.2" stroke-dasharray="4 4" />
+            <circle id="packet-stage2-3" r="4.5" fill="#10b981">
+              <animateMotion id="anim-motion-2-3" dur="1.2s" repeatCount="indefinite" path="M 501 105 C 538 105, 538 55, 576 55" />
+            </circle>
+
+            <!-- Col 3: 3 Model Pool Boxes -->
+            <g>
+              <rect id="svg-mp1-box" x="576" y="30" width="215" height="50" rx="8" fill="#ffffff" stroke="#10b981" stroke-width="1.5" />
+              <text x="588" y="49" font-size="11" font-weight="600" fill="#18181b">DeepSeek</text>
+              <text id="svg-mp1-kv" x="720" y="49" font-family="JetBrains Mono" font-size="9.5" fill="#059669">余量 92%</text>
+              <text x="588" y="68" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">旗舰池 · high(3x) · 0.4s</text>
+
+              <rect id="svg-mp2-box" x="576" y="92" width="215" height="50" rx="8" fill="#ffffff" stroke="#e4e4e7" stroke-width="1.2" />
+              <text x="588" y="111" font-size="11" font-weight="500" fill="#3f3f46">GLM-5.3</text>
+              <text x="726" y="111" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">Fast池</text>
+              <text x="588" y="130" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">只读轮次分流 · 省75%成本</text>
+
+              <rect id="svg-mp3-box" x="576" y="154" width="215" height="50" rx="8" fill="#ffffff" stroke="#e4e4e7" stroke-width="1.2" />
+              <text x="588" y="173" font-size="11" font-weight="500" fill="#3f3f46">Qwen-3.8</text>
+              <text id="svg-mp3-status" x="720" y="173" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">Fallback</text>
+              <text x="588" y="192" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">429熔断时 Turn 级无感接管</text>
+            </g>
+
+            <!-- Flow Lines: Col 3 -> Col 4 -->
+            <path id="path-m1-n1" d="M 791 55 L 866 55" fill="none" stroke="#10b981" stroke-width="2" class="flow-path-fast" />
+            <path id="path-m2-n2" d="M 791 117 L 866 117" fill="none" stroke="#d4d4d8" stroke-width="1.2" stroke-dasharray="4 4" />
+            <path id="path-m3-n3" d="M 791 179 L 866 179" fill="none" stroke="#d4d4d8" stroke-width="1.2" stroke-dasharray="4 4" />
+            <circle r="4.5" fill="#18181b">
+              <animateMotion id="anim-motion-3-4" dur="1.0s" repeatCount="indefinite" path="M 791 55 L 866 55" />
+            </circle>
+
+            <!-- Col 4: 3 Sandbox Node Boxes -->
+            <g>
+              <rect x="866" y="30" width="235" height="50" rx="8" fill="#ffffff" stroke="#18181b" stroke-width="1.5" />
+              <text x="878" y="49" font-size="11" font-weight="600" fill="#18181b">worker-us-west-01</text>
+              <text x="1030" y="49" font-family="JetBrains Mono" font-size="9.5" fill="#059669">Firecracker</text>
+              <text x="878" y="68" font-family="JetBrains Mono" font-size="9.5" fill="#52525b">预热65ms · 思考0.1C ⇄ 突发8C</text>
+
+              <rect x="866" y="92" width="235" height="50" rx="8" fill="#ffffff" stroke="#e4e4e7" stroke-width="1.2" />
+              <text x="878" y="111" font-size="11" font-weight="500" fill="#3f3f46">worker-us-west-02</text>
+              <text x="1030" y="111" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">Firecracker</text>
+              <text x="878" y="130" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">支持审批等待 CoW 零内存休眠</text>
+
+              <rect x="866" y="154" width="235" height="50" rx="8" fill="#ffffff" stroke="#e4e4e7" stroke-width="1.2" />
+              <text x="878" y="173" font-size="11" font-weight="500" fill="#3f3f46">worker-us-west-03</text>
+              <text x="1045" y="173" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">Kata/GPU</text>
+              <text x="878" y="192" font-family="JetBrains Mono" font-size="9.5" fill="#71717a">重型编译/浏览器 · Saga网关</text>
+            </g>
+          </svg>
+        </div>
+      </div>
+
+      <!-- Clean 3-Column Layout -->
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+
+        <!-- Left 4 Cols: Tenant DRF & Priority Queue -->
+        <div class="lg:col-span-4 space-y-4">
+          <div class="glass-panel rounded-xl p-4 space-y-3">
+            <div class="flex items-center justify-between border-b border-zinc-100 pb-2.5">
+              <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">多租配额与 W-DRF 份额</h2>
+              <span class="text-[11px] font-mono text-zinc-400">min(D_t) 优先</span>
+            </div>
+            <div id="tenant-drf-list" class="space-y-2"></div>
+          </div>
+
+          <div class="glass-panel rounded-xl p-4 space-y-3">
+            <div class="flex items-center justify-between border-b border-zinc-100 pb-2.5">
+              <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">排队池 (Aging + EDF)</h3>
+              <span id="queue-count-badge" class="text-xs font-mono text-zinc-600">4 待调度</span>
+            </div>
+            <div id="priority-queue-list" class="space-y-2 max-h-[340px] overflow-y-auto custom-scrollbar pr-1"></div>
+          </div>
+        </div>
+
+        <!-- Center 5 Cols: Worker Nodes -->
+        <div class="lg:col-span-5 space-y-4">
+          <div class="glass-panel rounded-xl p-4 space-y-3">
+            <div class="flex items-center justify-between border-b border-zinc-100 pb-2.5">
+              <h2 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">沙箱节点与运行实例</h2>
+              <div class="flex items-center gap-2 text-[11px] font-mono text-zinc-500">
+                <span>● RUNNING</span>
+                <span>○ HIBERNATED</span>
+              </div>
+            </div>
+            <div id="worker-nodes-container" class="space-y-3 max-h-[600px] overflow-y-auto custom-scrollbar pr-1"></div>
+          </div>
+        </div>
+
+        <!-- Right 3 Cols: Fault Drills & CloudEvents -->
+        <div class="lg:col-span-3 space-y-4">
+          <div class="glass-panel rounded-xl p-4 space-y-2.5">
+            <div class="flex items-center justify-between border-b border-zinc-100 pb-2">
+              <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">故障与背压演练</h3>
+              <span class="text-[10px] font-mono text-zinc-400">Chaos</span>
+            </div>
+            <div class="grid grid-cols-1 gap-1.5 pt-1">
+              <button id="btn-chaos-llm429" class="p-2.5 rounded-lg bg-zinc-50 hover:bg-zinc-100 border border-zinc-200 text-left transition">
+                <div class="text-xs font-medium text-zinc-900">🔥 触发下游 LLM 429 限流风暴</div>
+                <div class="text-[11px] text-zinc-500 mt-0.5">切换 Fallback 模型与 L1 降级</div>
+              </button>
+              <button id="btn-chaos-slow-consumer" class="p-2.5 rounded-lg bg-zinc-50 hover:bg-zinc-100 border border-zinc-200 text-left transition">
+                <div class="text-xs font-medium text-zinc-900">🐢 触发上游慢消费与配额红线背压</div>
+                <div class="text-[11px] text-zinc-500 mt-0.5">并发子会话收缩至 1</div>
+              </button>
+              <button id="btn-chaos-kill-node" class="p-2.5 rounded-lg bg-zinc-50 hover:bg-zinc-100 border border-zinc-200 text-left transition">
+                <div class="text-xs font-medium text-zinc-900">💥 模拟节点 01 宕机 (SIGKILL)</div>
+                <div class="text-[11px] text-zinc-500 mt-0.5">Epoch+1 抢占与 Turn-WAL 快照恢复</div>
+              </button>
+              <button id="btn-chaos-tool-loop" class="p-2.5 rounded-lg bg-zinc-50 hover:bg-zinc-100 border border-zinc-200 text-left transition">
+                <div class="text-xs font-medium text-zinc-900">♾️ 注入 Agent 语义停滞/死循环</div>
+                <div class="text-[11px] text-zinc-500 mt-0.5">进展率停滞检测与 Saga 熔断</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="glass-panel rounded-xl p-4 flex flex-col space-y-2.5">
+            <div class="flex items-center justify-between border-b border-zinc-100 pb-2">
+              <div class="flex items-center gap-1.5">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 live-dot"></span>
+                <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500">CloudEvents 事件流</h3>
+              </div>
+              <button id="btn-clear-events" class="text-[11px] text-zinc-400 hover:text-zinc-800">清空</button>
+            </div>
+
+            <div class="flex flex-wrap gap-1">
+              <button data-evt-filter="all" class="evt-filter-btn px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-900 text-white">全部</button>
+              <button data-evt-filter="sched" class="evt-filter-btn px-2 py-0.5 rounded text-[11px] bg-zinc-100 text-zinc-600">调度/准入</button>
+              <button data-evt-filter="harness" class="evt-filter-btn px-2 py-0.5 rounded text-[11px] bg-zinc-100 text-zinc-600">Turn/工具</button>
+              <button data-evt-filter="dfx" class="evt-filter-btn px-2 py-0.5 rounded text-[11px] bg-zinc-100 text-zinc-600">背压/熔断/恢复</button>
+            </div>
+
+            <div id="cloudevents-log" class="space-y-1.5 max-h-[310px] overflow-y-auto custom-scrollbar pr-1 font-mono text-[11px]"></div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ==================== TAB 2: TASKSPEC BUILDER ==================== -->
+    <section id="tab-builder" class="tab-view hidden space-y-5">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <div class="lg:col-span-7 glass-panel rounded-xl p-5 space-y-4">
+          <div class="flex items-center justify-between border-b border-zinc-100 pb-3">
+            <div>
+              <h2 class="text-sm font-semibold text-zinc-900">TaskSpec v1beta1 声明式任务构建器</h2>
+              <p class="text-xs text-zinc-500 mt-0.5">配置参数并直接投递至实时仿真队列</p>
+            </div>
+            <button id="btn-submit-custom-task" class="px-3.5 py-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-medium transition">
+              🚀 立即提交至调度队列
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5 text-xs">
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">所属租户队列</label>
+              <select id="spec-tenant" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="fin-enterprise">FinTech-Enterprise (w=4)</option>
+                <option value="codegen-pro">CodeGen-Pro (w=2)</option>
+                <option value="research-lab">Research-Lab (w=1)</option>
+              </select>
+            </div>
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">优先级泳道与初始分</label>
+              <select id="spec-priority" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="P0|950">P0 - Critical (950)</option>
+                <option value="P1|820" selected>P1 - High Interactive (820)</option>
+                <option value="P2|600">P2 - Normal Batch (600)</option>
+                <option value="P3|350">P3 - Low Background (350)</option>
+                <option value="P4|150">P4 - Spot (150)</option>
+              </select>
+            </div>
+
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">主模型</label>
+              <select id="spec-model" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="DeepSeek">DeepSeek</option>
+                <option value="GLM-5.3">GLM-5.3</option>
+                <option value="Qwen-3.8">Qwen-3.8</option>
+              </select>
+            </div>
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">推理强度 (Reasoning Effort)</label>
+              <select id="spec-effort" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="minimal|1.0">minimal (1.0x)</option>
+                <option value="low|1.2">low (1.2x)</option>
+                <option value="medium|1.8">medium (1.8x)</option>
+                <option value="high|3.0" selected>high (3.0x)</option>
+                <option value="max|5.0">max (5.0x)</option>
+              </select>
+            </div>
+
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">预留 TPS / 峰值 TPS</label>
+              <select id="spec-tps" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="80|200">80 / 200 TPS</option>
+                <option value="120|350" selected>120 / 350 TPS</option>
+                <option value="200|600">200 / 600 TPS</option>
+              </select>
+            </div>
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">总 Token 预算 &amp; 并发子会话</label>
+              <select id="spec-tokens-sessions" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="200000|2">200k Tokens · 2 Sessions</option>
+                <option value="500000|4" selected>500k Tokens · 4 Sessions</option>
+                <option value="1000000|8">1.0M Tokens · 8 Sessions</option>
+              </select>
+            </div>
+
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">沙箱算力与隔离驱动</label>
+              <select id="spec-compute" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="1|2048|firecracker">1.0 vCPU · 2 GiB (Firecracker)</option>
+                <option value="2|4096|firecracker" selected>2.0 vCPU · 4 GiB (Firecracker)</option>
+                <option value="4|8192|kata">4.0 vCPU · 8 GiB (Kata)</option>
+                <option value="1|1024|gvisor">1.0 vCPU · 1 GiB (gVisor)</option>
+              </select>
+            </div>
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">预热镜像池</label>
+              <select id="spec-image" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="pool-py312-ds" selected>pool-py312-ds</option>
+                <option value="pool-rust-toolchains">pool-rust-toolchains</option>
+                <option value="pool-playwright-browser">pool-playwright-browser</option>
+              </select>
+            </div>
+
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">Agent Harness 模式</label>
+              <select id="spec-harness" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900">
+                <option value="react-plan-execute-v2|12" selected>react-plan-execute-v2 (12 Turns)</option>
+                <option value="code-act-sandbox|16">code-act-sandbox (16 Turns)</option>
+                <option value="reflexion-deep-research|20">reflexion-deep-research (20 Turns)</option>
+              </select>
+            </div>
+            <div class="space-y-1">
+              <label class="text-zinc-600 font-medium">自定义元数据 (Custom Metadata)</label>
+              <input id="spec-meta" type="text" value="cost_center=CC-9042,biz=settlement-audit" class="w-full bg-zinc-50 border border-zinc-200 rounded-lg px-3 py-2 text-zinc-900 font-mono" />
+            </div>
+          </div>
+
+          <div class="p-3 rounded-lg bg-zinc-50 border border-zinc-200 text-xs flex items-center justify-between">
+            <span id="spec-vector-preview" class="font-mono text-zinc-700">Effective TPS = 360 · 2.0 vCPU · 4096 MB</span>
+            <span class="text-[11px] font-mono text-emerald-700">Warm Pool ~65ms</span>
+          </div>
+        </div>
+
+        <div class="lg:col-span-5 glass-panel rounded-xl p-5 flex flex-col justify-between space-y-3">
+          <div class="flex items-center justify-between border-b border-zinc-100 pb-2.5">
+            <span class="text-xs font-mono text-zinc-600">TaskSpec YAML</span>
+            <button id="btn-copy-spec-yaml" class="px-2.5 py-1 rounded bg-zinc-100 hover:bg-zinc-200 text-zinc-800 text-xs font-mono">
+              📋 复制 YAML
+            </button>
+          </div>
+          <pre class="bg-zinc-900 rounded-lg p-3.5 text-[11px] font-mono text-zinc-100 overflow-x-auto custom-scrollbar flex-1 max-h-[450px] leading-relaxed"><code id="spec-yaml-preview"></code></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 3: TELEMETRY & BACKPRESSURE ==================== -->
+    <section id="tab-telemetry" class="tab-view hidden space-y-5">
+      <div class="glass-panel rounded-xl p-5 space-y-4">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-zinc-100 pb-3">
+          <h2 class="text-sm font-semibold text-zinc-900">双向背压传导模拟</h2>
+          <span id="bp-live-banner" class="text-xs font-mono px-2.5 py-1 rounded bg-zinc-100 text-zinc-800">
+            当前传导状态: 双向畅通 (Normal Flow)
+          </span>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="bg-zinc-50 border border-zinc-200 rounded-lg p-4 space-y-2">
+            <div class="flex items-center justify-between text-xs">
+              <span class="font-medium text-zinc-800">⬅️ 自下而上反向背压 (下游拥塞率)</span>
+              <span id="slider-down-bp-val" class="font-mono text-zinc-900 font-semibold">错误率 5% (正常)</span>
+            </div>
+            <input id="slider-down-bp" type="range" min="0" max="100" step="5" value="5" class="w-full accent-zinc-900 cursor-pointer" />
+            <p class="text-[11px] text-zinc-500">&gt;35% 自动降级推理强度与切换备选池；&gt;70% 冻结出队并返回 HTTP 429。</p>
+          </div>
+
+          <div class="bg-zinc-50 border border-zinc-200 rounded-lg p-4 space-y-2">
+            <div class="flex items-center justify-between text-xs">
+              <span class="font-medium text-zinc-800">➡️ 自上而下正向背压 (客户端消费窗口信用)</span>
+              <span id="slider-up-bp-val" class="font-mono text-zinc-900 font-semibold">窗口信用 95% (充裕)</span>
+            </div>
+            <input id="slider-up-bp" type="range" min="5" max="100" step="5" value="95" class="w-full accent-zinc-900 cursor-pointer" />
+            <p class="text-[11px] text-zinc-500">&lt;50% 启动 Token Pacing 限速；&lt;25% 强制收缩沙箱并发子会话至 1。</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <div class="glass-panel rounded-xl p-5">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500 mb-3">实时有效 TPS 趋势</h3>
+          <div class="relative h-64 w-full">
+            <canvas id="tpsTimelineChart"></canvas>
+          </div>
+        </div>
+
+        <div class="glass-panel rounded-xl p-5">
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-zinc-500 mb-3">多租户资源份额对比</h3>
+          <div class="relative h-64 w-full">
+            <canvas id="tenantDrfChart"></canvas>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 4: DFX LAB ==================== -->
+    <section id="tab-dfx" class="tab-view hidden space-y-5">
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+        <div class="glass-panel rounded-xl p-5 flex flex-col justify-between space-y-4">
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium text-zinc-500">防脑裂栅栏</span>
+              <span id="dfx-epoch-badge" class="text-xs font-mono font-semibold text-zinc-900">当前合法 Epoch = 2</span>
+            </div>
+            <h3 class="text-sm font-semibold text-zinc-900">双元组栅栏 (Epoch, Turn) 校验</h3>
+            <p class="text-xs text-zinc-500 leading-relaxed">
+              存储层与工具网关校验请求携带的 <code class="font-mono text-zinc-800">(epoch, turn_seq)</code>，拦截假死旧节点的过期写请求。
+            </p>
+            <div id="dfx-fencing-log" class="bg-zinc-50 border border-zinc-200 rounded-lg p-3 font-mono text-[11px] text-zinc-700 space-y-1.5 min-h-[120px]">
+              <div>[Fence (2, 3)] node-us-west-02 持有合法租约。</div>
+            </div>
+          </div>
+          <button id="btn-test-stale-epoch" class="w-full py-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-medium transition">
+            🛡️ 模拟分区恢复的旧节点 (Epoch 1) 发起非法写请求
+          </button>
+        </div>
+
+        <div class="glass-panel rounded-xl p-5 flex flex-col justify-between space-y-4">
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium text-zinc-500">断点恢复</span>
+              <span class="text-xs font-mono text-zinc-700">RPO = 1 Turn</span>
+            </div>
+            <h3 class="text-sm font-semibold text-zinc-900">Turn-WAL 增量快照与跨节点续跑</h3>
+            <p class="text-xs text-zinc-500 leading-relaxed">
+              每轮 Turn 完成刷入上下文与文件差异块，故障切换时零 Token 损耗恢复执行。
+            </p>
+            <div id="dfx-checkpoint-list" class="bg-zinc-50 border border-zinc-200 rounded-lg p-3 font-mono text-[11px] text-zinc-700 space-y-1.5 min-h-[120px]">
+              <div>✓ Turn #1 Snapshot (14.2 KB + 1.8 MB FS)</div>
+              <div>✓ Turn #2 Snapshot (22.8 KB + 4.1 MB FS)</div>
+              <div class="text-emerald-700">⚡ Turn #3 执行中...</div>
+            </div>
+          </div>
+          <button id="btn-test-turn-resume" class="w-full py-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 text-white text-xs font-medium transition">
+            🔄 模拟跨节点拉取最新 Turn 快照并断点续跑
+          </button>
+        </div>
+
+        <div class="glass-panel rounded-xl p-5 flex flex-col justify-between space-y-4">
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-medium text-zinc-500">异常熔断网</span>
+              <span class="text-xs font-mono text-zinc-700">Task + Pool</span>
+            </div>
+            <h3 class="text-sm font-semibold text-zinc-900">模型池熔断与进展率 (V_k) + Saga 守卫</h3>
+            <p class="text-xs text-zinc-500 leading-relaxed">
+              监测模型池 429 错误率与单任务进展率，自动触发备用路由或 Saga 补偿回滚。
+            </p>
+            <div id="dfx-provider-breakers" class="bg-zinc-50 border border-zinc-200 rounded-lg p-3 font-mono text-[11px] space-y-2 min-h-[120px]"></div>
+          </div>
+          <button id="btn-reset-breakers" class="w-full py-2 rounded-lg bg-zinc-100 hover:bg-zinc-200 text-zinc-800 border border-zinc-200 text-xs font-medium transition">
+            🔧 恢复所有模型池熔断器至 CLOSED 状态
+          </button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    // ==================== GLOBAL SIMULATION STATE ====================
+    const EFFORT_MULTIPLIER = {
+      minimal: 1.0,
+      low: 1.2,
+      medium: 1.8,
+      high: 3.0,
+      max: 5.0
+    };
+
+    const CLUSTER_CAPACITY = {
+      cpu: 32.0,
+      mem: 65536,
+      sessions: 32,
+      tps: 2400,
+      tokenRate: 2400
+    };
+
+    const simState = {
+      tick: 1,
+      running: true,
+      speedMs: 1000,
+      downstreamErrorPct: 5,
+      upstreamWindowCredit: 95,
+      backpressureLevel: 'NORMAL',
+      circuitTripsCount: 0,
+      failoverCount: 1,
+      fencingEpochDemo: 2,
+      checkpointTurnDemo: 3,
+      eventFilter: 'all',
+      animMode: 'normal',
+
+      providerPools: [
+        { model: 'DeepSeek', state: 'CLOSED', errRate: '1.2%', ttft: '0.4s' },
+        { model: 'GLM-5.3', state: 'CLOSED', errRate: '0.6%', ttft: '0.7s' },
+        { model: 'Qwen-3.8', state: 'CLOSED', errRate: '0.4%', ttft: '0.6s' }
+      ],
+
+      tenants: {
+        'fin-enterprise': { id: 'fin-enterprise', name: 'FinTech-Enterprise', weight: 4, dominantShare: 0.12 },
+        'codegen-pro': { id: 'codegen-pro', name: 'CodeGen-Pro SaaS', weight: 2, dominantShare: 0.18 },
+        'research-lab': { id: 'research-lab', name: 'DeepResearch-Lab', weight: 1, dominantShare: 0.25 }
+      },
+
+      nodes: [
+        { id: 'node-01', name: 'worker-us-west-01', driver: 'firecracker', warmPools: ['pool-py312-ds', 'pool-rust-toolchains'], cpuCap: 8.0, memCap: 16384, alive: true },
+        { id: 'node-02', name: 'worker-us-west-02', driver: 'firecracker', warmPools: ['pool-py312-ds', 'pool-playwright-browser'], cpuCap: 8.0, memCap: 16384, alive: true },
+        { id: 'node-03', name: 'worker-us-west-03', driver: 'kata', warmPools: ['pool-rust-toolchains', 'pool-py312-ds'], cpuCap: 8.0, memCap: 16384, alive: true },
+        { id: 'node-04', name: 'worker-us-west-04', driver: 'gvisor', warmPools: ['pool-playwright-browser'], cpuCap: 8.0, memCap: 16384, alive: true }
+      ],
+
+      tasks: [
+        {
+          id: 'tsk_fin_901', tenantId: 'fin-enterprise', priorityClass: 'P0', baseScore: 950, enqueueTick: 0, deadlineTick: 25,
+          model: 'DeepSeek', fallbackModel: 'GLM-5.3', effort: 'high', reservedTps: 140, maxTokens: 400000, usedTokens: 168000,
+          maxSessions: 4, activeSessions: 3, cpu: 2.0, mem: 4096, driver: 'firecracker', imagePool: 'pool-py312-ds',
+          harness: 'react-plan-execute-v2', turn: 5, maxTurns: 12, state: 'RUNNING', phase: 'EXEC (6C)', kvHit: '92%', nodeId: 'node-01', epoch: 1, customMeta: 'biz=settlement'
+        },
+        {
+          id: 'tsk_code_402', tenantId: 'codegen-pro', priorityClass: 'P1', baseScore: 820, enqueueTick: 0, deadlineTick: 35,
+          model: 'GLM-5.3', fallbackModel: 'Qwen-3.8', effort: 'medium', reservedTps: 110, maxTokens: 300000, usedTokens: 92000,
+          maxSessions: 4, activeSessions: 2, cpu: 2.0, mem: 4096, driver: 'firecracker', imagePool: 'pool-rust-toolchains',
+          harness: 'code-act-sandbox', turn: 4, maxTurns: 14, state: 'RUNNING', phase: 'THINK (0.1C)', kvHit: '88%', nodeId: 'node-01', epoch: 1, customMeta: 'repo=engine'
+        },
+        {
+          id: 'tsk_code_415', tenantId: 'codegen-pro', priorityClass: 'P1', baseScore: 760, enqueueTick: 0, deadlineTick: 40,
+          model: 'GLM-5.3', fallbackModel: 'Qwen-3.8', effort: 'medium', reservedTps: 100, maxTokens: 250000, usedTokens: 0,
+          maxSessions: 3, activeSessions: 0, cpu: 2.0, mem: 4096, driver: 'firecracker', imagePool: 'pool-rust-toolchains',
+          harness: 'code-act-sandbox', turn: 0, maxTurns: 12, state: 'QUEUED', phase: 'QUEUED', kvHit: '91%', nodeId: null, epoch: 1, customMeta: 'repo=compiler'
+        },
+        {
+          id: 'tsk_res_710', tenantId: 'research-lab', priorityClass: 'P2', baseScore: 610, enqueueTick: 0, deadlineTick: 50,
+          model: 'DeepSeek', fallbackModel: 'Qwen-3.8', effort: 'max', reservedTps: 100, maxTokens: 600000, usedTokens: 485000,
+          maxSessions: 6, activeSessions: 4, cpu: 2.0, mem: 4096, driver: 'firecracker', imagePool: 'pool-py312-ds',
+          harness: 'reflexion-deep-research', turn: 9, maxTurns: 15, state: 'RUNNING', phase: 'THINK (0.1C)', kvHit: '95%', nodeId: 'node-02', epoch: 2, customMeta: 'topic=chem'
+        },
+        {
+          id: 'tsk_fin_905', tenantId: 'fin-enterprise', priorityClass: 'P1', baseScore: 800, enqueueTick: 0, deadlineTick: 40,
+          model: 'DeepSeek', fallbackModel: 'GLM-5.3', effort: 'medium', reservedTps: 90, maxTokens: 250000, usedTokens: 110000,
+          maxSessions: 2, activeSessions: 0, cpu: 2.0, mem: 4096, driver: 'firecracker', imagePool: 'pool-py312-ds',
+          harness: 'react-plan-execute-v2', turn: 6, maxTurns: 12, state: 'HIBERNATED', phase: 'IDLE (0C)', kvHit: '90%', nodeId: 'node-02', epoch: 1, customMeta: 'gate=approval'
+        },
+        {
+          id: 'tsk_code_409', tenantId: 'codegen-pro', priorityClass: 'P2', baseScore: 590, enqueueTick: 0, deadlineTick: 45,
+          model: 'Qwen-3.8', fallbackModel: 'GLM-5.3', effort: 'high', reservedTps: 100, maxTokens: 350000, usedTokens: 140000,
+          maxSessions: 3, activeSessions: 2, cpu: 4.0, mem: 8192, driver: 'kata', imagePool: 'pool-rust-toolchains',
+          harness: 'code-act-sandbox', turn: 5, maxTurns: 12, state: 'RUNNING', phase: 'EXEC (8C)', kvHit: '86%', nodeId: 'node-03', epoch: 1, customMeta: 'suite=e2e'
+        },
+        {
+          id: 'tsk_fin_912', tenantId: 'fin-enterprise', priorityClass: 'P1', baseScore: 840, enqueueTick: 1, deadlineTick: 18,
+          model: 'DeepSeek', fallbackModel: 'GLM-5.3', effort: 'high', reservedTps: 120, maxTokens: 400000, usedTokens: 0,
+          maxSessions: 4, activeSessions: 0, cpu: 2.0, mem: 4096, driver: 'firecracker', imagePool: 'pool-py312-ds',
+          harness: 'react-plan-execute-v2', turn: 0, maxTurns: 10, state: 'QUEUED', phase: 'QUEUED', kvHit: '91%', nodeId: null, epoch: 0, customMeta: 'biz=fx'
+        },
+        {
+          id: 'tsk_res_718', tenantId: 'research-lab', priorityClass: 'P3', baseScore: 380, enqueueTick: 0, deadlineTick: 28,
+          model: 'Qwen-3.8', fallbackModel: 'GLM-5.3', effort: 'medium', reservedTps: 90, maxTokens: 300000, usedTokens: 0,
+          maxSessions: 2, activeSessions: 0, cpu: 1.0, mem: 2048, driver: 'gvisor', imagePool: 'pool-playwright-browser',
+          harness: 'reflexion-deep-research', turn: 0, maxTurns: 10, state: 'QUEUED', phase: 'QUEUED', kvHit: '84%', nodeId: null, epoch: 0, customMeta: 'crawler=arxiv'
+        }
+      ],
+
+      events: []
+    };
+
+    // ==================== TOAST & HELPERS ====================
+    let toastTimeout = null;
+    function notifyToast(msg, color = 'bg-emerald-400') {
+      const box = document.getElementById('toast-box');
+      const dot = document.getElementById('toast-dot');
+      const txt = document.getElementById('toast-text');
+      dot.className = 'w-2 h-2 rounded-full ' + color;
+      txt.textContent = msg;
+      box.classList.remove('hidden');
+      if (toastTimeout) clearTimeout(toastTimeout);
+      toastTimeout = setTimeout(() => box.classList.add('hidden'), 2400);
+    }
+
+    function emitCloudEvent(category, type, taskId, summary) {
+      const now = new Date();
+      const ts = now.toTimeString().split(' ')[0];
+      simState.events.unshift({
+        id: 'evt_' + Math.random().toString(36).substring(2, 7),
+        ts,
+        tick: simState.tick,
+        category,
+        type,
+        taskId,
+        summary
+      });
+      if (simState.events.length > 50) simState.events.pop();
+    }
+
+    // ==================== ANIMATED PIPELINE CONTROLLER ====================
+    function applyAnimationScenario(mode) {
+      simState.animMode = mode;
+      const desc = document.getElementById('anim-pipeline-desc');
+      const headline = document.getElementById('svg-sched-headline');
+      const sub1 = document.getElementById('svg-sched-sub1');
+      const sub2 = document.getElementById('svg-sched-sub2');
+      const sub3 = document.getElementById('svg-sched-sub3');
+      const badge = document.getElementById('svg-sched-badge');
+      const motion23 = document.getElementById('anim-motion-2-3');
+      const motion34 = document.getElementById('anim-motion-3-4');
+
+      if (mode === 'normal') {
+        desc.textContent = '标准 5D W-DRF + 预热沙箱联合分配：选中五维主导份额最小的租户，结合 P50 乐观软预留路由至 DeepSeek 旗舰池并分配 65ms 预热沙箱。';
+        headline.textContent = '选中: FinTech (min D_t)';
+        sub1.textContent = 'P50 预留: 240k Tokens';
+        sub2.textContent = '双相算力: 0.1C ⇄ 2.0C';
+        sub3.textContent = '栅栏: Fence (Ep=2, T=1)';
+        badge.textContent = '✓ 配额余量92% · 预热65ms';
+        motion23.setAttribute('path', 'M 501 105 C 538 105, 538 55, 576 55');
+        motion34.setAttribute('path', 'M 791 55 L 866 55');
+      } else if (mode === 'escrow') {
+        desc.textContent = 'DAG 父子配额支票免排队直通：父任务微休眠让出槽位，签发 Escrow 支票让子任务 0ms 直通准入，消除死锁。';
+        headline.textContent = '🎫 Escrow 免排队通道';
+        sub1.textContent = '父任务 tsk_901 休眠让位';
+        sub2.textContent = '切分移交: 120 TPS 配额';
+        sub3.textContent = '慢分支提权: Boost 2.0x';
+        badge.textContent = '⚡ 0ms 直通 · 防死锁';
+        motion23.setAttribute('path', 'M 501 105 C 538 105, 538 55, 576 55');
+        motion34.setAttribute('path', 'M 791 117 L 866 117');
+      } else if (mode === 'cognitive') {
+        desc.textContent = 'Turn 级动态认知路由：识别当前轮次为只读文件查看，自动分流至 GLM-5.3 轻量池，节省 75% 成本。';
+        headline.textContent = '🔀 Turn 级认知降级路由';
+        sub1.textContent = '识别只读轮次 (PURE_READ)';
+        sub2.textContent = '路由: DeepSeek → GLM-5.3';
+        sub3.textContent = '强度: high → minimal(1x)';
+        badge.textContent = '💰 成本省75% · TTFT 0.18s';
+        motion23.setAttribute('path', 'M 501 117 L 576 117');
+        motion34.setAttribute('path', 'M 791 117 L 866 117');
+      } else if (mode === 'fallback') {
+        desc.textContent = '429 熔断备用路由重分配：主模型池触发 OPEN 熔断，下一轮 Turn 无感切换至热备 Qwen-3.8，沙箱零中断。';
+        headline.textContent = '🛡️ 模型池熔断无感切换';
+        sub1.textContent = '主池 DeepSeek OPEN';
+        sub2.textContent = '重路由: Qwen-3.8';
+        sub3.textContent = 'CoW 快照状态完整保留';
+        badge.textContent = '🔄 零重启切换完成';
+        motion23.setAttribute('path', 'M 501 129 C 538 129, 538 179, 576 179');
+        motion34.setAttribute('path', 'M 791 179 L 866 179');
+      }
+    }
+
+    document.querySelectorAll('.anim-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const mode = btn.getAttribute('data-anim-mode');
+        document.querySelectorAll('.anim-mode-btn').forEach(b => {
+          b.className = 'anim-mode-btn px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-100 hover:bg-zinc-200 text-zinc-700 transition';
+        });
+        btn.className = 'anim-mode-btn px-2.5 py-1 rounded-md text-xs font-medium bg-zinc-900 text-white transition';
+        applyAnimationScenario(mode);
+      });
+    });
+
+    // ==================== W-DRF & AGING+EDF ====================
+    function computeDynamicScore(task) {
+      const waitTicks = Math.max(0, simState.tick - task.enqueueTick);
+      const agingBonus = Math.round(65 * Math.log(1 + waitTicks / 2));
+      const remainingToDeadline = Math.max(1, task.deadlineTick - simState.tick);
+      const edfBonus = Math.round(180 / remainingToDeadline);
+      return { total: task.baseScore + agingBonus + edfBonus, agingBonus, edfBonus };
+    }
+
+    function computeTenantShares() {
+      const usage = {};
+      Object.keys(simState.tenants).forEach(tid => {
+        usage[tid] = { cpu: 0, mem: 0, sessions: 0, tps: 0 };
+      });
+
+      simState.tasks.forEach(t => {
+        if (t.state === 'RUNNING') {
+          const u = usage[t.tenantId];
+          if (!u) return;
+          const mult = EFFORT_MULTIPLIER[t.effort] || 1.0;
+          const effectiveCpu = t.phase && t.phase.startsWith('THINK') ? 0.4 * t.cpu : t.cpu;
+          u.cpu += effectiveCpu;
+          u.mem += t.mem;
+          u.sessions += t.activeSessions;
+          u.tps += Math.round(t.reservedTps * mult * 0.85);
+        }
+      });
+
+      Object.keys(simState.tenants).forEach(tid => {
+        const t = simState.tenants[tid];
+        const u = usage[tid];
+        const shares = [
+          u.cpu / CLUSTER_CAPACITY.cpu,
+          u.mem / CLUSTER_CAPACITY.mem,
+          u.sessions / CLUSTER_CAPACITY.sessions,
+          u.tps / CLUSTER_CAPACITY.tps
+        ];
+        const maxRawShare = Math.max(...shares);
+        t.rawShares = {
+          cpuPct: Math.min(100, Math.round((u.cpu / CLUSTER_CAPACITY.cpu) * 100)),
+          memPct: Math.min(100, Math.round((u.mem / CLUSTER_CAPACITY.mem) * 100)),
+          sessPct: Math.min(100, Math.round((u.sessions / CLUSTER_CAPACITY.sessions) * 100)),
+          tpsPct: Math.min(100, Math.round((u.tps / CLUSTER_CAPACITY.tps) * 100))
+        };
+        t.dominantShare = +(maxRawShare / t.weight).toFixed(3);
+      });
+
+      const q1 = document.getElementById('svg-q1-share');
+      const q2 = document.getElementById('svg-q2-share');
+      const q3 = document.getElementById('svg-q3-share');
+      if (q1) q1.textContent = 'D_t=' + simState.tenants['fin-enterprise'].dominantShare;
+      if (q2) q2.textContent = 'D_t=' + simState.tenants['codegen-pro'].dominantShare;
+      if (q3) q3.textContent = 'D_t=' + simState.tenants['research-lab'].dominantShare;
+    }
+
+    // ==================== SIMULATION TICK ====================
+    function runSimulationTick() {
+      simState.tick += 1;
+      document.getElementById('sim-clock-badge').textContent = 'Tick #' + simState.tick;
+
+      if (simState.downstreamErrorPct >= 70) simState.backpressureLevel = 'L2_QUEUE_FROZEN';
+      else if (simState.downstreamErrorPct >= 35) simState.backpressureLevel = 'L1_SOFT_PACING';
+      else if (simState.upstreamWindowCredit <= 30) simState.backpressureLevel = 'UPSTREAM_CONSTRAINED';
+      else simState.backpressureLevel = 'NORMAL';
+
+      simState.tasks.forEach(t => {
+        if (t.state !== 'RUNNING') return;
+        const hostNode = simState.nodes.find(n => n.id === t.nodeId);
+        if (!hostNode || !hostNode.alive) return;
+
+        t.phase = (t.turn % 2 === 0) ? 'THINK (0.1C)' : `EXEC (${t.cpu * 2}C)`;
+
+        const tokenRatio = t.usedTokens / t.maxTokens;
+        if (tokenRatio >= 0.80 && t.activeSessions > 1) {
+          t.activeSessions = 1;
+          emitCloudEvent('dfx', 'quota.watermark', t.id, `Token 达 ${(tokenRatio * 100).toFixed(0)}%，触发压缩并收缩子会话至 1`);
+        } else if (simState.backpressureLevel === 'UPSTREAM_CONSTRAINED' && t.activeSessions > 1) {
+          t.activeSessions = 1;
+        }
+
+        if (simState.backpressureLevel === 'L1_SOFT_PACING' && (t.effort === 'max' || t.effort === 'high')) {
+          t.effort = 'medium';
+          emitCloudEvent('dfx', 'backpressure.l1', t.id, `L1 软背压将推理强度下调至 medium`);
+        }
+
+        const mult = EFFORT_MULTIPLIER[t.effort] || 1.0;
+        t.usedTokens = Math.min(t.maxTokens, t.usedTokens + Math.round(t.reservedTps * mult * 85));
+        t.turn += 1;
+
+        if (t.turn >= t.maxTurns || t.usedTokens >= t.maxTokens) {
+          t.state = 'SUCCEEDED';
+          t.activeSessions = 0;
+          emitCloudEvent('sched', 'task.completed', t.id, `完成 ${t.turn} 轮推理并释放沙箱`);
+        } else {
+          emitCloudEvent('harness', 'turn.completed', t.id, `Turn #${t.turn}/${t.maxTurns} [${t.phase}] 快照已同步`);
+        }
+      });
+
+      computeTenantShares();
+      const queuedTasks = simState.tasks.filter(t => t.state === 'QUEUED');
+
+      if (queuedTasks.length > 0 && simState.backpressureLevel !== 'L2_QUEUE_FROZEN') {
+        const activeTenantIds = [...new Set(queuedTasks.map(t => t.tenantId))];
+        activeTenantIds.sort((a, b) => simState.tenants[a].dominantShare - simState.tenants[b].dominantShare);
+
+        for (const tid of activeTenantIds) {
+          const tenantCandidates = queuedTasks.filter(t => t.tenantId === tid);
+          tenantCandidates.sort((a, b) => computeDynamicScore(b).total - computeDynamicScore(a).total);
+          const candidate = tenantCandidates[0];
+
+          const aliveNodes = simState.nodes.filter(n => n.alive);
+          const feasibleNodes = aliveNodes.filter(n => {
+            const usedCpu = simState.tasks.filter(x => x.nodeId === n.id && x.state === 'RUNNING').reduce((acc, x) => acc + x.cpu, 0);
+            const usedMem = simState.tasks.filter(x => x.nodeId === n.id && x.state === 'RUNNING').reduce((acc, x) => acc + x.mem, 0);
+            return (usedCpu + candidate.cpu <= n.cpuCap) && (usedMem + candidate.mem <= n.memCap);
+          });
+
+          if (feasibleNodes.length > 0) {
+            const chosenNode = feasibleNodes[0];
+            candidate.state = 'RUNNING';
+            candidate.phase = 'THINK (0.1C)';
+            candidate.nodeId = chosenNode.id;
+            candidate.epoch += 1;
+            candidate.turn = 1;
+            candidate.activeSessions = Math.min(2, candidate.maxSessions);
+
+            emitCloudEvent('sched', 'task.started', candidate.id, `W-DRF 派发至 ${chosenNode.name} (Epoch ${candidate.epoch})`);
+            break;
+          }
+        }
+      }
+
+      const remainingQueued = simState.tasks.filter(t => t.state === 'QUEUED').length;
+      const runningCount = simState.tasks.filter(t => t.state === 'RUNNING').length;
+      if (remainingQueued < 2 && runningCount < 6 && simState.tick % 2 === 0) {
+        spawnRandomTasks(1, true);
+      }
+
+      computeTenantShares();
+      renderAllViews();
+      updateTelemetryCharts();
+    }
+
+    function spawnRandomTasks(count = 4, silent = false) {
+      const presets = [
+        { tenantId: 'fin-enterprise', priorityClass: 'P0', baseScore: 930, model: 'DeepSeek', fallbackModel: 'GLM-5.3', effort: 'high', reservedTps: 130, maxTokens: 450000, maxSessions: 4, cpu: 2.0, mem: 4096, driver: 'firecracker', imagePool: 'pool-py312-ds', harness: 'react-plan-execute-v2', meta: 'biz=risk', kvHit: '93%' },
+        { tenantId: 'codegen-pro', priorityClass: 'P1', baseScore: 810, model: 'GLM-5.3', fallbackModel: 'Qwen-3.8', effort: 'medium', reservedTps: 110, maxTokens: 320000, maxSessions: 3, cpu: 2.0, mem: 4096, driver: 'firecracker', imagePool: 'pool-rust-toolchains', harness: 'code-act-sandbox', meta: 'repo=compiler', kvHit: '88%' },
+        { tenantId: 'research-lab', priorityClass: 'P2', baseScore: 600, model: 'Qwen-3.8', fallbackModel: 'DeepSeek', effort: 'max', reservedTps: 95, maxTokens: 500000, maxSessions: 4, cpu: 2.0, mem: 4096, driver: 'kata', imagePool: 'pool-py312-ds', harness: 'reflexion-deep-research', meta: 'exp=protein', kvHit: '91%' },
+        { tenantId: 'codegen-pro', priorityClass: 'P3', baseScore: 390, model: 'DeepSeek', fallbackModel: 'GLM-5.3', effort: 'low', reservedTps: 80, maxTokens: 200000, maxSessions: 2, cpu: 1.0, mem: 2048, driver: 'gvisor', imagePool: 'pool-playwright-browser', harness: 'react-plan-execute-v2', meta: 'job=docs', kvHit: '85%' }
+      ];
+
+      for (let i = 0; i < count; i++) {
+        const p = presets[(simState.tick + i) % presets.length];
+        const newId = 'tsk_' + p.tenantId.slice(0, 3) + '_' + Math.floor(100 + Math.random() * 899);
+        simState.tasks.push({
+          id: newId, tenantId: p.tenantId, priorityClass: p.priorityClass, baseScore: p.baseScore,
+          enqueueTick: simState.tick, deadlineTick: simState.tick + 18 + i * 5, model: p.model, fallbackModel: p.fallbackModel,
+          effort: p.effort, reservedTps: p.reservedTps, maxTokens: p.maxTokens, usedTokens: 0, maxSessions: p.maxSessions,
+          activeSessions: 0, cpu: p.cpu, mem: p.mem, driver: p.driver, imagePool: p.imagePool, harness: p.harness,
+          turn: 0, maxTurns: 11, state: 'QUEUED', phase: 'QUEUED', kvHit: p.kvHit, nodeId: null, epoch: 0, customMeta: p.meta
+        });
+      }
+
+      const finished = simState.tasks.filter(t => t.state === 'SUCCEEDED' || t.state === 'CIRCUIT_BROKEN');
+      if (finished.length > 4) {
+        simState.tasks = simState.tasks.filter(t => t.id !== finished[0].id);
+      }
+
+      if (!silent) {
+        emitCloudEvent('sched', 'task.queued', 'batch_4', `注入 ${count} 个异构任务`);
+        notifyToast(`已注入 ${count} 个异构任务`);
+        computeTenantShares();
+        renderAllViews();
+      }
+    }
+
+    // ==================== MINIMALIST RENDER FUNCTIONS ====================
+    function renderKPIs() {
+      const runningTasks = simState.tasks.filter(t => t.state === 'RUNNING');
+      const hibernatedTasks = simState.tasks.filter(t => t.state === 'HIBERNATED');
+      const queuedTasks = simState.tasks.filter(t => t.state === 'QUEUED');
+
+      const totalCpu = runningTasks.reduce((s, t) => s + t.cpu, 0);
+      const totalSessions = runningTasks.reduce((s, t) => s + t.activeSessions, 0);
+      const totalEffectiveTps = runningTasks.reduce((s, t) => s + Math.round(t.reservedTps * (EFFORT_MULTIPLIER[t.effort] || 1)), 0);
+
+      document.getElementById('kpi-compute').textContent = `${totalCpu.toFixed(1)} / ${CLUSTER_CAPACITY.cpu} C · ${Math.round((totalCpu / CLUSTER_CAPACITY.cpu) * 100)}%`;
+      document.getElementById('kpi-tps').textContent = `${totalEffectiveTps.toLocaleString()} / ${CLUSTER_CAPACITY.tps} TPS`;
+      document.getElementById('kpi-sandboxes').textContent = `${runningTasks.length} 运行 · ${hibernatedTasks.length} 休眠 · ${queuedTasks.length} 排队`;
+      document.getElementById('kpi-sessions').textContent = `${totalSessions} / ${CLUSTER_CAPACITY.sessions} Slots`;
+      document.getElementById('kpi-dfx-count').textContent = `${simState.circuitTripsCount} 熔断 · ${simState.failoverCount} 断点恢复`;
+
+      const bpEl = document.getElementById('kpi-backpressure');
+      const bpIcon = document.getElementById('kpi-bp-icon');
+      const bpBanner = document.getElementById('bp-live-banner');
+
+      if (simState.backpressureLevel === 'L2_QUEUE_FROZEN') {
+        bpEl.textContent = 'L2 队列冻结';
+        bpIcon.textContent = '🔴';
+        bpBanner.textContent = '当前状态: L2 队列准入冻结 & HTTP 429';
+      } else if (simState.backpressureLevel === 'L1_SOFT_PACING') {
+        bpEl.textContent = 'L1 降级限速';
+        bpIcon.textContent = '🟡';
+        bpBanner.textContent = '当前状态: 下游软背压 → 自动下调推理强度';
+      } else if (simState.backpressureLevel === 'UPSTREAM_CONSTRAINED') {
+        bpEl.textContent = '正向流控 (Sess=1)';
+        bpIcon.textContent = '🟠';
+        bpBanner.textContent = '当前状态: 上游窗口受限 → 子会话收缩生效';
+      } else {
+        bpEl.textContent = 'NORMAL';
+        bpIcon.textContent = '🟢';
+        bpBanner.textContent = '当前传导状态: 双向畅通 (Normal Flow)';
+      }
+    }
+
+    function renderTenantDRF() {
+      const container = document.getElementById('tenant-drf-list');
+      container.innerHTML = '';
+
+      const sortedTenants = Object.values(simState.tenants).sort((a, b) => a.dominantShare - b.dominantShare);
+      sortedTenants.forEach((t, idx) => {
+        const s = t.rawShares || { cpuPct: 0, memPct: 0, sessPct: 0, tpsPct: 0 };
+        const isNextPick = idx === 0;
+        const card = document.createElement('div');
+        card.className = isNextPick
+          ? 'p-3 rounded-lg bg-zinc-50 border border-zinc-900 space-y-1.5'
+          : 'p-3 rounded-lg bg-white border border-zinc-200 space-y-1.5';
+        card.innerHTML = `
+          <div class="flex items-center justify-between text-xs">
+            <div class="flex items-center gap-1.5">
+              <span class="font-semibold text-zinc-900">${t.name}</span>
+              <span class="text-[10px] font-mono text-zinc-500">w=${t.weight}</span>
+            </div>
+            <span class="font-mono font-semibold ${isNextPick ? 'text-emerald-700' : 'text-zinc-600'}">D_t = ${t.dominantShare}</span>
+          </div>
+          <div class="grid grid-cols-4 gap-1 text-[10px] font-mono text-zinc-500">
+            <div>CPU ${s.cpuPct}%</div>
+            <div>Mem ${s.memPct}%</div>
+            <div>Sess ${s.sessPct}%</div>
+            <div>TPS ${s.tpsPct}%</div>
+          </div>
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    function renderPriorityQueue() {
+      const list = document.getElementById('priority-queue-list');
+      list.innerHTML = '';
+      const queued = simState.tasks.filter(t => t.state === 'QUEUED');
+      document.getElementById('queue-count-badge').textContent = `${queued.length} 待调度`;
+
+      if (queued.length === 0) {
+        list.innerHTML = `<div class="text-xs text-zinc-400 text-center py-6 font-mono">队列空闲</div>`;
+        return;
+      }
+
+      queued
+        .map(t => ({ task: t, scoreObj: computeDynamicScore(t) }))
+        .sort((a, b) => b.scoreObj.total - a.scoreObj.total)
+        .forEach(({ task, scoreObj }) => {
+          const item = document.createElement('div');
+          item.className = 'p-2.5 rounded-lg bg-zinc-50/70 border border-zinc-200 flex items-center justify-between gap-2 text-xs';
+          item.innerHTML = `
+            <div class="min-w-0">
+              <div class="flex items-center gap-1.5">
+                <span class="font-mono font-semibold text-[10px] px-1.5 py-0.5 rounded bg-zinc-200/80 text-zinc-800">${task.priorityClass}</span>
+                <span class="font-mono font-medium text-zinc-900 truncate">${task.id}</span>
+              </div>
+              <div class="text-[11px] font-mono text-zinc-500 truncate mt-0.5">
+                ${task.model} · ${task.effort} · ${task.reservedTps} TPS · ${task.driver}
+              </div>
+            </div>
+            <div class="text-right shrink-0 font-mono">
+              <div class="font-semibold text-zinc-900">S=${scoreObj.total}</div>
+              <div class="text-[10px] text-zinc-400">+${scoreObj.agingBonus}老/+${scoreObj.edfBonus}E</div>
+            </div>
+          `;
+          list.appendChild(item);
+        });
+    }
+
+    function renderWorkerNodes() {
+      const container = document.getElementById('worker-nodes-container');
+      container.innerHTML = '';
+
+      simState.nodes.forEach(node => {
+        const nodeTasks = simState.tasks.filter(t => t.nodeId === node.id && (t.state === 'RUNNING' || t.state === 'HIBERNATED' || t.state === 'CIRCUIT_BROKEN'));
+        const usedCpu = nodeTasks.filter(t => t.state === 'RUNNING').reduce((s, t) => s + t.cpu, 0);
+        const usedMem = nodeTasks.filter(t => t.state === 'RUNNING').reduce((s, t) => s + t.mem, 0);
+
+        const nodeEl = document.createElement('div');
+        nodeEl.className = node.alive
+          ? 'p-3 rounded-lg bg-zinc-50/60 border border-zinc-200 space-y-2'
+          : 'p-3 rounded-lg bg-rose-50/40 border border-rose-200 space-y-2 opacity-75';
+
+        let tasksHtml = '';
+        if (nodeTasks.length === 0) {
+          tasksHtml = `<div class="text-[11px] font-mono text-zinc-400 py-2 text-center border border-dashed border-zinc-200 rounded bg-white">空闲预热池 (${node.warmPools[0]})</div>`;
+        } else {
+          tasksHtml = `<div class="grid grid-cols-1 sm:grid-cols-2 gap-2">` + nodeTasks.map(t => {
+            const tokPct = Math.min(100, Math.round((t.usedTokens / t.maxTokens) * 100));
+            const statusDot = t.state === 'RUNNING' ? 'bg-emerald-500' : t.state === 'HIBERNATED' ? 'bg-amber-400' : 'bg-rose-500';
+
+            return `
+              <div class="p-2.5 rounded-md bg-white border border-zinc-200 space-y-1.5 text-xs">
+                <div class="flex items-center justify-between">
+                  <button data-inspect-task="${t.id}" class="font-mono font-semibold text-zinc-900 hover:underline flex items-center gap-1.5">
+                    <span class="w-1.5 h-1.5 rounded-full ${statusDot}"></span>
+                    <span>${t.id}</span>
+                  </button>
+                  <span class="text-[10px] font-mono text-zinc-400">F(${t.epoch},${t.turn})</span>
+                </div>
+                <div class="flex items-center justify-between text-[11px] font-mono text-zinc-500">
+                  <span class="truncate">${t.model}</span>
+                  <span class="text-zinc-700">${t.phase || 'THINK'}</span>
+                </div>
+                <div class="w-full bg-zinc-100 h-1 rounded-full overflow-hidden">
+                  <div class="bg-zinc-800 h-full transition-all" style="width:${tokPct}%"></div>
+                </div>
+                <div class="flex items-center justify-between pt-0.5 text-[10px] font-mono text-zinc-400">
+                  <span>Turn ${t.turn}/${t.maxTurns} · ${tokPct}%</span>
+                  <div class="flex gap-1">
+                    <button data-toggle-hibernate="${t.id}" class="px-1.5 py-0.5 rounded bg-zinc-100 hover:bg-zinc-200 text-zinc-700">
+                      ${t.state === 'HIBERNATED' ? '唤醒' : '休眠'}
+                    </button>
+                    <button data-inspect-task="${t.id}" class="px-1.5 py-0.5 rounded bg-zinc-100 hover:bg-zinc-200 text-zinc-700">
+                      详情
+                    </button>
+                  </div>
+                </div>
+              </div>
+            `;
+          }).join('') + `</div>`;
+        }
+
+        nodeEl.innerHTML = `
+          <div class="flex items-center justify-between text-xs">
+            <div class="flex items-center gap-2">
+              <span class="w-2 h-2 rounded-full ${node.alive ? 'bg-emerald-500' : 'bg-rose-500'}"></span>
+              <span class="font-mono font-semibold text-zinc-900">${node.name}</span>
+              <span class="text-[10px] font-mono text-zinc-400">${node.driver}</span>
+            </div>
+            <span class="text-[11px] font-mono text-zinc-500">${usedCpu.toFixed(1)}/${node.cpuCap}C · ${(usedMem/1024).toFixed(1)}G</span>
+          </div>
+          ${tasksHtml}
+        `;
+        container.appendChild(nodeEl);
+      });
+
+      container.querySelectorAll('[data-toggle-hibernate]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const tid = btn.getAttribute('data-toggle-hibernate');
+          const task = simState.tasks.find(x => x.id === tid);
+          if (!task) return;
+          if (task.state === 'RUNNING') {
+            task.state = 'HIBERNATED';
+            task.phase = 'IDLE (0C)';
+            task.activeSessions = 0;
+            emitCloudEvent('sched', 'task.hibernated', task.id, `转入 CoW 休眠并释放算力`);
+          } else if (task.state === 'HIBERNATED') {
+            task.state = 'RUNNING';
+            task.phase = 'THINK (0.1C)';
+            task.activeSessions = Math.min(2, task.maxSessions);
+            emitCloudEvent('sched', 'task.resumed', task.id, `从 CoW 快照唤醒恢复`);
+          }
+          computeTenantShares();
+          renderAllViews();
+        });
+      });
+
+      container.querySelectorAll('[data-inspect-task]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          openTaskInspector(btn.getAttribute('data-inspect-task'));
+        });
+      });
+    }
+
+    function renderCloudEvents() {
+      const log = document.getElementById('cloudevents-log');
+      log.innerHTML = '';
+
+      const filtered = simState.events.filter(e => simState.eventFilter === 'all' || e.category === simState.eventFilter);
+      filtered.slice(0, 20).forEach(ev => {
+        const div = document.createElement('div');
+        div.className = 'p-2 rounded bg-zinc-50 border border-zinc-200/80 space-y-0.5';
+        div.innerHTML = `
+          <div class="flex items-center justify-between text-[10px] text-zinc-400">
+            <span class="font-semibold text-zinc-700">${ev.type}</span>
+            <span>#${ev.tick} · ${ev.ts}</span>
+          </div>
+          <div class="text-zinc-600"><strong class="text-zinc-900">${ev.taskId}</strong>: ${ev.summary}</div>
+        `;
+        log.appendChild(div);
+      });
+    }
+
+    function renderProviderBreakers() {
+      const box = document.getElementById('dfx-provider-breakers');
+      if (!box) return;
+      box.innerHTML = '';
+      simState.providerPools.forEach(p => {
+        const row = document.createElement('div');
+        row.className = 'flex items-center justify-between p-2 rounded bg-white border border-zinc-200';
+        row.innerHTML = `
+          <div>
+            <div class="font-semibold text-zinc-900">${p.model}</div>
+            <div class="text-[10px] text-zinc-400">Err: ${p.errRate} · TTFT: ${p.ttft}</div>
+          </div>
+          <span class="px-2 py-0.5 rounded text-[10px] font-semibold ${p.state === 'CLOSED' ? 'bg-zinc-100 text-zinc-800' : 'bg-rose-100 text-rose-800'}">${p.state}</span>
+        `;
+        box.appendChild(row);
+      });
+    }
+
+    function renderAllViews() {
+      renderKPIs();
+      renderTenantDRF();
+      renderPriorityQueue();
+      renderWorkerNodes();
+      renderCloudEvents();
+      renderProviderBreakers();
+    }
+
+    // ==================== MODAL & DRILLS ====================
+    function openTaskInspector(taskId) {
+      const t = simState.tasks.find(x => x.id === taskId);
+      if (!t) return;
+      const modal = document.getElementById('task-modal');
+      document.getElementById('modal-task-id').textContent = `${t.id} [Fence (${t.epoch}, ${t.turn})]`;
+      document.getElementById('modal-task-state').textContent = t.state;
+      document.getElementById('modal-task-desc').textContent = `租户: ${t.tenantId} · 节点: ${t.nodeId || '待分配'} · 标签: ${t.customMeta}`;
+
+      const mult = EFFORT_MULTIPLIER[t.effort] || 1.0;
+      const body = document.getElementById('modal-task-body');
+      body.innerHTML = `
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono">
+          <div class="bg-zinc-50 p-2.5 rounded border border-zinc-200">
+            <div class="text-zinc-400 text-[10px]">模型与强度</div>
+            <div class="text-zinc-900 font-semibold mt-0.5">${t.model} (${t.effort})</div>
+          </div>
+          <div class="bg-zinc-50 p-2.5 rounded border border-zinc-200">
+            <div class="text-zinc-400 text-[10px]">有效 TPS</div>
+            <div class="text-zinc-900 font-semibold mt-0.5">${Math.round(t.reservedTps * mult)} TPS</div>
+          </div>
+          <div class="bg-zinc-50 p-2.5 rounded border border-zinc-200">
+            <div class="text-zinc-400 text-[10px]">驱动与相变</div>
+            <div class="text-zinc-900 font-semibold mt-0.5">${t.driver} · ${t.phase}</div>
+          </div>
+          <div class="bg-zinc-50 p-2.5 rounded border border-zinc-200">
+            <div class="text-zinc-400 text-[10px]">轮次进度</div>
+            <div class="text-zinc-900 font-semibold mt-0.5">Turn ${t.turn}/${t.maxTurns}</div>
+          </div>
+        </div>
+        <div class="bg-zinc-900 rounded-lg p-3 font-mono text-[11px] space-y-1 text-zinc-200">
+          ${Array.from({ length: Math.max(1, t.turn) }, (_, idx) => `
+            <div class="flex items-center justify-between py-0.5 border-b border-zinc-800">
+              <span class="text-emerald-400">✓ Turn #${idx + 1} Snapshot [Fence (${t.epoch}, ${idx + 1})]</span>
+              <span class="text-zinc-400">s3://checkpoints/${t.id}/ep-${t.epoch}/turn-${idx + 1}.wal</span>
+            </div>
+          `).join('')}
+        </div>
+      `;
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+    }
+
+    document.getElementById('btn-close-modal').addEventListener('click', () => {
+      const modal = document.getElementById('task-modal');
+      modal.classList.add('hidden');
+      modal.classList.remove('flex');
+    });
+
+    document.getElementById('btn-chaos-llm429').addEventListener('click', () => {
+      simState.downstreamErrorPct = 55;
+      document.getElementById('slider-down-bp').value = 55;
+      document.getElementById('slider-down-bp-val').textContent = '错误率 55% (L1/Fallback)';
+      simState.providerPools[0].state = 'OPEN';
+      simState.providerPools[0].errRate = '42.0%';
+
+      simState.tasks.forEach(t => {
+        if (t.state === 'RUNNING' && t.model === 'DeepSeek') {
+          t.model = t.fallbackModel;
+          t.effort = 'medium';
+          emitCloudEvent('dfx', 'breaker.fallback', t.id, `切换备用模型 ${t.model}`);
+        }
+      });
+      simState.circuitTripsCount += 1;
+      applyAnimationScenario('fallback');
+      notifyToast('已触发 429 限流并切换 Fallback 路由', 'bg-rose-500');
+      renderAllViews();
+    });
+
+    document.getElementById('btn-chaos-slow-consumer').addEventListener('click', () => {
+      simState.upstreamWindowCredit = 20;
+      document.getElementById('slider-up-bp').value = 20;
+      document.getElementById('slider-up-bp-val').textContent = '窗口信用 20% (节流)';
+      simState.backpressureLevel = 'UPSTREAM_CONSTRAINED';
+      simState.tasks.forEach(t => { if (t.state === 'RUNNING') t.activeSessions = 1; });
+      emitCloudEvent('dfx', 'backpressure.upstream', 'cluster', `并发子会话已收缩至 1`);
+      notifyToast('已触发正向流控', 'bg-amber-500');
+      renderAllViews();
+    });
+
+    document.getElementById('btn-chaos-kill-node').addEventListener('click', () => {
+      const node01 = simState.nodes[0];
+      if (!node01.alive) {
+        node01.alive = true;
+        notifyToast(`${node01.name} 已恢复在线`);
+        renderAllViews();
+        return;
+      }
+      node01.alive = false;
+      const affected = simState.tasks.filter(t => t.nodeId === node01.id && (t.state === 'RUNNING' || t.state === 'HIBERNATED'));
+      const backupNodes = simState.nodes.filter(n => n.alive);
+      affected.forEach((t, idx) => {
+        t.nodeId = backupNodes[idx % backupNodes.length].id;
+        t.epoch += 1;
+        simState.failoverCount += 1;
+        emitCloudEvent('dfx', 'task.failover', t.id, `迁移至 ${t.nodeId} (Epoch ${t.epoch})`);
+      });
+      notifyToast(`node-01 离线，${affected.length} 个任务已跨节点断点恢复`, 'bg-amber-500');
+      renderAllViews();
+    });
+
+    document.getElementById('btn-chaos-tool-loop').addEventListener('click', () => {
+      const running = simState.tasks.filter(t => t.state === 'RUNNING');
+      if (running.length === 0) return;
+      const victim = running[0];
+      victim.state = 'CIRCUIT_BROKEN';
+      victim.phase = 'BROKEN';
+      victim.activeSessions = 0;
+      simState.circuitTripsCount += 1;
+      emitCloudEvent('dfx', 'breaker.tripped', victim.id, `进展率 V_k=0.04 < 0.10 触发树回滚与 Saga 逆向补偿后熔断`);
+      notifyToast(`任务 ${victim.id} 已触发熔断`, 'bg-rose-500');
+      computeTenantShares();
+      renderAllViews();
+    });
+
+    // ==================== TAB 2: BUILDER ====================
+    function updateSpecYamlPreview() {
+      const tenant = document.getElementById('spec-tenant').value;
+      const [prioClass, prioScore] = document.getElementById('spec-priority').value.split('|');
+      const model = document.getElementById('spec-model').value;
+      const [effort, mult] = document.getElementById('spec-effort').value.split('|');
+      const [resTps, burstTps] = document.getElementById('spec-tps').value.split('|');
+      const [maxTok, maxSess] = document.getElementById('spec-tokens-sessions').value.split('|');
+      const [cpu, mem, driver] = document.getElementById('spec-compute').value.split('|');
+      const imagePool = document.getElementById('spec-image').value;
+      const [harness, maxTurns] = document.getElementById('spec-harness').value.split('|');
+      const metaStr = document.getElementById('spec-meta').value;
+
+      const effTps = Math.round(parseInt(resTps, 10) * parseFloat(mult));
+      document.getElementById('spec-vector-preview').textContent =
+        `Effective TPS = ${effTps} · 0.1C ⇄ ${cpu * 2}.0 vCPU · ${mem} MB · ${maxSess} Sessions`;
+
+      document.getElementById('spec-yaml-preview').textContent = `apiVersion: scheduler.agent.io/v1beta1
+kind: AgentTask
+metadata:
+  tenant_id: "${tenant}"
+  priority_class: "${prioClass}"
+  priority_score: ${prioScore}
+  custom_metadata: "${metaStr}"
+spec:
+  cognitive_policy:
+    primary_model: "${model}"
+    default_reasoning_effort: "${effort}"
+  quota_and_dag_policy:
+    max_total_tokens: ${maxTok}
+    reserved_tps: ${resTps}
+    max_burst_tps: ${burstTps}
+    max_concurrent_sessions: ${maxSess}
+  execution_and_sandbox:
+    max_turns: ${maxTurns}
+    isolation_driver: "${driver}"
+    warm_pool_id: "${imagePool}"
+    phase_elastic_resources:
+      cognitive_phase: { cpu_cores: 0.1 }
+      execution_phase: { cpu_burst_limit_cores: ${cpu * 2}.0, memory_limit_mb: ${mem} }
+  harness_and_resilience:
+    harness_type: "${harness}"`;
+    }
+
+    ['spec-tenant', 'spec-priority', 'spec-model', 'spec-effort', 'spec-tps', 'spec-tokens-sessions', 'spec-compute', 'spec-image', 'spec-harness', 'spec-meta'].forEach(id => {
+      document.getElementById(id).addEventListener('change', updateSpecYamlPreview);
+      document.getElementById(id).addEventListener('input', updateSpecYamlPreview);
+    });
+
+    document.getElementById('btn-submit-custom-task').addEventListener('click', () => {
+      const tenant = document.getElementById('spec-tenant').value;
+      const [prioClass, prioScore] = document.getElementById('spec-priority').value.split('|');
+      const model = document.getElementById('spec-model').value;
+      const [effort] = document.getElementById('spec-effort').value.split('|');
+      const [resTps] = document.getElementById('spec-tps').value.split('|');
+      const [maxTok, maxSess] = document.getElementById('spec-tokens-sessions').value.split('|');
+      const [cpu, mem, driver] = document.getElementById('spec-compute').value.split('|');
+      const imagePool = document.getElementById('spec-image').value;
+      const [harness, maxTurns] = document.getElementById('spec-harness').value.split('|');
+      const metaStr = document.getElementById('spec-meta').value;
+
+      const newId = 'tsk_usr_' + Math.floor(100 + Math.random() * 899);
+      simState.tasks.push({
+        id: newId, tenantId: tenant, priorityClass: prioClass, baseScore: parseInt(prioScore, 10),
+        enqueueTick: simState.tick, deadlineTick: simState.tick + 15, model, fallbackModel: 'GLM-5.3',
+        effort, reservedTps: parseInt(resTps, 10), maxTokens: parseInt(maxTok, 10), usedTokens: 0,
+        maxSessions: parseInt(maxSess, 10), activeSessions: 0, cpu: parseFloat(cpu), mem: parseInt(mem, 10),
+        driver, imagePool, harness, turn: 0, maxTurns: parseInt(maxTurns, 10), state: 'QUEUED', phase: 'QUEUED',
+        kvHit: '94%', nodeId: null, epoch: 0, customMeta: metaStr
+      });
+
+      emitCloudEvent('sched', 'task.submitted', newId, `自定义任务入队 (${prioClass}, ${model})`);
+      notifyToast(`任务 ${newId} 已入队`);
+      renderAllViews();
+      document.querySelector('[data-tab="overview"]').click();
+    });
+
+    document.getElementById('btn-copy-spec-yaml').addEventListener('click', () => {
+      const text = document.getElementById('spec-yaml-preview').textContent;
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta);
+      notifyToast('YAML 已复制');
+    });
+
+    // ==================== TAB 3: CHARTS ====================
+    let tpsChart = null;
+    let drfChart = null;
+
+    function initCharts() {
+      const ctx1 = document.getElementById('tpsTimelineChart').getContext('2d');
+      tpsChart = new Chart(ctx1, {
+        type: 'line',
+        data: {
+          labels: ['T-4', 'T-3', 'T-2', 'T-1', 'T0'],
+          datasets: [
+            { label: '有效 TPS', data: [980, 1120, 1290, 1180, 1240], borderColor: '#18181b', backgroundColor: 'rgba(24,24,27,0.06)', fill: true, tension: 0.3 },
+            { label: '警戒水位 (2000)', data: [2000, 2000, 2000, 2000, 2000], borderColor: '#e11d48', borderDash: [5, 5], pointRadius: 0, fill: false }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { labels: { color: '#52525b', font: { size: 11 } } } },
+          scales: {
+            y: { beginAtZero: true, max: 2600, grid: { color: '#f4f4f5' }, ticks: { color: '#71717a' } },
+            x: { grid: { display: false }, ticks: { color: '#71717a' } }
+          }
+        }
+      });
+
+      const ctx2 = document.getElementById('tenantDrfChart').getContext('2d');
+      drfChart = new Chart(ctx2, {
+        type: 'bar',
+        data: {
+          labels: ['CPU%', 'Mem%', 'Sess%', 'TPS%'],
+          datasets: [
+            { label: 'FinTech (w=4)', data: [25, 25, 22, 35], backgroundColor: '#18181b' },
+            { label: 'CodeGen (w=2)', data: [19, 19, 16, 20], backgroundColor: '#71717a' },
+            { label: 'Research (w=1)', data: [12, 12, 18, 22], backgroundColor: '#d4d4d8' }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { labels: { color: '#52525b', font: { size: 11 } } } },
+          scales: {
+            y: { beginAtZero: true, max: 60, grid: { color: '#f4f4f5' }, ticks: { color: '#71717a' } },
+            x: { grid: { display: false }, ticks: { color: '#71717a' } }
+          }
+        }
+      });
+    }
+
+    function updateTelemetryCharts() {
+      if (!tpsChart || !drfChart) return;
+      const runningTasks = simState.tasks.filter(t => t.state === 'RUNNING');
+      const totalEffectiveTps = runningTasks.reduce((s, t) => s + Math.round(t.reservedTps * (EFFORT_MULTIPLIER[t.effort] || 1)), 0);
+
+      tpsChart.data.labels.push('T' + simState.tick);
+      tpsChart.data.datasets[0].data.push(totalEffectiveTps);
+      tpsChart.data.datasets[1].data.push(2000);
+      if (tpsChart.data.labels.length > 10) {
+        tpsChart.data.labels.shift();
+        tpsChart.data.datasets[0].data.shift();
+        tpsChart.data.datasets[1].data.shift();
+      }
+      tpsChart.update('none');
+
+      const f = simState.tenants['fin-enterprise'].rawShares || { cpuPct: 0, memPct: 0, sessPct: 0, tpsPct: 0 };
+      const c = simState.tenants['codegen-pro'].rawShares || { cpuPct: 0, memPct: 0, sessPct: 0, tpsPct: 0 };
+      const r = simState.tenants['research-lab'].rawShares || { cpuPct: 0, memPct: 0, sessPct: 0, tpsPct: 0 };
+
+      drfChart.data.datasets[0].data = [f.cpuPct, f.memPct, f.sessPct, f.tpsPct];
+      drfChart.data.datasets[1].data = [c.cpuPct, c.memPct, c.sessPct, c.tpsPct];
+      drfChart.data.datasets[2].data = [r.cpuPct, r.memPct, r.sessPct, r.tpsPct];
+      drfChart.update('none');
+    }
+
+    document.getElementById('slider-down-bp').addEventListener('input', (e) => {
+      const val = parseInt(e.target.value, 10);
+      simState.downstreamErrorPct = val;
+      document.getElementById('slider-down-bp-val').textContent = `错误率 ${val}%`;
+      renderKPIs();
+    });
+
+    document.getElementById('slider-up-bp').addEventListener('input', (e) => {
+      const val = parseInt(e.target.value, 10);
+      simState.upstreamWindowCredit = val;
+      document.getElementById('slider-up-bp-val').textContent = `窗口信用 ${val}%`;
+      renderKPIs();
+    });
+
+    // ==================== TAB 4: DFX LAB ====================
+    document.getElementById('btn-test-stale-epoch').addEventListener('click', () => {
+      const log = document.getElementById('dfx-fencing-log');
+      const div = document.createElement('div');
+      div.className = 'text-rose-600';
+      div.textContent = `[409 拦截] 拒绝过期 Fence (1, 3) < 当前合法 Fence (${simState.fencingEpochDemo}, ${simState.checkpointTurnDemo})`;
+      log.prepend(div);
+      notifyToast('成功拦截过期节点写请求');
+    });
+
+    document.getElementById('btn-test-turn-resume').addEventListener('click', () => {
+      simState.checkpointTurnDemo += 1;
+      simState.fencingEpochDemo += 1;
+      document.getElementById('dfx-epoch-badge').textContent = `当前合法 Epoch = ${simState.fencingEpochDemo}`;
+      const box = document.getElementById('dfx-checkpoint-list');
+      const item = document.createElement('div');
+      item.className = 'text-emerald-700';
+      item.textContent = `✓ [Fence (${simState.fencingEpochDemo}, ${simState.checkpointTurnDemo})] 从 Turn #${simState.checkpointTurnDemo - 1} 快照无损续跑`;
+      box.prepend(item);
+      notifyToast(`已完成 Turn #${simState.checkpointTurnDemo - 1} 断点恢复`);
+    });
+
+    document.getElementById('btn-reset-breakers').addEventListener('click', () => {
+      simState.providerPools.forEach(p => { p.state = 'CLOSED'; p.errRate = '0.8%'; });
+      simState.downstreamErrorPct = 5;
+      simState.upstreamWindowCredit = 95;
+      simState.backpressureLevel = 'NORMAL';
+      applyAnimationScenario('normal');
+      renderAllViews();
+      notifyToast('所有熔断器已恢复 CLOSED');
+    });
+
+    // ==================== PLAYBACK & TABS ====================
+    let intervalHandle = null;
+    function startLoop() {
+      if (intervalHandle) clearInterval(intervalHandle);
+      if (simState.running) intervalHandle = setInterval(runSimulationTick, simState.speedMs);
+    }
+
+    document.getElementById('btn-sim-toggle').addEventListener('click', () => {
+      simState.running = !simState.running;
+      document.getElementById('sim-toggle-icon').textContent = simState.running ? '⏸️' : '▶️';
+      document.getElementById('sim-toggle-text').textContent = simState.running ? '运行中' : '已暂停';
+      startLoop();
+    });
+
+    document.getElementById('btn-sim-step').addEventListener('click', runSimulationTick);
+    document.getElementById('select-sim-speed').addEventListener('change', (e) => {
+      simState.speedMs = parseInt(e.target.value, 10);
+      startLoop();
+    });
+    document.getElementById('btn-burst-submit').addEventListener('click', () => spawnRandomTasks(4, false));
+    document.getElementById('btn-reset-all').addEventListener('click', () => {
+      simState.nodes.forEach(n => { n.alive = true; });
+      simState.downstreamErrorPct = 5;
+      simState.upstreamWindowCredit = 95;
+      simState.backpressureLevel = 'NORMAL';
+      simState.providerPools.forEach(p => { p.state = 'CLOSED'; p.errRate = '0.8%'; });
+      applyAnimationScenario('normal');
+      spawnRandomTasks(3, true);
+      computeTenantShares();
+      renderAllViews();
+      notifyToast('已重置集群状态');
+    });
+
+    document.getElementById('btn-clear-events').addEventListener('click', () => {
+      simState.events = [];
+      renderCloudEvents();
+    });
+
+    document.querySelectorAll('.evt-filter-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        simState.eventFilter = btn.getAttribute('data-evt-filter');
+        document.querySelectorAll('.evt-filter-btn').forEach(b => {
+          b.className = 'evt-filter-btn px-2 py-0.5 rounded text-[11px] bg-zinc-100 text-zinc-600';
+        });
+        btn.className = 'evt-filter-btn px-2 py-0.5 rounded text-[11px] font-medium bg-zinc-900 text-white';
+        renderCloudEvents();
+      });
+    });
+
+    document.querySelectorAll('.main-tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const target = btn.getAttribute('data-tab');
+        document.querySelectorAll('.main-tab-btn').forEach(b => {
+          b.className = 'main-tab-btn px-3 py-1.5 rounded-md text-xs font-medium text-zinc-600 hover:text-zinc-900 hover:bg-zinc-100 flex items-center gap-1.5 transition';
+        });
+        btn.className = 'main-tab-btn px-3 py-1.5 rounded-md text-xs font-medium bg-zinc-900 text-white flex items-center gap-1.5 transition';
+
+        document.querySelectorAll('.tab-view').forEach(v => {
+          if (v.id === 'tab-' + target) v.classList.remove('hidden');
+          else v.classList.add('hidden');
+        });
+
+        if (target === 'telemetry' && tpsChart && drfChart) {
+          tpsChart.resize();
+          drfChart.resize();
+        }
+      });
+    });
+
+    window.addEventListener('DOMContentLoaded', () => {
+      emitCloudEvent('sched', 'cluster.ready', 'system', '极简仿真看板已启动');
+      computeTenantShares();
+      updateSpecYamlPreview();
+      initCharts();
+      renderAllViews();
+      startLoop();
+    });
+  </script>
+</body>
+</html>

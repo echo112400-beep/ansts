@@ -3,12 +3,12 @@
 | 文档属性 (Document Metadata) | 详细内容 (Specification Details) |
 | :--- | :--- |
 | **文档标题 (Title)** | **ANSTS v2.0 Microservices Architecture Specification: 面向大规模 Agent 沙箱调度的微服务拆分、通信契约与分布式数据架构** |
-| **文档状态 (Status)** | **APPROVED / PRODUCTION ARCHITECTURE SPECIFICATION (v2.0)** |
+| **文档状态 (Status)** | **APPROVED / SYNCHRONIZED PRODUCTION ARCHITECTURE SPECIFICATION (v2.2 — TypeScript + celld HA + Horizontal Scale-Out + Multi-Region Federation Edition)** |
 | **作者 (Authors)** | 分布式 Agent 平台架构组 (Distributed Agent Platform Architecture Team) |
 | **关联主文档 (Parent Doc)** | `ANSTS v2.0 全量架构规范` (5D Phase & Effort-Aware W-DRF + 相变弹性沙箱 + 双元组栅栏 + Saga 工具网关) |
 | **最后更新 (Last Updated)** | 2026-10-29 |
 | **核心模型池 (Model Pools)** | `DeepSeek` (旗舰深度推理池)、`GLM-5.3` (高速轻量/只读轮次分流池)、`Qwen-3.8` (高可用热备与弹性容灾池) |
-| **技术栈选型 (Tech Stack)** | Rust (核心调度器 / 认知路由 / 宿主机 Daemon / 沙箱 Harness)、Go (API 网关 / Saga 工具网关 / 事件通知)、gRPC + Protobuf、Kafka、S3、TiKV/Etcd |
+| **技术栈选型 (Tech Stack)** | TypeScript (Node.js / V8 Isolate / Cloudflare Workers / denoland/celld 全栈统一实现)、RustFS (S3 EC:4 对象存储)、SQLite WAL / LTX、gRPC + Protobuf、gRPC + Protobuf、Kafka、S3、TiKV/Etcd |
 
 ---
 

@@ -1,5 +1,5 @@
 /**
- * ANSTS v2.0 TypeScript Microservices Public Exports.
+ * ANSTS v2.2 TypeScript Microservices & `denoland/celld` HA Runtime Public Barrel Exports (M1 ~ M13).
  */
 
 export * from "./models";
@@ -17,42 +17,37 @@ export * from "./gateway/server";
 export * from "./dag/escrow";
 export * from "./router/pool_client";
 export * from "./router/breaker_limiter";
+export * from "./router/live_llm_adapter";
 export * from "./saga/compensator";
 export * from "./saga/staging";
+export * from "./saga/mcp_registry";
 export * from "./runtime/warm_pool";
 export * from "./runtime/phase_controller";
 export * from "./runtime/psi_guard";
 export * from "./runtime/vsock_bridge";
+export * from "./runtime/linux_cgroup_psi";
+export * from "./runtime/container_driver";
+export * from "./runtime/vsock_daemon";
+export * from "./runtime/live_migration";
 export * from "./harness/runner";
 export * from "./harness/velocity_breaker";
 export * from "./checkpoint/wal_engine";
 export * from "./checkpoint/compactor";
 export * from "./checkpoint/time_travel";
+export * from "./checkpoint/s3_ltx_driver";
 export * from "./telemetry/cloudevents";
 export * from "./telemetry/outbox_webhook";
+export * from "./telemetry/otel_prometheus";
 export * from "./cluster/backpressure_loop";
+export * from "./cluster/k8s_autoscaler";
+export * from "./finops/budget_controller";
 export * from "./cli/anstsctl";
 export * from "./dashboard/server";
 export * from "./cloudflare/env";
 export * from "./cloudflare/scheduler_cell";
 export * from "./cloudflare/harness_cell";
-export { default as cloudflareCelldWorker } from "./cloudflare/worker";
-export * from "./cloudflare/celld_ha_engine";
-
 export * from "./cloudflare/celld_ha_engine";
 export * from "./cloudflare/horizontal_scaler";
 export * from "./cloudflare/celld_admin_client";
-export * from "./checkpoint/s3_ltx_driver";
-export * from "./router/live_llm_adapter";
-
-export * from "./runtime/linux_cgroup_psi";
-export * from "./runtime/container_driver";
-export * from "./runtime/vsock_daemon";
-export * from "./runtime/live_migration";
-
-export * from "./cluster/k8s_autoscaler";
-export * from "./telemetry/otel_prometheus";
-export * from "./saga/mcp_registry";
-export * from "./finops/budget_controller";
-export * from "./dashboard/server";
 export * from "./cloudflare/federation_router";
+export { default as cloudflareCelldWorker } from "./cloudflare/worker";
