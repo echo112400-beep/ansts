@@ -49,3 +49,10 @@ export * from "./runtime/linux_cgroup_psi";
 export * from "./runtime/container_driver";
 export * from "./runtime/vsock_daemon";
 export * from "./runtime/live_migration";
+
+export * from "./cluster/k8s_autoscaler";
+export * from "./telemetry/otel_prometheus";
+export * from "./saga/mcp_registry";
+export * from "./finops/budget_controller";
+export * from "./dashboard/server";
+export * from "./cloudflare/federation_router";

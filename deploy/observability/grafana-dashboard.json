@@ -1,0 +1,31 @@
+{
+  "title": "ANSTS v2.2 & celld HA Production Fleet Dashboard",
+  "uid": "ansts-v2-celld-ha",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "title": "5D W-DRF Dominant Share by Tenant",
+      "type": "timeseries",
+      "targets": [{ "expr": "ansts_tenant_dominant_share_ratio" }]
+    },
+    {
+      "id": 2,
+      "title": "SchedulerCell Shard In-Flight Load Distribution (P2C)",
+      "type": "barchart",
+      "targets": [{ "expr": "ansts_scheduler_shard_inflight_requests" }]
+    },
+    {
+      "id": 3,
+      "title": "Model Pool TTFT & Circuit Breaker State (DeepSeek / GLM-5.3 / Qwen-3.8)",
+      "type": "stat",
+      "targets": [{ "expr": "ansts_model_pool_ttft_seconds" }]
+    },
+    {
+      "id": 4,
+      "title": "celld RPO=0 Verified Transactions (Fleet vs Bucket)",
+      "type": "timeseries",
+      "targets": [{ "expr": "rate(ansts_celld_rpo_zero_commits_total[1m])" }]
+    }
+  ]
+}

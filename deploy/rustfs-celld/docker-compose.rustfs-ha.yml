@@ -1,0 +1,36 @@
+version: "3.9"
+
+# TASK-58: Production 4-Node x 4-NVMe Drive (16 Drives Total) RustFS Erasure-Coding (EC:4) HA Cluster
+# Tolerates simultaneous loss of up to 2 storage nodes (8 drives) with zero S3 CAS or LTX interruption.
+
+x-rustfs-common: &rustfs-common
+  image: rustfs/rustfs:latest
+  user: "10001:10001"
+  environment:
+    RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+    RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
+    RUSTFS_ERASURE_SET_DRIVE_COUNT: "16"
+    RUSTFS_STORAGE_CLASS_STANDARD: "EC:4"
+  command: server http://rustfs-node-{1...4}:9000/data/nvme{1...4} --console-address ":9001"
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/rustfs/health/live"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+
+services:
+  rustfs-node-1:
+    <<: *rustfs-common
+    hostname: rustfs-node-1
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+  rustfs-node-2:
+    <<: *rustfs-common
+    hostname: rustfs-node-2
+  rustfs-node-3:
+    <<: *rustfs-common
+    hostname: rustfs-node-3
+  rustfs-node-4:
+    <<: *rustfs-common
+    hostname: rustfs-node-4

@@ -1,0 +1,72 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: celldfleets.scheduler.agent.io
+spec:
+  group: scheduler.agent.io
+  names:
+    kind: CelldFleet
+    plural: celldfleets
+    singular: celldfleet
+  scope: Namespaced
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ansts-celld-fleet-pdb
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ansts-celld-brain
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ansts-celld-brain
+spec:
+  serviceName: ansts-celld-headless
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: ansts-celld-brain
+  template:
+    metadata:
+      labels:
+        app: ansts-celld-brain
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: celld
+          image: ghcr.io/denoland/celld:latest
+          args:
+            - "--bucket=s3://ansts-fleet"
+            - "--endpoint=http://rustfs-ha.storage.svc:9000"
+            - "--listen=0.0.0.0:8080"
+            - "--internal-listen=0.0.0.0:9001"
+          env:
+            - name: CELLD_DURABILITY
+              value: "fleet"
+            - name: CELLD_TTL_MS
+              value: "10000"
+            - name: CELLD_REBALANCE_INTERVAL_MS
+              value: "5000"
+            - name: CELLD_LTX_RETENTION_SECS
+              value: "86400"
+          readinessProbe:
+            httpGet:
+              path: /.well-known/celld/health
+              port: 8080
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "curl -fsS -X POST http://127.0.0.1:9001/shutdown?handoff=preserve"
