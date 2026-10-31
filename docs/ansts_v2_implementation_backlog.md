@@ -3,7 +3,7 @@
 | 文档属性 (Document Metadata) | 详细内容 (Details) |
 | :--- | :--- |
 | **项目名称 (Project)** | **Agent-Native Sandbox Task Scheduler (ANSTS v2.2 — `celld` HA & Scale-Out Edition)** |
-| **当前代码仓基线 (Baseline)** | `main @ d2a2aa1`（45 个 TypeScript 模块编译通过，**M1 ~ M10 共 52 项任务已实现**，**37/37** 项集成/混沌/高可用/横向扩容测试 100% 通过） |
+| **当前代码仓基线 (Baseline)** | `main @ d2a2aa1`（45 个 TypeScript 模块编译通过，**M1 ~ M11 共 56 项任务已实现**，**41/41** 项集成/混沌/高可用/横向扩容测试 100% 通过） |
 | **待实现规划范围 (Pending Scope)** | **M10 ~ M13（`TASK-49` ~ `TASK-64`，共 4 大阶段、16 项待实现工程任务）**：聚焦热路径全链路装配、真实协议栈驱动、Linux 内核/容器原语落地、K8s/RustFS 生产编排及 MCP/FinOps 治理 |
 | **核心模型池 (Model Pools)** | `DeepSeek`（旗舰深度推理池）、`GLM-5.3`（多步工具编排与轻量高速分流池）、`Qwen-3.8`（高频语法修复与高可用热备容灾池） |
 
@@ -23,7 +23,7 @@
 | **M8：基于 `celld.dev/docs` 的持久化可恢复高可用引擎** | `RPO = 0` 双模式证明、写游标保护、`DurableWorkflowContext`、分片队列、安全 Epoch GC 与自愈 | `src/cloudflare/celld_ha_engine.ts` | `TASK-41` ~ `TASK-45` | `P0` | ✅ **已完成** |
 | **M9：高并发横向扩容引擎 (Scale-Out Engine)** | 双层分片调度器（P2C + 热点租户分裂 + Gossip 配额）、动态队列自动扩分片与脑体分离扩容 | `src/cloudflare/horizontal_scaler.ts` | `TASK-46` ~ `TASK-48` | `P0` | ✅ **已完成** |
 | **M10：热路径全链路装配与真实存储/模型协议栈对接** | 打通边缘 Worker -> 分片调度/队列 -> 真实 `RustFS` S3 LTX 流驱动 -> 真实 LLM SSE 客户端 | `src/cloudflare/*`<br>`src/checkpoint/s3_ltx_driver.ts`<br>`src/router/live_llm_adapter.ts` | **`TASK-49` ~ `TASK-52`** | **`P0`** | ✅ **已完成** |
-| **M11：Linux 宿主机内核原语与容器/MicroVM 运行时落地** | 对接真实 `/sys/fs/cgroup`、`/proc/pressure`、Containerd/Firecracker API、VSOCK 与 `<50ms` 热迁移 | `src/runtime/linux_cgroup_psi.ts`<br>`src/runtime/container_driver.ts` | **`TASK-53` ~ `TASK-56`** | **`P0 / P1`** | 📋 **待实现** |
+| **M11：Linux 宿主机内核原语与容器/MicroVM 运行时落地** | 对接真实 `/sys/fs/cgroup`、`/proc/pressure`、Containerd/Firecracker API、VSOCK 与 `<50ms` 热迁移 | `src/runtime/linux_cgroup_psi.ts`<br>`src/runtime/container_driver.ts`<br>`src/runtime/vsock_daemon.ts`<br>`src/runtime/live_migration.ts` | **`TASK-53` ~ `TASK-56`** | **`P0 / P1`** | ✅ **已完成** |
 | **M12：Kubernetes 编排器、`RustFS` 纠删码与真机混沌演练** | K8s Operator & HPA Adapter、`RustFS` 多机 EC 集群、OTLP/Prometheus 导出器与 Toxiproxy 混沌测试 | `deploy/k8s-operator/*`<br>`src/telemetry/otel_prometheus.ts` | **`TASK-57` ~ `TASK-60`** | **`P1`** | 📋 **待实现** |
 | **M13：MCP 生态协议治理、FinOps 预算硬顶与多活联邦** | 标准 MCP 工具动态注册与事务绑定、租户预算硬顶熔断、分片热力图控制台与多 Region 双活路由 | `src/saga/mcp_registry.ts`<br>`src/finops/*`<br>`src/cloudflare/federation_router.ts` | **`TASK-61` ~ `TASK-64`** | **`P1 / P2`** | 📋 **待实现** |
 
@@ -53,7 +53,7 @@
 
 ---
 
-### 阶段十一（M11）：Linux 宿主机内核原语与容器/MicroVM 运行时落地 (`P0 / P1` — 第二顺位冲刺)
+### 阶段十一（M11）：Linux 宿主机内核原语与容器/MicroVM 运行时落地 (`P0 / P1` — ✅ 已完成，41/41 CI 测试通过)
 
 > **核心目标**：将宿主机守护进程 (`node_daemon.ts`) 中的 Cgroups v2、Linux PSI、容器生命周期与 VSOCK 通信从内存状态机推进至可操作真实 Linux 内核接口与容器引擎的生产驱动。
 
