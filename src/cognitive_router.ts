@@ -7,6 +7,19 @@ import { LeaseCoordinator } from "./lease_coordinator";
 import { AgentTask, EFFORT_MULTIPLIERS, FenceToken, ModelPoolName, ReasoningEffort } from "./models";
 import { SlidingWindowTokenBucket, ThreeStateCircuitBreaker } from "./router/breaker_limiter";
 import { ModelPoolClientAdapter, SseTokenChunk, TurnMeteringSummary } from "./router/pool_client";
+import { MeteredProviderCallExecutor, MeteredProviderCallResult } from "./router/provider_call";
+
+export interface MeteredCognitiveTurnRequest {
+  callId: string;
+  periodKey: string;
+  requestedMaxOutputTokens?: number;
+  payload: unknown;
+  fallbackOfCallId?: string;
+  routingVersion?: number;
+  isReadOnlyTurn?: boolean;
+  consecutiveToolErrors?: number;
+  now?: number;
+}
 
 export interface ModelPoolHealth {
   poolName: ModelPoolName;
@@ -22,7 +35,10 @@ export class CognitiveRouter {
   public tokenBuckets: Record<ModelPoolName, SlidingWindowTokenBucket>;
   public readonly poolAdapter = new ModelPoolClientAdapter();
 
-  constructor(public readonly leaseCoordinator: LeaseCoordinator) {
+  constructor(
+    public readonly leaseCoordinator: LeaseCoordinator,
+    public readonly meteredCallExecutor?: MeteredProviderCallExecutor,
+  ) {
     this.pools = {
       DeepSeek: {
         poolName: "DeepSeek",
@@ -133,5 +149,54 @@ export class CognitiveRouter {
       chunks,
       metering: summary,
     };
+  }
+
+  /** Execute one provider call through durable routing, quota and tenant-budget authorities. */
+  public async routeMeteredTurn(
+    task: AgentTask,
+    fence: FenceToken,
+    request: MeteredCognitiveTurnRequest,
+  ): Promise<{ routedModel: ModelPoolName; effectiveEffort: ReasoningEffort; metering: MeteredProviderCallResult }> {
+    if (!this.meteredCallExecutor) {
+      throw new Error("A MeteredProviderCallExecutor must be injected before durable model calls are enabled.");
+    }
+    const now = request.now ?? 10.0;
+    this.leaseCoordinator.verifyAndAdvanceFence(fence);
+    for (const name of ["DeepSeek", "GLM-5.3", "Qwen-3.8"] as ModelPoolName[]) {
+      this.breakers[name].allowRequest(now);
+      this.pools[name].breakerState = this.breakers[name].state;
+    }
+
+    let routedModel: ModelPoolName;
+    let effectiveEffort: ReasoningEffort;
+    if (request.isReadOnlyTurn && this.pools[task.fastUtilityModel].breakerState !== "OPEN") {
+      routedModel = task.fastUtilityModel;
+      effectiveEffort = "minimal";
+    } else {
+      const primaryPool = this.pools[task.primaryModel];
+      if (primaryPool.breakerState === "OPEN") {
+        routedModel = task.fallbackModels[0];
+        effectiveEffort = task.effort === "high" || task.effort === "max" ? "medium" : task.effort;
+      } else {
+        routedModel = task.primaryModel;
+        effectiveEffort = (request.consecutiveToolErrors ?? 0) >= 2 ? "max" : task.effort;
+      }
+    }
+
+    const metering = await this.meteredCallExecutor.execute({
+      callId: request.callId,
+      tenantId: task.tenantId,
+      taskId: task.taskId,
+      poolName: routedModel,
+      periodKey: request.periodKey,
+      requestedMaxOutputTokens: request.requestedMaxOutputTokens,
+      reasoningEffort: effectiveEffort,
+      payload: request.payload,
+      fallbackOfCallId: request.fallbackOfCallId,
+      routingVersion: request.routingVersion,
+    });
+    if (metering.status !== "NOT_STARTED") task.assignedModelPool = routedModel;
+    if (metering.status === "SETTLED") task.usedTokens += metering.usage.inputTokens + metering.usage.outputTokens;
+    return { routedModel, effectiveEffort, metering };
   }
 }

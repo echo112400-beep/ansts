@@ -14,6 +14,7 @@
 import * as http from "node:http";
 import * as https from "node:https";
 import { AgentTask, ModelPoolName } from "../models";
+import { ProviderUsageEvidence } from "../persistence/provider-quota";
 
 export interface ModelPoolEndpointConfig {
   poolName: ModelPoolName;
@@ -35,6 +36,17 @@ export interface StreamingLlmTurnResult {
   totalDurationMs: number;
   failoverAttempted: boolean;
   failoverFromPool?: ModelPoolName;
+  usageEvidence?: ProviderUsageEvidence;
+}
+
+export interface SinglePoolCompletionParams {
+  pool: ModelPoolName;
+  modelId?: string;
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  reasoningEffort?: string;
+  maxOutputTokens: number;
+  idempotencyKey: string;
+  onDelta?: (delta: { type: "reasoning" | "content"; text: string }) => void;
 }
 
 export class LiveOpenAiCompatibleSseAdapter {
@@ -88,11 +100,30 @@ export class LiveOpenAiCompatibleSseAdapter {
     throw lastError ?? new Error("All configured LLM model pools failed during SSE stream");
   }
 
+  /** A durable metered call must attempt exactly one pool; fallback needs a new hold and grant. */
+  public async streamSinglePoolCompletionTurn(params: SinglePoolCompletionParams): Promise<StreamingLlmTurnResult> {
+    if (!Number.isSafeInteger(params.maxOutputTokens) || params.maxOutputTokens <= 0) {
+      throw new TypeError("maxOutputTokens must be a positive safe integer.");
+    }
+    if (typeof params.idempotencyKey !== "string" || params.idempotencyKey.trim().length === 0) {
+      throw new TypeError("idempotencyKey must be a non-empty string.");
+    }
+    const configuredEndpoint = this.endpoints.get(params.pool);
+    if (!configuredEndpoint) throw new Error(`No configured provider endpoint for ${params.pool}.`);
+    const endpoint = params.modelId ? { ...configuredEndpoint, modelId: params.modelId } : configuredEndpoint;
+    const result = await this.streamSingleEndpoint(endpoint, params.messages, params.reasoningEffort, params.onDelta, {
+      maxOutputTokens: params.maxOutputTokens,
+      idempotencyKey: params.idempotencyKey,
+    });
+    return { ...result, failoverAttempted: false };
+  }
+
   private streamSingleEndpoint(
     cfg: ModelPoolEndpointConfig,
     messages: Array<{ role: string; content: string }>,
     reasoningEffort?: string,
     onDelta?: (delta: { type: "reasoning" | "content"; text: string }) => void,
+    callOptions?: { maxOutputTokens: number; idempotencyKey: string },
   ): Promise<Omit<StreamingLlmTurnResult, "failoverAttempted" | "failoverFromPool">> {
     const parsedUrl = new URL(cfg.baseUrl);
     const transport = parsedUrl.protocol === "https:" ? https : http;
@@ -101,6 +132,7 @@ export class LiveOpenAiCompatibleSseAdapter {
       stream: true,
       reasoning_effort: reasoningEffort ?? "high",
       messages,
+      ...(callOptions ? { max_tokens: callOptions.maxOutputTokens, stream_options: { include_usage: true } } : {}),
     });
 
     const startMs = performance.now();
@@ -109,6 +141,8 @@ export class LiveOpenAiCompatibleSseAdapter {
     let contentText = "";
     let reasoningTokens = 0;
     let completionTokens = 0;
+    let providerRequestId: string | undefined;
+    let usageEvidence: ProviderUsageEvidence | undefined;
 
     return new Promise((resolve, reject) => {
       const req = transport.request(
@@ -123,10 +157,13 @@ export class LiveOpenAiCompatibleSseAdapter {
             accept: "text/event-stream",
             authorization: `Bearer ${cfg.apiKey}`,
             "content-length": String(Buffer.byteLength(payload)),
+            ...(callOptions ? { "idempotency-key": callOptions.idempotencyKey } : {}),
           },
           timeout: cfg.timeoutMs ?? 15000,
         },
         (res) => {
+          const requestHeader = res.headers["x-request-id"];
+          if (typeof requestHeader === "string") providerRequestId = requestHeader;
           if ((res.statusCode ?? 500) >= 400) {
             res.resume();
             reject(new Error(`LLM Pool ${cfg.poolName} returned HTTP ${res.statusCode}`));
@@ -151,12 +188,31 @@ export class LiveOpenAiCompatibleSseAdapter {
                   choices?: Array<{
                     delta?: { reasoning_content?: string; content?: string };
                   }>;
+                  id?: string;
                   usage?: {
                     reasoning_tokens?: number;
                     completion_tokens?: number;
                     total_tokens?: number;
+                    prompt_tokens?: number;
+                    input_tokens?: number;
+                    output_tokens?: number;
                   };
                 };
+
+                if (typeof parsed.id === "string" && parsed.id.length > 0) providerRequestId = parsed.id;
+                const usageInput = parsed.usage?.prompt_tokens ?? parsed.usage?.input_tokens;
+                const usageOutput = parsed.usage?.completion_tokens ?? parsed.usage?.output_tokens;
+                if (
+                  providerRequestId && Number.isSafeInteger(usageInput) && Number(usageInput) >= 0 &&
+                  Number.isSafeInteger(usageOutput) && Number(usageOutput) >= 0
+                ) {
+                  usageEvidence = {
+                    verified: true,
+                    reference: providerRequestId,
+                    inputTokens: Number(usageInput),
+                    outputTokens: Number(usageOutput),
+                  };
+                }
 
                 if (ttftMs === null) {
                   ttftMs = Number((performance.now() - startMs).toFixed(3));
@@ -191,6 +247,7 @@ export class LiveOpenAiCompatibleSseAdapter {
               totalTokens: reasoningTokens + completionTokens,
               ttftMs: ttftMs ?? totalDurationMs,
               totalDurationMs,
+              usageEvidence,
             });
           });
         },
