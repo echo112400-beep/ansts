@@ -1,10 +1,10 @@
 /**
  * AgentTaskHarnessCell: Brain-Body Disaggregated Durable Object / celld Cell (~0.47 MB RAM).
- * - Implements `rehydrateFromSql()` in constructor so waking from HIBERNATED / INACTIVE
- *   in `celld` or Cloudflare Durable Objects restores `fence`, `walStore`, and `sagaJournal`
- *   with zero state loss.
- * - TASK-49: Wires `RpoZeroDurabilityEngine` (`commitAndProveRpoZero` / `claimCellOwnershipCas`)
- *   and `DurableWorkflowContext` (`do`, `waitForEvent`, `sleep`) directly into the Cell hot path.
+ * - Implements `rehydrateFromSql()` to reconstruct selected legacy metadata from local SQLite.
+ *   The in-process simulator and legacy WAL path do not establish fleet or bucket durability.
+ * - The legacy `RpoZeroDurabilityEngine` is an in-memory simulation; it is not Celld's proof.
+ *   Real Cell write confirmation is provided by Celld's `storage.sync()` / response output gate.
+ * - `DurableWorkflowContext` is also a local orchestration model, not the task-state authority.
  */
 
 import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel";
@@ -27,6 +27,7 @@ import {
   RpoZeroDurabilityEngine,
 } from "./celld_ha_engine";
 import { CloudflareCelldEnv, DurableObjectState, WebSocketLike } from "./env";
+import { initializeCellProtocol } from "../persistence/schema";
 
 export class AgentTaskHarnessCell {
   public readonly leaseCoord = new LeaseCoordinator();
@@ -45,6 +46,7 @@ export class AgentTaskHarnessCell {
     public readonly env: CloudflareCelldEnv,
   ) {
     const taskId = ctx.id.name ?? ctx.id.toString();
+    initializeCellProtocol(this.ctx.storage.sql, { type: "task", key: taskId });
     this.task = new AgentTask({
       taskId,
       tenantId: "fin-enterprise",

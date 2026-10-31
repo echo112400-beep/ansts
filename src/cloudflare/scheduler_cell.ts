@@ -7,6 +7,7 @@ import { AnstsClusterRuntime } from "../cli/anstsctl";
 import { ClusterPressureSignals } from "../cluster/backpressure_loop";
 import { AgentTask } from "../models";
 import { CloudflareCelldEnv, DurableObjectState } from "./env";
+import { initializeCellProtocol } from "../persistence/schema";
 
 export class AnstsSchedulerCell {
   public readonly cluster: AnstsClusterRuntime;
@@ -16,7 +17,11 @@ export class AnstsSchedulerCell {
     public readonly env: CloudflareCelldEnv,
   ) {
     this.cluster = new AnstsClusterRuntime();
-    // Initialize celld/DO private SQLite tables for LTX RPO=0 lease & queue persistence
+    initializeCellProtocol(this.ctx.storage.sql, {
+      type: "scheduler-pool",
+      key: this.ctx.id.name ?? this.ctx.id.toString(),
+    });
+    // These legacy metadata tables live in local SQLite; durable confirmation depends on the configured Celld proof.
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS cell_leases (task_id TEXT, node_id TEXT, model_pool TEXT, epoch INTEGER, turn_seq INTEGER)",
     );
