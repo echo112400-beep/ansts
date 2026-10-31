@@ -125,6 +125,39 @@ test("stale execution epochs cannot authorize a new external operation", async (
   assert.equal(effects, 0);
 });
 
+test("suspended tasks block new external effects but can persist an in-flight outcome", async () => {
+  const { operations, state } = createTaskOperations("task-operation-suspended");
+  const fence = new FenceToken(3, 1, "task-operation-suspended");
+  const blockedRequest = {
+    operationId: stableTaskOperationId("task-operation-suspended", "call-suspended"),
+    tenantId: "tenant-7",
+    fence,
+    toolName: "payments/capture",
+    effectClass: ToolEffectClass.IDEMPOTENT_WRITE,
+    args: { paymentId: "pay-suspended" },
+  };
+  await operations.prepareOperation(blockedRequest);
+  state.storage.sql.exec("UPDATE task_execution SET lifecycle_state = ? WHERE task_id = ?", "SUSPENDED", "task-operation-suspended");
+  let effects = 0;
+  await assert.rejects(operations.executeOperation(blockedRequest, {
+    supportsIdempotency: true,
+    async execute() { effects += 1; return "captured"; },
+  }), { code: "TASK_NOT_EXECUTING" });
+  assert.equal(effects, 0);
+
+  state.storage.sql.exec("UPDATE task_execution SET lifecycle_state = ? WHERE task_id = ?", "RUNNING", "task-operation-suspended");
+  const inFlightRequest = { ...blockedRequest, operationId: stableTaskOperationId("task-operation-suspended", "call-in-flight") };
+  await operations.prepareOperation(inFlightRequest);
+  const attempt = await operations.beginAttempt({ operationId: inFlightRequest.operationId, attemptId: "attempt-before-suspend", fence });
+  assert.equal(attempt.status, "RUNNING");
+  state.storage.sql.exec("UPDATE task_execution SET lifecycle_state = ? WHERE task_id = ?", "SUSPENDED", "task-operation-suspended");
+  const completed = await operations.recordOperationOutcome({
+    operationId: inFlightRequest.operationId, attemptId: attempt.attemptId, fence,
+    outcome: "SUCCEEDED", result: { paymentId: "pay-suspended", captured: true },
+  });
+  assert.equal(completed.status, "SUCCEEDED");
+});
+
 test("a provider lookup resolves an unknown result without repeating the external effect", async () => {
   const { operations } = createTaskOperations("task-operation-reconcile");
   const request = {

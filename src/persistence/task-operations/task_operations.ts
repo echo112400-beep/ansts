@@ -3,7 +3,7 @@ import { CellInboxEvent, CellMigration, CellOperationCommand, PersistenceObjectS
 import { digestJson } from "../digest";
 import { consumeCellInboxEvent } from "../inbox";
 import { executeCellOperation } from "../operations";
-import { assertBusinessEpoch, TaskExecutionRecord } from "../task-core/task_core";
+import { TaskExecutionRecord } from "../task-core/task_core";
 import { confirmCellWrite } from "../transactions";
 
 export type TaskOperationStatus = "APPROVAL_REQUIRED" | "READY" | "RUNNING" | "SUCCEEDED" | "FAILED" | "OUTCOME_UNKNOWN";
@@ -606,14 +606,16 @@ function assertAuthorizedTask(sql: PersistenceSqlStorage, taskId: string, tenant
   const task = sql.exec<TaskExecutionRecord>("SELECT * FROM task_execution WHERE task_id = ?", taskId).toArray()[0];
   if (!task) throw new TaskOperationError("TASK_NOT_INITIALIZED", `Task ${taskId} is not initialized.`, 404);
   if (task.tenant_id !== tenantId) throw new TaskOperationError("TASK_OPERATION_TENANT_MISMATCH", "Operation tenant does not own this task.", 403);
-  try {
-    assertBusinessEpoch(task, fence.epoch);
-  } catch (error) {
-    const code = error instanceof Error && "code" in error ? String(error.code) : "TASK_OPERATION_FENCE_REJECTED";
-    throw new TaskOperationError(code, error instanceof Error ? error.message : String(error));
+  if (Number(task.business_epoch) !== fence.epoch) {
+    throw new TaskOperationError("STALE_EXECUTION_EPOCH", `Execution epoch ${fence.epoch} is stale; task ${taskId} is at business epoch ${task.business_epoch}.`);
   }
-  if (requireNextTurn && Number(task.last_turn_seq) + 1 !== fence.turnSeq) {
-    throw new TaskOperationError("TASK_OPERATION_TURN_FENCE_REJECTED", `Task expects turn ${Number(task.last_turn_seq) + 1}; received ${fence.turnSeq}.`);
+  if (requireNextTurn) {
+    if (task.lifecycle_state !== "RUNNING") {
+      throw new TaskOperationError("TASK_NOT_EXECUTING", `Task ${taskId} is ${task.lifecycle_state}.`);
+    }
+    if (Number(task.last_turn_seq) + 1 !== fence.turnSeq) {
+      throw new TaskOperationError("TASK_OPERATION_TURN_FENCE_REJECTED", `Task expects turn ${Number(task.last_turn_seq) + 1}; received ${fence.turnSeq}.`);
+    }
   }
   return task;
 }
