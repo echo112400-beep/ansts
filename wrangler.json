@@ -11,6 +11,10 @@
       {
         "name": "AGENT_HARNESS_CELL",
         "class_name": "AgentTaskHarnessCell"
+      },
+      {
+        "name": "TENANT_LEDGER_CELL",
+        "class_name": "TenantLedgerCell"
       }
     ]
   },
@@ -20,6 +24,12 @@
       "new_sqlite_classes": [
         "AnstsSchedulerCell",
         "AgentTaskHarnessCell"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "TenantLedgerCell"
       ]
     }
   ],

@@ -23,12 +23,14 @@ import {
   runCli,
   RustFsS3LtxDriver,
   S3CasPreconditionFailedError,
+  TenantLedgerCell,
 } from "../src/index";
 
-test("M10 (TASK-49): Edge Worker hot-path multi-shard routing, dynamic queue auto-sharding, RPO=0 turn proof & Durable Workflow", async () => {
+test("M10 (TASK-49): TenantLedger admission, scheduler scale-out, RPO=0 turn proof & Durable Workflow", async () => {
   const kvMap = new Map<string, string>();
   const schedulerShards = new Map<string, AnstsSchedulerCell>();
   const harnessCells = new Map<string, AgentTaskHarnessCell>();
+  const tenantLedgerCells = new Map<string, TenantLedgerCell>();
   const queuedEvents: any[] = [];
 
   const env: CloudflareCelldEnv = {
@@ -60,6 +62,22 @@ test("M10 (TASK-49): Edge Worker hot-path multi-shard routing, dynamic queue aut
           harnessCells.set(key, new AgentTaskHarnessCell(new MockDurableObjectState(key), env));
         }
         const cell = harnessCells.get(key)!;
+        return {
+          fetch: (input: RequestInfo, init?: RequestInit) => {
+            const req = typeof input === "string" ? new Request(input, init) : input;
+            return cell.fetch(req);
+          },
+        };
+      },
+    },
+    TENANT_LEDGER_CELL: {
+      idFromName: (name: string) => ({ toString: () => name, name }),
+      get: (id: { toString(): string; name?: string }) => {
+        const key = id.name ?? id.toString();
+        if (!tenantLedgerCells.has(key)) {
+          tenantLedgerCells.set(key, new TenantLedgerCell(new MockDurableObjectState(key), env));
+        }
+        const cell = tenantLedgerCells.get(key)!;
         return {
           fetch: (input: RequestInfo, init?: RequestInit) => {
             const req = typeof input === "string" ? new Request(input, init) : input;
@@ -103,8 +121,8 @@ test("M10 (TASK-49): Edge Worker hot-path multi-shard routing, dynamic queue aut
     },
   };
 
-  // 1. Submit 40 concurrent tasks for "fin-enterprise" -> triggers hot-tenant P2C multi-shard routing
-  const hitShards = new Set<string>();
+  // 1. Submit 40 tasks for "fin-enterprise" -> admission remains on its single budget authority.
+  const hitTenantLedgers = new Set<string>();
   for (let i = 0; i < 40; i++) {
     const resp = await cloudflareCelldWorker.fetch(
       new Request("https://ansts.edge/v1beta1/tasks", {
@@ -126,10 +144,12 @@ test("M10 (TASK-49): Edge Worker hot-path multi-shard routing, dynamic queue aut
     );
     assert.equal(resp.status, 202);
     const body = (await resp.json()) as Record<string, any>;
-    assert.ok(body.scheduler_shard_id.startsWith("scheduler-cell-shard-"));
-    hitShards.add(body.scheduler_shard_id);
+    assert.equal(body.accepted, true);
+    assert.equal(body.tenant_id, "fin-enterprise");
+    hitTenantLedgers.add(body.tenant_id);
   }
-  assert.ok(hitShards.size >= 2, "Hot tenant submissions must distribute across multiple SchedulerCell shards");
+  assert.equal(hitTenantLedgers.size, 1, "All admissions for one tenant retain one ledger identity");
+  assert.equal(tenantLedgerCells.size, 1, "A hot tenant is not split across budget authorities");
 
   // 2. Scale out scheduler shards online via POST /v1beta1/scheduler/shards
   const scaleShardRes = await cloudflareCelldWorker.fetch(

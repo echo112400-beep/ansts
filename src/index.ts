@@ -42,6 +42,7 @@ export * from "./cluster/backpressure_loop";
 export * from "./cluster/manual_scale_controller";
 export * from "./finops/budget_controller";
 export * from "./persistence";
+export * from "./persistence/tenant";
 export * from "./cli/anstsctl";
 export * from "./dashboard/server";
 export * from "./cloudflare/env";
