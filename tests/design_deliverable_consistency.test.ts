@@ -34,6 +34,7 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
     "docs/microservices_architecture.md",
     "docs/celld_persistent_recoverable_ha_scheduler_design.md",
     "docs/ansts_v2_implementation_backlog.md",
+    "docs/ansts_production_deployment_architecture_design.md",
     "docs/agent_sandbox_scheduler_dashboard.html",
   ];
   for (const relDoc of requiredDocs) {
@@ -74,7 +75,9 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
     "deploy/rustfs-celld/docker-compose.rustfs-ha.yml",
     "deploy/rustfs-celld/rustfs-ec-setup.sh",
     "deploy/rustfs-celld/systemd/celld.service",
-    "deploy/k8s-operator/celld-fleet-operator.yaml",
+    "deploy/manual-fleet/fleet-topology.yaml",
+    "deploy/manual-fleet/scale-fleet.sh",
+    "deploy/manual-fleet/systemd/ansts-node-daemon.service",
     "deploy/observability/grafana-dashboard.json",
   ];
   for (const relManifest of requiredManifests) {
@@ -135,7 +138,7 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
     "CompanionContainerAndOverlayDriver",
     "ZeroTrustVsockHostDaemon",
     "EphemeralHeavyExecutorMigrator",
-    "KubernetesCelldHpaAdapter",
+    "ManualFleetScaleController",
     "OtelAndPrometheusExporter",
     "McpDynamicToolRegistry",
     "FinOpsBudgetController",
@@ -156,7 +159,7 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
   assert.ok(cluster.finopsController);
   assert.ok(cluster.otelExporter);
   assert.ok(cluster.federationRouter);
-  assert.ok(cluster.k8sAutoscaler);
+  assert.ok(cluster.manualScaleController);
   const cliMetrics = runCli(["metrics"]);
   assert.ok(cliMetrics.prometheus_text.includes("ansts_tenant_dominant_share_ratio"));
 

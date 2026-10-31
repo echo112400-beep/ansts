@@ -39,7 +39,7 @@ export * from "./telemetry/cloudevents";
 export * from "./telemetry/outbox_webhook";
 export * from "./telemetry/otel_prometheus";
 export * from "./cluster/backpressure_loop";
-export * from "./cluster/k8s_autoscaler";
+export * from "./cluster/manual_scale_controller";
 export * from "./finops/budget_controller";
 export * from "./cli/anstsctl";
 export * from "./dashboard/server";

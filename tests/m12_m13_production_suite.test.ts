@@ -1,13 +1,5 @@
 /**
- * M12 & M13 Production Readiness & Governance Test Suite (TASK-57 ~ TASK-64):
- * - TASK-57: Kubernetes Operator (`CelldFleet` CRD, PDB, PreStop `handoff=preserve`) & `KubernetesCelldHpaAdapter`
- * - TASK-58: `RustFS` 4-Node x 4-NVMe (16-Drive EC:4) HA Cluster Compose & Setup Script Verification
- * - TASK-59: OpenTelemetry (OTLP) Span Exporter, Prometheus `/metrics` OpenMetrics Formatter & Grafana Dashboard
- * - TASK-60: E2E Multi-Node Network Partition, Stale-Leader GC Pause & Split-Brain Chaos Harness
- * - TASK-61: MCP Dynamic Tool Registry & 4-Tier Transaction Contract Binder (Automatic `STAGED_COMMIT` Safety Downgrade)
- * - TASK-62: Multi-Tenant FinOps Real-Time Cost Ledger, 80% Soft Warning & 100% Hard-Cap Graceful Drain Breaker
- * - TASK-63: Real-Time Dashboard Shard Heatmap & Interactive `STAGED_COMMIT` Online Approval / Rejection
- * - TASK-64: Multi-Region Active-Active Federation Router (Strict GDPR Data Residency & <1s Regional Failover)
+ * M12 & M13 Production Readiness & Governance Test Suite (TASK-57 ~ TASK-64, Non-K8s Manual Scale-Out Edition)
  */
 
 import * as assert from "node:assert/strict";
@@ -21,94 +13,96 @@ import {
   DashboardBackendServer,
   FenceToken,
   FinOpsBudgetController,
-  KubernetesCelldHpaAdapter,
   LeaseCoordinator,
+  ManualFleetScaleController,
   McpDynamicToolRegistry,
   MultiRegionFederationRouter,
   OtelAndPrometheusExporter,
   RpoZeroDurabilityEngine,
+  runCli,
   SagaToolGateway,
   StaleFenceError,
   TaskState,
   ToolEffectClass,
 } from "../src/index";
 
-test("M12 (TASK-57 & TASK-58): K8s CelldFleet Operator, HPA Adapter, and RustFS 16-Drive EC:4 HA Cluster manifests", () => {
+test("M12 (TASK-57 & TASK-58): Non-K8s Bare-Metal ManualFleetScaleController, scale-fleet.sh, and RustFS 16-Drive EC:4 HA Cluster manifests", () => {
   const rootDir = path.join(__dirname, "..", "..");
 
-  // 1. Verify K8s Operator YAML documents (CRD + PDB + StatefulSet with PreStop handoff=preserve)
-  const k8sYamlPath = path.join(rootDir, "deploy", "k8s-operator", "celld-fleet-operator.yaml");
-  const k8sDocs = yaml.loadAll(fs.readFileSync(k8sYamlPath, "utf8")) as Array<Record<string, any>>;
-  assert.equal(k8sDocs.length, 3);
-  assert.equal(k8sDocs[0].kind, "CustomResourceDefinition");
-  assert.equal(k8sDocs[1].kind, "PodDisruptionBudget");
-  assert.equal(k8sDocs[2].kind, "StatefulSet");
-  const preStopCmd =
-    k8sDocs[2].spec.template.spec.containers[0].lifecycle.preStop.exec.command.join(" ");
-  assert.ok(preStopCmd.includes("/shutdown?handoff=preserve"));
+  // 1. Verify Non-K8s Manual Fleet Topology YAML, Systemd service & scale-fleet.sh script
+  const topoPath = path.join(rootDir, "deploy", "manual-fleet", "fleet-topology.yaml");
+  const scaleScriptPath = path.join(rootDir, "deploy", "manual-fleet", "scale-fleet.sh");
+  const daemonServicePath = path.join(rootDir, "deploy", "manual-fleet", "systemd", "ansts-node-daemon.service");
 
-  // 2. Verify KubernetesCelldHpaAdapter blocks scaling when restoring > 0, and scales out when pressured
-  const hpa = new KubernetesCelldHpaAdapter(3, 32, 2500);
-  const blockedPlan = hpa.reconcileClusterReplicas({
-    brainNodes: [
-      {
-        node_id: "celld-0",
-        sampled_ms: Date.now(),
-        owned_cells: 3000,
-        placement_weight: 100,
-        resident_cells: 500,
-        host_websockets: 50,
-        rss_bytes: 500_000_000,
-        in_use_bytes: 400_000_000,
-        cpu_percent_x100: 7000,
-        open_fds: 120,
-        pressured: true,
-        memory_headroom: false,
-        shed_cells: 10,
-        restoring: 4, // Restoring in progress -> must block replica mutation!
-        draining: false,
-      },
-    ],
-    bodyHosts: [
-      {
-        hostId: "body-host-01",
-        activeToolBurstSandboxes: 20,
-        maxBurstSandboxesPerHost: 20,
-        warmPoolIdleContainers: 1,
-        psiCpuSomeAvg10: 0.15,
-        psiMemoryFullAvg10: 0.02,
-      },
-    ],
-    activeToolBurstTasks: 80,
-  });
-  assert.equal(blockedPlan.brainStatefulSet.action, "BLOCKED_BY_RESTORING");
-  assert.equal(blockedPlan.bodyDeployment.desiredReplicas, 5); // ceil(80 * 1.25 / 20) = 5
+  const topo = yaml.load(fs.readFileSync(topoPath, "utf8")) as Record<string, any>;
+  assert.equal(topo.kind, "ManualFleetTopology");
+  assert.equal(topo.metadata.deployment_mode, "systemd-and-compose");
+  assert.equal(topo.spec.celld_brain_nodes.nodes.length, 3);
+  assert.equal(topo.spec.sandbox_body_hosts.hosts.length, 2);
 
-  const scaleOutPlan = hpa.reconcileClusterReplicas({
-    brainNodes: [
-      {
-        node_id: "celld-0",
-        sampled_ms: Date.now(),
-        owned_cells: 6500,
-        placement_weight: 100,
-        resident_cells: 900,
-        host_websockets: 80,
-        rss_bytes: 700_000_000,
-        in_use_bytes: 600_000_000,
-        cpu_percent_x100: 8500,
-        open_fds: 200,
-        pressured: true,
-        memory_headroom: false,
-        shed_cells: 12,
-        restoring: 0,
-        draining: false,
-      },
-    ],
-    bodyHosts: [],
-    activeToolBurstTasks: 40,
+  const scriptText = fs.readFileSync(scaleScriptPath, "utf8");
+  assert.ok(scriptText.includes("add-brain-node"));
+  assert.ok(scriptText.includes("remove-brain-node"));
+  assert.ok(scriptText.includes("add-body-host"));
+  assert.ok(scriptText.includes("scale-shards"));
+  assert.equal(fs.existsSync(daemonServicePath), true);
+
+  // 2. Verify ManualFleetScaleController blocks manual scale-out while restoring > 0, and scales out cleanly when restoring == 0
+  const manualCtrl = new ManualFleetScaleController();
+  manualCtrl.fleetController.registerOrUpdateNodeLoad({
+    node_id: "celld-node-01",
+    sampled_ms: Date.now(),
+    owned_cells: 500,
+    placement_weight: 100,
+    resident_cells: 100,
+    host_websockets: 10,
+    rss_bytes: 256_000_000,
+    in_use_bytes: 128_000_000,
+    cpu_percent_x100: 3000,
+    open_fds: 64,
+    pressured: false,
+    memory_headroom: true,
+    shed_cells: 0,
+    restoring: 3, // Active paged restore in progress -> must block manual topology change!
+    draining: false,
   });
-  assert.equal(scaleOutPlan.brainStatefulSet.action, "SCALE_OUT");
-  assert.ok(scaleOutPlan.brainStatefulSet.desiredReplicas >= 4);
+
+  const blockedScale = manualCtrl.executeManualScaleOut({
+    addBrainNodes: [{ nodeId: "celld-node-02", advertiseAddress: "10.240.16.12:9001" }],
+  });
+  assert.equal(blockedScale.status, "BLOCKED_BY_RESTORING");
+
+  // Once restoring finishes (restoring = 0), manual scale-out adds brain nodes, body hosts & scheduler shards and triggers 32-cell rebalance
+  manualCtrl.fleetController.nodes.get("celld-node-01")!.restoring = 0;
+  const okScale = manualCtrl.executeManualScaleOut(
+    {
+      addBrainNodes: [
+        { nodeId: "celld-node-02", advertiseAddress: "10.240.16.12:9001", placementWeight: 100 },
+        { nodeId: "celld-node-03", advertiseAddress: "10.240.16.13:9001", placementWeight: 100 },
+      ],
+      addBodyHosts: [
+        { hostId: "body-host-03", ipAddress: "10.240.32.13", maxBurstSandboxes: 20 },
+      ],
+      addSchedulerShards: 4,
+    },
+    40,
+  );
+  assert.equal(okScale.status, "SCALED_OUT");
+  assert.equal(okScale.totalBrainNodes, 3);
+  assert.equal(okScale.totalBodyHosts, 3);
+  assert.equal(okScale.totalSchedulerShards, 12);
+  assert.equal(okScale.rebalanceBatch?.movedCells, 32);
+
+  // Test manual scale-in (`preserve` vs `drain`) and `anstsctl fleet scale-out` CLI
+  const preserveRes = manualCtrl.executeManualNodeDrain("celld-node-03", "preserve");
+  assert.equal(preserveRes.allowed, true);
+  const drainRes = manualCtrl.executeManualNodeDrain("celld-node-02", "drain");
+  assert.equal(drainRes.allowed, true);
+  assert.equal(drainRes.remainingBrainNodes, 2);
+
+  const cliScaleOut = runCli(["fleet", "scale-out", "celld-node-05", "body-host-05"]);
+  assert.equal(cliScaleOut.status, "SCALED_OUT");
+  assert.ok(cliScaleOut.addedBrainNodeIds.includes("celld-node-05"));
 
   // 3. Verify RustFS 4-Node x 4-NVMe (16-Drive EC:4) HA Compose & setup script
   const rustfsHaPath = path.join(rootDir, "deploy", "rustfs-celld", "docker-compose.rustfs-ha.yml");

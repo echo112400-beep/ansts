@@ -1,0 +1,31 @@
+# ANSTS v2.2 Non-K8s Bare-Metal / VM Fleet Topology & Manual Scaling Inventory
+apiVersion: scheduler.agent.io/v1beta1
+kind: ManualFleetTopology
+metadata:
+  cluster_name: ansts-prod-baremetal-01
+  deployment_mode: systemd-and-compose # No Kubernetes required
+spec:
+  storage_cluster:
+    engine: rustfs-ec4
+    endpoint: "http://10.240.64.11:9000"
+    bucket: "s3://ansts-fleet"
+    erasure_coding: "EC:4"
+    nodes:
+      - { id: "rustfs-node-1", ip: "10.240.64.11", drives: ["/data/nvme1", "/data/nvme2", "/data/nvme3", "/data/nvme4"] }
+      - { id: "rustfs-node-2", ip: "10.240.64.12", drives: ["/data/nvme1", "/data/nvme2", "/data/nvme3", "/data/nvme4"] }
+      - { id: "rustfs-node-3", ip: "10.240.64.13", drives: ["/data/nvme1", "/data/nvme2", "/data/nvme3", "/data/nvme4"] }
+      - { id: "rustfs-node-4", ip: "10.240.64.14", drives: ["/data/nvme1", "/data/nvme2", "/data/nvme3", "/data/nvme4"] }
+  celld_brain_nodes:
+    durability: "fleet"
+    ttl_ms: 10000
+    rebalance_interval_ms: 5000
+    nodes:
+      - { id: "celld-node-01", listen: "10.240.16.11:8080", internal: "10.240.16.11:9001", weight: 100 }
+      - { id: "celld-node-02", listen: "10.240.16.12:8080", internal: "10.240.16.12:9001", weight: 100 }
+      - { id: "celld-node-03", listen: "10.240.16.13:8080", internal: "10.240.16.13:9001", weight: 100 }
+  sandbox_body_hosts:
+    max_burst_per_host: 20
+    warm_pool_buffer_ratio: 0.25
+    hosts:
+      - { id: "body-host-01", ip: "10.240.32.11", vcpu: 64, ram_gb: 128, isolation: "firecracker" }
+      - { id: "body-host-02", ip: "10.240.32.12", vcpu: 64, ram_gb: 128, isolation: "firecracker" }

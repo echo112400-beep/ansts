@@ -14,6 +14,7 @@
  */
 
 import * as crypto from "crypto";
+import { ManualFleetScaleController } from "../cluster/manual_scale_controller";
 import { DashboardBackendServer } from "../dashboard/server";
 import { FinOpsBudgetController } from "../finops/budget_controller";
 import { OtelAndPrometheusExporter } from "../telemetry/otel_prometheus";
@@ -44,6 +45,7 @@ const globalFederationRouter = new MultiRegionFederationRouter();
 const globalFinOpsController = new FinOpsBudgetController();
 const globalOtelExporter = new OtelAndPrometheusExporter();
 const globalDashboardServer = new DashboardBackendServer();
+const globalManualScaleController = new ManualFleetScaleController(undefined, globalSchedulerRouter, globalQueueAutoSharder);
 const tenantActiveCounts = new Map<string, number>();
 
 export default {
@@ -53,6 +55,7 @@ export default {
   publicFederationRouter: globalFederationRouter,
   publicFinOpsController: globalFinOpsController,
   publicOtelExporter: globalOtelExporter,
+  publicManualScaleController: globalManualScaleController,
 
   async fetch(
     request: Request,
@@ -221,6 +224,31 @@ export default {
       });
       return new Response(JSON.stringify(decision), {
         status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    // Route 1E: Operator-Initiated Manual Fleet Scale-Out / Scale-In (TASK-57 Non-K8s)
+    if (request.method === "POST" && url.pathname === "/v1beta1/fleet/scale") {
+      const body = (await request.json()) as Record<string, any>;
+      if (body.action === "scale-in") {
+        const drainRes = globalManualScaleController.executeManualNodeDrain(
+          body.node_id ?? "celld-node-02",
+          body.mode ?? "drain",
+        );
+        return new Response(JSON.stringify(drainRes), {
+          status: drainRes.allowed ? 200 : 409,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const scaleRes = globalManualScaleController.executeManualScaleOut({
+        addBrainNodes: body.add_brain_nodes,
+        addBodyHosts: body.add_body_hosts,
+        addSchedulerShards: body.add_scheduler_shards,
+        targetQueueShards: body.target_queue_shards,
+      });
+      return new Response(JSON.stringify(scaleRes), {
+        status: scaleRes.status === "SCALED_OUT" ? 200 : 409,
         headers: { "content-type": "application/json" },
       });
     }

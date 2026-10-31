@@ -1,6 +1,6 @@
 /**
  * TASK-30, TASK-51 & M12-M13 Unified Cluster Facade (`AnstsClusterRuntime`) and `anstsctl` CLI Tool.
- * Composes all M1 ~ M13 subsystems into a single cohesive runtime.
+ * Supports Non-K8s Bare-Metal / Systemd / Docker Compose manual scale-out (`anstsctl fleet scale-out | scale-in`).
  */
 
 import { WalCompactorAndPagedRestorer } from "../checkpoint/compactor";
@@ -10,7 +10,7 @@ import { FleetHaAndAutoscalerController } from "../cloudflare/celld_ha_engine";
 import { MultiRegionFederationRouter } from "../cloudflare/federation_router";
 import { PartitionedSchedulerRouter } from "../cloudflare/horizontal_scaler";
 import { BidirectionalBackpressureController } from "../cluster/backpressure_loop";
-import { KubernetesCelldHpaAdapter } from "../cluster/k8s_autoscaler";
+import { ManualFleetScaleController } from "../cluster/manual_scale_controller";
 import { CognitiveRouter } from "../cognitive_router";
 import { FinOpsBudgetController } from "../finops/budget_controller";
 import { ApiGatewayServer } from "../gateway/server";
@@ -34,8 +34,12 @@ export class AnstsClusterRuntime {
   public readonly finopsController = new FinOpsBudgetController();
   public readonly otelExporter = new OtelAndPrometheusExporter();
   public readonly federationRouter = new MultiRegionFederationRouter();
-  public readonly k8sAutoscaler = new KubernetesCelldHpaAdapter();
   public readonly schedulerRouter = new PartitionedSchedulerRouter({ initialShardCount: 8 });
+  public readonly fleetController = new FleetHaAndAutoscalerController();
+  public readonly manualScaleController = new ManualFleetScaleController(
+    this.fleetController,
+    this.schedulerRouter,
+  );
   public readonly scheduler = new CoreScheduler5D(
     this.queueMgr,
     this.profiler,
@@ -49,7 +53,6 @@ export class AnstsClusterRuntime {
   public readonly replayer = new DeterministicTimeTravelReplayer();
   public readonly eventsBus = new CloudEventsBus();
   public readonly bpController = new BidirectionalBackpressureController();
-  public readonly fleetController = new FleetHaAndAutoscalerController();
 
   constructor() {
     this.scheduler.registerTenant("fin-enterprise", 4.0);
@@ -181,6 +184,20 @@ export function runCli(argv: string[]): Record<string, any> {
       const gate = cluster.fleetController.evaluateFleetAutoscalingAndRollout();
       const handoff = cluster.fleetController.prepareShutdownHandoff("celld-node-01", true);
       return { rolling_gate: gate, preserve_handoff: handoff };
+    }
+    if (sub === "scale-out") {
+      const nodeId = argv[2] ?? "celld-node-03";
+      const bodyId = argv[3] ?? "body-host-03";
+      return cluster.manualScaleController.executeManualScaleOut({
+        addBrainNodes: [{ nodeId, advertiseAddress: "10.240.16.13:9001", placementWeight: 100 }],
+        addBodyHosts: [{ hostId: bodyId, ipAddress: "10.240.32.13", maxBurstSandboxes: 20 }],
+        addSchedulerShards: 4,
+      });
+    }
+    if (sub === "scale-in") {
+      const nodeId = argv[2] ?? "celld-node-02";
+      const mode = (argv[3] as "preserve" | "drain") ?? "drain";
+      return cluster.manualScaleController.executeManualNodeDrain(nodeId, mode);
     }
   }
   return {};

@@ -1,0 +1,21 @@
+[Unit]
+Description=ANSTS v2.2 Sandbox Body Host Daemon (Cgroups v2 + OverlayFS + Zero-Trust VSOCK)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ansts
+Environment="NODE_ENV=production"
+Environment="ANSTS_CGROUP_ROOT=/sys/fs/cgroup"
+Environment="ANSTS_PROC_PRESSURE_ROOT=/proc/pressure"
+Environment="ANSTS_WORKSPACE_ROOT=/var/lib/ansts/overlay"
+Environment="ANSTS_MAX_BURST_SANDBOXES=20"
+ExecStart=/usr/bin/node /opt/ansts/dist/src/cli/anstsctl.js top
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

@@ -24,7 +24,7 @@
 | **M9：高并发横向扩容引擎 (Scale-Out Engine)** | 双层分片调度器（P2C + 热点租户分裂 + Gossip 配额）、动态队列自动扩分片与脑体分离扩容 | `src/cloudflare/horizontal_scaler.ts` | `TASK-46` ~ `TASK-48` | `P0` | ✅ **已完成** |
 | **M10：热路径全链路装配与真实存储/模型协议栈对接** | 打通边缘 Worker -> 分片调度/队列 -> 真实 `RustFS` S3 LTX 流驱动 -> 真实 LLM SSE 客户端 | `src/cloudflare/celld_admin_client.ts`<br>`src/checkpoint/s3_ltx_driver.ts`<br>`src/router/live_llm_adapter.ts` | `TASK-49` ~ `TASK-52` | `P0` | ✅ **已完成** |
 | **M11：Linux 宿主机内核原语与容器/MicroVM 运行时落地** | 对接真实 `/sys/fs/cgroup`、`/proc/pressure`、OverlayFS CoW 快照、零信任 VSOCK 与 `<50ms` 热迁移 | `src/runtime/linux_cgroup_psi.ts`<br>`src/runtime/container_driver.ts`<br>`src/runtime/vsock_daemon.ts`<br>`src/runtime/live_migration.ts` | `TASK-53` ~ `TASK-56` | `P0 / P1` | ✅ **已完成** |
-| **M12：Kubernetes 编排器、`RustFS` 纠删码与真机混沌演练** | K8s Operator & HPA Adapter、`RustFS` 16 盘 EC:4 集群、OTLP/Prometheus 导出器与多节点脑裂混沌测试 | `deploy/k8s-operator/*`<br>`src/cluster/k8s_autoscaler.ts`<br>`src/telemetry/otel_prometheus.ts` | `TASK-57` ~ `TASK-60` | `P1` | ✅ **已完成** |
+| **M12：无 K8s 手动扩容控制器、`RustFS` 纠删码与真机混沌演练** | 无 K8s 手动扩容控制器 (`ManualFleetScaleController` & `scale-fleet.sh`)、`RustFS` 16 盘 EC:4 集群、OTLP/Prometheus 导出器与多节点脑裂混沌测试 | `deploy/manual-fleet/*`<br>`src/cluster/manual_scale_controller.ts`<br>`src/telemetry/otel_prometheus.ts` | `TASK-57` ~ `TASK-60` | `P1` | ✅ **已完成** |
 | **M13：MCP 生态协议治理、FinOps 预算硬顶与多活联邦** | 标准 MCP 工具动态注册与事务绑定、租户预算硬顶熔断、分片热力图控制台与多 Region 双活路由 | `src/saga/mcp_registry.ts`<br>`src/finops/budget_controller.ts`<br>`src/cloudflare/federation_router.ts` | `TASK-61` ~ `TASK-64` | `P1 / P2` | ✅ **已完成** |
 
 ---
@@ -53,7 +53,7 @@
 
 | 任务 ID | 任务名称 | 交付代码路径 | 验收测试编号 | 核心实现与验证结果 |
 | :--- | :--- | :--- | :--- | :--- |
-| **`TASK-57`** | **Kubernetes Operator (`CelldFleet` CRD) 与自定义 HPA 弹性伸缩适配器** | `deploy/k8s-operator/celld-fleet-operator.yaml`<br>`src/cluster/k8s_autoscaler.ts` | `test 37` (`PASS`) | 定义 CRD、PDB 与 `PreStop`（`handoff=preserve`），`KubernetesCelldHpaAdapter` 在 `restoring > 0` 时锁定副本变更并按负载自动扩缩脑/体池 |
+| **`TASK-57`** | **无 K8s 裸金属/Systemd 手动扩容控制器 (`ManualFleetScaleController`) 与运维脚本 (`scale-fleet.sh`)** | `deploy/manual-fleet/fleet-topology.yaml`<br>`deploy/manual-fleet/scale-fleet.sh`<br>`src/cluster/manual_scale_controller.ts` | `test 37` (`PASS`) | 提供无 K8s 的 `fleet-topology.yaml`、`scale-fleet.sh`、`ansts-node-daemon.service` 与 `ManualFleetScaleController`，支持通过 CLI/API 手动在线扩缩脑节点、沙箱宿主机与调度分片，并在 `restoring > 0` 时强制锁定防抖 |
 | **`TASK-58`** | **`RustFS` 4 节点 $\times$ 4 盘（16 驱动器 EC:4）分布式高可用部署清单** | `deploy/rustfs-celld/docker-compose.rustfs-ha.yml`<br>`deploy/rustfs-celld/rustfs-ec-setup.sh` | `test 37` (`PASS`) | 配置 16 驱动器 `EC:4` 纠删码集群（容忍任意 2 台存储节点同时宕机零中断）与跨可用区镜像同步脚本 |
 | **`TASK-59`** | **OpenTelemetry (OTLP) 链路追踪、Prometheus `/metrics` 导出器与 Grafana 大盘** | `src/telemetry/otel_prometheus.ts`<br>`deploy/observability/grafana-dashboard.json` | `test 38` (`PASS`) | 输出标准 OpenMetrics 文本指标（W-DRF 份额、分片并发、模型 TTFT、`RPO = 0` 提交计数、Epoch GC 计数）及 Grafana 面板 JSON |
 | **`TASK-60`** | **多节点网络分区与脑裂注入端到端混沌测试套件 (`E2E Chaos Harness`)** | `tests/m12_m13_production_suite.test.ts` | `test 38` (`PASS`) | 注入 Stale Leader GC 停顿 + 网络分区 + 双节点并发抢占，验证 `SessionSealed` 100% 阻断僵尸写且已确认 LTX 数据 `RPO = 0` 零丢失 |
