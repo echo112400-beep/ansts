@@ -171,33 +171,42 @@ function createMockCloudflareCelldEnv(): {
   return { env, schedulerCell, schedulerCells, harnessCells, tenantLedgerCells, nodeCapacityCells, d1Rows, queuedMessages };
 }
 
-async function simulateNodeStartReceipt(env: CloudflareCelldEnv, dispatch: Record<string, any>, receipt: string, pool = schedulerPoolCellKey(dispatch.region, dispatch.resource_pool)): Promise<Response> {
-  const scheduler = env.SCHEDULER_CELL!.get(env.SCHEDULER_CELL!.idFromName(pool));
-  // This test adapter stands in for the authenticated node callback after the node reports running.
-  return scheduler.fetch("http://scheduler.internal/scheduler/started", {
+async function simulateNodeStartReceipt(env: CloudflareCelldEnv, dispatch: Record<string, any>, receipt: string): Promise<Response> {
+  // This test adapter stands in for the node callback after the node reports running.
+  return cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/started", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       dispatch_id: dispatch.dispatch_id,
       node_id: dispatch.node_id,
       node_incarnation: dispatch.node_incarnation,
+      region: dispatch.region,
+      resource_pool: dispatch.resource_pool,
       authorization_token: dispatch.authorization_token,
       business_epoch: dispatch.business_epoch,
       start_receipt: receipt,
     }),
-  });
+  }), env);
 }
 
 test("07. wrangler.json & D1 SQL migration schema verification for celld and Cloudflare Workers", () => {
   const rootDir = path.join(__dirname, "..", "..");
   const wranglerJson = JSON.parse(fs.readFileSync(path.join(rootDir, "wrangler.json"), "utf8"));
   assert.equal(wranglerJson.main, "src/cloudflare/worker.ts");
-  assert.equal(wranglerJson.durable_objects.bindings.length, 3);
+  assert.equal(wranglerJson.durable_objects.bindings.length, 4);
   assert.equal(
     wranglerJson.durable_objects.bindings.find((binding: Record<string, string>) => binding.name === "TENANT_LEDGER_CELL")?.class_name,
     "TenantLedgerCell",
   );
-  assert.equal(wranglerJson.migrations.at(-1).tag, "v2");
+  assert.equal(
+    wranglerJson.durable_objects.bindings.find((binding: Record<string, string>) => binding.name === "NODE_CAPACITY_CELL")?.class_name,
+    "NodeCapacityCell",
+  );
+  assert.equal(wranglerJson.migrations.at(-1).tag, "v3");
+  assert.ok(wranglerJson.migrations.at(-1).new_sqlite_classes.includes("NodeCapacityCell"));
+  const wranglerToml = fs.readFileSync(path.join(rootDir, "wrangler.toml"), "utf8");
+  assert.match(wranglerToml, /name = "NODE_CAPACITY_CELL"\s+class_name = "NodeCapacityCell"/);
+  assert.match(wranglerToml, /tag = "v3"\s+new_sqlite_classes = \["NodeCapacityCell"\]/);
   assert.equal(wranglerJson.d1_databases[0].binding, "ANSTS_D1");
   assert.equal(wranglerJson.kv_namespaces[0].binding, "ANSTS_KV");
   assert.equal(wranglerJson.r2_buckets[0].binding, "ANSTS_CHECKPOINTS_R2");
@@ -338,11 +347,13 @@ test("scheduler tick replays dispatch stages and reserves shared node capacity o
   assert.equal(firstBody.dispatches[0].business_epoch, 1);
   assert.equal(nodeCapacityCells.get("node-capacity-1")!.capacity.getReservation("dispatch-stable-1")!.status, "STARTING");
   const taskCell = harnessCells.get("dispatch-task-1")!;
-  const pendingCommands = await taskCell.fetch(new Request("http://task.internal/execution/start-commands"));
+  const pendingCommands = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks/dispatch-task-1/start-commands"), env);
   const startCommandBody = await pendingCommands.json() as any;
   assert.equal(startCommandBody.commands.length, 1);
   assert.equal(startCommandBody.commands[0].payload.authorization_token, firstBody.dispatches[0].authorization_token);
-  const commandReplay = await taskCell.fetch(new Request("http://task.internal/execution/start-commands"));
+  assert.equal(startCommandBody.commands[0].payload.region, "us-west-1");
+  assert.equal(startCommandBody.commands[0].payload.resource_pool, "cpu-small");
+  const commandReplay = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks/dispatch-task-1/start-commands"), env);
   assert.deepEqual(((await commandReplay.json()) as any).commands[0], startCommandBody.commands[0]);
   const authorizationReplay = await tick();
   const authorizationReplayBody = await authorizationReplay.json() as any;
@@ -364,7 +375,7 @@ test("scheduler tick replays dispatch stages and reserves shared node capacity o
     }),
   }));
   assert.equal(changedReservation.status, 409);
-  const commandAfterConflict = await taskCell.fetch(new Request("http://task.internal/execution/start-commands"));
+  const commandAfterConflict = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks/dispatch-task-1/start-commands"), env);
   assert.deepEqual(((await commandAfterConflict.json()) as any).commands[0], startCommandBody.commands[0]);
   const prematureTurn = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks/dispatch-task-1/turn", {
     method: "POST", body: JSON.stringify({ epoch: 1, turn_seq: 1, is_read_only_turn: true }),
@@ -374,7 +385,7 @@ test("scheduler tick replays dispatch stages and reserves shared node capacity o
   const started = await simulateNodeStartReceipt(env, firstBody.dispatches[0], "node-receipt-dispatch-stable-1");
   assert.equal(started.status, 200);
   assert.equal(((await started.json()) as any).stage, "STARTED");
-  const acknowledgedCommands = await taskCell.fetch(new Request("http://task.internal/execution/start-commands"));
+  const acknowledgedCommands = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks/dispatch-task-1/start-commands"), env);
   assert.equal(((await acknowledgedCommands.json()) as any).commands.length, 0);
 
   const replay = await tick();
@@ -436,6 +447,59 @@ test("dispatch retry repairs TaskCore RESERVED after a failure between node rese
   assert.equal(retryBody.dispatches[0].stage, "AUTHORIZED");
   assert.equal(taskCell.taskCore.getDispatch(dispatchId)!.stage, "AUTHORIZED");
   assert.equal(nodeCapacityCells.get(candidate.node_id)!.capacity.getReservations().length, 1);
+});
+
+test("public Worker splits mixed scheduler ticks by stable region and resource-pool owner", async () => {
+  const { env, schedulerCells } = createMockCloudflareCelldEnv();
+  const resourceCapacity = { cpu: 4, memory_mb: 2048, burst_cpu: 2, sessions: 2, tps: 20 };
+  const candidates = [
+    {
+      task_id: "mixed-pool-task-a",
+      tenant_id: "tenant-mixed-a",
+      dispatch_id: "mixed-pool-dispatch-a",
+      node_id: "mixed-pool-node-a",
+      node_incarnation: "mixed-boot-a",
+      region: "us-west-2",
+      resource_pool: "cpu-general",
+      kind: "ordinary",
+      task_spec: { metadata: { task_id: "mixed-pool-task-a", tenant_id: "tenant-mixed-a" }, spec: {} },
+      resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 5 },
+    },
+    {
+      task_id: "mixed-pool-task-b",
+      tenant_id: "tenant-mixed-b",
+      dispatch_id: "mixed-pool-dispatch-b",
+      node_id: "mixed-pool-node-b",
+      node_incarnation: "mixed-boot-b",
+      region: "eu-west-1",
+      resource_pool: "gpu-burst",
+      kind: "ordinary",
+      task_spec: { metadata: { task_id: "mixed-pool-task-b", tenant_id: "tenant-mixed-b" }, spec: {} },
+      resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 5 },
+    },
+  ];
+  const response = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      nodes: [
+        { node_id: candidates[0].node_id, incarnation: candidates[0].node_incarnation, capacity: resourceCapacity },
+        { node_id: candidates[1].node_id, incarnation: candidates[1].node_incarnation, capacity: resourceCapacity },
+      ],
+      candidates,
+    }),
+  }), env);
+
+  assert.equal(response.status, 200);
+  const body = await response.json() as any;
+  assert.deepEqual(body.dispatches.map((dispatch: any) => dispatch.dispatch_id).sort(), [
+    "mixed-pool-dispatch-a",
+    "mixed-pool-dispatch-b",
+  ]);
+  assert.ok(schedulerCells.has(schedulerPoolCellKey("us-west-2", "cpu-general")));
+  assert.ok(schedulerCells.has(schedulerPoolCellKey("eu-west-1", "gpu-burst")));
+  assert.equal(schedulerCells.get(schedulerPoolCellKey("us-west-2", "cpu-general"))!.schedulerPool.getDispatch("mixed-pool-dispatch-a")!.stage, "AUTHORIZED");
+  assert.equal(schedulerCells.get(schedulerPoolCellKey("eu-west-1", "gpu-burst"))!.schedulerPool.getDispatch("mixed-pool-dispatch-b")!.stage, "AUTHORIZED");
 });
 
 test("independent SchedulerPool cells cannot reserve the same node capacity concurrently", async () => {
@@ -949,7 +1013,7 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
     }),
     env,
   );
-  assert.equal(oldDispatchReplay.status, 409);
+  assert.equal(oldDispatchReplay.status, 409, await oldDispatchReplay.clone().text());
   assert.equal(((await oldDispatchReplay.json()) as any).error, "STALE_DISPATCH_AUTHORIZATION");
 
   const zombieRes = await cloudflareCelldWorker.fetch(
@@ -968,7 +1032,7 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
     }),
     env,
   );
-  assert.equal(zombieRes.status, 409);
+  assert.equal(zombieRes.status, 409, await zombieRes.clone().text());
   assert.equal(((await zombieRes.json()) as any).error, "STALE_EXECUTION_EPOCH");
 
   // Test Hibernatable WebSocket credit ACK & alarm() hibernation on the Cell

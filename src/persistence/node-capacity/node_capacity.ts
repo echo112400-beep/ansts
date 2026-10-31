@@ -501,4 +501,3 @@ function fits(used: NodeResourceVector, requested: NodeResourceVector, capacity:
     used.sessions + requested.sessions <= capacity.sessions &&
     used.tps + requested.tps <= capacity.tps;
 }
-

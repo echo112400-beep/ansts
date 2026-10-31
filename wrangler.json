@@ -15,6 +15,10 @@
       {
         "name": "TENANT_LEDGER_CELL",
         "class_name": "TenantLedgerCell"
+      },
+      {
+        "name": "NODE_CAPACITY_CELL",
+        "class_name": "NodeCapacityCell"
       }
     ]
   },
@@ -30,6 +34,12 @@
       "tag": "v2",
       "new_sqlite_classes": [
         "TenantLedgerCell"
+      ]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": [
+        "NodeCapacityCell"
       ]
     }
   ],

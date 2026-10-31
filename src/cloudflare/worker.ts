@@ -26,8 +26,10 @@ import { DynamicQueueAutoSharder, PartitionedSchedulerRouter } from "./horizonta
 import { AnstsSchedulerCell } from "./scheduler_cell";
 import { persistenceCellStub } from "../persistence/registry";
 import { TenantLedgerCell } from "../persistence/tenant";
+import { schedulerPoolCellKey } from "../persistence/scheduler-pool";
+import { NodeCapacityCell } from "./node_capacity_cell";
 
-export { AnstsSchedulerCell, AgentTaskHarnessCell, TenantLedgerCell };
+export { AnstsSchedulerCell, AgentTaskHarnessCell, NodeCapacityCell, TenantLedgerCell };
 
 const globalSchedulerRouter = new PartitionedSchedulerRouter({
   initialShardCount: 8,
@@ -265,30 +267,148 @@ export default {
       });
     }
 
-    // Route 2: Trigger 5D W-DRF Scheduler Tick or Inspect Cluster Top
-    if (
-      url.pathname === "/v1beta1/scheduler/tick" ||
-      url.pathname === "/v1beta1/cluster/top" ||
-      url.pathname === "/v1beta1/dag/spawn-escrow"
-    ) {
-      const targetShard = url.searchParams.get("shard") ?? "global-5d-scheduler";
-        const schedStub = persistenceCellStub(env, "scheduler-pool", targetShard);
-      const internalPath = url.pathname.replace("/v1beta1", "");
-      return schedStub.fetch(`http://scheduler.internal${internalPath}`, {
-        method: request.method,
-        body: request.method === "POST" ? await request.text() : undefined,
+    // SchedulerPool identity is derived from the candidate's region and resource pool.
+    if (url.pathname === "/v1beta1/scheduler/tick" && request.method === "POST") {
+      let body: Record<string, any>;
+      try {
+        body = await request.json() as Record<string, any>;
+      } catch {
+        return jsonResponse({ error: "INVALID_JSON" }, 400);
+      }
+      const candidates = Array.isArray(body.candidates) ? body.candidates : null;
+      if (candidates === null || candidates.length === 0) {
+        try {
+          const poolKey = url.searchParams.get("shard") ?? schedulerPoolCellKey(body.region, body.resource_pool);
+          return callSchedulerPool(env, poolKey, "/scheduler/tick", "POST", body);
+        } catch (error) {
+          return jsonResponse({ error: "INVALID_SCHEDULER_POOL", message: error instanceof Error ? error.message : String(error) }, 400);
+        }
+      }
+      let groups: Map<string, any[]>;
+      try {
+        groups = groupSchedulerCandidates(candidates);
+      } catch (error) {
+        return jsonResponse({ error: "INVALID_SCHEDULER_POOL", message: error instanceof Error ? error.message : String(error) }, 400);
+      }
+      const poolResults = await Promise.all(Array.from(groups, async ([poolKey, poolCandidates]) => {
+        const response = await callSchedulerPool(env, poolKey, "/scheduler/tick", "POST", { ...body, candidates: poolCandidates });
+        let result: Record<string, any>;
+        try { result = await response.json() as Record<string, any>; }
+        catch { result = { error: "INVALID_SCHEDULER_RESPONSE" }; }
+        return { pool_key: poolKey, status: response.status, body: result };
+      }));
+      const dispatches = poolResults.flatMap((result) => Array.isArray(result.body.dispatches) ? result.body.dispatches : []);
+      if (poolResults.some((result) => result.status < 200 || result.status >= 300)) {
+        if (poolResults.length === 1) return jsonResponse(poolResults[0].body, poolResults[0].status);
+        return jsonResponse({ error: "SCHEDULER_POOL_PARTIAL_FAILURE", outcome: "UNKNOWN", pool_results: poolResults, dispatches }, 503);
+      }
+      return jsonResponse({
+        dispatched_count: dispatches.filter((dispatch) => dispatch.stage === "STARTED").length,
+        blocked_count: dispatches.filter((dispatch) => dispatch.status === "BLOCKED_CAPACITY").length,
+        suspected_tasks: poolResults.flatMap((result) => Array.isArray(result.body.suspected_tasks) ? result.body.suspected_tasks : []),
+        dispatches,
       });
     }
 
-    // Route 3: Per-Task AgentTaskHarnessCell Operations (/v1beta1/tasks/:taskId/turn | /workflow | /replay | /failover)
-    const taskMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)\/(turn|workflow|replay|failover)$/);
+    if (url.pathname === "/v1beta1/scheduler/dispatch" && request.method === "POST") {
+      let body: Record<string, any>;
+      try { body = await request.json() as Record<string, any>; }
+      catch { return jsonResponse({ error: "INVALID_JSON" }, 400); }
+      const candidate = body.candidate ?? body;
+      try {
+        return callSchedulerPool(env, schedulerPoolCellKey(candidate.region, candidate.resource_pool), "/scheduler/dispatch", "POST", {
+          ...candidate,
+          nodes: body.nodes ?? [],
+        });
+      } catch (error) {
+        return jsonResponse({ error: "INVALID_SCHEDULER_POOL", message: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+
+    if (url.pathname === "/v1beta1/scheduler/started" && request.method === "POST") {
+      let body: Record<string, any>;
+      try { body = await request.json() as Record<string, any>; }
+      catch { return jsonResponse({ error: "INVALID_JSON" }, 400); }
+      try {
+        return callSchedulerPool(
+          env,
+          schedulerPoolCellKey(body.region, body.resource_pool),
+          "/scheduler/started",
+          "POST",
+          body,
+        );
+      } catch (error) {
+        return jsonResponse({ error: "INVALID_SCHEDULER_POOL", message: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+
+    if (url.pathname === "/v1beta1/dag/spawn-escrow" && request.method === "POST") {
+      let body: Record<string, any>;
+      try { body = await request.json() as Record<string, any>; }
+      catch { return jsonResponse({ error: "INVALID_JSON" }, 400); }
+      const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+      if (candidates.length === 0) {
+        try {
+          return callSchedulerPool(
+            env,
+            url.searchParams.get("shard") ?? schedulerPoolCellKey(body.region, body.resource_pool),
+            "/dag/spawn-escrow",
+            "POST",
+            body,
+          );
+        } catch (error) {
+          return jsonResponse({ error: "INVALID_SCHEDULER_POOL", message: error instanceof Error ? error.message : String(error) }, 400);
+        }
+      }
+      let groups: Map<string, any[]>;
+      try { groups = groupSchedulerCandidates(candidates); }
+      catch (error) { return jsonResponse({ error: "INVALID_SCHEDULER_POOL", message: error instanceof Error ? error.message : String(error) }, 400); }
+      const poolResults = await Promise.all(Array.from(groups, async ([poolKey, poolCandidates]) => {
+        const response = await callSchedulerPool(env, poolKey, "/dag/spawn-escrow", "POST", { ...body, candidates: poolCandidates });
+        let result: Record<string, any>;
+        try { result = await response.json() as Record<string, any>; }
+        catch { result = { error: "INVALID_SCHEDULER_RESPONSE" }; }
+        return { pool_key: poolKey, status: response.status, body: result };
+      }));
+      const dispatches = poolResults.flatMap((result) => Array.isArray(result.body.dispatches) ? result.body.dispatches : []);
+      if (poolResults.some((result) => result.status < 200 || result.status >= 300)) {
+        if (poolResults.length === 1) return jsonResponse(poolResults[0].body, poolResults[0].status);
+        return jsonResponse({ error: "SCHEDULER_POOL_PARTIAL_FAILURE", outcome: "UNKNOWN", pool_results: poolResults, dispatches }, 503);
+      }
+      return jsonResponse({
+        dispatched_children: poolResults.flatMap((result) => Array.isArray(result.body.dispatched_children) ? result.body.dispatched_children : []),
+        dispatches,
+      });
+    }
+
+    if (url.pathname === "/v1beta1/cluster/top" && request.method === "GET") {
+      let targetShard = url.searchParams.get("shard");
+      if (!targetShard) {
+        try {
+          targetShard = schedulerPoolCellKey(url.searchParams.get("region") ?? undefined, url.searchParams.get("resource_pool") ?? undefined);
+        } catch (error) {
+          return jsonResponse({ error: "INVALID_SCHEDULER_POOL", message: error instanceof Error ? error.message : String(error) }, 400);
+        }
+      }
+      return callSchedulerPool(env, targetShard, "/cluster/top", "GET");
+    }
+
+    // Route 3: Per-Task AgentTaskHarnessCell operations and pending start commands.
+    const taskMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)\/(turn|workflow|replay|failover|start-commands)$/);
     if (taskMatch) {
       const [, taskId, action] = taskMatch;
-        const cellStub = persistenceCellStub(env, "task", taskId);
-      const resp = await cellStub.fetch(`http://harness.internal/${action}`, {
-        method: request.method,
-        body: await request.text(),
-      });
+      if (action === "start-commands" && request.method !== "GET") return jsonResponse({ error: "MethodNotAllowed" }, 405);
+      const cellStub = persistenceCellStub(env, "task", taskId);
+      const internalPath = action === "start-commands" ? "/execution/start-commands" : `/${action}`;
+      let resp: Response;
+      try {
+        resp = await cellStub.fetch(`http://harness.internal${internalPath}`, {
+          method: action === "start-commands" ? "GET" : request.method,
+          body: action === "start-commands" ? undefined : await request.text(),
+        });
+      } catch {
+        return jsonResponse({ error: "TASK_CELL_UNAVAILABLE", outcome: "UNKNOWN", task_id: taskId }, 503);
+      }
       if (action === "turn" && resp.status === 200) {
         globalOtelExporter.incrementRpoZeroCommit("bucket");
       }
@@ -340,3 +460,42 @@ export default {
     await schedStub.fetch("http://scheduler.internal/scheduler/tick", { method: "POST" });
   },
 };
+
+function groupSchedulerCandidates(candidates: unknown[]): Map<string, any[]> {
+  const groups = new Map<string, any[]>();
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new TypeError("Each scheduler candidate must be an object.");
+    }
+    const item = candidate as Record<string, any>;
+    const poolKey = schedulerPoolCellKey(item.region, item.resource_pool);
+    const group = groups.get(poolKey) ?? [];
+    group.push(item);
+    groups.set(poolKey, group);
+  }
+  return groups;
+}
+
+async function callSchedulerPool(
+  env: CloudflareCelldEnv,
+  poolKey: string,
+  path: string,
+  method: string,
+  body?: unknown,
+): Promise<Response> {
+  try {
+    const stub = persistenceCellStub(env, "scheduler-pool", poolKey);
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "content-type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+    return await stub.fetch(`http://scheduler.internal${path}`, init);
+  } catch {
+    return jsonResponse({ error: "SCHEDULER_POOL_UNAVAILABLE", outcome: "UNKNOWN", pool_key: poolKey }, 503);
+  }
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}

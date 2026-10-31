@@ -48,6 +48,7 @@ export * from "./dashboard/server";
 export * from "./cloudflare/env";
 export * from "./cloudflare/scheduler_cell";
 export * from "./cloudflare/harness_cell";
+export * from "./cloudflare/node_capacity_cell";
 export * from "./cloudflare/celld_ha_engine";
 export * from "./cloudflare/horizontal_scaler";
 export * from "./cloudflare/celld_admin_client";

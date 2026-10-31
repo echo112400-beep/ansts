@@ -360,6 +360,8 @@ export class TaskCore {
           task_id: params.task_id,
           node_id: params.node_id,
           node_incarnation: params.node_incarnation,
+          region: params.region ?? "default",
+          resource_pool: params.resource_pool ?? "default",
           reservation_id: params.reservation_id,
           reservation_token: params.reservation_token,
           authorization_token: authorizationToken,
@@ -678,4 +680,3 @@ function validateText(value: string | undefined, label: string): void {
 function jsonCompatible<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
-

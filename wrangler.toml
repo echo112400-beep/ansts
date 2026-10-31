@@ -19,6 +19,10 @@ class_name = "AgentTaskHarnessCell"
 name = "TENANT_LEDGER_CELL"
 class_name = "TenantLedgerCell"
 
+[[durable_objects.bindings]]
+name = "NODE_CAPACITY_CELL"
+class_name = "NodeCapacityCell"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AnstsSchedulerCell", "AgentTaskHarnessCell"]
@@ -26,6 +30,10 @@ new_sqlite_classes = ["AnstsSchedulerCell", "AgentTaskHarnessCell"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["TenantLedgerCell"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["NodeCapacityCell"]
 
 [[d1_databases]]
 binding = "ANSTS_D1"

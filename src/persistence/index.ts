@@ -10,4 +10,7 @@ export {
 } from "./outbox";
 export * from "./registry";
 export * from "./schema";
+export * from "./task-core";
+export * from "./scheduler-pool";
+export * from "./node-capacity";
 export * from "./transactions";
