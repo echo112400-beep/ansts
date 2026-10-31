@@ -6,7 +6,7 @@
  * 2. Production Deployment Manifests (`wrangler.json`, `migrations/0001_init_ansts.sql`, `deploy/rustfs-celld/*`,
  *    `deploy/k8s-operator/*`, `deploy/observability/*`)
  * 3. All M1 ~ M13 (`TASK-01` ~ `TASK-64`) TypeScript classes, exact method names, `AnstsClusterRuntime` composition,
- *    and Edge Worker HTTP endpoints (`/metrics`, `/v1beta1/federation/route`, `/api/v1/saga/approve`, FinOps `402`).
+ *    and Edge Worker HTTP endpoints (`/metrics`, `/v1beta1/federation/route`, `/api/v1/saga/approve`, TenantLedger budgets).
  */
 
 import * as assert from "node:assert/strict";
@@ -23,6 +23,7 @@ import {
   cloudflareCelldWorker,
   MockDurableObjectState,
   runCli,
+  TenantLedgerCell,
 } from "../src/index";
 
 test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests, and Edge Worker routes match 100%", async () => {
@@ -142,6 +143,7 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
     "OtelAndPrometheusExporter",
     "McpDynamicToolRegistry",
     "FinOpsBudgetController",
+    "TenantLedgerCell",
     "DashboardBackendServer",
     "DashboardBridgeService",
     "MultiRegionFederationRouter",
@@ -163,7 +165,8 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
   const cliMetrics = runCli(["metrics"]);
   assert.ok(cliMetrics.prometheus_text.includes("ansts_tenant_dominant_share_ratio"));
 
-  // 5. Verify Edge Worker M12/M13 HTTP endpoints (/metrics, /v1beta1/federation/route, /api/v1/saga/approve, FinOps 402)
+  // 5. Verify Edge Worker M12/M13 endpoints and that admission remains separate from local FinOps state.
+  const tenantLedgerCells = new Map<string, TenantLedgerCell>();
   const mockEnv: CloudflareCelldEnv = {
     PRIMARY_MODEL_POOL: "DeepSeek",
     FAST_UTILITY_POOL: "GLM-5.3",
@@ -182,6 +185,20 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
       idFromName: (n: string) => ({ toString: () => n, name: n }),
       get: (id) => {
         const cell = new AgentTaskHarnessCell(new MockDurableObjectState(id.toString()), mockEnv);
+        return {
+          fetch: (input: RequestInfo, init?: RequestInit) =>
+            cell.fetch(typeof input === "string" ? new Request(input, init) : input),
+        };
+      },
+    },
+    TENANT_LEDGER_CELL: {
+      idFromName: (n: string) => ({ toString: () => n, name: n }),
+      get: (id) => {
+        const tenantId = id.name ?? id.toString();
+        if (!tenantLedgerCells.has(tenantId)) {
+          tenantLedgerCells.set(tenantId, new TenantLedgerCell(new MockDurableObjectState(tenantId), mockEnv));
+        }
+        const cell = tenantLedgerCells.get(tenantId)!;
         return {
           fetch: (input: RequestInfo, init?: RequestInit) =>
             cell.fetch(typeof input === "string" ? new Request(input, init) : input),
@@ -237,9 +254,9 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
   const sagaApproveBody = (await sagaApproveRes.json()) as Record<string, any>;
   assert.equal(sagaApproveBody.decision, "APPROVED_AND_FLUSHED");
 
-  // FinOps 402 Payment Required / Budget Hard-Cap Check on Edge Worker
+  // The process-local FinOps compatibility controller does not decide durable task acceptance.
   cloudflareCelldWorker.publicFinOpsController.registerTenantBudget("bankrupt-tenant", 0.0);
-  const finopsBlockedRes = await cloudflareCelldWorker.fetch(
+  const admittedWithoutLocalFinOpsDecision = await cloudflareCelldWorker.fetch(
     new Request("https://ansts.edge/v1beta1/tasks", {
       method: "POST",
       body: JSON.stringify({
@@ -251,5 +268,5 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
     }),
     mockEnv,
   );
-  assert.equal(finopsBlockedRes.status, 402);
+  assert.equal(admittedWithoutLocalFinOpsDecision.status, 202);
 });

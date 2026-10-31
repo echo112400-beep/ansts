@@ -5,8 +5,8 @@
  *   - `npx wrangler dev` / `npx wrangler deploy`
  *
  * Composes all M1 ~ M13 hot-path capabilities:
- * - Edge KV Idempotency + FinOps Hard-Cap Admission Check (`FinOpsBudgetController`)
- * - Two-Tier Partitioned Scheduler Routing (`PartitionedSchedulerRouter` P2C + Hot-Tenant Splitting)
+ * - TenantLedgerCell admission, idempotency and budget authority
+ * - Two-Tier Partitioned Scheduler Management (`PartitionedSchedulerRouter`)
  * - Dynamic Queue Auto-Sharding (`DynamicQueueAutoSharder` + `ShardedQueueBrokerPool`)
  * - Multi-Region Active-Active Federation Routing (`MultiRegionFederationRouter`)
  * - OpenMetrics / Prometheus `/metrics` endpoint (`OtelAndPrometheusExporter`)
@@ -25,8 +25,9 @@ import { AgentTaskHarnessCell } from "./harness_cell";
 import { DynamicQueueAutoSharder, PartitionedSchedulerRouter } from "./horizontal_scaler";
 import { AnstsSchedulerCell } from "./scheduler_cell";
 import { persistenceCellStub } from "../persistence/registry";
+import { TenantLedgerCell } from "../persistence/tenant";
 
-export { AnstsSchedulerCell, AgentTaskHarnessCell };
+export { AnstsSchedulerCell, AgentTaskHarnessCell, TenantLedgerCell };
 
 const globalSchedulerRouter = new PartitionedSchedulerRouter({
   initialShardCount: 8,
@@ -47,7 +48,6 @@ const globalFinOpsController = new FinOpsBudgetController();
 const globalOtelExporter = new OtelAndPrometheusExporter();
 const globalDashboardServer = new DashboardBackendServer();
 const globalManualScaleController = new ManualFleetScaleController(undefined, globalSchedulerRouter, globalQueueAutoSharder);
-const tenantActiveCounts = new Map<string, number>();
 
 export default {
   publicRouter: globalSchedulerRouter,
@@ -83,100 +83,94 @@ export default {
       });
     }
 
-    // Route 1: Submit TaskSpec v1beta1 with FinOps Guard + KV Idempotency + Partitioned Shard Routing
+    // Route 1: Persist the complete admission in the authoritative per-tenant ledger.
     if (request.method === "POST" && url.pathname === "/v1beta1/tasks") {
-      const rawSpec = (await request.json()) as Record<string, any>;
-      const tenantId = rawSpec?.metadata?.tenant_id ?? "default";
-      const taskId = rawSpec?.metadata?.task_id ?? `tsk_${Date.now()}`;
-      const idemKey = rawSpec?.metadata?.idempotency_key ?? taskId;
-      const kvKey = `idem:${tenantId}:${idemKey}`;
-
-      // FinOps Hard-Cap Admission Check (TASK-62)
-      const budgetCheck = globalFinOpsController.canAdmitTenantTask(tenantId);
-      if (!budgetCheck.allowed) {
+      const rawBody = await request.text();
+      let rawSpec: Record<string, any>;
+      try {
+        rawSpec = JSON.parse(rawBody) as Record<string, any>;
+      } catch {
+        return new Response(JSON.stringify({ error: "INVALID_JSON", message: "TaskSpec must be valid JSON." }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const tenantId = rawSpec?.metadata?.tenant_id;
+      if (typeof tenantId !== "string" || tenantId.trim().length === 0) {
+        return new Response(JSON.stringify({ error: "TENANT_REQUIRED", message: "metadata.tenant_id is required." }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      try {
+        const tenantStub = persistenceCellStub(env, "tenant-ledger", tenantId);
+        return await tenantStub.fetch("http://tenant-ledger.internal/admissions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: rawBody,
+        });
+      } catch {
         return new Response(
-          JSON.stringify({ error: "FinOpsHardCapExceeded", message: budgetCheck.reason }),
-          { status: 402, headers: { "content-type": "application/json" } },
+          JSON.stringify({ error: "TENANT_LEDGER_UNAVAILABLE", outcome: "UNKNOWN", tenant_id: tenantId }),
+          { status: 503, headers: { "content-type": "application/json" } },
         );
       }
+    }
 
-      const cachedTask = await env.ANSTS_KV.get(kvKey, "json");
-      if (cachedTask) {
-        return new Response(JSON.stringify({ ...cachedTask, deduplicated: true }), {
-          status: 200,
-          headers: { "content-type": "application/json", "X-Idempotent-Replay": "true" },
+    // Queries use the same tenant owner as admission; no process-local or D1 copy is authoritative.
+    const taskQueryMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)$/);
+    const admissionQueryMatch = url.pathname.match(/^\/v1beta1\/admissions\/by-key\/([^/]+)$/);
+    if (request.method === "GET" && (taskQueryMatch || admissionQueryMatch)) {
+      const tenantId = url.searchParams.get("tenant_id");
+      if (!tenantId) {
+        return new Response(JSON.stringify({ error: "TENANT_REQUIRED", message: "tenant_id is required." }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
         });
       }
+      try {
+        const tenantStub = persistenceCellStub(env, "tenant-ledger", tenantId);
+        const entityId = decodeURIComponent((taskQueryMatch ?? admissionQueryMatch)![1]);
+        const internalPath = taskQueryMatch
+          ? `/tasks/${encodeURIComponent(entityId)}?tenant_id=${encodeURIComponent(tenantId)}`
+          : `/admissions/by-key/${encodeURIComponent(entityId)}?tenant_id=${encodeURIComponent(tenantId)}`;
+        return await tenantStub.fetch(`http://tenant-ledger.internal${internalPath}`, { method: "GET" });
+      } catch {
+        return new Response(JSON.stringify({ error: "TENANT_LEDGER_UNAVAILABLE", outcome: "UNKNOWN", tenant_id: tenantId }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+    }
 
-      const currentTenantConcurrency = (tenantActiveCounts.get(tenantId) ?? 0) + 1;
-      tenantActiveCounts.set(tenantId, currentTenantConcurrency);
-
-      const routeDecision = globalSchedulerRouter.routeTaskAdmission(
-        tenantId,
-        taskId,
-        currentTenantConcurrency,
-      );
-      globalSchedulerRouter.recordShardDispatchStart(routeDecision.targetShardId);
-
-      const startMs = performance.now();
-      const schedStub = persistenceCellStub(env, "scheduler-pool", routeDecision.targetShardId);
-      const resp = await schedStub.fetch("http://scheduler.internal/tasks/submit", {
-        method: "POST",
-        body: JSON.stringify(rawSpec),
-      });
-      globalSchedulerRouter.recordShardDispatchComplete(
-        routeDecision.targetShardId,
-        performance.now() - startMs,
-      );
-
-      const respBody = (await resp.json()) as Record<string, any>;
-
-      if (resp.status === 202) {
-        const eventPayload = {
-          event_type: "agent.task.queued",
-          task_id: respBody.task_id,
-          tenant_id: tenantId,
-          scheduler_shard_id: routeDecision.targetShardId,
-          routing_mode: routeDecision.routingMode,
-          epoch: 0,
-          turn_seq: 0,
-          payload: respBody,
-        };
-
-        const queueReceipt = globalShardedQueuePool.produceMessage(
-          `${tenantId}:${respBody.task_id}`,
-          eventPayload,
+    // Tenant budget commands and queries share the same per-tenant authority as admission.
+    const budgetRouteMatch = url.pathname.match(/^\/v1beta1\/tenants\/([^/]+)(\/.*)$/);
+    if (
+      budgetRouteMatch &&
+      /^\/(?:budget-periods|budget-grants|budget-accounts|budget-holds|allowance-transfers)(?:\/|$)/.test(budgetRouteMatch[2])
+    ) {
+      const tenantId = decodeURIComponent(budgetRouteMatch[1]);
+      const requestedTenant = url.searchParams.get("tenant_id");
+      if (requestedTenant && requestedTenant !== tenantId) {
+        return new Response(JSON.stringify({ error: "TENANT_SCOPE_MISMATCH" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      try {
+        const tenantStub = persistenceCellStub(env, "tenant-ledger", tenantId);
+        const internalUrl = new URL(`http://tenant-ledger.internal${budgetRouteMatch[2]}`);
+        for (const [key, value] of url.searchParams) internalUrl.searchParams.set(key, value);
+        internalUrl.searchParams.set("tenant_id", tenantId);
+        const init: RequestInit = { method: request.method, headers: request.headers };
+        if (request.method !== "GET" && request.method !== "HEAD") init.body = await request.arrayBuffer();
+        return await tenantStub.fetch(internalUrl.toString(), init);
+      } catch {
+        return new Response(
+          JSON.stringify({ error: "TENANT_LEDGER_UNAVAILABLE", outcome: "UNKNOWN", tenant_id: tenantId }),
+          { status: 503, headers: { "content-type": "application/json" } },
         );
-        const scaleEval = globalQueueAutoSharder.evaluateAndScale({
-          0: currentTenantConcurrency,
-        });
-
-        const enrichedBody = {
-          ...respBody,
-          scheduler_shard_id: routeDecision.targetShardId,
-          routing_mode: routeDecision.routingMode,
-          queue_shard_id: queueReceipt.shardIndex,
-          active_queue_shards: scaleEval.newShards,
-        };
-
-        await env.ANSTS_KV.put(kvKey, JSON.stringify(enrichedBody), { expirationTtl: 86400 });
-        await env.ANSTS_EVENTS_QUEUE.send(eventPayload);
-
-        return new Response(JSON.stringify(enrichedBody), {
-          status: resp.status,
-          headers: {
-            "content-type": "application/json",
-            "X-Scheduler-Shard": routeDecision.targetShardId,
-            "X-Routing-Mode": routeDecision.routingMode,
-            "X-Queue-Shard": String(queueReceipt.shardIndex),
-          },
-        });
       }
-
-      return new Response(JSON.stringify(respBody), {
-        status: resp.status,
-        headers: { "content-type": "application/json" },
-      });
     }
 
     // Route 1B: Inspect or Scale Out Scheduler & Queue Shards Online (TASK-49 & TASK-63)
