@@ -88,6 +88,8 @@ export class RpoZeroDurabilityEngine {
     cellScope: string;
     nodeId: string;
     fence: FenceToken;
+    /** Celld owner lease epoch is separate from the task's business fence epoch. */
+    ownershipEpoch?: number;
     ltxPayload: string;
     peerFollowerIds: string[];
     writeCursorConsumed?: boolean;
@@ -96,7 +98,8 @@ export class RpoZeroDurabilityEngine {
       throw new Error("celld SQLite Rule Violation: Unfinished SQL write cursor must be consumed before output/sync");
     }
 
-    const sessionKey = `${params.cellScope}:${params.nodeId}:${params.fence.epoch}`;
+    const ownershipEpoch = params.ownershipEpoch ?? params.fence.epoch;
+    const sessionKey = `${params.cellScope}:${params.nodeId}:${ownershipEpoch}`;
     if (this.sealedNodeSessions.has(sessionKey)) {
       throw new StaleFenceError(
         `409 SessionSealed: Prior node-log session ${sessionKey} was sealed by a newer owner takeover`,
@@ -120,7 +123,7 @@ export class RpoZeroDurabilityEngine {
     if (
       !currentOwner ||
       currentOwner.ownerNodeId !== params.nodeId ||
-      currentOwner.epoch !== params.fence.epoch
+      currentOwner.epoch !== ownershipEpoch
     ) {
       throw new StaleFenceError(
         `409 BucketProofFailed: Ownership of ${params.cellScope} changed during bucket write; refusing to acknowledge`,

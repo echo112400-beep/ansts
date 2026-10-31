@@ -28,6 +28,17 @@ import {
 } from "./celld_ha_engine";
 import { CloudflareCelldEnv, DurableObjectState, WebSocketLike } from "./env";
 import { initializeCellProtocol } from "../persistence/schema";
+import { listDueCellOutbox } from "../persistence/outbox";
+import { persistenceCellStub } from "../persistence/registry";
+import {
+  assertBusinessEpoch,
+  TaskCore,
+  TaskCoreError,
+  TaskDispatchRequest,
+  taskCoreMigration,
+} from "../persistence/task-core";
+import { NodeResourceVector } from "../persistence/node-capacity";
+import { schedulerPoolCellKey } from "../persistence/scheduler-pool";
 
 export class AgentTaskHarnessCell {
   public readonly leaseCoord = new LeaseCoordinator();
@@ -36,17 +47,21 @@ export class AgentTaskHarnessCell {
   public readonly nodeDaemon = new NodeDaemon(this.leaseCoord, this.cogRouter, this.sagaGw);
   public readonly replayer = new DeterministicTimeTravelReplayer();
   public readonly durabilityEngine = new RpoZeroDurabilityEngine("bucket", 10000);
+  /** Local Celld ownership lease epoch; distinct from TaskCore's business epoch. */
+  public cellOwnershipEpoch: number = 0;
   public readonly workflowCtx: DurableWorkflowContext;
   public currentOwnerNodeId: string = "celld-node-01";
   public task: AgentTask;
   public clientCreditWindow: number = 100;
+  public readonly taskCore: TaskCore;
 
   constructor(
     public readonly ctx: DurableObjectState,
     public readonly env: CloudflareCelldEnv,
   ) {
     const taskId = ctx.id.name ?? ctx.id.toString();
-    initializeCellProtocol(this.ctx.storage.sql, { type: "task", key: taskId });
+    initializeCellProtocol(this.ctx.storage.sql, { type: "task", key: taskId }, [taskCoreMigration]);
+    this.taskCore = new TaskCore(this.ctx.storage);
     this.task = new AgentTask({
       taskId,
       tenantId: "fin-enterprise",
@@ -56,8 +71,8 @@ export class AgentTaskHarnessCell {
         ((env.FALLBACK_MODEL_POOL as ModelPoolName) ?? "Qwen-3.8"),
         ((env.FAST_UTILITY_POOL as ModelPoolName) ?? "GLM-5.3"),
       ],
-      state: TaskState.RUNNING,
-      phase: SandboxPhase.COGNITIVE,
+      state: TaskState.SUBMITTED,
+      phase: SandboxPhase.IDLE,
     });
     this.workflowCtx = new DurableWorkflowContext(`wf-${taskId}`, 3600_000);
 
@@ -75,13 +90,10 @@ export class AgentTaskHarnessCell {
   public rehydrateFromSql(): void {
     const taskId = this.task.taskId;
     const walRows = this.ctx.storage.sql.exec("SELECT * FROM turn_wal_frames").toArray();
+    const execution = this.taskCore.get(taskId);
     if (walRows.length === 0) {
-      this.task.fence = this.leaseCoord.acquireOrIncrementEpoch(
-        taskId,
-        this.currentOwnerNodeId,
-        this.task.primaryModel,
-      );
-      this.durabilityEngine.claimCellOwnershipCas(taskId, this.currentOwnerNodeId, Date.now());
+      if (execution) this.applyTaskExecution(execution);
+      this.cellOwnershipEpoch = this.durabilityEngine.claimCellOwnershipCas(taskId, this.currentOwnerNodeId, Date.now()).epoch;
       return;
     }
 
@@ -107,15 +119,16 @@ export class AgentTaskHarnessCell {
     this.task.usedTokens = totalUsedTokens;
 
     const lastFrame = frames[frames.length - 1];
-    const nextFence = new FenceToken(lastFrame.fence.epoch, lastFrame.fence.turnSeq + 1, taskId);
-    this.leaseCoord.acquireOrIncrementEpoch(taskId, this.currentOwnerNodeId, this.task.primaryModel);
-    this.durabilityEngine.claimCellOwnershipCas(taskId, this.currentOwnerNodeId, Date.now());
-    for (let ep = 1; ep < nextFence.epoch; ep++) {
-      this.leaseCoord.acquireOrIncrementEpoch(taskId, this.currentOwnerNodeId, this.task.primaryModel);
-      this.durabilityEngine.claimCellOwnershipCas(taskId, this.currentOwnerNodeId, Date.now() + 20000 * ep);
-    }
-    this.leaseCoord.verifyAndAdvanceFence(nextFence);
+    const nextFence = new FenceToken(
+      execution?.business_epoch ?? 0,
+      (execution?.last_turn_seq ?? lastFrame.fence.turnSeq) + 1,
+      taskId,
+    );
+    this.cellOwnershipEpoch = this.durabilityEngine.claimCellOwnershipCas(taskId, this.currentOwnerNodeId, Date.now()).epoch;
     this.task.fence = nextFence;
+    if (execution) this.applyTaskExecution(execution);
+    this.leaseCoord.restoreFence(taskId, this.currentOwnerNodeId, this.task.assignedModelPool ?? this.task.primaryModel,
+      new FenceToken(nextFence.epoch, Math.max(0, nextFence.turnSeq - 1), taskId));
 
     const sagaRows = this.ctx.storage.sql.exec("SELECT * FROM saga_journal").toArray();
     for (const sr of sagaRows) {
@@ -132,7 +145,96 @@ export class AgentTaskHarnessCell {
   }
 
   public async fetch(request: Request): Promise<Response> {
+    try {
+      return await this.handleRequest(request);
+    } catch (error) {
+      if (error instanceof TaskCoreError) return json({ error: error.code, message: error.message }, error.status);
+      throw error;
+    }
+  }
+
+  private async handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/execution/prepare") {
+      const body = await request.json() as TaskDispatchRequest;
+      const dispatch = await this.taskCore.prepareDispatch(body);
+      this.applyTaskExecution(this.taskCore.get(this.task.taskId)!);
+      return json({ dispatch });
+    }
+
+    if (request.method === "POST" && url.pathname === "/execution/reserved") {
+      const body = await request.json() as TaskDispatchRequest;
+      const dispatch = await this.taskCore.recordReservation(body);
+      this.applyTaskExecution(this.taskCore.get(this.task.taskId)!);
+      return json({ dispatch });
+    }
+
+    if (request.method === "POST" && url.pathname === "/execution/authorize") {
+      const body = await request.json() as TaskDispatchRequest;
+      await this.assertCurrentNodeReservation(body);
+      const authorization = await this.taskCore.authorizeDispatch(body);
+      this.applyTaskExecution(this.taskCore.get(this.task.taskId)!);
+      return json(authorization);
+    }
+
+    const dispatchMatch = url.pathname.match(/^\/execution\/dispatches\/([^/]+)$/);
+    if (request.method === "GET" && dispatchMatch) {
+      const dispatch = this.taskCore.getDispatch(decodeURIComponent(dispatchMatch[1]));
+      return dispatch ? json(dispatch) : json({ error: "TASK_DISPATCH_NOT_FOUND" }, 404);
+    }
+
+    if (request.method === "POST" && url.pathname === "/execution/started") {
+      const body = await request.json() as { authorization: any; start_receipt: string };
+      const execution = await this.taskCore.markStarted(body.authorization, body.start_receipt);
+      this.applyTaskExecution(execution);
+      this.nodeDaemon.applyAuthorizedExecution(
+        this.task,
+        execution.current_node_id ?? body.authorization.node_id,
+        new FenceToken(execution.business_epoch, execution.last_turn_seq + 1, execution.task_id),
+      );
+      return json({ task_id: execution.task_id, state: execution.lifecycle_state, business_epoch: execution.business_epoch });
+    }
+
+    if (request.method === "GET" && url.pathname === "/execution/state") {
+      const execution = this.taskCore.get(this.task.taskId);
+      return execution ? json(execution) : json({ error: "TASK_NOT_INITIALIZED" }, 404);
+    }
+
+    if (request.method === "GET" && url.pathname === "/execution/start-commands") {
+      const commands = listDueCellOutbox(this.ctx.storage.sql)
+        .filter((event) => event.aggregateId === this.task.taskId && event.eventType === "task.execution.start_requested");
+      return json({ commands });
+    }
+
+    if (request.method === "POST" && url.pathname === "/execution/suspect") {
+      const body = await request.json() as { epoch: number; reason: string };
+      const execution = await this.taskCore.markSuspect(this.task.taskId, body.epoch, body.reason);
+      if (execution.current_node_id && execution.current_dispatch_id) {
+        await this.callNodeCapacity(execution.current_node_id, `/reservations/${encodeURIComponent(execution.current_dispatch_id)}/suspect`, "POST", { reason: body.reason });
+      }
+      this.applyTaskExecution(execution);
+      return json({ task_id: execution.task_id, state: execution.lifecycle_state, business_epoch: execution.business_epoch });
+    }
+
+    if (request.method === "POST" && url.pathname === "/execution/suspend") {
+      const body = await request.json() as { epoch: number; progress?: unknown };
+      const execution = await this.taskCore.suspend(this.task.taskId, body.epoch, body.progress);
+      this.applyTaskExecution(execution);
+      return json({ task_id: execution.task_id, state: execution.lifecycle_state, progress: JSON.parse(execution.progress_json) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/execution/resume") {
+      const execution = await this.taskCore.resume(this.task.taskId);
+      this.applyTaskExecution(execution);
+      return json({
+        task_id: execution.task_id,
+        state: execution.lifecycle_state,
+        task_spec: JSON.parse(execution.task_spec_json),
+        execution_policy: JSON.parse(execution.execution_policy_json),
+        progress: JSON.parse(execution.progress_json),
+      });
+    }
 
     if (request.method === "POST" && url.pathname.endsWith("/turn")) {
       const body = (await request.json()) as {
@@ -162,6 +264,16 @@ export class AgentTaskHarnessCell {
       );
 
       try {
+        const execution = this.taskCore.get(this.task.taskId);
+        if (!execution) throw new TaskCoreError("TASK_NOT_INITIALIZED", "Task must be prepared and authorized before Turn execution.", 409);
+        assertBusinessEpoch(execution, incomingFence.epoch, incomingFence.turnSeq);
+        this.applyTaskExecution(execution);
+        this.leaseCoord.restoreFence(
+          this.task.taskId,
+          execution.current_node_id ?? this.currentOwnerNodeId,
+          this.task.assignedModelPool ?? this.task.primaryModel,
+          new FenceToken(execution.business_epoch, execution.last_turn_seq, this.task.taskId),
+        );
         if (body.deepseek_429_open) {
           this.cogRouter.tripPoolBreaker("DeepSeek", 0.48);
         }
@@ -227,6 +339,7 @@ export class AgentTaskHarnessCell {
           cellScope: this.task.taskId,
           nodeId: this.currentOwnerNodeId,
           fence: incomingFence,
+          ownershipEpoch: this.cellOwnershipEpoch,
           ltxPayload: JSON.stringify({ wsHash, tokens: routeRes.tokensConsumed }),
           peerFollowerIds: [],
           writeCursorConsumed: true,
@@ -242,6 +355,14 @@ export class AgentTaskHarnessCell {
           errorCount: errCount,
           diffEntropy,
         });
+
+        const committedExecution = await this.taskCore.markTurnCommitted(
+          this.task.taskId,
+          incomingFence.epoch,
+          incomingFence.turnSeq,
+          { workspace_merkle_hash: wsHash, tokens_used: this.task.usedTokens },
+        );
+        this.applyTaskExecution(committedExecution);
 
         if (audit.action === "BACKTRACKED") {
           this.ctx.storage.sql.exec(
@@ -267,8 +388,8 @@ export class AgentTaskHarnessCell {
           { status: 200, headers: { "content-type": "application/json" } },
         );
       } catch (err: any) {
-        if (err instanceof StaleFenceError) {
-          return new Response(JSON.stringify({ error: "StaleFenceRejected", message: err.message }), {
+        if (err instanceof StaleFenceError || err instanceof TaskCoreError) {
+          return new Response(JSON.stringify({ error: err instanceof TaskCoreError ? err.code : "StaleFenceRejected", message: err.message }), {
             status: 409,
             headers: { "content-type": "application/json" },
           });
@@ -327,27 +448,65 @@ export class AgentTaskHarnessCell {
     }
 
     if (request.method === "POST" && url.pathname.endsWith("/failover")) {
-      const body = (await request.json()) as { new_node_id: string };
-      const newFence = this.nodeDaemon.failoverTaskToNode(this.task, body.new_node_id);
-      this.currentOwnerNodeId = body.new_node_id;
-      // Advance CAS ownership epoch & seal prior node session (simulating expired lease takeover)
-      this.durabilityEngine.claimCellOwnershipCas(
-        this.task.taskId,
-        body.new_node_id,
-        Date.now() + 20000 * newFence.epoch,
-      );
+      const body = (await request.json()) as {
+        new_node_id: string;
+        node_incarnation?: string;
+        capacity?: NodeResourceVector;
+        region?: string;
+        resource_pool?: string;
+      };
+      const execution = this.taskCore.get(this.task.taskId);
+      if (!execution) return json({ error: "TASK_NOT_INITIALIZED" }, 409);
+      if (execution.current_node_id && execution.current_dispatch_id) {
+        await this.callNodeCapacity(execution.current_node_id, `/reservations/${encodeURIComponent(execution.current_dispatch_id)}/suspect`, "POST", { reason: "heartbeat-loss-investigation" });
+      }
+      await this.taskCore.markSuspect(this.task.taskId, execution.business_epoch, "heartbeat-loss-investigation");
+      const region = body.region ?? execution.region;
+      const resourcePool = body.resource_pool ?? execution.resource_pool;
+      const scheduler = persistenceCellStub(this.env, "scheduler-pool", schedulerPoolCellKey(region, resourcePool));
+      const requestCandidate = {
+        task_id: this.task.taskId,
+        tenant_id: execution.tenant_id,
+        dispatch_id: `recovery:${this.task.taskId}:${execution.business_epoch + 1}`,
+        node_id: body.new_node_id,
+        node_incarnation: body.node_incarnation,
+        region,
+        resource_pool: resourcePool,
+        kind: "recovery",
+        task_spec: JSON.parse(execution.task_spec_json),
+        execution_policy: JSON.parse(execution.execution_policy_json),
+        resources: demandForTask(this.task),
+      };
+      const response = await scheduler.fetch("http://scheduler.internal/scheduler/dispatch", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(requestCandidate),
+      });
+      const dispatchResult = await response.json() as any;
+      if (!response.ok || dispatchResult.stage !== "AUTHORIZED") {
+        return json({ error: dispatchResult.error ?? dispatchResult.status ?? "RECOVERY_DISPATCH_BLOCKED", dispatch: dispatchResult }, response.status >= 400 ? response.status : 409);
+      }
+      const newFence = new FenceToken(Number(dispatchResult.business_epoch), this.taskCore.get(this.task.taskId)!.last_turn_seq + 1, this.task.taskId);
+      this.task.fence = newFence;
+      this.applyTaskExecution(this.taskCore.get(this.task.taskId)!);
       return new Response(
         JSON.stringify({
           task_id: this.task.taskId,
           new_epoch: newFence.epoch,
+          business_epoch: newFence.epoch,
           next_turn_seq: newFence.turnSeq,
           assigned_node_id: this.task.assignedNodeId,
+          node_id: body.new_node_id,
+          state: "STARTING",
+          region,
+          resource_pool: resourcePool,
+          dispatch_id: dispatchResult.dispatch_id,
+          node_incarnation: dispatchResult.node_incarnation,
+          authorization_token: dispatchResult.authorization_token,
         }),
-        { status: 200, headers: { "content-type": "application/json" } },
+        { status: 202, headers: { "content-type": "application/json" } },
       );
     }
 
-    return new Response(JSON.stringify({ error: "NotFound" }), { status: 404 });
+      return json({ error: "NotFound" }, 404);
   }
 
   public async webSocketMessage(ws: WebSocketLike, message: string): Promise<void> {
@@ -365,11 +524,83 @@ export class AgentTaskHarnessCell {
   }
 
   public async alarm(): Promise<void> {
+    const execution = this.taskCore.get(this.task.taskId);
     this.task.state = TaskState.HIBERNATED;
     this.task.phase = SandboxPhase.IDLE;
     this.task.activeSessions = 0;
     if (this.ctx.container && this.ctx.container.running) {
       await this.ctx.container.stop();
     }
+    if (execution && execution.lifecycle_state === "RUNNING") {
+      await this.taskCore.suspend(this.task.taskId, execution.business_epoch, JSON.parse(execution.progress_json));
+    }
   }
+
+  private applyTaskExecution(execution: NonNullable<ReturnType<TaskCore["get"]>>): void {
+    this.task.fence = new FenceToken(execution.business_epoch, execution.last_turn_seq + 1, this.task.taskId);
+    this.task.assignedNodeId = execution.current_node_id ?? undefined;
+    this.task.state = taskState(execution.lifecycle_state);
+    this.task.phase = execution.lifecycle_state === "RUNNING" || execution.lifecycle_state === "STARTING"
+      ? SandboxPhase.COGNITIVE
+      : SandboxPhase.IDLE;
+    this.leaseCoord.restoreFence(
+      this.task.taskId,
+      execution.current_node_id ?? this.currentOwnerNodeId,
+      this.task.assignedModelPool ?? this.task.primaryModel,
+      new FenceToken(execution.business_epoch, execution.last_turn_seq, this.task.taskId),
+    );
+  }
+
+  private async assertCurrentNodeReservation(body: TaskDispatchRequest): Promise<void> {
+    if (!body.node_id || !body.reservation_id) throw new TaskCoreError("TASK_RESERVATION_INVALID", "Node and reservation identity are required.");
+    const result = await this.callNodeCapacity(body.node_id, `/reservations/${encodeURIComponent(body.dispatch_id)}`, "GET");
+    if (!result.ok) throw new TaskCoreError("NODE_RESERVATION_UNAVAILABLE", "NodeCapacity reservation is unavailable.", 503);
+    const reservation = result.body;
+    if (
+      reservation.dispatch_id !== body.dispatch_id || reservation.task_id !== body.task_id ||
+      reservation.node_incarnation !== body.node_incarnation || reservation.status !== "RESERVED" ||
+      reservation.reservation_token !== body.reservation_token
+    ) throw new TaskCoreError("TASK_RESERVATION_INVALID", "TaskCell authorization requires the current matching NodeCapacity reservation.");
+  }
+
+  private async callNodeCapacity(nodeId: string, path: string, method: string, body?: unknown): Promise<{ ok: boolean; body: any }> {
+    const namespace = this.env.NODE_CAPACITY_CELL;
+    if (!namespace) throw new TaskCoreError("NODE_CAPACITY_UNAVAILABLE", "NODE_CAPACITY_CELL binding is required.", 503);
+    const stub = namespace.get(namespace.idFromName(nodeId));
+    const response = await stub.fetch(`http://node-capacity.internal${path}`, {
+      method,
+      headers: body === undefined ? undefined : { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    let parsed: any = null;
+    try { parsed = await response.json(); } catch { parsed = null; }
+    return { ok: response.ok, body: parsed };
+  }
+}
+
+function taskState(status: string): TaskState {
+  switch (status) {
+    case "RUNNING": case "STARTING": return TaskState.RUNNING;
+    case "RESERVED": return TaskState.PROVISIONING;
+    case "SUSPENDED": return TaskState.HIBERNATED;
+    case "SUSPECT": return TaskState.RECOVERING;
+    case "SUCCEEDED": return TaskState.SUCCEEDED;
+    case "FAILED": return TaskState.CIRCUIT_BROKEN;
+    default: return TaskState.QUEUED;
+  }
+}
+
+function demandForTask(task: AgentTask): NodeResourceVector {
+  const demand = task.demandVector();
+  return {
+    cpu: demand.steadyCpu,
+    memory_mb: demand.steadyMemMb,
+    burst_cpu: demand.burstCpu,
+    sessions: demand.sessions,
+    tps: demand.effectiveTps,
+  };
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }

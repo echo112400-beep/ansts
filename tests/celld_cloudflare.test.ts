@@ -17,12 +17,16 @@ import {
   TenantLedgerCell,
   ToolEffectClass,
 } from "../src/index";
+import { NodeCapacityCell } from "../src/cloudflare/node_capacity_cell";
+import { schedulerPoolCellKey } from "../src/persistence/scheduler-pool";
 
 function createMockCloudflareCelldEnv(): {
   env: CloudflareCelldEnv;
   schedulerCell: AnstsSchedulerCell;
+  schedulerCells: Map<string, AnstsSchedulerCell>;
   harnessCells: Map<string, AgentTaskHarnessCell>;
   tenantLedgerCells: Map<string, TenantLedgerCell>;
+  nodeCapacityCells: Map<string, NodeCapacityCell>;
   d1Rows: Array<any[]>;
   queuedMessages: any[];
 } {
@@ -32,6 +36,7 @@ function createMockCloudflareCelldEnv(): {
   const queuedMessages: any[] = [];
   const harnessCells = new Map<string, AgentTaskHarnessCell>();
   const tenantLedgerCells = new Map<string, TenantLedgerCell>();
+  const nodeCapacityCells = new Map<string, NodeCapacityCell>();
 
   const env: CloudflareCelldEnv = {
     PRIMARY_MODEL_POOL: "DeepSeek",
@@ -94,15 +99,21 @@ function createMockCloudflareCelldEnv(): {
 
   const schedulerState = new MockDurableObjectState("global-5d-scheduler");
   const schedulerCell = new AnstsSchedulerCell(schedulerState, env);
+  const schedulerCells = new Map<string, AnstsSchedulerCell>([["global-5d-scheduler", schedulerCell]]);
 
   env.SCHEDULER_CELL = {
     idFromName: (name: string) => ({ toString: () => `sched_${name}`, name }),
-    get: () => ({
+    get: (id: { toString(): string; name?: string }) => {
+      const key = id.name ?? id.toString();
+      if (!schedulerCells.has(key)) schedulerCells.set(key, new AnstsSchedulerCell(new MockDurableObjectState(key), env));
+      const cell = schedulerCells.get(key)!;
+      return {
       fetch: (input: RequestInfo, init?: RequestInit) => {
         const req = typeof input === "string" ? new Request(input, init) : input;
-        return schedulerCell.fetch(req);
+        return cell.fetch(req);
       },
-    }),
+      };
+    },
   };
 
   env.AGENT_HARNESS_CELL = {
@@ -140,7 +151,41 @@ function createMockCloudflareCelldEnv(): {
     },
   };
 
-  return { env, schedulerCell, harnessCells, tenantLedgerCells, d1Rows, queuedMessages };
+  env.NODE_CAPACITY_CELL = {
+    idFromName: (name: string) => ({ toString: () => `node_${name}`, name }),
+    get: (id: { toString(): string; name?: string }) => {
+      const nodeId = id.name ?? id.toString();
+      if (!nodeCapacityCells.has(nodeId)) {
+        nodeCapacityCells.set(nodeId, new NodeCapacityCell(new MockDurableObjectState(nodeId), env));
+      }
+      const cell = nodeCapacityCells.get(nodeId)!;
+      return {
+        fetch: (input: RequestInfo, init?: RequestInit) => {
+          const req = typeof input === "string" ? new Request(input, init) : input;
+          return cell.fetch(req);
+        },
+      };
+    },
+  };
+
+  return { env, schedulerCell, schedulerCells, harnessCells, tenantLedgerCells, nodeCapacityCells, d1Rows, queuedMessages };
+}
+
+async function simulateNodeStartReceipt(env: CloudflareCelldEnv, dispatch: Record<string, any>, receipt: string, pool = schedulerPoolCellKey(dispatch.region, dispatch.resource_pool)): Promise<Response> {
+  const scheduler = env.SCHEDULER_CELL!.get(env.SCHEDULER_CELL!.idFromName(pool));
+  // This test adapter stands in for the authenticated node callback after the node reports running.
+  return scheduler.fetch("http://scheduler.internal/scheduler/started", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      dispatch_id: dispatch.dispatch_id,
+      node_id: dispatch.node_id,
+      node_incarnation: dispatch.node_incarnation,
+      authorization_token: dispatch.authorization_token,
+      business_epoch: dispatch.business_epoch,
+      start_receipt: receipt,
+    }),
+  });
 }
 
 test("07. wrangler.json & D1 SQL migration schema verification for celld and Cloudflare Workers", () => {
@@ -257,6 +302,291 @@ test("08B. Public task route resolves the logical TaskCell binding by stable tas
 
   assert.equal(response.status, 200);
   assert.deepEqual(routedNames, ["task-registry-7"]);
+});
+
+test("scheduler tick replays dispatch stages and reserves shared node capacity once", async () => {
+  const { env, harnessCells, nodeCapacityCells } = createMockCloudflareCelldEnv();
+  const candidate = {
+    task_id: "dispatch-task-1",
+    tenant_id: "tenant-a",
+    dispatch_id: "dispatch-stable-1",
+    node_id: "node-capacity-1",
+    region: "us-west-1",
+    resource_pool: "cpu-small",
+    kind: "ordinary",
+    task_spec: { task_id: "dispatch-task-1", tenant_id: "tenant-a", execution_policy: { retry: 3 } },
+    resources: { cpu: 2, memory_mb: 1024, burst_cpu: 1, sessions: 1, tps: 10 },
+  };
+  const poolKey = schedulerPoolCellKey("us-west-1", "cpu-small");
+  const tick = () => cloudflareCelldWorker.fetch(
+    new Request(`https://ansts.edge/v1beta1/scheduler/tick?shard=${encodeURIComponent(poolKey)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nodes: [{ node_id: "node-capacity-1", incarnation: "boot-1", capacity: { cpu: 2, memory_mb: 1024, burst_cpu: 1, sessions: 1, tps: 10 } }],
+        candidates: [candidate],
+      }),
+    }),
+    env,
+  );
+
+  const first = await tick();
+  assert.equal(first.status, 200);
+  const firstBody = (await first.json()) as any;
+  assert.equal(firstBody.dispatches[0].stage, "AUTHORIZED");
+  assert.equal(firstBody.dispatches[0].status, "AWAITING_NODE_START");
+  assert.equal(firstBody.dispatches[0].business_epoch, 1);
+  assert.equal(nodeCapacityCells.get("node-capacity-1")!.capacity.getReservation("dispatch-stable-1")!.status, "STARTING");
+  const taskCell = harnessCells.get("dispatch-task-1")!;
+  const pendingCommands = await taskCell.fetch(new Request("http://task.internal/execution/start-commands"));
+  const startCommandBody = await pendingCommands.json() as any;
+  assert.equal(startCommandBody.commands.length, 1);
+  assert.equal(startCommandBody.commands[0].payload.authorization_token, firstBody.dispatches[0].authorization_token);
+  const commandReplay = await taskCell.fetch(new Request("http://task.internal/execution/start-commands"));
+  assert.deepEqual(((await commandReplay.json()) as any).commands[0], startCommandBody.commands[0]);
+  const authorizationReplay = await tick();
+  const authorizationReplayBody = await authorizationReplay.json() as any;
+  assert.equal(authorizationReplayBody.dispatches[0].authorization_token, firstBody.dispatches[0].authorization_token);
+  const changedReservation = await taskCell.fetch(new Request("http://task.internal/execution/authorize", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      dispatch_id: candidate.dispatch_id,
+      task_id: candidate.task_id,
+      tenant_id: candidate.tenant_id,
+      kind: candidate.kind,
+      node_id: candidate.node_id,
+      node_incarnation: candidate.node_incarnation,
+      region: candidate.region,
+      resource_pool: candidate.resource_pool,
+      reservation_id: candidate.dispatch_id,
+      reservation_token: "changed-reservation-token",
+    }),
+  }));
+  assert.equal(changedReservation.status, 409);
+  const commandAfterConflict = await taskCell.fetch(new Request("http://task.internal/execution/start-commands"));
+  assert.deepEqual(((await commandAfterConflict.json()) as any).commands[0], startCommandBody.commands[0]);
+  const prematureTurn = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks/dispatch-task-1/turn", {
+    method: "POST", body: JSON.stringify({ epoch: 1, turn_seq: 1, is_read_only_turn: true }),
+  }), env);
+  assert.equal(prematureTurn.status, 409);
+
+  const started = await simulateNodeStartReceipt(env, firstBody.dispatches[0], "node-receipt-dispatch-stable-1");
+  assert.equal(started.status, 200);
+  assert.equal(((await started.json()) as any).stage, "STARTED");
+  const acknowledgedCommands = await taskCell.fetch(new Request("http://task.internal/execution/start-commands"));
+  assert.equal(((await acknowledgedCommands.json()) as any).commands.length, 0);
+
+  const replay = await tick();
+  assert.equal(replay.status, 200);
+  const replayBody = (await replay.json()) as any;
+  assert.equal(replayBody.dispatches[0].stage, "STARTED");
+  assert.equal(replayBody.dispatches[0].business_epoch, 1);
+  const conflictingReceipt = await simulateNodeStartReceipt(env, firstBody.dispatches[0], "conflicting-receipt");
+  assert.equal(conflictingReceipt.status, 409);
+
+  const capacityCell = nodeCapacityCells.get("node-capacity-1")!;
+  const capacity = await capacityCell.fetch(new Request("https://node.internal/allocations"));
+  const capacityBody = (await capacity.json()) as any;
+  assert.equal(capacityBody.allocations.length, 1);
+  assert.equal(capacityBody.allocations[0].dispatch_id, "dispatch-stable-1");
+});
+
+test("dispatch retry repairs TaskCore RESERVED after a failure between node reserve and SchedulerPool advance", async () => {
+  const { env, harnessCells, nodeCapacityCells } = createMockCloudflareCelldEnv();
+  const taskId = "dispatch-reservation-replay-task";
+  const dispatchId = "dispatch-reservation-replay";
+  env.AGENT_HARNESS_CELL!.get(env.AGENT_HARNESS_CELL!.idFromName(taskId));
+  const taskCell = harnessCells.get(taskId)!;
+  const originalFetch = taskCell.fetch.bind(taskCell);
+  let failReservedOnce = true;
+  taskCell.fetch = async (request: Request) => {
+    if (failReservedOnce && new URL(request.url).pathname === "/execution/reserved") {
+      failReservedOnce = false;
+      return new Response(JSON.stringify({ error: "INJECTED_TRANSIENT_FAILURE" }), { status: 503 });
+    }
+    return originalFetch(request);
+  };
+  const candidate = {
+    task_id: taskId,
+    tenant_id: "tenant-replay",
+    dispatch_id: dispatchId,
+    node_id: "reservation-replay-node",
+    node_incarnation: "reservation-replay-boot-1",
+    kind: "ordinary",
+    task_spec: { metadata: { task_id: taskId, tenant_id: "tenant-replay" }, spec: {} },
+    resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 },
+  };
+  const tick = () => cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      nodes: [{ node_id: candidate.node_id, incarnation: candidate.node_incarnation, capacity: candidate.resources }],
+      candidates: [candidate],
+    }),
+  }), env);
+
+  assert.equal((await tick()).status, 503);
+  assert.equal(taskCell.taskCore.getDispatch(dispatchId)!.stage, "PREPARING");
+  assert.equal(nodeCapacityCells.get(candidate.node_id)!.capacity.getReservations().length, 1);
+
+  const retry = await tick();
+  assert.equal(retry.status, 200);
+  const retryBody = await retry.json() as any;
+  assert.equal(retryBody.dispatches[0].stage, "AUTHORIZED");
+  assert.equal(taskCell.taskCore.getDispatch(dispatchId)!.stage, "AUTHORIZED");
+  assert.equal(nodeCapacityCells.get(candidate.node_id)!.capacity.getReservations().length, 1);
+});
+
+test("independent SchedulerPool cells cannot reserve the same node capacity concurrently", async () => {
+  const { env, nodeCapacityCells } = createMockCloudflareCelldEnv();
+  const capacity = { cpu: 2, memory_mb: 1024, burst_cpu: 1, sessions: 1, tps: 10 };
+  const candidate = (taskId: string, region: string) => ({
+    task_id: taskId,
+    tenant_id: `tenant-${taskId}`,
+    dispatch_id: `dispatch-${taskId}`,
+    node_id: "contended-node",
+    node_incarnation: "contended-boot-1",
+    region,
+    resource_pool: "cpu",
+    kind: "ordinary",
+    task_spec: { metadata: { task_id: taskId, tenant_id: `tenant-${taskId}` }, spec: {} },
+    resources: capacity,
+  });
+  const tick = (region: string, taskId: string) => cloudflareCelldWorker.fetch(
+    new Request(`https://ansts.edge/v1beta1/scheduler/tick?shard=${encodeURIComponent(schedulerPoolCellKey(region, "cpu"))}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nodes: [{ node_id: "contended-node", incarnation: "contended-boot-1", capacity }],
+        candidates: [candidate(taskId, region)],
+      }),
+    }),
+    env,
+  );
+
+  const [left, right] = await Promise.all([tick("region-a", "task-left"), tick("region-b", "task-right")]);
+  const results = await Promise.all([left.json() as Promise<any>, right.json() as Promise<any>]);
+  const stages = results.map((result) => result.dispatches[0].stage);
+  const statuses = results.map((result) => result.dispatches[0].status);
+  assert.equal(stages.filter((stage) => stage === "AUTHORIZED").length, 1);
+  assert.equal(statuses.filter((status) => status === "BLOCKED_CAPACITY").length, 1);
+  assert.equal(nodeCapacityCells.get("contended-node")!.capacity.getReservations().length, 1);
+  const admitted = results.find((result) => result.dispatches[0].stage === "AUTHORIZED")!;
+  const pool = schedulerPoolCellKey(admitted.dispatches[0].region, admitted.dispatches[0].resource_pool);
+  const started = await simulateNodeStartReceipt(env, admitted.dispatches[0], "node-receipt-contended", pool);
+  assert.equal(started.status, 200);
+  assert.equal(nodeCapacityCells.get("contended-node")!.capacity.getReservation(admitted.dispatches[0].dispatch_id)!.status, "RUNNING");
+});
+
+test("ordinary and DAG starts use the same durable NodeCapacity reservation path", async () => {
+  const { env, nodeCapacityCells } = createMockCloudflareCelldEnv();
+  const resources = { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 };
+  const candidates = ["ordinary", "dag"].map((kind) => ({
+    task_id: `${kind}-capacity-task`,
+    tenant_id: "tenant-shared",
+    dispatch_id: `${kind}-capacity-dispatch`,
+    node_id: "ordinary-dag-node",
+    node_incarnation: "ordinary-dag-boot-1",
+    kind,
+    task_spec: { metadata: { task_id: `${kind}-capacity-task`, tenant_id: "tenant-shared" }, spec: {} },
+    resources,
+  }));
+  const response = await cloudflareCelldWorker.fetch(
+    new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nodes: [{ node_id: "ordinary-dag-node", incarnation: "ordinary-dag-boot-1", capacity: { cpu: 2, memory_mb: 1024, burst_cpu: 2, sessions: 2, tps: 20 } }],
+        candidates,
+      }),
+    }),
+    env,
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as any;
+  assert.deepEqual(body.dispatches.map((dispatch: any) => dispatch.stage), ["AUTHORIZED", "AUTHORIZED"]);
+  for (const dispatch of body.dispatches) {
+    const started = await simulateNodeStartReceipt(env, dispatch, `node-receipt-${dispatch.dispatch_id}`);
+    assert.equal(started.status, 200);
+  }
+  const allocations = nodeCapacityCells.get("ordinary-dag-node")!.capacity.getReservations();
+  assert.deepEqual(allocations.map((allocation) => allocation.kind).sort(), ["dag", "ordinary"]);
+  assert.deepEqual(allocations.map((allocation) => allocation.status).sort(), ["RUNNING", "RUNNING"]);
+});
+
+test("SchedulerPool greedily orders weighted multi-resource demand against configured node capacity", async () => {
+  const { env } = createMockCloudflareCelldEnv();
+  const poolKey = schedulerPoolCellKey("eu-central-1", "cpu-memory");
+  const candidates = [
+    { task_id: "alpha-1", tenant_id: "tenant-alpha", dispatch_id: "dispatch-a1", tenant_weight: 1,
+      node_id: "fair-node", node_incarnation: "fair-boot-1", region: "eu-central-1", resource_pool: "cpu-memory", kind: "ordinary",
+      task_spec: { metadata: { task_id: "alpha-1", tenant_id: "tenant-alpha" }, spec: {} },
+      resources: { cpu: 4, memory_mb: 10, burst_cpu: 1, sessions: 1, tps: 10 } },
+    { task_id: "alpha-2", tenant_id: "tenant-alpha", dispatch_id: "dispatch-a2", tenant_weight: 1,
+      node_id: "fair-node", node_incarnation: "fair-boot-1", region: "eu-central-1", resource_pool: "cpu-memory", kind: "ordinary",
+      task_spec: { metadata: { task_id: "alpha-2", tenant_id: "tenant-alpha" }, spec: {} },
+      resources: { cpu: 4, memory_mb: 10, burst_cpu: 1, sessions: 1, tps: 10 } },
+    { task_id: "beta-1", tenant_id: "tenant-beta", dispatch_id: "dispatch-b1", tenant_weight: 2,
+      node_id: "fair-node", node_incarnation: "fair-boot-1", region: "eu-central-1", resource_pool: "cpu-memory", kind: "ordinary",
+      task_spec: { metadata: { task_id: "beta-1", tenant_id: "tenant-beta" }, spec: {} },
+      resources: { cpu: 1, memory_mb: 180, burst_cpu: 1, sessions: 1, tps: 10 } },
+  ];
+  const response = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/scheduler/tick?shard=${encodeURIComponent(poolKey)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      nodes: [{ node_id: "fair-node", incarnation: "fair-boot-1", capacity: { cpu: 10, memory_mb: 200, burst_cpu: 3, sessions: 3, tps: 30 } }],
+      candidates,
+    }),
+  }), env);
+  assert.equal(response.status, 200);
+  const body = await response.json() as any;
+  assert.deepEqual(body.dispatches.map((dispatch: any) => dispatch.dispatch_id), ["dispatch-a1", "dispatch-b1", "dispatch-a2"]);
+  assert.deepEqual(body.dispatches.map((dispatch: any) => dispatch.stage), ["AUTHORIZED", "AUTHORIZED", "AUTHORIZED"]);
+});
+
+test("NodeCapacity keeps reservations until stop or incarnation isolation evidence", async () => {
+  const { env } = createMockCloudflareCelldEnv();
+  const stub = env.NODE_CAPACITY_CELL!.get(env.NODE_CAPACITY_CELL!.idFromName("incarnation-node"));
+  const call = (path: string, body?: unknown) => stub.fetch(`http://node.internal${path}`, {
+    method: body === undefined ? "GET" : "POST",
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const capacity = { cpu: 2, memory_mb: 1024, burst_cpu: 1, sessions: 1, tps: 10 };
+  assert.equal((await call("/nodes/register", { incarnation: "boot-old", capacity })).status, 200);
+  assert.equal((await call("/reservations", {
+    dispatch_id: "incarnation-dispatch",
+    task_id: "incarnation-task",
+    tenant_id: "tenant-incarnation",
+    kind: "ordinary",
+    node_incarnation: "boot-old",
+    resources: capacity,
+  })).status, 201);
+
+  const unsupportedRelease = await call("/reservations/incarnation-dispatch/release", { node_incarnation: "boot-old" });
+  assert.equal(unsupportedRelease.status, 400);
+  assert.equal((await call("/allocations").then((response) => response.json()) as any).allocations[0].status, "RESERVED");
+  assert.equal((await call("/nodes/register", { incarnation: "boot-new", capacity })).status, 409);
+
+  assert.equal((await call("/nodes/register", {
+    incarnation: "boot-new",
+    capacity,
+    reboot_evidence_id: "host-reboot-991",
+  })).status, 200);
+  const allocations = (await call("/allocations").then((response) => response.json()) as any).allocations;
+  assert.equal(allocations[0].status, "ISOLATED");
+  assert.equal(allocations[0].release_evidence_id.includes("host-reboot-991"), true);
+  const staleIncarnationReservation = await call("/reservations", {
+    dispatch_id: "old-incarnation-dispatch",
+    task_id: "another-task",
+    tenant_id: "tenant-incarnation",
+    kind: "recovery",
+    node_incarnation: "boot-old",
+    resources: capacity,
+  });
+  assert.equal(staleIncarnationReservation.status, 409);
 });
 
 test("public Worker admission is stored in TenantLedgerCell and remains queryable by tenant", async () => {
@@ -474,8 +804,41 @@ test("public Worker budget routes conserve integer allowances across grant, hold
 });
 
 test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Burst, SQLite WAL & Fencing", async () => {
-  const { env, harnessCells } = createMockCloudflareCelldEnv();
+  const { env, harnessCells, nodeCapacityCells } = createMockCloudflareCelldEnv();
   const taskId = "tsk_celld_agent_01";
+  const taskSpec = {
+    metadata: { task_id: taskId, tenant_id: "fin-enterprise" },
+    spec: { execution_policy: { max_retries: 3, checkpoint: "turn-boundary" } },
+  };
+  const dispatch = await cloudflareCelldWorker.fetch(
+    new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nodes: [
+          { node_id: "celld-node-01", incarnation: "agent-boot-1", capacity: { cpu: 32, memory_mb: 65536, burst_cpu: 16, sessions: 16, tps: 1000 } },
+          { node_id: "celld-node-02", incarnation: "agent-boot-1", capacity: { cpu: 32, memory_mb: 65536, burst_cpu: 16, sessions: 16, tps: 1000 } },
+        ],
+        candidates: [{
+          task_id: taskId,
+          tenant_id: "fin-enterprise",
+          dispatch_id: `ordinary:${taskId}:1`,
+          node_id: "celld-node-01",
+          node_incarnation: "agent-boot-1",
+          kind: "ordinary",
+          task_spec: taskSpec,
+          resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 },
+        }],
+      }),
+    }),
+    env,
+  );
+  assert.equal(dispatch.status, 200);
+  const initialDispatch = ((await dispatch.json()) as any).dispatches[0];
+  assert.equal(initialDispatch.stage, "AUTHORIZED");
+  const initialReceipt = await simulateNodeStartReceipt(env, initialDispatch, `node-receipt-${initialDispatch.dispatch_id}`);
+  assert.equal(initialReceipt.status, 200);
+  assert.equal(harnessCells.get(taskId)!.taskCore.getDispatch(initialDispatch.dispatch_id)!.stage, "STARTED");
 
   // Turn 1: Read-only utility turn -> stays in V8 Cell (no container burst) and routes to GLM-5.3
   const turn1Res = await cloudflareCelldWorker.fetch(
@@ -534,7 +897,7 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
   assert.equal(replayBody.tokens_billed_during_replay, 0);
   assert.equal(replayBody.restored_workspace_hash, "merkle_v1");
 
-  // Simulate node failover (Epoch 1 -> 2) and verify stale Epoch 1 request gets HTTP 409 StaleFenceRejected
+  // Simulate recovery dispatch. TaskCell issues business epoch 2; the old allocation stays held as suspect.
   const foRes = await cloudflareCelldWorker.fetch(
     new Request(`https://ansts.edge/v1beta1/tasks/${taskId}/failover`, {
       method: "POST",
@@ -543,16 +906,70 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
     env,
   );
   const foBody = (await foRes.json()) as Record<string, any>;
+  assert.equal(foRes.status, 202);
   assert.equal(foBody.new_epoch, 2);
+  const oldAllocation = await nodeCapacityCells.get("celld-node-01")!.fetch(
+    new Request(`http://node.internal/reservations/ordinary:${taskId}:1`),
+  );
+  assert.equal(((await oldAllocation.json()) as any).status, "SUSPECT");
+  const recoveryAllocation = await nodeCapacityCells.get("celld-node-02")!.fetch(
+    new Request(`http://node.internal/reservations/recovery:${taskId}:2`),
+  );
+  assert.equal(((await recoveryAllocation.json()) as any).status, "STARTING");
+  const recoveryReceipt = await simulateNodeStartReceipt(env, foBody, "node-receipt-recovery-2");
+  assert.equal(recoveryReceipt.status, 200);
+  assert.equal(((await nodeCapacityCells.get("celld-node-02")!.fetch(
+    new Request(`http://node.internal/reservations/recovery:${taskId}:2`),
+  ).then((response) => response.json())) as any).status, "RUNNING");
+
+  const recoveredTurn = await cloudflareCelldWorker.fetch(
+    new Request(`https://ansts.edge/v1beta1/tasks/${taskId}/turn`, {
+      method: "POST",
+      body: JSON.stringify({ epoch: foBody.new_epoch, turn_seq: 3, is_read_only_turn: true, workspace_merkle_hash: "merkle_after_recovery" }),
+    }),
+    env,
+  );
+  assert.equal(recoveredTurn.status, 200);
+  assert.equal(((await recoveredTurn.json()) as any).task_id, taskId);
+
+  const oldDispatchReplay = await cloudflareCelldWorker.fetch(
+    new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ candidates: [{
+        task_id: taskId,
+        tenant_id: "fin-enterprise",
+        dispatch_id: `ordinary:${taskId}:1`,
+        node_id: "celld-node-01",
+        node_incarnation: "agent-boot-1",
+        kind: "ordinary",
+        task_spec: taskSpec,
+        resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 },
+      }] }),
+    }),
+    env,
+  );
+  assert.equal(oldDispatchReplay.status, 409);
+  assert.equal(((await oldDispatchReplay.json()) as any).error, "STALE_DISPATCH_AUTHORIZATION");
 
   const zombieRes = await cloudflareCelldWorker.fetch(
     new Request(`https://ansts.edge/v1beta1/tasks/${taskId}/turn`, {
       method: "POST",
-      body: JSON.stringify({ epoch: 1, turn_seq: 3 }),
+      body: JSON.stringify({
+        epoch: 1,
+        turn_seq: 4,
+        tool_call: {
+          tool_call_id: "stale-call-03",
+          tool_name: "git_branch_push",
+          effect_class: ToolEffectClass.IDEMPOTENT_WRITE,
+          payload: "branch=must-not-execute",
+        },
+      }),
     }),
     env,
   );
   assert.equal(zombieRes.status, 409);
+  assert.equal(((await zombieRes.json()) as any).error, "STALE_EXECUTION_EPOCH");
 
   // Test Hibernatable WebSocket credit ACK & alarm() hibernation on the Cell
   const cell = harnessCells.get(taskId)!;

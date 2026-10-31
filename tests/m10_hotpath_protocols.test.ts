@@ -25,12 +25,14 @@ import {
   S3CasPreconditionFailedError,
   TenantLedgerCell,
 } from "../src/index";
+import { NodeCapacityCell } from "../src/cloudflare/node_capacity_cell";
 
 test("M10 (TASK-49): TenantLedger admission, scheduler scale-out, RPO=0 turn proof & Durable Workflow", async () => {
   const kvMap = new Map<string, string>();
   const schedulerShards = new Map<string, AnstsSchedulerCell>();
   const harnessCells = new Map<string, AgentTaskHarnessCell>();
   const tenantLedgerCells = new Map<string, TenantLedgerCell>();
+  const nodeCapacityCells = new Map<string, NodeCapacityCell>();
   const queuedEvents: any[] = [];
 
   const env: CloudflareCelldEnv = {
@@ -78,6 +80,22 @@ test("M10 (TASK-49): TenantLedger admission, scheduler scale-out, RPO=0 turn pro
           tenantLedgerCells.set(key, new TenantLedgerCell(new MockDurableObjectState(key), env));
         }
         const cell = tenantLedgerCells.get(key)!;
+        return {
+          fetch: (input: RequestInfo, init?: RequestInit) => {
+            const req = typeof input === "string" ? new Request(input, init) : input;
+            return cell.fetch(req);
+          },
+        };
+      },
+    },
+    NODE_CAPACITY_CELL: {
+      idFromName: (name: string) => ({ toString: () => name, name }),
+      get: (id: { toString(): string; name?: string }) => {
+        const key = id.name ?? id.toString();
+        if (!nodeCapacityCells.has(key)) {
+          nodeCapacityCells.set(key, new NodeCapacityCell(new MockDurableObjectState(key), env));
+        }
+        const cell = nodeCapacityCells.get(key)!;
         return {
           fetch: (input: RequestInfo, init?: RequestInit) => {
             const req = typeof input === "string" ? new Request(input, init) : input;
@@ -163,9 +181,55 @@ test("M10 (TASK-49): TenantLedger admission, scheduler scale-out, RPO=0 turn pro
   assert.equal(scaleShardBody.added_shards.length, 4);
   assert.ok(scaleShardBody.total_shards >= 12);
 
+  // Dispatch task 0 through the shared SchedulerPool/NodeCapacity boundary before executing Turns.
+  const taskId = "m10-hot-task-0";
+  const dispatchId = "m10-hot-task-0:initial";
+  const scheduled = await cloudflareCelldWorker.fetch(
+    new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nodes: [{ node_id: "m10-node-0", incarnation: "m10-boot-1", capacity: { cpu: 4, memory_mb: 2048, burst_cpu: 2, sessions: 4, tps: 100 } }],
+        candidates: [{
+          task_id: taskId,
+          tenant_id: "fin-enterprise",
+          dispatch_id: dispatchId,
+          node_id: "m10-node-0",
+          node_incarnation: "m10-boot-1",
+          kind: "ordinary",
+          task_spec: { metadata: { task_id: taskId, tenant_id: "fin-enterprise" }, spec: {} },
+          resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 },
+        }],
+      }),
+    }),
+    env,
+  );
+  assert.equal(scheduled.status, 200);
+  const scheduledBody = (await scheduled.json()) as any;
+  const taskDispatch = scheduledBody.dispatches[0];
+  assert.equal(taskDispatch.stage, "AUTHORIZED");
+  assert.equal(harnessCells.get(taskId)!.taskCore.getDispatch(dispatchId)!.stage, "AUTHORIZED");
+
+  // Test-only node adapter callback simulates an authenticated report after the node has started.
+  const schedulerOwner = env.SCHEDULER_CELL!.get(env.SCHEDULER_CELL!.idFromName("global-5d-scheduler"));
+  const startReceipt = await schedulerOwner.fetch("http://scheduler.internal/scheduler/started", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      dispatch_id: taskDispatch.dispatch_id,
+      node_id: taskDispatch.node_id,
+      node_incarnation: taskDispatch.node_incarnation,
+      authorization_token: taskDispatch.authorization_token,
+      business_epoch: taskDispatch.business_epoch,
+      start_receipt: "test-node-running:m10-hot-task-0:initial",
+    }),
+  });
+  assert.equal(startReceipt.status, 200);
+  assert.equal(harnessCells.get(taskId)!.taskCore.getDispatch(dispatchId)!.stage, "STARTED");
+
   // 3. Execute turn on AgentTaskHarnessCell -> verifies embedded RPO=0 proof in response
   const turnRes = await cloudflareCelldWorker.fetch(
-    new Request("https://ansts.edge/v1beta1/tasks/m10-hot-task-0/turn", {
+    new Request(`https://ansts.edge/v1beta1/tasks/${taskId}/turn`, {
       method: "POST",
       body: JSON.stringify({
         epoch: 1,

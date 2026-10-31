@@ -8,6 +8,7 @@ import { test } from "node:test";
 import {
   AgentTask,
   AgentTaskHarnessCell,
+  AnstsSchedulerCell,
   AnstsClusterRuntime,
   BayesianTaskProfiler,
   CloudflareCelldEnv,
@@ -16,6 +17,7 @@ import {
   TaskState,
   ToolEffectClass,
 } from "../src/index";
+import { NodeCapacityCell } from "../src/cloudflare/node_capacity_cell";
 
 test("Audit Fix #1: celld / Durable Object Cold-Start & Hibernation Wakeup SQLite Rehydration", async () => {
   const sharedState = new MockDurableObjectState("tsk_rehydrate_01");
@@ -25,8 +27,68 @@ test("Audit Fix #1: celld / Durable Object Cold-Start & Hibernation Wakeup SQLit
     FALLBACK_MODEL_POOL: "Qwen-3.8",
   } as CloudflareCelldEnv;
 
+  const nodeCells = new Map<string, NodeCapacityCell>();
+  let activeHarness: AgentTaskHarnessCell;
+  mockEnv.AGENT_HARNESS_CELL = {
+    idFromName: (name: string) => ({ toString: () => name, name }),
+    get: () => ({ fetch: (input: RequestInfo, init?: RequestInit) => {
+      const req = typeof input === "string" ? new Request(input, init) : input;
+      return activeHarness.fetch(req);
+    } }),
+  };
+  mockEnv.NODE_CAPACITY_CELL = {
+    idFromName: (name: string) => ({ toString: () => name, name }),
+    get: (id: { toString(): string; name?: string }) => {
+      const nodeId = id.name ?? id.toString();
+      if (!nodeCells.has(nodeId)) nodeCells.set(nodeId, new NodeCapacityCell(new MockDurableObjectState(nodeId), mockEnv));
+      const cell = nodeCells.get(nodeId)!;
+      return { fetch: (input: RequestInfo, init?: RequestInit) => {
+        const req = typeof input === "string" ? new Request(input, init) : input;
+        return cell.fetch(req);
+      } };
+    },
+  };
+  const scheduler = new AnstsSchedulerCell(new MockDurableObjectState("global-5d-scheduler"), mockEnv);
+  const dispatch = async (kind: "ordinary" | "recovery", nodeId: string, incarnation: string, dispatchId: string) => {
+    const nodeCapacity = { cpu: 8, memory_mb: 4096, burst_cpu: 4, sessions: 8, tps: 100 };
+    const response = await scheduler.fetch(new Request("http://scheduler.internal/scheduler/dispatch", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        task_id: "tsk_rehydrate_01",
+        tenant_id: "fin-enterprise",
+        kind,
+        dispatch_id: dispatchId,
+        node_id: nodeId,
+        node_incarnation: incarnation,
+        nodes: [{ node_id: nodeId, incarnation, capacity: nodeCapacity }],
+        task_spec: { metadata: { task_id: "tsk_rehydrate_01", tenant_id: "fin-enterprise" }, spec: {} },
+        resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 },
+      }),
+    }));
+    const result = await response.json() as any;
+    assert.equal(result.stage, "AUTHORIZED");
+    const started = await scheduler.fetch(new Request("http://scheduler.internal/scheduler/started", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        dispatch_id: result.dispatch_id,
+        node_id: result.node_id,
+        node_incarnation: result.node_incarnation,
+        authorization_token: result.authorization_token,
+        business_epoch: result.business_epoch,
+        start_receipt: `test-node-running:${dispatchId}`,
+      }),
+    }));
+    assert.equal(started.status, 200);
+    return result;
+  };
+
   // First activation: execute Turn 1 and Turn 2, then hibernate and destroy V8 Isolate
   const cellInstance1 = new AgentTaskHarnessCell(sharedState, mockEnv);
+  activeHarness = cellInstance1;
+  const firstDispatch = await dispatch("ordinary", "rehydrate-node-1", "rehydrate-boot-1", "rehydrate-initial");
+  assert.equal(cellInstance1.taskCore.getDispatch(firstDispatch.dispatch_id)!.stage, "STARTED");
   await cellInstance1.fetch(
     new Request("http://harness.internal/turn", {
       method: "POST",
@@ -59,10 +121,17 @@ test("Audit Fix #1: celld / Durable Object Cold-Start & Hibernation Wakeup SQLit
 
   // Second activation (Cold-Start Wakeup on same SQLite storage): constructor must rehydrate Turn 1 & 2!
   const cellInstance2 = new AgentTaskHarnessCell(sharedState, mockEnv);
+  activeHarness = cellInstance2;
   assert.equal(cellInstance2.task.fence.epoch, 1);
   assert.equal(cellInstance2.task.fence.turnSeq, 3);
   assert.ok(cellInstance2.task.usedTokens > 0);
   assert.equal((cellInstance2.nodeDaemon.walStore.get("tsk_rehydrate_01") ?? []).length, 2);
+
+  // Recovery restarts the suspended execution through TaskCore and the same capacity boundary.
+  const recovery = await dispatch("recovery", "rehydrate-node-2", "rehydrate-boot-2", "rehydrate-recovery-2");
+  assert.equal(recovery.business_epoch, 2);
+  assert.equal(cellInstance2.taskCore.getDispatch(recovery.dispatch_id)!.stage, "STARTED");
+  assert.equal(cellInstance2.task.fence.epoch, 2);
 
   // Replay to Turn 2 works seamlessly on the newly rehydrated Cell instance
   const replayRes = await cellInstance2.fetch(
@@ -71,6 +140,7 @@ test("Audit Fix #1: celld / Durable Object Cold-Start & Hibernation Wakeup SQLit
       body: JSON.stringify({ target_turn_seq: 2 }),
     }),
   );
+  assert.equal(replayRes.status, 200);
   const replayBody = (await replayRes.json()) as Record<string, any>;
   assert.equal(replayBody.replayed_up_to_turn, 2);
   assert.equal(replayBody.restored_workspace_hash, "hash_turn_2");
