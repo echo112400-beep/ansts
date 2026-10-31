@@ -15,9 +15,17 @@ class_name = "AnstsSchedulerCell"
 name = "AGENT_HARNESS_CELL"
 class_name = "AgentTaskHarnessCell"
 
+[[durable_objects.bindings]]
+name = "TENANT_LEDGER_CELL"
+class_name = "TenantLedgerCell"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AnstsSchedulerCell", "AgentTaskHarnessCell"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["TenantLedgerCell"]
 
 [[d1_databases]]
 binding = "ANSTS_D1"

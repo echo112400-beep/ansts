@@ -109,6 +109,7 @@ export interface QueueBinding {
 export interface CloudflareCelldEnv extends PersistenceCellBindings {
   SCHEDULER_CELL: DurableObjectNamespace;
   AGENT_HARNESS_CELL: DurableObjectNamespace;
+  TENANT_LEDGER_CELL: DurableObjectNamespace;
   ANSTS_D1: D1DatabaseBinding;
   ANSTS_KV: KVNamespaceBinding;
   ANSTS_CHECKPOINTS_R2: R2BucketBinding;

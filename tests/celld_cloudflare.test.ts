@@ -14,6 +14,7 @@ import {
   CloudflareCelldEnv,
   cloudflareCelldWorker,
   MockDurableObjectState,
+  TenantLedgerCell,
   ToolEffectClass,
 } from "../src/index";
 
@@ -21,6 +22,7 @@ function createMockCloudflareCelldEnv(): {
   env: CloudflareCelldEnv;
   schedulerCell: AnstsSchedulerCell;
   harnessCells: Map<string, AgentTaskHarnessCell>;
+  tenantLedgerCells: Map<string, TenantLedgerCell>;
   d1Rows: Array<any[]>;
   queuedMessages: any[];
 } {
@@ -29,6 +31,7 @@ function createMockCloudflareCelldEnv(): {
   const d1Rows: Array<any[]> = [];
   const queuedMessages: any[] = [];
   const harnessCells = new Map<string, AgentTaskHarnessCell>();
+  const tenantLedgerCells = new Map<string, TenantLedgerCell>();
 
   const env: CloudflareCelldEnv = {
     PRIMARY_MODEL_POOL: "DeepSeek",
@@ -37,6 +40,7 @@ function createMockCloudflareCelldEnv(): {
     WEBHOOK_HMAC_SECRET: "whsec_celld_test",
     SCHEDULER_CELL: null as any,
     AGENT_HARNESS_CELL: null as any,
+    TENANT_LEDGER_CELL: null as any,
     ANSTS_KV: {
       get: async (key: string, type?: "text" | "json") => {
         const val = kvMap.get(key);
@@ -119,14 +123,36 @@ function createMockCloudflareCelldEnv(): {
     },
   };
 
-  return { env, schedulerCell, harnessCells, d1Rows, queuedMessages };
+  env.TENANT_LEDGER_CELL = {
+    idFromName: (name: string) => ({ toString: () => `tenant_${name}`, name }),
+    get: (id: { toString(): string; name?: string }) => {
+      const tenantId = id.name ?? id.toString();
+      if (!tenantLedgerCells.has(tenantId)) {
+        tenantLedgerCells.set(tenantId, new TenantLedgerCell(new MockDurableObjectState(tenantId), env));
+      }
+      const cell = tenantLedgerCells.get(tenantId)!;
+      return {
+        fetch: (input: RequestInfo, init?: RequestInit) => {
+          const req = typeof input === "string" ? new Request(input, init) : input;
+          return cell.fetch(req);
+        },
+      };
+    },
+  };
+
+  return { env, schedulerCell, harnessCells, tenantLedgerCells, d1Rows, queuedMessages };
 }
 
 test("07. wrangler.json & D1 SQL migration schema verification for celld and Cloudflare Workers", () => {
   const rootDir = path.join(__dirname, "..", "..");
   const wranglerJson = JSON.parse(fs.readFileSync(path.join(rootDir, "wrangler.json"), "utf8"));
   assert.equal(wranglerJson.main, "src/cloudflare/worker.ts");
-  assert.equal(wranglerJson.durable_objects.bindings.length, 2);
+  assert.equal(wranglerJson.durable_objects.bindings.length, 3);
+  assert.equal(
+    wranglerJson.durable_objects.bindings.find((binding: Record<string, string>) => binding.name === "TENANT_LEDGER_CELL")?.class_name,
+    "TenantLedgerCell",
+  );
+  assert.equal(wranglerJson.migrations.at(-1).tag, "v2");
   assert.equal(wranglerJson.d1_databases[0].binding, "ANSTS_D1");
   assert.equal(wranglerJson.kv_namespaces[0].binding, "ANSTS_KV");
   assert.equal(wranglerJson.r2_buckets[0].binding, "ANSTS_CHECKPOINTS_R2");
@@ -135,12 +161,12 @@ test("07. wrangler.json & D1 SQL migration schema verification for celld and Clo
   assert.ok(sqlMig.includes("CREATE TABLE IF NOT EXISTS task_audit_events"));
 });
 
-test("08. Stateless Edge Worker + KV Idempotency + AnstsSchedulerCell 5D W-DRF & DAG Escrow", async () => {
+test("08. TenantLedger admission + AnstsSchedulerCell 5D W-DRF & DAG Escrow", async () => {
   const { env, queuedMessages, d1Rows } = createMockCloudflareCelldEnv();
   const specPath = path.join(__dirname, "..", "..", "specs", "taskspec_v1beta1_example.yaml");
   const sampleSpec = yaml.load(fs.readFileSync(specPath, "utf8")) as Record<string, any>;
 
-  // First submission -> 202 Accepted and queued into ANSTS_EVENTS_QUEUE
+  // First submission -> 202 Accepted; initial queue intent and outbox are owned by TenantLedgerCell.
   const res1 = await cloudflareCelldWorker.fetch(
     new Request("https://ansts.edge/v1beta1/tasks", {
       method: "POST",
@@ -151,9 +177,10 @@ test("08. Stateless Edge Worker + KV Idempotency + AnstsSchedulerCell 5D W-DRF &
   assert.equal(res1.status, 202);
   const body1 = (await res1.json()) as Record<string, any>;
   assert.equal(body1.deduplicated, false);
-  assert.equal(queuedMessages.length, 1);
+  assert.equal(body1.runnable_status, "PENDING_DISPATCH");
+  assert.equal(queuedMessages.length, 0);
 
-  // Duplicate submission -> intercepted at edge by ANSTS_KV in ~0.2ms
+  // Duplicate submission -> the durable tenant ledger returns the same acceptance identity.
   const res2 = await cloudflareCelldWorker.fetch(
     new Request("https://ansts.edge/v1beta1/tasks", {
       method: "POST",
@@ -164,8 +191,9 @@ test("08. Stateless Edge Worker + KV Idempotency + AnstsSchedulerCell 5D W-DRF &
   assert.equal(res2.status, 200);
   const body2 = (await res2.json()) as Record<string, any>;
   assert.equal(body2.deduplicated, true);
+  assert.equal(body2.task_id, body1.task_id);
 
-  // Cron scheduled() trigger runs 5D W-DRF tick and persists lease into Scheduler Cell SQLite
+  // Admission is not falsely treated as scheduler dispatch; a separate reconciler consumes its durable intent.
   await cloudflareCelldWorker.scheduled({ scheduledTime: Date.now(), cron: "* * * * *" }, env);
 
   const topRes = await cloudflareCelldWorker.fetch(
@@ -173,9 +201,9 @@ test("08. Stateless Edge Worker + KV Idempotency + AnstsSchedulerCell 5D W-DRF &
     env,
   );
   const topBody = (await topRes.json()) as Record<string, any>;
-  assert.equal(topBody.celld_sqlite_leases_count, 1);
+  assert.equal(topBody.celld_sqlite_leases_count, 0);
 
-  // Process queue() batch into ANSTS_D1 audit table
+  // The generic Queue consumer remains independently testable with a synthetic outbox delivery.
   let acked = false;
   await cloudflareCelldWorker.queue(
     {
@@ -184,7 +212,12 @@ test("08. Stateless Edge Worker + KV Idempotency + AnstsSchedulerCell 5D W-DRF &
         {
           id: "msg_01",
           timestamp: new Date(),
-          body: queuedMessages[0],
+          body: {
+            task_id: body1.task_id,
+            tenant_id: body1.tenant_id,
+            event_type: "task.admitted",
+            payload: { task_id: body1.task_id },
+          },
           ack: () => {
             acked = true;
           },
@@ -224,6 +257,220 @@ test("08B. Public task route resolves the logical TaskCell binding by stable tas
 
   assert.equal(response.status, 200);
   assert.deepEqual(routedNames, ["task-registry-7"]);
+});
+
+test("public Worker admission is stored in TenantLedgerCell and remains queryable by tenant", async () => {
+  const { env } = createMockCloudflareCelldEnv();
+  const cells = new Map<string, TenantLedgerCell>();
+  env.TENANT_LEDGER_CELL = {
+    idFromName: (name: string) => ({ toString: () => `tenant_${name}`, name }),
+    get: (id: { toString(): string; name?: string }) => {
+      const tenantId = id.name ?? id.toString();
+      if (!cells.has(tenantId)) {
+        cells.set(tenantId, new TenantLedgerCell(new MockDurableObjectState(tenantId), env));
+      }
+      const cell = cells.get(tenantId)!;
+      return {
+        fetch: (input: RequestInfo, init?: RequestInit) => {
+          const req = typeof input === "string" ? new Request(input, init) : input;
+          return cell.fetch(req);
+        },
+      };
+    },
+  };
+  const sampleSpec = yaml.load(
+    fs.readFileSync(path.join(__dirname, "..", "..", "specs", "taskspec_v1beta1_example.yaml"), "utf8"),
+  ) as Record<string, any>;
+
+  const accepted = await cloudflareCelldWorker.fetch(
+    new Request("https://ansts.edge/v1beta1/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(sampleSpec),
+    }),
+    env,
+  );
+  assert.equal(accepted.status, 202);
+  const admission = (await accepted.json()) as Record<string, any>;
+  assert.equal(admission.accepted, true);
+  assert.equal(admission.task_id, sampleSpec.metadata.task_id);
+  assert.equal(admission.tenant_id, sampleSpec.metadata.tenant_id);
+  assert.equal(admission.idempotency_key, sampleSpec.metadata.idempotency_key);
+  assert.equal(admission.runnable_status, "PENDING_DISPATCH");
+
+  const task = await cloudflareCelldWorker.fetch(
+    new Request(
+      `https://ansts.edge/v1beta1/tasks/${encodeURIComponent(sampleSpec.metadata.task_id)}?tenant_id=${encodeURIComponent(sampleSpec.metadata.tenant_id)}`,
+    ),
+    env,
+  );
+  assert.equal(task.status, 200);
+  const taskBody = (await task.json()) as Record<string, any>;
+  assert.equal(taskBody.task_id, sampleSpec.metadata.task_id);
+  assert.equal(taskBody.task_spec.spec.tools_and_saga_config.transactional_policies[3].tool_name, "settlement_ledger_post");
+
+  const replay = await cloudflareCelldWorker.fetch(
+    new Request("https://ansts.edge/v1beta1/tasks", { method: "POST", body: JSON.stringify(sampleSpec) }),
+    env,
+  );
+  assert.equal(replay.status, 200);
+  assert.equal(((await replay.json()) as any).task_id, sampleSpec.metadata.task_id);
+
+  const changedPayload = structuredClone(sampleSpec);
+  changedPayload.metadata.priority_score = Number(changedPayload.metadata.priority_score ?? 0) + 1;
+  const conflict = await cloudflareCelldWorker.fetch(
+    new Request("https://ansts.edge/v1beta1/tasks", { method: "POST", body: JSON.stringify(changedPayload) }),
+    env,
+  );
+  assert.equal(conflict.status, 409);
+
+  const admissionByKey = await cloudflareCelldWorker.fetch(
+    new Request(`https://ansts.edge/v1beta1/admissions/by-key/${encodeURIComponent(sampleSpec.metadata.idempotency_key)}?tenant_id=${encodeURIComponent(sampleSpec.metadata.tenant_id)}`),
+    env,
+  );
+  assert.equal(admissionByKey.status, 200);
+  assert.equal(((await admissionByKey.json()) as any).task_id, sampleSpec.metadata.task_id);
+
+  const concurrentSpec = structuredClone(sampleSpec);
+  concurrentSpec.metadata.task_id = "tsk_concurrent_tenant_admission_01";
+  concurrentSpec.metadata.idempotency_key = "idem_concurrent_tenant_admission_01";
+  const concurrent = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      cloudflareCelldWorker.fetch(
+        new Request("https://ansts.edge/v1beta1/tasks", { method: "POST", body: JSON.stringify(concurrentSpec) }),
+        env,
+      ),
+    ),
+  );
+  const concurrentBodies = await Promise.all(concurrent.map((response) => response.json() as Promise<Record<string, any>>));
+  assert.equal(concurrent.every((response) => response.status === 202 || response.status === 200), true);
+  assert.equal(new Set(concurrentBodies.map((body) => body.task_id)).size, 1);
+  assert.equal(concurrentBodies.filter((body) => body.deduplicated === false).length, 1);
+
+  const wrongTenant = await cloudflareCelldWorker.fetch(
+    new Request(
+      `https://ansts.edge/v1beta1/tasks/${encodeURIComponent(sampleSpec.metadata.task_id)}?tenant_id=other-tenant`,
+    ),
+    env,
+  );
+  assert.equal(wrongTenant.status, 404);
+});
+
+test("public Worker budget routes conserve integer allowances across grant, hold, unknown, settlement and transfer", async () => {
+  const { env } = createMockCloudflareCelldEnv();
+  const tenantId = "tenant-ledger-budget-test";
+  const base = `https://ansts.edge/v1beta1/tenants/${tenantId}`;
+  const request = (path: string, method: string, body?: Record<string, unknown>) =>
+    cloudflareCelldWorker.fetch(
+      new Request(`${base}${path}`, {
+        method,
+        headers: body ? { "content-type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      }),
+      env,
+    );
+
+  const period = await request("/budget-periods/2026-11", "PUT", {
+    currency: "USD",
+    hard_limit_minor: 1000,
+    price_version: "price-v1",
+  });
+  assert.equal(period.status, 201);
+
+  const grant = {
+    period_key: "2026-11",
+    task_id: "parent-task",
+    grant_id: "grant-parent-1",
+    amount_minor: 800,
+    currency: "USD",
+  };
+  assert.equal((await request("/budget-grants", "POST", grant)).status, 201);
+  assert.equal((await request("/budget-grants", "POST", grant)).status, 200);
+  const overCap = await request("/budget-grants", "POST", {
+    ...grant,
+    grant_id: "grant-parent-over-cap",
+    amount_minor: 300,
+  });
+  assert.equal(overCap.status, 402);
+
+  const hold = {
+    period_key: "2026-11",
+    task_id: "parent-task",
+    hold_id: "hold-primary-1",
+    amount_minor: 300,
+    cost_bound_minor: 300,
+    currency: "USD",
+  };
+  assert.equal((await request("/budget-holds", "POST", hold)).status, 201);
+  assert.equal((await request("/budget-holds", "POST", hold)).status, 200);
+  const heldAccount = await request("/budget-accounts/parent-task?period_key=2026-11", "GET");
+  assert.deepEqual(
+    (({ available_minor, reserved_minor }: any) => ({ available_minor, reserved_minor }))(await heldAccount.json()),
+    { available_minor: 500, reserved_minor: 300 },
+  );
+  const changedHold = await request("/budget-holds", "POST", { ...hold, amount_minor: 250, cost_bound_minor: 250 });
+  assert.equal(changedHold.status, 409);
+  assert.equal((await request("/budget-holds/hold-primary-1/unknown", "POST", { reason: "provider timed out" })).status, 201);
+  assert.equal((await request("/budget-holds/hold-primary-1/unknown", "POST", { reason: "provider timed out" })).status, 200);
+  const unknown = await request("/budget-holds?period_key=2026-11&status=UNKNOWN", "GET");
+  assert.equal(unknown.status, 200);
+  assert.equal(((await unknown.json()) as any).holds[0].hold_id, "hold-primary-1");
+
+  const settlement = {
+    settlement_id: "settlement-primary-1",
+    actual_minor: 275,
+    currency: "USD",
+    usage_reference: "provider-usage-42",
+  };
+  assert.equal((await request("/budget-holds/hold-primary-1/settlements", "POST", settlement)).status, 201);
+  assert.equal((await request("/budget-holds/hold-primary-1/settlements", "POST", settlement)).status, 200);
+  assert.equal(
+    (await request("/budget-holds/hold-primary-1/settlements", "POST", { ...settlement, actual_minor: 250 })).status,
+    409,
+  );
+
+  const transfer = {
+    period_key: "2026-11",
+    transfer_id: "parent-to-child-1",
+    source_task_id: "parent-task",
+    target_task_id: "child-task",
+    amount_minor: 200,
+    currency: "USD",
+  };
+  assert.equal((await request("/allowance-transfers", "POST", transfer)).status, 201);
+  assert.equal((await request("/allowance-transfers", "POST", transfer)).status, 200);
+
+  const parent = await request("/budget-accounts/parent-task?period_key=2026-11", "GET");
+  const child = await request("/budget-accounts/child-task?period_key=2026-11", "GET");
+  assert.deepEqual(
+    { available: (await parent.json() as any).available_minor, reserved: 0, spent: 275 },
+    { available: 325, reserved: 0, spent: 275 },
+  );
+  assert.equal((await child.json() as any).available_minor, 200);
+
+  const noBound = await request("/budget-holds", "POST", {
+    period_key: "2026-11",
+    task_id: "parent-task",
+    hold_id: "hold-without-bound",
+    amount_minor: 10,
+    currency: "USD",
+    strict_hard_budget: true,
+  });
+  assert.equal(noBound.status, 422);
+  const fractionalAmount = await request("/budget-holds", "POST", {
+    period_key: "2026-11",
+    task_id: "parent-task",
+    hold_id: "hold-fractional",
+    amount_minor: 1.5,
+    cost_bound_minor: 1.5,
+    currency: "USD",
+  });
+  assert.equal(fractionalAmount.status, 400);
+  const crossTenant = await cloudflareCelldWorker.fetch(
+    new Request(`${base}/budget-periods/2026-11?tenant_id=somebody-else`),
+    env,
+  );
+  assert.equal(crossTenant.status, 404);
 });
 
 test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Burst, SQLite WAL & Fencing", async () => {
