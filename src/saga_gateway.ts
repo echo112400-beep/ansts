@@ -8,6 +8,7 @@ import { LeaseCoordinator } from "./lease_coordinator";
 import { AgentTask, FenceToken, ToolEffectClass } from "./models";
 import { SagaCompensatorEngine } from "./saga/compensator";
 import { StagingCommitAndApprovalGate } from "./saga/staging";
+import { stableTaskOperationId, TaskOperationProvider, TaskOperationRequest, TaskOperations } from "./persistence/task-operations";
 
 export interface SagaLogEntry {
   taskId: string;
@@ -25,11 +26,34 @@ export class SagaToolGateway {
   public sagaJournal: Map<string, SagaLogEntry[]> = new Map();
   public stagingBuffer: Map<string, SagaLogEntry[]> = new Map();
   public flushedProductionWrites: SagaLogEntry[] = [];
-  public readonly compensator = new SagaCompensatorEngine(3);
+  public readonly compensator: SagaCompensatorEngine;
   public readonly approvalGate = new StagingCommitAndApprovalGate();
 
-  constructor(public readonly leaseCoordinator: LeaseCoordinator) {}
+  constructor(public readonly leaseCoordinator: LeaseCoordinator, public readonly taskOperations?: TaskOperations) {
+    this.compensator = new SagaCompensatorEngine(3, taskOperations);
+  }
 
+  /** Durable path used by TaskCell integrations. It returns only after TaskOperations confirms intent. */
+  public executeDurableTool<T>(params: Omit<TaskOperationRequest, "operationId"> & {
+    toolCallId: string;
+    provider: TaskOperationProvider<T>;
+  }): ReturnType<TaskOperations["executeOperation"]> {
+    if (!this.taskOperations) throw new Error("TASK_OPERATIONS_NOT_CONFIGURED");
+    const { toolCallId, provider, ...request } = params;
+    const operationId = stableTaskOperationId(request.fence.taskId, toolCallId);
+    return this.taskOperations.executeOperation({ ...request, operationId }, provider);
+  }
+
+  public compensatePersisted(
+    fence: FenceToken,
+    targetTurnSeq: number,
+    executor: Parameters<SagaCompensatorEngine["compensatePersisted"]>[3],
+  ): ReturnType<SagaCompensatorEngine["compensatePersisted"]> {
+    if (!this.taskOperations) throw new Error("TASK_OPERATIONS_NOT_CONFIGURED");
+    return this.compensator.compensatePersisted(fence.taskId, targetTurnSeq, fence, executor);
+  }
+
+  /** Legacy in-process simulator retained for existing non-TaskCell callers. */
   public executeTool(params: {
     fence: FenceToken;
     toolCallId: string;
