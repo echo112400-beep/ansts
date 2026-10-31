@@ -55,6 +55,7 @@ export class LeaseCoordinator {
     return newFence;
   }
 
+  /** Legacy local simulation; Cloudflare execution epochs are issued durably by TaskCore. */
   public acquireOrIncrementEpoch(taskId: string, nodeId: string, modelPool: string): FenceToken {
     const existing = this.leases.get(taskId);
     const expectedEpoch = existing ? existing.fence.epoch : 0;
@@ -80,5 +81,14 @@ export class LeaseCoordinator {
 
   public getLease(taskId: string): TaskLeaseRecord | undefined {
     return this.leases.get(taskId);
+  }
+
+  /** Restore the local cache from TaskCell; this method does not issue an execution epoch. */
+  public restoreFence(taskId: string, nodeId: string, modelPool: string, fence: FenceToken): void {
+    const current = this.leases.get(taskId);
+    if (current && fence.epoch < current.fence.epoch) {
+      throw new StaleFenceError(`Cannot restore stale business epoch ${fence.epoch}; cached epoch is ${current.fence.epoch}.`);
+    }
+    this.leases.set(taskId, { taskId, nodeId, modelPool, fence });
   }
 }

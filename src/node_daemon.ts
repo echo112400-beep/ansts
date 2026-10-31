@@ -28,6 +28,7 @@ export class NodeDaemon {
   public burstSemaphoreLimit: number = 4;
   public psiMemoryPressurePct: number = 12.0;
   public consecutiveSaturatedTurns: number = 0;
+  /** Rebuildable isolate-local mirror; TaskCell SQLite/TaskCore own execution and committed turn authority. */
   public walStore: Map<string, TurnWalFrame[]> = new Map();
   public cgroupCpuAllocation: Map<string, number> = new Map();
   public attachedHeavyExecutors: Map<string, AttachedHeavyExecutor> = new Map();
@@ -199,6 +200,7 @@ export class NodeDaemon {
     return { action: "CONTINUE", velocity: vk, nextFence: task.fence };
   }
 
+  /** Legacy in-process simulation only. Cloudflare recovery must use TaskCore-issued authorization. */
   public failoverTaskToNode(task: AgentTask, newNodeId: string): FenceToken {
     const newFence = this.leaseCoordinator.acquireOrIncrementEpoch(
       task.taskId,
@@ -212,5 +214,15 @@ export class NodeDaemon {
     task.assignedNodeId = newNodeId;
     task.state = TaskState.RUNNING;
     return task.fence;
+  }
+
+  /** Apply a placement and business epoch already authorized by the task owner. */
+  public applyAuthorizedExecution(task: AgentTask, nodeId: string, authorization: FenceToken): void {
+    if (authorization.taskId !== task.taskId) throw new Error("TaskCell authorization belongs to another task.");
+    if (authorization.epoch < task.fence.epoch) throw new Error("TaskCell authorization is stale.");
+    task.fence = authorization;
+    task.assignedNodeId = nodeId;
+    task.state = TaskState.RUNNING;
+    this.leaseCoordinator.restoreFence(task.taskId, nodeId, task.assignedModelPool ?? task.primaryModel, authorization);
   }
 }
