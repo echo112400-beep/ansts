@@ -1,0 +1,35 @@
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.4
+    ports:
+      - "127.0.0.1:${CELLD_ACCEPTANCE_S3_PORT}:9000"
+      - "127.0.0.1:${CELLD_ACCEPTANCE_CONSOLE_PORT}:9001"
+    volumes:
+      - rustfs_bucket:/data
+      - rustfs_logs:/var/log/rustfs
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: :9000
+      RUSTFS_CONSOLE_ADDRESS: :9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+      RUSTFS_OBS_LOG_DIRECTORY: /var/log/rustfs
+      RUSTFS_ACCESS_KEY: ${CELLD_ACCEPTANCE_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${CELLD_ACCEPTANCE_SECRET_KEY}
+    command: ["/data"]
+
+  aws:
+    image: amazon/aws-cli:2.39.3
+    profiles: [tools]
+    environment:
+      AWS_ACCESS_KEY_ID: ${CELLD_ACCEPTANCE_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${CELLD_ACCEPTANCE_SECRET_KEY}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: us-east-1
+    entrypoint: ["aws"]
+
+volumes:
+  rustfs_bucket:
+    name: ${CELLD_ACCEPTANCE_VOLUME}_bucket
+  rustfs_logs:
+    name: ${CELLD_ACCEPTANCE_VOLUME}_logs
