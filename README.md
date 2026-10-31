@@ -4,6 +4,8 @@
 
 **ANSTS v2.0** 是面向大规模自主智能体（Autonomous AI Agents）沙箱工作负载构建的多租户、双相脉冲与认知强度感知的分布式调度系统（全量 **TypeScript** 实现，覆盖 M1 ~ M6 全部 32 项工程任务）。
 
+持久化设计以 [Celld 微服务持久化设计规范](docs/celld_persistence_design.md) 为准（2026-11-01 已确认，待实施）。该规范定义七类权威 Cell、本地事务、跨 Cell 恢复协议及迁移验收；旧文档中冲突的存储选型与未经实测的 SLO 由该规范替代。
+
 ## 核心架构特性
 
 1. **5D Phase & Effort-Aware W-DRF 公平调度 (`src/scheduler.ts`)**：统一调度稳态期望算力（$\widetilde{\text{CPU}}$）、突发算力余量（$\text{CPU}_{\text{burst}}$）、稳态内存（$\widetilde{\text{Mem}}$）、并发子会话槽位（$\text{Sess}$）与推理强度折算有效吞吐（$\widetilde{\text{TPS}}$），配合对数老化（Aging）与最早截止时间优先（EDF）彻底消除饥饿。
