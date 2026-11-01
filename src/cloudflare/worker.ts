@@ -728,8 +728,10 @@ export default {
     _controller: { scheduledTime: number; cron: string },
     env: CloudflareCelldEnv,
   ): Promise<void> {
-    const schedStub = persistenceCellStub(env, "scheduler-pool", "global-5d-scheduler");
-    await schedStub.fetch("http://scheduler.internal/scheduler/tick", { method: "POST" });
+    try {
+      const schedStub = persistenceCellStub(env, "scheduler-pool", "global-5d-scheduler");
+      await schedStub.fetch("http://scheduler.internal/scheduler/tick", { method: "POST" });
+    } catch { /* Scheduler failure must not prevent independent durable query repair. */ }
     try {
       await pruneTaskEventProjection(env.ANSTS_D1);
       const tenants = await listProjectedTenants(env.ANSTS_D1, 20);
