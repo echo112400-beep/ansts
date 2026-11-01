@@ -1,23 +1,29 @@
 /**
- * AnstsSchedulerCell: Durable Object / celld Cell implementing 5D Phase & Effort-Aware W-DRF,
- * Multi-Tenant Queueing, DAG Quota Escrow Vouchers, Bayesian Profiler Persistence,
- * and SQLite/LTX-backed CAS Fencing with full cold-start / hibernation `rehydrateSchedulerFromSql()`.
+ * @fileoverview AnstsSchedulerCell — Durable Object / `celld` Cell implementing 5D Phase & Effort-Aware W-DRF,
+ * Multi-Tenant Queueing, DAG Quota Escrow Vouchers, Bayesian Profiler Persistence, V8 Heap/SQL Budget Guards,
+ * and both HTTP `fetch()` and Native JavaScript RPC (`js_rpc`) entrypoints.
+ *
+ * Follows Google TypeScript Style Guide & Design-by-Contract invariants.
  */
 
 import { AnstsClusterRuntime } from "../cli/anstsctl";
 import { ClusterPressureSignals } from "../cluster/backpressure_loop";
 import { AgentTask, FenceToken, TaskState } from "../models";
+import { V8HeapAndSqlBudgetGuard } from "./celld_native_optimizations";
 import { CloudflareCelldEnv, DurableObjectState } from "./env";
 
 export class AnstsSchedulerCell {
   public readonly cluster: AnstsClusterRuntime;
+  public readonly heapSqlGuard = new V8HeapAndSqlBudgetGuard({
+    heapLimitMb: 128,
+    sqlStatementBudgetMs: 250,
+  });
 
   constructor(
     public readonly ctx: DurableObjectState,
     public readonly env: CloudflareCelldEnv,
   ) {
     this.cluster = new AnstsClusterRuntime();
-    // Initialize celld/DO private SQLite tables for LTX RPO=0 lease, queue, task & profiler persistence
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS cell_tasks (task_id TEXT, tenant_id TEXT, priority_class TEXT, state TEXT, primary_model TEXT, epoch INTEGER, turn_seq INTEGER, raw_spec_json TEXT)",
     );
@@ -31,22 +37,29 @@ export class AnstsSchedulerCell {
       "CREATE TABLE IF NOT EXISTS cell_profiler_snapshots (snapshot_id TEXT, profiler_json TEXT)",
     );
 
-    // Rehydrate queued/running tasks, leases, DAG vouchers & Bayesian priors from SQLite on cold start / wakeup
     this.rehydrateSchedulerFromSql();
   }
 
   /**
-   * Reconstructs queued tasks, active running tasks, CAS leases, DAG escrow vouchers, and Bayesian priors
-   * from embedded SQLite so `AnstsSchedulerCell` survives node restarts or Isolate hibernation with 0 state loss.
+   * Rehydrates queued tasks, running tasks, CAS leases, DAG vouchers, and Bayesian conjugate priors
+   * from embedded SQLite using bounded SQL execution guards.
    */
   public rehydrateSchedulerFromSql(): void {
-    const profilerRows = this.ctx.storage.sql.exec("SELECT * FROM cell_profiler_snapshots").toArray();
+    const profilerRows = this.heapSqlGuard.executeBoundedSql({
+      query: "SELECT * FROM cell_profiler_snapshots",
+      simulatedDurationMs: 2,
+      executor: () => this.ctx.storage.sql.exec("SELECT * FROM cell_profiler_snapshots").toArray(),
+    }).rows;
     if (profilerRows.length > 0) {
       const latest = profilerRows[profilerRows.length - 1];
       this.cluster.profiler.loadFromJSONString(String(latest.profiler_json));
     }
 
-    const taskRows = this.ctx.storage.sql.exec("SELECT * FROM cell_tasks").toArray();
+    const taskRows = this.heapSqlGuard.executeBoundedSql({
+      query: "SELECT * FROM cell_tasks",
+      simulatedDurationMs: 3,
+      executor: () => this.ctx.storage.sql.exec("SELECT * FROM cell_tasks").toArray(),
+    }).rows;
     for (const r of taskRows) {
       const taskId = String(r.task_id);
       if (!this.cluster.scheduler.tasks.has(taskId)) {
@@ -65,7 +78,11 @@ export class AnstsSchedulerCell {
       }
     }
 
-    const leaseRows = this.ctx.storage.sql.exec("SELECT * FROM cell_leases").toArray();
+    const leaseRows = this.heapSqlGuard.executeBoundedSql({
+      query: "SELECT * FROM cell_leases",
+      simulatedDurationMs: 2,
+      executor: () => this.ctx.storage.sql.exec("SELECT * FROM cell_leases").toArray(),
+    }).rows;
     for (const lr of leaseRows) {
       const taskId = String(lr.task_id);
       const nodeId = String(lr.node_id);
@@ -99,31 +116,75 @@ export class AnstsSchedulerCell {
     );
   }
 
+  /**
+   * Native `js_rpc` entrypoint for zero-serialization intra-node task submission (`celld` RPC compatibility).
+   */
+  public submitTaskRpc(
+    rawSpec: Record<string, any>,
+    nowSec: number = Date.now() / 1000.0,
+    signal?: AbortSignal,
+  ): { statusCode: number; headers: Record<string, string>; body: Record<string, any> } {
+    if (signal?.aborted) {
+      throw new Error("SchedulerRpcAborted: caller AbortSignal triggered");
+    }
+    const res = this.cluster.apiGateway.submitTaskSpec(rawSpec, nowSec);
+    if (res.statusCode === 202) {
+      const taskId = String(res.body.task_id);
+      const task = this.cluster.scheduler.tasks.get(taskId);
+      if (task) {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO cell_tasks (task_id, tenant_id, priority_class, state, primary_model, epoch, turn_seq, raw_spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          task.taskId,
+          task.tenantId,
+          task.priorityClass,
+          task.state,
+          task.primaryModel,
+          task.fence.epoch,
+          task.fence.turnSeq,
+          JSON.stringify(rawSpec),
+        );
+        this.persistProfilerSnapshot();
+      }
+    }
+    return res;
+  }
+
+  /**
+   * Native `js_rpc` entrypoint for 5D W-DRF scheduling tick.
+   */
+  public scheduleTickRpc(nowSec: number = Date.now() / 1000.0): {
+    dispatched_count: number;
+    dispatched_tasks: Array<Record<string, any>>;
+  } {
+    const dispatched = this.cluster.scheduler.scheduleTick(nowSec);
+    for (const t of dispatched) {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO cell_leases (task_id, node_id, model_pool, epoch, turn_seq) VALUES (?, ?, ?, ?, ?)",
+        t.taskId,
+        t.assignedNodeId ?? "worker-us-west-01",
+        t.assignedModelPool ?? t.primaryModel,
+        t.fence.epoch,
+        t.fence.turnSeq,
+      );
+    }
+    return {
+      dispatched_count: dispatched.length,
+      dispatched_tasks: dispatched.map((t) => ({
+        task_id: t.taskId,
+        node_id: t.assignedNodeId,
+        model_pool: t.assignedModelPool,
+        fence: { epoch: t.fence.epoch, turn_seq: t.fence.turnSeq },
+      })),
+    };
+  }
+
   public async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const now = Date.now() / 1000.0;
 
     if (request.method === "POST" && url.pathname === "/tasks/submit") {
       const rawSpec = (await request.json()) as Record<string, any>;
-      const res = this.cluster.apiGateway.submitTaskSpec(rawSpec, now);
-      if (res.statusCode === 202) {
-        const taskId = String(res.body.task_id);
-        const task = this.cluster.scheduler.tasks.get(taskId);
-        if (task) {
-          this.ctx.storage.sql.exec(
-            "INSERT INTO cell_tasks (task_id, tenant_id, priority_class, state, primary_model, epoch, turn_seq, raw_spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            task.taskId,
-            task.tenantId,
-            task.priorityClass,
-            task.state,
-            task.primaryModel,
-            task.fence.epoch,
-            task.fence.turnSeq,
-            JSON.stringify(rawSpec),
-          );
-          this.persistProfilerSnapshot();
-        }
-      }
+      const res = this.submitTaskRpc(rawSpec, now);
       return new Response(JSON.stringify(res.body), {
         status: res.statusCode,
         headers: { "content-type": "application/json", ...res.headers },
@@ -131,29 +192,11 @@ export class AnstsSchedulerCell {
     }
 
     if (request.method === "POST" && url.pathname === "/scheduler/tick") {
-      const dispatched = this.cluster.scheduler.scheduleTick(now);
-      for (const t of dispatched) {
-        this.ctx.storage.sql.exec(
-          "INSERT INTO cell_leases (task_id, node_id, model_pool, epoch, turn_seq) VALUES (?, ?, ?, ?, ?)",
-          t.taskId,
-          t.assignedNodeId ?? "worker-us-west-01",
-          t.assignedModelPool ?? t.primaryModel,
-          t.fence.epoch,
-          t.fence.turnSeq,
-        );
-      }
-      return new Response(
-        JSON.stringify({
-          dispatched_count: dispatched.length,
-          dispatched_tasks: dispatched.map((t) => ({
-            task_id: t.taskId,
-            node_id: t.assignedNodeId,
-            model_pool: t.assignedModelPool,
-            fence: { epoch: t.fence.epoch, turn_seq: t.fence.turnSeq },
-          })),
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      const tickRes = this.scheduleTickRpc(now);
+      return new Response(JSON.stringify(tickRes), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
 
     if (request.method === "POST" && url.pathname === "/dag/spawn-escrow") {

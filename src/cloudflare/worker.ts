@@ -19,6 +19,7 @@ import { DashboardBackendServer } from "../dashboard/server";
 import { FinOpsBudgetController } from "../finops/budget_controller";
 import { OtelAndPrometheusExporter } from "../telemetry/otel_prometheus";
 import { ShardedQueueBrokerPool } from "./celld_ha_engine";
+import { CelldKvOptimizerAndGuard, DynamicWorkerSandboxLoader } from "./celld_native_optimizations";
 import { CloudflareCelldEnv, MessageBatch } from "./env";
 import { FederationRegionId, MultiRegionFederationRouter } from "./federation_router";
 import { AgentTaskHarnessCell } from "./harness_cell";
@@ -46,6 +47,8 @@ const globalFinOpsController = new FinOpsBudgetController();
 const globalOtelExporter = new OtelAndPrometheusExporter();
 const globalDashboardServer = new DashboardBackendServer();
 const globalManualScaleController = new ManualFleetScaleController(undefined, globalSchedulerRouter, globalQueueAutoSharder);
+const globalKvOptimizer = new CelldKvOptimizerAndGuard(8, true);
+const globalDynamicWorkerLoader = new DynamicWorkerSandboxLoader();
 const tenantActiveCounts = new Map<string, number>();
 
 export default {
@@ -56,6 +59,8 @@ export default {
   publicFinOpsController: globalFinOpsController,
   publicOtelExporter: globalOtelExporter,
   publicManualScaleController: globalManualScaleController,
+  publicKvOptimizer: globalKvOptimizer,
+  publicDynamicWorkerLoader: globalDynamicWorkerLoader,
 
   async fetch(
     request: Request,
@@ -159,6 +164,8 @@ export default {
           active_queue_shards: scaleEval.newShards,
         };
 
+        const kvShardInfo = globalKvOptimizer.putSharded(kvKey, JSON.stringify(enrichedBody), { expirationTtl: 86400 });
+        (enrichedBody as any).kv_namespace_shard_id = kvShardInfo.namespaceShardId;
         await env.ANSTS_KV.put(kvKey, JSON.stringify(enrichedBody), { expirationTtl: 86400 });
         await env.ANSTS_EVENTS_QUEUE.send(eventPayload);
 
@@ -266,6 +273,41 @@ export default {
         requiredModelPool: body.required_model_pool,
       });
       return new Response(JSON.stringify(decision), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    // Route 1F: Dynamic Workers Sandbox Execution Endpoint (TASK-70)
+    if (request.method === "POST" && url.pathname === "/v1beta1/dynamic-workers/invoke") {
+      const body = (await request.json()) as {
+        worker_name: string;
+        compatibility_date?: string;
+        code?: string;
+        cpu_limit_ms?: number;
+        subrequests_limit?: number;
+        simulated_cpu_ms?: number;
+        outbound_urls?: string[];
+        props?: Record<string, any>;
+      };
+      globalDynamicWorkerLoader.loadWorkerCode(body.worker_name, {
+        compatibilityDate: body.compatibility_date ?? "2026-10-01",
+        mainModule: "index.js",
+        modules: { "index.js": body.code ?? "export default {}" },
+        limits: {
+          cpuMs: body.cpu_limit_ms ?? 50,
+          subrequests: body.subrequests_limit ?? 4,
+        },
+      });
+      const execOut = await globalDynamicWorkerLoader.invokeEntrypoint({
+        workerName: body.worker_name,
+        props: body.props ?? {},
+        simulatedCpuMs: body.simulated_cpu_ms ?? 5,
+        outboundSubrequests: body.outbound_urls ?? [],
+        outboundFetchFirewall: (u) => !u.includes("evil"),
+        handler: (p) => ({ executed: true, worker: body.worker_name, props: p }),
+      });
+      return new Response(JSON.stringify(execOut), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
