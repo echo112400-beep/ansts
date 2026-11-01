@@ -15,7 +15,7 @@ import { TenantLedgerCell } from "../src/persistence/tenant";
 async function fixture(childIds = ["child"], startChildren = true) {
   const tenantId = "tenant-dag-acceptance", dagId = "dag-acceptance", parentId = "parent";
   const env: any = { DAG_VOUCHER_SECRET: "dedicated-test-dag-voucher-secret-0123456789", ANSTS_CHECKPOINTS_R2: {} };
-  let loseReturnResponse = false, loseBoostResponse = false, rejectDagSync = false;
+  let loseReturnResponse = false, loseBoostResponse = false, rejectDagSync = false, hideQuotaAssignment = false;
   function namespace(Cell: any, kind: string) {
     const owners = new Map<string, { state: MockDurableObjectState; cell: any }>();
     return { idFromName: (name: string) => ({ name, toString: () => name }), get(id: any) {
@@ -28,6 +28,11 @@ async function fixture(childIds = ["child"], startChildren = true) {
         const request = new Request(input, init);
         const body = kind === "ledger" && request.method === "POST" ? await request.clone().json().catch(() => ({})) as any : {};
         const result = await owners.get(id.name)!.cell.fetch(request);
+        if (hideQuotaAssignment && kind === "task" && new URL(request.url).pathname === "/execution/state" && result.ok) {
+          const body = await result.json() as any;
+          for (const field of ["quota_dag_id", "quota_voucher_id", "quota_tokens_used", "quota_tokens_reserved"]) delete body[field];
+          return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+        }
         if (loseReturnResponse && String(body.transfer_id ?? "").startsWith("dag-return:")) {
           loseReturnResponse = false; throw new Error("committed return response lost");
         }
@@ -97,7 +102,7 @@ async function fixture(childIds = ["child"], startChildren = true) {
     state: () => check(request(`${base}/state?tenant_id=${tenantId}`)),
     reactivate: () => env.DAG_CELL.reactivate(),
     loseReturn: () => { loseReturnResponse = true; }, loseBoost: () => { loseBoostResponse = true; },
-    rejectProof: (value: boolean) => { rejectDagSync = value; } };
+    rejectProof: (value: boolean) => { rejectDagSync = value; }, legacySourceState: () => { hideQuotaAssignment = true; } };
 }
 
 test("DAG allowance return recovers its original amount after a committed transfer response is lost", async () => {
@@ -175,4 +180,16 @@ test("distinct boosts cannot delegate the same donor token and TPS allocation tw
   assert.equal(duplicateAllocation.status, 409);
   assert.equal((await f.account("source")).available_minor, 150);
   assert.equal((await f.account("target")).available_minor, 250);
+});
+
+test("legacy source state without durable quota accounting cannot delegate additional tokens", async () => {
+  const f = await fixture(["source", "target"]);
+  await f.complete("source"); await f.stop("source");
+  f.legacySourceState();
+  const boost = await f.request(`${f.base}/boosts`, { tenant_id: f.tenantId, boost_id: "legacy-boost",
+    source_task_id: "source", target_task_id: "target", amount_minor: 50, delegated_tokens: 100, delegated_tps: 0 });
+  assert.equal(boost.status, 409);
+  assert.equal(((await boost.json()) as any).error, "DAG_BOOST_SOURCE_USAGE_UNKNOWN");
+  assert.equal((await f.account("source")).available_minor, 200);
+  assert.equal((await f.account("target")).available_minor, 200);
 });
