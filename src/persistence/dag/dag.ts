@@ -1,6 +1,7 @@
 import { CellOperationCommand, CellMigration, PersistenceObjectStorage, PersistenceSqlStorage } from "../contracts";
 import { digestJson } from "../digest";
 import { executeCellOperation } from "../operations";
+import { confirmCellWrite } from "../transactions";
 
 export type DagState = "PREPARING" | "TRANSFERRING" | "ACTIVE" | "JOIN_READY" | "RESUMING" | "COMPLETED";
 export type DagChildState = "WAITING" | "READY" | "RUNNING" | "SUCCEEDED" | "FAILED" | "STOPPING" | "STOPPED";
@@ -70,6 +71,13 @@ export interface DagBoostRecord {
   voucher_signature: string;
   created_at: number;
   updated_at: number;
+}
+
+export interface DagReturnRecord {
+  task_id: string;
+  transfer_id: string;
+  amount_minor: number;
+  status: "PENDING" | "RETURNED";
 }
 
 export interface DagRecord {
@@ -169,6 +177,16 @@ export const dagBoostMigration: CellMigration = {
   },
 };
 
+export const dagReturnMigration: CellMigration = {
+  version: 4,
+  description: "durable child allowance return identity and amount before cross-Cell transfer",
+  up(sql) {
+    sql.exec(`CREATE TABLE IF NOT EXISTS durable_dag_returns (
+      task_id TEXT PRIMARY KEY, transfer_id TEXT NOT NULL, amount_minor INTEGER NOT NULL, status TEXT NOT NULL
+    )`);
+  },
+};
+
 /** SQL authority for one DagCell. Cross-Cell work is deliberately performed by its adapter. */
 export class DagStore {
   constructor(public readonly storage: PersistenceObjectStorage, public readonly dagId: string) {}
@@ -180,6 +198,7 @@ export class DagStore {
     if (existing) {
       const digest = (existing as DagRow & { create_digest: string }).create_digest;
       if (digest !== canonical.sha256) throw new DagPersistenceError("DAG_CREATE_CONFLICT", `DAG ${this.dagId} already exists with different topology.`);
+      await confirmCellWrite(this.storage);
       return this.get()!;
     }
 
@@ -261,6 +280,30 @@ export class DagStore {
       .map((boost) => ({ ...boost, amount_minor: Number(boost.amount_minor), delegated_tps: Number(boost.delegated_tps), delegated_tokens: Number(boost.delegated_tokens), created_at: Number(boost.created_at), updated_at: Number(boost.updated_at) }));
   }
 
+  public allowanceReturn(taskId: string): DagReturnRecord | null {
+    const row = this.storage.sql.exec<DagReturnRecord>("SELECT * FROM durable_dag_returns WHERE task_id = ?", taskId).toArray()[0];
+    return row ? { ...row, amount_minor: Number(row.amount_minor) } : null;
+  }
+
+  public allowanceReturns(): DagReturnRecord[] {
+    return this.storage.sql.exec<DagReturnRecord>("SELECT * FROM durable_dag_returns ORDER BY task_id").toArray()
+      .map((row) => ({ ...row, amount_minor: Number(row.amount_minor) }));
+  }
+
+  public async beginAllowanceReturn(taskId: string, transferId: string, amountMinor: number): Promise<DagReturnRecord> {
+    const existing = this.allowanceReturn(taskId);
+    if (existing) {
+      if (existing.transfer_id !== transferId) throw new DagPersistenceError("DAG_RETURN_CONFLICT", "Return already has a different transfer identity.");
+      await confirmCellWrite(this.storage);
+      return existing;
+    }
+    if (!Number.isSafeInteger(amountMinor) || amountMinor < 0) throw new DagPersistenceError("DAG_CHILD_ACCOUNT_INVALID", "Return amount must be a non-negative safe integer.", 503);
+    await this.mutate(`dag:${this.dagId}:return-pending:${encodeURIComponent(taskId)}`, "dag.allowance.return_pending", { task_id: taskId, transfer_id: transferId, amount_minor: amountMinor }, (sql) => {
+      sql.exec("INSERT INTO durable_dag_returns (task_id, transfer_id, amount_minor, status) VALUES (?, ?, ?, ?)", taskId, transferId, amountMinor, "PENDING");
+    });
+    return this.allowanceReturn(taskId)!;
+  }
+
   public async beginBoost(input: {
     boost_id: string; source_task_id: string; target_task_id: string; amount_minor: number;
     delegated_tps: number; delegated_tokens: number; voucher: DagBoostVoucher; signature: string;
@@ -293,6 +336,7 @@ export class DagStore {
       if (existing.voucher_json !== JSON.stringify(input.voucher) || existing.voucher_signature !== input.signature) {
         throw new DagPersistenceError("DAG_BOOST_CONFLICT", `Boost ${input.boost_id} already has different content.`);
       }
+      await confirmCellWrite(this.storage);
       return { ...existing, amount_minor: Number(existing.amount_minor), delegated_tps: Number(existing.delegated_tps), delegated_tokens: Number(existing.delegated_tokens), created_at: Number(existing.created_at), updated_at: Number(existing.updated_at) };
     }
     const source = this.requireChild(input.source_task_id);
@@ -303,6 +347,19 @@ export class DagStore {
     }
     const payload = { ...input, voucher: input.voucher };
     await this.mutate(`dag:${this.dagId}:boost:${encodeURIComponent(input.boost_id)}:begin`, "dag.allowance.boost_pending", payload, (sql) => {
+      const freshSource = this.requireChild(input.source_task_id);
+      const freshTarget = this.requireChild(input.target_task_id);
+      const freshDag = this.requireDag();
+      if (freshDag.state !== "ACTIVE" || !["SUCCEEDED", "FAILED", "STOPPED"].includes(freshSource.observed_state) || freshTarget.observed_state !== "RUNNING") {
+        throw new DagPersistenceError("DAG_BOOST_BARRIER_INVALID", "Boost source/target changed while preparing the intent.", 409);
+      }
+      const outgoing = this.boosts().filter((entry) => entry.source_task_id === input.source_task_id);
+      for (const field of ["delegated_tokens", "delegated_tps"] as const) {
+        const total = outgoing.reduce((sum, entry) => sum + Number(entry[field]), input[field]);
+        if (!Number.isSafeInteger(total) || total > Number(freshSource[field]) || !Number.isSafeInteger(Number(freshTarget[field]) + input[field])) {
+          throw new DagPersistenceError("DAG_BOOST_QUOTA_EXCEEDED", "Boost exceeds the source's remaining delegated quota.", 409);
+        }
+      }
       const now = Date.now();
       sql.exec(`INSERT INTO durable_dag_boosts (
         boost_id, dag_id, tenant_id, source_task_id, target_task_id, amount_minor, delegated_tps,
@@ -318,7 +375,7 @@ export class DagStore {
   public async finishBoost(boostId: string): Promise<DagBoostRecord> {
     const boost = this.storage.sql.exec<DagBoostRecord>("SELECT * FROM durable_dag_boosts WHERE boost_id = ?", boostId).toArray()[0];
     if (!boost) throw new DagPersistenceError("DAG_BOOST_NOT_FOUND", `Boost ${boostId} is unknown.`, 404);
-    if (boost.status === "TRANSFERRED") return boost;
+    if (boost.status === "TRANSFERRED") { await confirmCellWrite(this.storage); return boost; }
     await this.mutate(`dag:${this.dagId}:boost:${encodeURIComponent(boostId)}:transferred`, "dag.allowance.boost_transferred", { dag_id: this.dagId, boost_id: boostId, transfer_id: boost.transfer_id }, (sql) => {
       const target = sql.exec<DagChildRecord>("SELECT * FROM durable_dag_children WHERE dag_id = ? AND task_id = ?", this.dagId, boost.target_task_id).toArray()[0];
       if (!target) throw new DagPersistenceError("DAG_CHILD_NOT_FOUND", `Boost target ${boost.target_task_id} is unknown.`, 404);
@@ -336,7 +393,7 @@ export class DagStore {
 
   public async markParentYielded(): Promise<void> {
     const dag = this.requireDag();
-    if (dag.parent_yielded) return;
+    if (dag.parent_yielded) { await confirmCellWrite(this.storage); return; }
     await this.mutate(`dag:${this.dagId}:parent-yielded`, "dag.parent.yielded", { dag_id: this.dagId, parent_task_id: dag.parent_task_id }, (sql) => {
       sql.exec("UPDATE durable_dags SET parent_yielded = ?, state = ?, updated_at = ? WHERE dag_id = ?", 1, dag.children.length === 0 ? "JOIN_READY" : "TRANSFERRING", Date.now(), this.dagId);
     });
@@ -344,7 +401,7 @@ export class DagStore {
 
   public async markTransferred(taskId: string): Promise<void> {
     const child = this.requireChild(taskId);
-    if (child.transfer_status === "TRANSFERRED" || child.transfer_status === "RETURNED") return;
+    if (child.transfer_status === "TRANSFERRED" || child.transfer_status === "RETURNED") { await confirmCellWrite(this.storage); return; }
     await this.mutate(`dag:${this.dagId}:transfer:${encodeURIComponent(taskId)}`, "dag.allowance.transferred", { dag_id: this.dagId, task_id: taskId, transfer_id: child.transfer_id }, (sql) => {
       sql.exec("UPDATE durable_dag_children SET transfer_status = ?, updated_at = ? WHERE dag_id = ? AND task_id = ?", "TRANSFERRED", Date.now(), this.dagId, taskId);
     });
@@ -352,7 +409,7 @@ export class DagStore {
 
   public async activate(): Promise<void> {
     const dag = this.requireDag();
-    if (dag.state === "ACTIVE" || ["JOIN_READY", "RESUMING", "COMPLETED"].includes(dag.state)) return;
+    if (dag.state === "ACTIVE" || ["JOIN_READY", "RESUMING", "COMPLETED"].includes(dag.state)) { await confirmCellWrite(this.storage); return; }
     if (!dag.parent_yielded || dag.children.some((child) => child.transfer_status !== "TRANSFERRED")) {
       throw new DagPersistenceError("DAG_NOT_READY", "DAG allowances cannot be activated before the parent is durably yielded and all transfers are confirmed.", 409);
     }
@@ -365,7 +422,7 @@ export class DagStore {
     const dag = this.requireDag();
     const child = this.requireChild(taskId);
     if (child.voucher_id !== voucherId) throw new DagPersistenceError("DAG_VOUCHER_UNKNOWN", "Voucher does not belong to this child.", 404);
-    if (child.voucher_status === "REDEEMED") return child;
+    if (child.voucher_status === "REDEEMED") { await confirmCellWrite(this.storage); return child; }
     if (dag.state !== "ACTIVE" || !dag.parent_yielded || child.transfer_status !== "TRANSFERRED") {
       throw new DagPersistenceError("DAG_VOUCHER_NOT_READY", "Voucher is not spendable until parent yield and allowance transfer are confirmed.", 409);
     }
@@ -389,6 +446,7 @@ export class DagStore {
       if (priorEvent.payload_digest !== digest || priorEvent.task_id !== input.task_id || Number(priorEvent.aggregate_version) !== input.aggregate_version) {
         throw new DagPersistenceError("DAG_EVENT_CONFLICT", `Event ${input.event_id} was reused with different content.`);
       }
+      await confirmCellWrite(this.storage);
       return { duplicate: true, child };
     }
     if (input.aggregate_version !== child.observation_version + 1) {
@@ -413,6 +471,7 @@ export class DagStore {
     if (child.observed_state !== "SUCCEEDED") throw new DagPersistenceError("DAG_WINNER_NOT_SUCCEEDED", "Only an observed successful child can win.");
     if (dag.winner_task_id) {
       if (dag.winner_task_id !== winnerTaskId) throw new DagPersistenceError("DAG_RACE_WINNER_CONFLICT", `Race ${dag.dag_id} already selected ${dag.winner_task_id}.`);
+      await confirmCellWrite(this.storage);
       return dag;
     }
     const decisionId = `dag-decision:${this.dagId}`;
@@ -426,7 +485,7 @@ export class DagStore {
 
   public async markWinnerNotified(taskId: string): Promise<void> {
     const child = this.requireChild(taskId);
-    if (Number(child.winner_notified) === 1) return;
+    if (Number(child.winner_notified) === 1) { await confirmCellWrite(this.storage); return; }
     await this.mutate(`dag:${this.dagId}:winner-notified:${encodeURIComponent(taskId)}`, "dag.race.winner_delivered", { dag_id: this.dagId, task_id: taskId }, (sql) => {
       sql.exec("UPDATE durable_dag_children SET winner_notified = ?, updated_at = ? WHERE dag_id = ? AND task_id = ?", 1, Date.now(), this.dagId, taskId);
     });
@@ -434,7 +493,7 @@ export class DagStore {
 
   public async setState(state: DagState, operationSuffix: string, payload: unknown = {}): Promise<void> {
     const dag = this.requireDag();
-    if (dag.state === state) return;
+    if (dag.state === state) { await confirmCellWrite(this.storage); return; }
     await this.mutate(`dag:${this.dagId}:${operationSuffix}`, `dag.${operationSuffix.replaceAll(":", ".")}`, { dag_id: this.dagId, ...asRecord(payload), state }, (sql) => {
       sql.exec("UPDATE durable_dags SET state = ?, updated_at = ? WHERE dag_id = ?", state, Date.now(), this.dagId);
     });
@@ -444,10 +503,12 @@ export class DagStore {
     const child = this.requireChild(taskId);
     if (child.transfer_status === "RETURNED") {
       if (child.return_transfer_id !== transferId) throw new DagPersistenceError("DAG_RETURN_CONFLICT", "Child allowance was already returned under a different transfer.");
+      await confirmCellWrite(this.storage);
       return;
     }
     await this.mutate(`dag:${this.dagId}:return:${encodeURIComponent(taskId)}`, "dag.allowance.returned", { dag_id: this.dagId, task_id: taskId, transfer_id: transferId, amount_minor: amountMinor }, (sql) => {
       sql.exec("UPDATE durable_dag_children SET transfer_status = ?, returned_minor = ?, return_transfer_id = ?, updated_at = ? WHERE dag_id = ? AND task_id = ?", "RETURNED", amountMinor, transferId, Date.now(), this.dagId, taskId);
+      sql.exec("UPDATE durable_dag_returns SET status = ? WHERE task_id = ?", "RETURNED", taskId);
     });
   }
 
@@ -460,8 +521,10 @@ export class DagStore {
   public async isDispatchAuthorized(taskId: string, voucherId: string): Promise<boolean> {
     const dag = this.get();
     const child = this.child(taskId);
-    return Boolean(dag && child && dag.state === "ACTIVE" && (!dag.race_mode || !dag.winner_task_id || dag.winner_task_id === taskId) &&
+    const authorized = Boolean(dag && child && dag.state === "ACTIVE" && (!dag.race_mode || !dag.winner_task_id || dag.winner_task_id === taskId) &&
       child.voucher_status === "REDEEMED" && child.transfer_status === "TRANSFERRED" && child.voucher_id === voucherId);
+    if (authorized) await confirmCellWrite(this.storage);
+    return authorized;
   }
 
   private async mutate(operationId: string, operationType: string, payload: unknown, apply: (sql: PersistenceSqlStorage) => void): Promise<void> {
