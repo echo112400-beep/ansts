@@ -9,7 +9,9 @@ import {
   executeCellOperation,
   initializeCellProtocol,
   listDueCellOutbox,
+  markCellOutboxBatchDelivered,
   markCellOutboxDelivered,
+  pruneDeliveredCellOutboxPayloads,
   recordCellOutboxFailure,
   CellDurabilityUnavailableError,
 } from "../src/persistence";
@@ -160,6 +162,43 @@ test("outbox work remains queryable until acknowledged and preserves event ident
   assert.equal(retried.attempts, 1);
   assert.equal(retried.lastError, "temporary outage");
   assert.equal(await markCellOutboxDelivered(state.storage, "event-admit-7", 2), true);
+  const syncsAfterDelivery = state.durableSyncCalls;
+  assert.equal(await markCellOutboxDelivered(state.storage, "event-admit-7", 3), false);
+  assert.equal(state.durableSyncCalls, syncsAfterDelivery + 1, "idempotent delivery retry must reconfirm the committed row");
+  await executeCellOperation(state.storage, { ...operation, operationId: "admit-8", resourceId: "task-8", expectedVersion: 1 },
+    () => ({ status: "ACCEPTED" }), [{ ...event, eventId: "event-admit-8", payload: { taskId: "task-8" } }]);
+  assert.equal(await markCellOutboxBatchDelivered(state.storage, {
+    eventIds: ["event-admit-8"], tenantId: "tenant-7", aggregateType: "tenant-admissions", aggregateId: "tenant-7",
+  }, 4), 1);
+  await assert.rejects(markCellOutboxBatchDelivered(state.storage, {
+    eventIds: ["event-admit-8"], tenantId: "tenant-other", aggregateType: "tenant-admissions", aggregateId: "tenant-7",
+  }, 5), { code: "CELL_OUTBOX_CONFLICT" });
+  state.storage.sql.exec("UPDATE cell_outbox SET created_at = ? WHERE event_id = ?", 1, "event-admit-8");
+  await executeCellOperation(state.storage, { ...operation, operationId: "admit-9", resourceId: "task-9", expectedVersion: 2 },
+    () => ({ status: "ACCEPTED" }), [{ ...event, eventId: "event-admit-9", payload: { taskId: "task-9" } }]);
+  state.storage.sql.exec("UPDATE cell_outbox SET created_at = ?, next_attempt_at = ? WHERE event_id = ?", 1, 1, "event-admit-9");
+  const beforePrune = state.storage.sql.exec<{ event_id: string; status: string; created_at: number; payload_json: string }>(
+    "SELECT event_id, status, created_at, payload_json FROM cell_outbox WHERE event_id = ?", "event-admit-8").toArray()[0];
+  assert.deepEqual(beforePrune, { event_id: "event-admit-8", status: "DELIVERED", created_at: 1, payload_json: JSON.stringify({ taskId: "task-8" }) });
+  const deliveredRows = state.storage.sql.exec<{ event_id: string }>("SELECT * FROM cell_outbox WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ? AND status = ?",
+    "tenant-7", "tenant-admissions", "tenant-7", "DELIVERED").toArray();
+  assert.ok(deliveredRows.some((row: any) => row.event_id === "event-admit-8"));
+  assert.equal(Number((deliveredRows as any[]).find((row) => row.event_id === "event-admit-8").created_at), 1);
+  assert.equal(await pruneDeliveredCellOutboxPayloads(state.storage, {
+    tenantId: "tenant-7", aggregateType: "tenant-admissions", aggregateId: "tenant-7", cutoff: 2,
+  }), 1);
+  const prunedPayload = state.storage.sql.exec<{ payload_json: string; status: string }>(
+    "SELECT payload_json, status FROM cell_outbox WHERE event_id = ?", "event-admit-8").toArray()[0];
+  assert.deepEqual(JSON.parse(prunedPayload.payload_json), {}, "expired delivered payload is discarded but identity metadata remains");
+  assert.equal(prunedPayload.status, "DELIVERED");
+  assert.equal(listDueCellOutbox(state.storage.sql, 10).some((item) => item.eventId === "event-admit-9"), true,
+    "expired pending delivery remains available for replay");
+  const replayAfterPayloadRetention = await executeCellOperation(state.storage, { ...operation, operationId: "admit-8", resourceId: "task-8", expectedVersion: 1 },
+    () => { throw new Error("retained operation must not reapply"); }, [{ ...event, eventId: "event-admit-8", payload: { taskId: "task-8" } }]);
+  assert.equal(replayAfterPayloadRetention.outcome, "REPLAYED");
+  await markCellOutboxBatchDelivered(state.storage, {
+    eventIds: ["event-admit-9"], tenantId: "tenant-7", aggregateType: "tenant-admissions", aggregateId: "tenant-7",
+  }, 6);
   assert.deepEqual(listDueCellOutbox(state.storage.sql, 10), []);
   assert.ok(state.durableSyncCalls >= 3);
 });

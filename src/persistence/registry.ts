@@ -14,6 +14,7 @@ export const PERSISTENCE_CELL_CLASS_NAMES: Record<PersistenceCellType, string> =
   dag: "DagCell",
   "provider-quota": "ProviderQuotaCell",
   "routing-config": "RoutingConfigCell",
+  "tenant-directory": "TenantDirectoryCell",
 };
 
 export interface PersistenceWorkerBindings extends PersistenceCellBindings {
@@ -49,6 +50,8 @@ export function persistenceCellNamespace(
         return bindings.PROVIDER_QUOTA_CELL;
       case "routing-config":
         return bindings.ROUTING_CONFIG_CELL;
+      case "tenant-directory":
+        return bindings.TENANT_DIRECTORY_CELL;
     }
   })();
 

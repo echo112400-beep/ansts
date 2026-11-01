@@ -8,6 +8,7 @@ import {
   RoutingCallPin,
   RoutingConfigSnapshot,
 } from "../persistence/routing-config";
+import { digestJson } from "../persistence/digest";
 
 export interface RoutingConfigAuthority {
   getCurrent(tenantId: string): Promise<RoutingConfigSnapshot | null> | RoutingConfigSnapshot | null;
@@ -59,6 +60,7 @@ export interface TenantBudgetAuthority {
 }
 
 export interface ProviderCallAdapter {
+  preflight?(input: { tenantId: string; taskId: string; route: ModelRouteConfig; payload: unknown }): Promise<void> | void;
   call(input: {
     callId: string;
     idempotencyKey: string;
@@ -77,10 +79,26 @@ export interface TrustedInputTokenEstimator {
 }
 
 export interface TrustedInputTokenEstimate {
-  /** Exact count from the injected server-side tokenizer. */
+  /** Server-side estimate; conservative byte bounds may be used when no tokenizer is installed. */
   estimatedTokens: number;
   /** Conservative upper bound after applying any tokenizer/provider safety margin. */
   upperBoundTokens: number;
+}
+
+export interface ProviderCallResultJournal {
+  getModelCallResult(input: { taskId: string; tenantId: string; callId: string }): Promise<{
+    response: unknown;
+    usage: ProviderUsageEvidence;
+    routeRefs?: Record<string, unknown>;
+  } | null>;
+  recordModelCallResult(input: {
+    taskId: string;
+    tenantId: string;
+    callId: string;
+    response: unknown;
+    usage: ProviderUsageEvidence;
+    routeRefs: Record<string, unknown>;
+  }): Promise<unknown>;
 }
 
 export interface MeteredProviderCallDependencies {
@@ -90,6 +108,8 @@ export interface MeteredProviderCallDependencies {
   budget: TenantBudgetAuthority;
   provider: ProviderCallAdapter;
   inputTokenEstimator?: TrustedInputTokenEstimator;
+  /** Persist a completed provider response before quota completion and budget settlement. */
+  resultJournal?: ProviderCallResultJournal;
 }
 
 export interface MeteredProviderCallRequest {
@@ -113,6 +133,7 @@ export type MeteredProviderCallResult =
       grantId: string;
       routingVersion: number;
       priceVersion: string;
+      currency: string;
       reservedMinor: number;
       actualMinor: number;
       releasedMinor: number;
@@ -156,6 +177,13 @@ export class MeteredProviderCallExecutor {
     const callId = normalizeText(request.callId, "callId");
     const tenantId = normalizeText(request.tenantId, "tenantId");
     const taskId = normalizeText(request.taskId, "taskId");
+    const requestDigest = (await digestJson({
+      payload: request.payload,
+      poolName: request.poolName,
+      reasoningEffort: request.reasoningEffort ?? null,
+      requestedMaxOutputTokens: request.requestedMaxOutputTokens ?? null,
+      routingVersion: request.routingVersion ?? null,
+    })).sha256;
     const requestId = `${tenantId}:${taskId}:${callId}`;
 
     const pin = await this.dependencies.routingConfig.pinCall(tenantId, requestId, request.poolName, request.routingVersion);
@@ -167,6 +195,7 @@ export class MeteredProviderCallExecutor {
         pin.priceVersion !== (route.pricing?.priceVersion ?? null) || JSON.stringify(pin.route) !== JSON.stringify(route)) {
       throw new MeteredProviderCallError("ROUTING_CALL_PIN_CONFLICT", "The pinned route does not match its immutable configuration snapshot.", 409);
     }
+    await this.dependencies.provider.preflight?.({ tenantId, taskId, route, payload: request.payload });
     const providerQuota = this.dependencies.providerQuotaForRoute?.(route) ?? this.dependencies.providerQuota;
     if (!providerQuota) throw new MeteredProviderCallError("PROVIDER_QUOTA_AUTHORITY_REQUIRED", "A quota authority for the selected provider domain must be injected.", 500);
     const existingGrant = await providerQuota.getGrantByRequestId(requestId);
@@ -225,6 +254,35 @@ export class MeteredProviderCallExecutor {
       return unknownResult(callId, holdId, existingGrant?.grantId ?? `grant:${requestId}`, snapshot.version, quote, reason);
     }
 
+    const stagedResult = await this.dependencies.resultJournal?.getModelCallResult({ taskId, tenantId, callId });
+    if (stagedResult) {
+      const usage = validateUsageWithinBound(stagedResult.usage, quote);
+      const refs = stagedResult.routeRefs ?? {};
+      if (!usage ||
+          (refs.routingVersion !== undefined && refs.routingVersion !== snapshot.version) ||
+          (refs.priceVersion !== undefined && refs.priceVersion !== quote.priceVersion) ||
+          (refs.holdId !== undefined && refs.holdId !== holdId) ||
+          (refs.grantId !== undefined && refs.grantId !== grant.grantId) ||
+          (refs.requestDigest !== undefined && refs.requestDigest !== requestDigest)) {
+        const reason = "A staged provider result does not match the pinned route, hold, grant, or token bound.";
+        await safelyMarkBudgetUnknown(this.dependencies.budget, holdId, reason);
+        await safelyMarkQuotaUnknown(providerQuota, grant.grantId, requestId, reason);
+        return unknownResult(callId, holdId, grant.grantId, snapshot.version, quote, reason);
+      }
+      await providerQuota.completeCall(grant.grantId, requestId, usage);
+      return this.settleUsage({
+        callId,
+        holdId,
+        grant,
+        snapshot,
+        quote,
+        usage,
+        response: stagedResult.response,
+        recovered: true,
+        providerQuota,
+      });
+    }
+
     const begin = await providerQuota.beginCall(grant.grantId, requestId);
     if (begin.state === "EXPIRED") {
       await this.dependencies.budget.settle({
@@ -278,6 +336,31 @@ export class MeteredProviderCallExecutor {
       await safelyMarkQuotaUnknown(providerQuota, grant.grantId, requestId, reason);
       return unknownResult(callId, holdId, grant.grantId, snapshot.version, quote, reason);
     }
+    if (this.dependencies.resultJournal) {
+      try {
+        await this.dependencies.resultJournal.recordModelCallResult({
+          taskId,
+          tenantId,
+          callId,
+          response: providerResult.response,
+          usage,
+          routeRefs: {
+            holdId,
+            grantId: grant.grantId,
+            routingVersion: snapshot.version,
+            priceVersion: quote.priceVersion,
+            provider: route.provider,
+            modelId: route.modelId,
+            requestDigest,
+          },
+        });
+      } catch (error) {
+        const reason = `Provider result could not be durably journaled: ${errorMessage(error)}`;
+        await safelyMarkBudgetUnknown(this.dependencies.budget, holdId, reason);
+        await safelyMarkQuotaUnknown(providerQuota, grant.grantId, requestId, reason);
+        return unknownResult(callId, holdId, grant.grantId, snapshot.version, quote, reason);
+      }
+    }
     await providerQuota.completeCall(grant.grantId, requestId, usage);
     return this.settleUsage({ callId, holdId, grant, snapshot, quote, usage, response: providerResult.response, recovered: false, providerQuota });
   }
@@ -319,6 +402,7 @@ export class MeteredProviderCallExecutor {
       grantId: params.grant.grantId,
       routingVersion: params.snapshot.version,
       priceVersion: params.quote.priceVersion,
+      currency: params.quote.currency,
       reservedMinor: params.quote.amountMinor,
       actualMinor,
       releasedMinor: params.quote.amountMinor - actualMinor,

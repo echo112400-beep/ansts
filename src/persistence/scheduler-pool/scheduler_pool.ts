@@ -13,6 +13,8 @@ export interface SchedulerCandidate {
   resource_pool?: string;
   tenant_weight?: number;
   kind?: TaskDispatchKind;
+  dag_id?: string;
+  voucher_id?: string;
   resources: NodeResourceVector;
   task_spec?: unknown;
   execution_policy?: unknown;
@@ -256,6 +258,9 @@ function validateCandidate(candidate: SchedulerCandidate): void {
     throw new TypeError("Candidate requires a finite non-negative resource vector.");
   }
   if (candidate.kind && !["ordinary", "recovery", "dag"].includes(candidate.kind)) throw new TypeError("Candidate kind must be ordinary, recovery or dag.");
+  if (candidate.kind === "dag" && (!candidate.dag_id?.trim() || !candidate.voucher_id?.trim())) {
+    throw new TypeError("DAG candidates require a durable dag_id and redeemed voucher_id.");
+  }
   if (candidate.tenant_weight !== undefined && (!Number.isFinite(candidate.tenant_weight) || candidate.tenant_weight <= 0)) {
     throw new TypeError("tenant_weight must be finite and positive.");
   }
@@ -306,6 +311,7 @@ function assertSameCandidate(existing: SchedulerDispatchRecord, candidate: Sched
     existing.node_id !== candidate.node_id || existing.kind !== candidate.kind ||
     existing.region !== candidate.region || existing.resource_pool !== candidate.resource_pool ||
     existing.node_incarnation !== candidate.node_incarnation ||
+    old.dag_id !== candidate.dag_id || old.voucher_id !== candidate.voucher_id ||
     JSON.stringify(JSON.parse(existing.resources_json)) !== JSON.stringify(candidate.resources) ||
     JSON.stringify(old.task_spec) !== JSON.stringify(candidate.task_spec)
   ) throw new Error(`Dispatch ${candidate.dispatch_id} was reused with different request content.`);

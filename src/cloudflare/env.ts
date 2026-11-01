@@ -64,15 +64,16 @@ export interface KVNamespaceBinding {
 
 export interface R2ObjectBody {
   key: string;
-  body: string;
+  body?: string;
   customMetadata?: Record<string, string>;
   text(): Promise<string>;
+  arrayBuffer(): Promise<ArrayBuffer>;
 }
 
 export interface R2BucketBinding {
   put(
     key: string,
-    value: string,
+    value: string | ArrayBuffer | ArrayBufferView,
     options?: { onlyIf?: { etagDoesNotMatch?: string }; customMetadata?: Record<string, string> },
   ): Promise<{ key: string } | null>;
   get(key: string): Promise<R2ObjectBody | null>;
@@ -106,18 +107,41 @@ export interface QueueBinding {
   send(message: any): Promise<void>;
 }
 
+/** Internal provider bridge for MCP/tool effects; absence fails closed before an attempt begins. */
+export interface TaskOperationExecutorBinding {
+  fetch(input: RequestInfo, init?: RequestInit): Promise<Response>;
+}
+
+/** Optional service binding used by tests or a controlled provider egress proxy. */
+export interface ModelProviderProxyBinding {
+  fetch(input: RequestInfo, init?: RequestInit): Promise<Response>;
+}
+
 export interface CloudflareCelldEnv extends PersistenceCellBindings {
   SCHEDULER_CELL: DurableObjectNamespace;
   AGENT_HARNESS_CELL: DurableObjectNamespace;
   TENANT_LEDGER_CELL: DurableObjectNamespace;
+  TENANT_DIRECTORY_CELL?: DurableObjectNamespace;
   ANSTS_D1: D1DatabaseBinding;
   ANSTS_KV: KVNamespaceBinding;
   ANSTS_CHECKPOINTS_R2: R2BucketBinding;
   ANSTS_EVENTS_QUEUE: QueueBinding;
+  TASK_OPERATION_EXECUTOR?: TaskOperationExecutorBinding;
+  MODEL_PROVIDER_PROXY?: ModelProviderProxyBinding;
+  DEEPSEEK_CHAT_COMPLETIONS_URL?: string;
+  DEEPSEEK_API_KEY?: string;
+  GLM53_CHAT_COMPLETIONS_URL?: string;
+  GLM53_API_KEY?: string;
+  QWEN_CHAT_COMPLETIONS_URL?: string;
+  QWEN_API_KEY?: string;
+  /** Explicit local test-only switch for the in-memory legacy Turn simulator. */
+  TEST_SIMULATOR_MODE?: boolean;
   PRIMARY_MODEL_POOL?: string;
   FAST_UTILITY_POOL?: string;
   FALLBACK_MODEL_POOL?: string;
   WEBHOOK_HMAC_SECRET?: string;
+  /** Required HMAC key for spendable durable DAG vouchers. Configure as a runtime secret. */
+  DAG_VOUCHER_SECRET?: string;
 }
 
 /**

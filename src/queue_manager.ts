@@ -18,6 +18,10 @@ export interface TenantQueueQuota {
 export class SubAgentDagGroup {
   public stragglerTriggerRatio: number = 0.75;
   public boostTpsMultiplier: number = 2.0;
+  public transferredBoostTps = 0;
+  public parentResumed = false;
+  public raceWinnerTaskId?: string;
+  public readonly prunedTaskIds = new Set<string>();
 
   constructor(
     public readonly dagId: string,
@@ -27,9 +31,13 @@ export class SubAgentDagGroup {
   ) {}
 
   public completionRatio(): number {
-    if (this.children.length === 0) return 0.0;
-    const done = this.children.filter((c) => c.state === TaskState.SUCCEEDED).length;
+    if (this.children.length === 0) return 1.0;
+    const done = this.children.filter((c) => [TaskState.SUCCEEDED, TaskState.CIRCUIT_BROKEN].includes(c.state)).length;
     return done / this.children.length;
+  }
+
+  public allChildrenTerminal(): boolean {
+    return this.children.every((child) => [TaskState.SUCCEEDED, TaskState.CIRCUIT_BROKEN].includes(child.state));
   }
 }
 
@@ -127,37 +135,48 @@ export class MultiTenantQueueManager {
     const actions: string[] = [];
     for (const dag of this.activeDags.values()) {
       if (dag.speculativeRaceMode) {
-        const winners = dag.children.filter((c) => c.state === TaskState.SUCCEEDED);
-        if (winners.length > 0) {
+        const winner = dag.raceWinnerTaskId
+          ? dag.children.find((child) => child.taskId === dag.raceWinnerTaskId)
+          : dag.children.find((child) => child.state === TaskState.SUCCEEDED);
+        if (winner && !dag.raceWinnerTaskId) dag.raceWinnerTaskId = winner.taskId;
+        if (winner) {
           for (const c of dag.children) {
-            if (c.taskId !== winners[0].taskId && c.state === TaskState.RUNNING) {
+            if (c.taskId !== winner.taskId && c.state === TaskState.RUNNING && !dag.prunedTaskIds.has(c.taskId)) {
               c.state = TaskState.CIRCUIT_BROKEN;
               c.activeSessions = 0;
+              dag.prunedTaskIds.add(c.taskId);
               actions.push(`RACE_PRUNED:${c.taskId}`);
             }
           }
-          dag.parentTask.state = TaskState.RUNNING;
-          dag.parentTask.phase = SandboxPhase.COGNITIVE;
-          actions.push(`PARENT_RESUMED:${dag.parentTask.taskId}`);
+          if (!dag.parentResumed && dag.allChildrenTerminal()) {
+            dag.parentTask.state = TaskState.RUNNING;
+            dag.parentTask.phase = SandboxPhase.COGNITIVE;
+            dag.parentResumed = true;
+            actions.push(`PARENT_RESUMED:${dag.parentTask.taskId}`);
+          }
         }
       } else {
         const ratio = dag.completionRatio();
-        if (ratio >= 1.0) {
+        if (ratio >= 1.0 && !dag.parentResumed) {
           dag.parentTask.state = TaskState.RUNNING;
           dag.parentTask.phase = SandboxPhase.COGNITIVE;
+          dag.parentResumed = true;
           actions.push(`JOIN_COMPLETED:${dag.parentTask.taskId}`);
         } else if (ratio >= dag.stragglerTriggerRatio) {
-          const unusedTps = dag.children
+          let availableTps = Math.max(0, dag.children
             .filter((c) => c.state === TaskState.SUCCEEDED)
-            .reduce((acc, c) => acc + c.reservedTps, 0);
+            .reduce((acc, c) => acc + c.reservedTps, 0) - dag.transferredBoostTps);
           const running = dag.children.filter((c) => c.state === TaskState.RUNNING);
           for (const straggler of running) {
-            straggler.reservedTps = Math.floor(
-              Math.min(
-                straggler.reservedTps * dag.boostTpsMultiplier,
-                straggler.reservedTps + Math.floor(unusedTps / Math.max(1, running.length)),
-              ),
-            );
+            const distributable = Math.floor(availableTps / Math.max(1, running.length));
+            const boost = Math.max(0, Math.min(
+              Math.floor(straggler.reservedTps * (dag.boostTpsMultiplier - 1)),
+              distributable,
+            ));
+            if (boost === 0) continue;
+            straggler.reservedTps += boost;
+            dag.transferredBoostTps += boost;
+            availableTps -= boost;
             straggler.baseScore += 150;
             actions.push(`STRAGGLER_BOOSTED:${straggler.taskId}`);
           }

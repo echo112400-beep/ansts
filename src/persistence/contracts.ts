@@ -7,6 +7,7 @@ export const PERSISTENCE_CELL_TYPES = [
   "dag",
   "provider-quota",
   "routing-config",
+  "tenant-directory",
 ] as const;
 
 export type PersistenceCellType = (typeof PERSISTENCE_CELL_TYPES)[number];
@@ -56,6 +57,7 @@ export interface PersistenceCellBindings {
   DAG_CELL?: PersistenceCellNamespace;
   PROVIDER_QUOTA_CELL?: PersistenceCellNamespace;
   ROUTING_CONFIG_CELL?: PersistenceCellNamespace;
+  TENANT_DIRECTORY_CELL?: PersistenceCellNamespace;
 }
 
 export interface CellOperationCommand {

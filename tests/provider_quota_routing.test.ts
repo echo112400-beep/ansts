@@ -281,6 +281,65 @@ test("metered provider calls reserve the versioned maximum cost before calling a
   assert.equal(events.filter((event) => event === "provider").length, 1);
 });
 
+test("a staged model response recovers after provider success but before quota completion", async () => {
+  const events: string[] = [];
+  let providerCalls = 0;
+  let quotaCompletions = 0;
+  let stored: { response: unknown; usage: { verified: true; reference: string; inputTokens: number; outputTokens: number }; routeRefs?: Record<string, unknown> } | null = null;
+  const resultJournal = {
+    getModelCallResult: async () => stored,
+    recordModelCallResult: async (input: { response: unknown; usage: { verified: true; reference: string; inputTokens: number; outputTokens: number }; routeRefs: Record<string, unknown> }) => {
+      events.push("journal");
+      stored = { response: input.response, usage: input.usage, routeRefs: input.routeRefs };
+    },
+  };
+  const executor = new MeteredProviderCallExecutor({
+    routingConfig: routingAuthority({ ...config(), version: 7, publishedAt: 10 }),
+    providerQuota: {
+      acquireGrant: async (input) => ({ grantId: `grant:${input.requestId}`, requestId: input.requestId, tenantId: input.tenantId,
+        provider: input.provider, routeVersion: input.routeVersion, requests: input.requests, tokensPerSecond: input.tokensPerSecond,
+        status: "GRANTED", expiresAt: 99_999, policyVersion: 3 }),
+      getGrantByRequestId: async () => null,
+      beginCall: async () => ({ state: "STARTED" }),
+      completeCall: async () => {
+        events.push("quota-complete");
+        quotaCompletions += 1;
+        if (quotaCompletions === 1) throw new Error("simulated lost response from quota owner");
+        return {} as never;
+      },
+      markUnknown: async () => ({} as never),
+    },
+    budget: {
+      reserve: async (input) => ({ holdId: input.holdId, amountMinor: input.amountMinor, currency: input.currency,
+        priceVersion: input.priceVersion, status: "HELD" }),
+      settle: async () => ({ status: "SETTLED" }),
+      markUnknown: async () => {},
+    },
+    provider: {
+      call: async () => {
+        providerCalls += 1;
+        events.push("provider");
+        return { response: { content_text: "durable answer" }, usage: { verified: true, reference: "provider-response-9", inputTokens: 5, outputTokens: 7 } };
+      },
+    },
+    inputTokenEstimator: serverInputEstimator,
+    resultJournal,
+  });
+  const request = {
+    callId: "call-journal-1", tenantId: "tenant-1", taskId: "task-1", poolName: "DeepSeek",
+    periodKey: "2026-11", payload: { messages: [{ role: "user", content: "hello" }] },
+  };
+
+  await assert.rejects(executor.execute(request), /simulated lost response/);
+  const recovered = await executor.execute(request);
+  assert.equal(recovered.status, "SETTLED");
+  if (recovered.status !== "SETTLED") throw new Error("expected settled recovered provider result");
+  assert.deepEqual(recovered.response, { content_text: "durable answer" });
+  assert.equal(recovered.recovered, true);
+  assert.equal(providerCalls, 1, "a result already journaled in TaskCell must not call the provider again");
+  assert.ok(events.indexOf("journal") < events.indexOf("quota-complete"));
+});
+
 test("strict hard-budget calls reject without an explicit credible input, output, and price bound", async () => {
   const events: string[] = [];
   const executor = new MeteredProviderCallExecutor({

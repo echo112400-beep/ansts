@@ -24,6 +24,7 @@ import {
   MockDurableObjectState,
   runCli,
   TenantLedgerCell,
+  TenantDirectoryCell,
 } from "../src/index";
 
 test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests, and Edge Worker routes match 100%", async () => {
@@ -167,6 +168,7 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
 
   // 5. Verify Edge Worker M12/M13 endpoints and that admission remains separate from local FinOps state.
   const tenantLedgerCells = new Map<string, TenantLedgerCell>();
+  const tenantDirectoryCells = new Map<string, TenantDirectoryCell>();
   const mockEnv: CloudflareCelldEnv = {
     PRIMARY_MODEL_POOL: "DeepSeek",
     FAST_UTILITY_POOL: "GLM-5.3",
@@ -199,6 +201,18 @@ test("Design-Deliverable Consistency Audit: All M1~M13 exports, docs, manifests,
           tenantLedgerCells.set(tenantId, new TenantLedgerCell(new MockDurableObjectState(tenantId), mockEnv));
         }
         const cell = tenantLedgerCells.get(tenantId)!;
+        return {
+          fetch: (input: RequestInfo, init?: RequestInit) =>
+            cell.fetch(typeof input === "string" ? new Request(input, init) : input),
+        };
+      },
+    },
+    TENANT_DIRECTORY_CELL: {
+      idFromName: (n: string) => ({ toString: () => n, name: n }),
+      get: (id) => {
+        const key = id.name ?? id.toString();
+        if (!tenantDirectoryCells.has(key)) tenantDirectoryCells.set(key, new TenantDirectoryCell(new MockDurableObjectState(key), mockEnv));
+        const cell = tenantDirectoryCells.get(key)!;
         return {
           fetch: (input: RequestInfo, init?: RequestInit) =>
             cell.fetch(typeof input === "string" ? new Request(input, init) : input),

@@ -3,6 +3,7 @@
  */
 
 import { strict as assert } from "assert";
+import { createHash } from "node:crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { test } from "node:test";
@@ -16,9 +17,59 @@ import {
   MockDurableObjectState,
   TenantLedgerCell,
   ToolEffectClass,
+  ProviderQuotaCell,
+  RoutingConfigCell,
+  DagCell,
+  TenantDirectoryCell,
 } from "../src/index";
 import { NodeCapacityCell } from "../src/cloudflare/node_capacity_cell";
 import { schedulerPoolCellKey } from "../src/persistence/scheduler-pool";
+import { stableTaskOperationId } from "../src/persistence/task-operations";
+import { providerQuotaCellKey } from "../src/persistence/provider-quota";
+import { TENANT_DIRECTORY_SHARD_COUNT, tenantDirectoryShardIndex } from "../src/cloudflare/tenant_directory_cell";
+
+test("admission response loss remains UNKNOWN and retries recover the original accepted task", async () => {
+  const { env, tenantLedgerCells } = createMockCloudflareCelldEnv();
+  const spec = yaml.load(fs.readFileSync(path.join(__dirname, "../../specs/taskspec_v1beta1_example.yaml"), "utf8")) as any;
+  const owner = env.TENANT_LEDGER_CELL;
+  let loseResponse = true;
+  env.TENANT_LEDGER_CELL = { idFromName: (name) => owner.idFromName(name), get(id) {
+    const stub = owner.get(id);
+    return { async fetch(input, init) {
+      const result = await stub.fetch(input, init);
+      if (loseResponse && String(input).endsWith("/admissions")) {
+        loseResponse = false; throw new Error("accepted response lost");
+      }
+      return result;
+    } };
+  } };
+  const submit = () => cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks", {
+    method: "POST", body: JSON.stringify(spec),
+  }), env);
+  const uncertain = await submit();
+  assert.equal(uncertain.status, 503);
+  assert.equal(((await uncertain.json()) as any).outcome, "UNKNOWN");
+  assert.equal(tenantLedgerCells.size, 1);
+  const query = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/admissions/by-key/${encodeURIComponent(spec.metadata.idempotency_key)}?tenant_id=${encodeURIComponent(spec.metadata.tenant_id)}`), env);
+  const recovered = await query.json() as any;
+  assert.equal(recovered.outcome, "ACCEPTED");
+  const retried = await submit();
+  assert.equal(retried.status, 200);
+  assert.equal(((await retried.json()) as any).task_id, recovered.task_id);
+});
+
+test("directory failure rejects admission before contacting the tenant ledger", async () => {
+  const { env, tenantLedgerCells } = createMockCloudflareCelldEnv();
+  const spec = yaml.load(fs.readFileSync(path.join(__dirname, "../../specs/taskspec_v1beta1_example.yaml"), "utf8")) as any;
+  env.TENANT_DIRECTORY_CELL = { idFromName: (name) => ({ name, toString: () => name }),
+    get: () => ({ fetch: async () => { throw new Error("directory unavailable"); } }) };
+  const result = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks", {
+    method: "POST", body: JSON.stringify(spec),
+  }), env);
+  assert.equal(result.status, 503);
+  assert.equal(((await result.json()) as any).outcome, "NOT_ACCEPTED");
+  assert.equal(tenantLedgerCells.size, 0);
+});
 
 function createMockCloudflareCelldEnv(): {
   env: CloudflareCelldEnv;
@@ -27,25 +78,63 @@ function createMockCloudflareCelldEnv(): {
   harnessCells: Map<string, AgentTaskHarnessCell>;
   tenantLedgerCells: Map<string, TenantLedgerCell>;
   nodeCapacityCells: Map<string, NodeCapacityCell>;
+  providerQuotaCells: Map<string, ProviderQuotaCell>;
+  routingConfigCells: Map<string, RoutingConfigCell>;
+  dagCells: Map<string, DagCell>;
+  tenantDirectoryCells: Map<string, TenantDirectoryCell>;
   d1Rows: Array<any[]>;
+  tenantTaskProjections: Map<string, Record<string, any>>;
+  taskEventProjections: Map<string, Record<string, any>>;
   queuedMessages: any[];
+  taskOperationResults: Map<string, unknown>;
+  taskExecutorCalls: { execute: number; compensate: number };
+  modelProviderCalls: { calls: number };
 } {
   const kvMap = new Map<string, string>();
-  const r2Map = new Map<string, string>();
+  const r2Map = new Map<string, Uint8Array>();
   const d1Rows: Array<any[]> = [];
+  const tenantTaskProjections = new Map<string, Record<string, any>>();
+  const taskEventProjections = new Map<string, Record<string, any>>();
   const queuedMessages: any[] = [];
+  const taskOperationResults = new Map<string, unknown>();
+  const taskExecutorCalls = { execute: 0, compensate: 0 };
+  const modelProviderCalls = { calls: 0 };
   const harnessCells = new Map<string, AgentTaskHarnessCell>();
   const tenantLedgerCells = new Map<string, TenantLedgerCell>();
   const nodeCapacityCells = new Map<string, NodeCapacityCell>();
+  const providerQuotaCells = new Map<string, ProviderQuotaCell>();
+  const routingConfigCells = new Map<string, RoutingConfigCell>();
+  const dagCells = new Map<string, DagCell>();
+  const tenantDirectoryCells = new Map<string, TenantDirectoryCell>();
 
   const env: CloudflareCelldEnv = {
+    TEST_SIMULATOR_MODE: true,
     PRIMARY_MODEL_POOL: "DeepSeek",
     FAST_UTILITY_POOL: "GLM-5.3",
     FALLBACK_MODEL_POOL: "Qwen-3.8",
     WEBHOOK_HMAC_SECRET: "whsec_celld_test",
+    DAG_VOUCHER_SECRET: "test-only-dag-voucher-secret-0123456789abcdef",
+    DEEPSEEK_CHAT_COMPLETIONS_URL: "https://provider.internal/v1/chat/completions",
+    DEEPSEEK_API_KEY: "test-deepseek-key",
+    GLM53_CHAT_COMPLETIONS_URL: "https://provider.internal/v1/chat/completions",
+    GLM53_API_KEY: "test-glm-key",
+    QWEN_CHAT_COMPLETIONS_URL: "https://provider.internal/v1/chat/completions",
+    QWEN_API_KEY: "test-qwen-key",
+    MODEL_PROVIDER_PROXY: {
+      fetch: async (_input: RequestInfo, _init?: RequestInit) => {
+        modelProviderCalls.calls += 1;
+        const requestId = `provider-request-${modelProviderCalls.calls}`;
+        return new Response([
+          `data: ${JSON.stringify({ id: requestId, model: "test-model", choices: [{ delta: { content: "durable answer" } }] })}\n\n`,
+          `data: ${JSON.stringify({ id: requestId, choices: [], usage: { prompt_tokens: 7, completion_tokens: 3 } })}\n\n`,
+          "data: [DONE]\n\n",
+        ].join(""), { headers: { "content-type": "text/event-stream", "x-request-id": requestId } });
+      },
+    },
     SCHEDULER_CELL: null as any,
     AGENT_HARNESS_CELL: null as any,
     TENANT_LEDGER_CELL: null as any,
+    TENANT_DIRECTORY_CELL: null as any,
     ANSTS_KV: {
       get: async (key: string, type?: "text" | "json") => {
         const val = kvMap.get(key);
@@ -60,21 +149,34 @@ function createMockCloudflareCelldEnv(): {
       },
     },
     ANSTS_CHECKPOINTS_R2: {
-      put: async (key: string, value: string) => {
-        r2Map.set(key, value);
+      put: async (key: string, value: string | ArrayBuffer | ArrayBufferView, options?: { onlyIf?: { etagDoesNotMatch?: string } }) => {
+        if (options?.onlyIf?.etagDoesNotMatch === "*" && r2Map.has(key)) return null;
+        const bytes = typeof value === "string"
+          ? new TextEncoder().encode(value)
+          : value instanceof ArrayBuffer
+            ? new Uint8Array(value)
+            : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        r2Map.set(key, new Uint8Array(bytes));
         return { key };
       },
       get: async (key: string) => {
         const v = r2Map.get(key);
         if (!v) return null;
-        return { key, body: v, text: async () => v };
+        const copy = new Uint8Array(v);
+        return {
+          key,
+          body: new TextDecoder().decode(copy),
+          text: async () => new TextDecoder().decode(copy),
+          arrayBuffer: async () => copy.buffer.slice(copy.byteOffset, copy.byteOffset + copy.byteLength),
+        };
       },
       list: async () => ({
         objects: Array.from(r2Map.keys()).map((key) => ({ key })),
       }),
+      delete: async (key: string) => { r2Map.delete(key); },
     },
     ANSTS_D1: {
-      prepare: (_query: string) => {
+      prepare: (query: string) => {
         let bound: any[] = [];
         const stmt = {
           bind: (...values: any[]) => {
@@ -82,10 +184,39 @@ function createMockCloudflareCelldEnv(): {
             return stmt;
           },
           run: async () => {
+            if (query.includes("INSERT INTO tenant_task_projection")) {
+              const [tenant_id, task_id, admission_status, runnable_status, accepted_at, lifecycle_state,
+                business_epoch, last_turn_seq, execution_version, projected_at] = bound;
+              const key = `${tenant_id}:${task_id}`;
+              const prior = tenantTaskProjections.get(key);
+              if (!prior || Number(execution_version) >= Number(prior.execution_version)) {
+                tenantTaskProjections.set(key, { tenant_id, task_id, admission_status, runnable_status, accepted_at,
+                  lifecycle_state, business_epoch, last_turn_seq, execution_version, projected_at });
+              }
+            } else if (query.includes("INSERT OR IGNORE INTO task_event_projection")) {
+              const [event_id, tenant_id, task_id, event_type, aggregate_version, payload_digest, payload_json, created_at] = bound;
+              if (!taskEventProjections.has(String(event_id))) taskEventProjections.set(String(event_id), {
+                event_id, tenant_id, task_id, event_type, aggregate_version, payload_digest, payload_json, created_at,
+              });
+            }
             d1Rows.push(bound);
             return { success: true };
           },
-          all: async <T = any>() => ({ results: d1Rows as T[] }),
+          all: async <T = any>() => {
+            if (query.includes("FROM tenant_task_projection")) {
+              if (query.includes("GROUP BY tenant_id")) {
+                const rows = Array.from(tenantTaskProjections.values()).sort((a, b) => Number(a.projected_at) - Number(b.projected_at));
+                return { results: [...new Set(rows.map((row) => row.tenant_id))].slice(0, Number(bound[0])).map((tenant_id) => ({ tenant_id })) as T[] };
+              }
+              const rows = Array.from(tenantTaskProjections.values()).filter((row) => row.tenant_id === bound[0])
+                .sort((a, b) => Number(b.accepted_at) - Number(a.accepted_at)).slice(0, Number(bound[1]));
+              return { results: rows as T[] };
+            }
+            if (query.includes("FROM task_event_projection")) {
+              return { results: (taskEventProjections.has(String(bound[0])) ? [taskEventProjections.get(String(bound[0]))!] : []) as T[] };
+            }
+            return { results: d1Rows as T[] };
+          },
         };
         return stmt;
       },
@@ -94,6 +225,33 @@ function createMockCloudflareCelldEnv(): {
       send: async (msg: any) => {
         queuedMessages.push(msg);
       },
+    },
+  };
+
+  env.TASK_OPERATION_EXECUTOR = {
+    fetch: async (input: RequestInfo, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      if (request.method === "POST" && url.pathname === "/v1/operations/execute") {
+        const body = await request.json() as Record<string, any>;
+        taskExecutorCalls.execute += 1;
+        const prior = taskOperationResults.get(String(body.operation_id));
+        if (prior !== undefined) return new Response(JSON.stringify({ result: prior }), { headers: { "content-type": "application/json" } });
+        const result = { tool_name: body.tool_name, args: body.args, accepted: true };
+        taskOperationResults.set(String(body.operation_id), result);
+        return new Response(JSON.stringify({ result }), { headers: { "content-type": "application/json" } });
+      }
+      if (request.method === "POST" && url.pathname === "/v1/operations/compensate") {
+        taskExecutorCalls.compensate += 1;
+        return new Response(JSON.stringify({ status: "COMPENSATED" }), { headers: { "content-type": "application/json" } });
+      }
+      const operationMatch = url.pathname.match(/^\/v1\/operations\/([^/]+)$/);
+      if (request.method === "GET" && operationMatch) {
+        const result = taskOperationResults.get(decodeURIComponent(operationMatch[1]));
+        const body = result === undefined ? { status: "NOT_FOUND", authoritative: true } : { status: "FOUND", result };
+        return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ error: "NotFound" }), { status: 404, headers: { "content-type": "application/json" } });
     },
   };
 
@@ -151,6 +309,23 @@ function createMockCloudflareCelldEnv(): {
     },
   };
 
+  env.TENANT_DIRECTORY_CELL = {
+    idFromName: (name: string) => ({ toString: () => `tenant_directory_${name}`, name }),
+    get: (id: { toString(): string; name?: string }) => {
+      const shardKey = id.name ?? id.toString();
+      if (!tenantDirectoryCells.has(shardKey)) {
+        tenantDirectoryCells.set(shardKey, new TenantDirectoryCell(new MockDurableObjectState(shardKey), env));
+      }
+      const cell = tenantDirectoryCells.get(shardKey)!;
+      return {
+        fetch: (input: RequestInfo, init?: RequestInit) => {
+          const req = typeof input === "string" ? new Request(input, init) : input;
+          return cell.fetch(req);
+        },
+      };
+    },
+  };
+
   env.NODE_CAPACITY_CELL = {
     idFromName: (name: string) => ({ toString: () => `node_${name}`, name }),
     get: (id: { toString(): string; name?: string }) => {
@@ -168,7 +343,52 @@ function createMockCloudflareCelldEnv(): {
     },
   };
 
-  return { env, schedulerCell, schedulerCells, harnessCells, tenantLedgerCells, nodeCapacityCells, d1Rows, queuedMessages };
+  env.PROVIDER_QUOTA_CELL = {
+    idFromName: (name: string) => ({ toString: () => `quota_${name}`, name }),
+    get: (id: { toString(): string; name?: string }) => {
+      const key = id.name ?? id.toString();
+      if (!providerQuotaCells.has(key)) providerQuotaCells.set(key, new ProviderQuotaCell(new MockDurableObjectState(key), env));
+      const cell = providerQuotaCells.get(key)!;
+      return {
+        fetch: (input: RequestInfo, init?: RequestInit) => {
+          const req = typeof input === "string" ? new Request(input, init) : input;
+          return cell.fetch(req);
+        },
+      };
+    },
+  };
+
+  env.ROUTING_CONFIG_CELL = {
+    idFromName: (name: string) => ({ toString: () => `route_${name}`, name }),
+    get: (id: { toString(): string; name?: string }) => {
+      const key = id.name ?? id.toString();
+      if (!routingConfigCells.has(key)) routingConfigCells.set(key, new RoutingConfigCell(new MockDurableObjectState(key), env));
+      const cell = routingConfigCells.get(key)!;
+      return {
+        fetch: (input: RequestInfo, init?: RequestInit) => {
+          const req = typeof input === "string" ? new Request(input, init) : input;
+          return cell.fetch(req);
+        },
+      };
+    },
+  };
+
+  env.DAG_CELL = {
+    idFromName: (name: string) => ({ toString: () => `dag_${name}`, name }),
+    get: (id: { toString(): string; name?: string }) => {
+      const key = id.name ?? id.toString();
+      if (!dagCells.has(key)) dagCells.set(key, new DagCell(new MockDurableObjectState(key), env));
+      const cell = dagCells.get(key)!;
+      return {
+        fetch: (input: RequestInfo, init?: RequestInit) => {
+          const req = typeof input === "string" ? new Request(input, init) : input;
+          return cell.fetch(req);
+        },
+      };
+    },
+  };
+
+  return { env, schedulerCell, schedulerCells, harnessCells, tenantLedgerCells, nodeCapacityCells, providerQuotaCells, routingConfigCells, dagCells, tenantDirectoryCells, d1Rows, tenantTaskProjections, taskEventProjections, queuedMessages, taskOperationResults, taskExecutorCalls, modelProviderCalls };
 }
 
 async function simulateNodeStartReceipt(env: CloudflareCelldEnv, dispatch: Record<string, any>, receipt: string): Promise<Response> {
@@ -193,7 +413,7 @@ test("07. wrangler.json & D1 SQL migration schema verification for celld and Clo
   const rootDir = path.join(__dirname, "..", "..");
   const wranglerJson = JSON.parse(fs.readFileSync(path.join(rootDir, "wrangler.json"), "utf8"));
   assert.equal(wranglerJson.main, "src/cloudflare/worker.ts");
-  assert.equal(wranglerJson.durable_objects.bindings.length, 4);
+  assert.equal(wranglerJson.durable_objects.bindings.length, 8);
   assert.equal(
     wranglerJson.durable_objects.bindings.find((binding: Record<string, string>) => binding.name === "TENANT_LEDGER_CELL")?.class_name,
     "TenantLedgerCell",
@@ -202,17 +422,102 @@ test("07. wrangler.json & D1 SQL migration schema verification for celld and Clo
     wranglerJson.durable_objects.bindings.find((binding: Record<string, string>) => binding.name === "NODE_CAPACITY_CELL")?.class_name,
     "NodeCapacityCell",
   );
-  assert.equal(wranglerJson.migrations.at(-1).tag, "v3");
-  assert.ok(wranglerJson.migrations.at(-1).new_sqlite_classes.includes("NodeCapacityCell"));
+  assert.equal(wranglerJson.migrations.at(-1).tag, "v6");
+  assert.ok(wranglerJson.migrations.at(-4).new_sqlite_classes.includes("NodeCapacityCell"));
+  assert.ok(wranglerJson.migrations.at(-3).new_sqlite_classes.includes("ProviderQuotaCell"));
+  assert.ok(wranglerJson.migrations.at(-3).new_sqlite_classes.includes("RoutingConfigCell"));
+  assert.ok(wranglerJson.migrations.at(-2).new_sqlite_classes.includes("DagCell"));
+  assert.ok(wranglerJson.migrations.at(-1).new_sqlite_classes.includes("TenantDirectoryCell"));
   const wranglerToml = fs.readFileSync(path.join(rootDir, "wrangler.toml"), "utf8");
   assert.match(wranglerToml, /name = "NODE_CAPACITY_CELL"\s+class_name = "NodeCapacityCell"/);
   assert.match(wranglerToml, /tag = "v3"\s+new_sqlite_classes = \["NodeCapacityCell"\]/);
+  assert.match(wranglerToml, /name = "PROVIDER_QUOTA_CELL"\s+class_name = "ProviderQuotaCell"/);
+  assert.match(wranglerToml, /name = "ROUTING_CONFIG_CELL"\s+class_name = "RoutingConfigCell"/);
+  assert.match(wranglerToml, /name = "DAG_CELL"\s+class_name = "DagCell"/);
+  assert.match(wranglerToml, /name = "TENANT_DIRECTORY_CELL"\s+class_name = "TenantDirectoryCell"/);
   assert.equal(wranglerJson.d1_databases[0].binding, "ANSTS_D1");
   assert.equal(wranglerJson.kv_namespaces[0].binding, "ANSTS_KV");
   assert.equal(wranglerJson.r2_buckets[0].binding, "ANSTS_CHECKPOINTS_R2");
 
   const sqlMig = fs.readFileSync(path.join(rootDir, "migrations", "0001_init_ansts.sql"), "utf8");
   assert.ok(sqlMig.includes("CREATE TABLE IF NOT EXISTS task_audit_events"));
+  const projectionMigration = fs.readFileSync(path.join(rootDir, "migrations", "0002_rebuildable_task_projections.sql"), "utf8");
+  assert.ok(projectionMigration.includes("CREATE TABLE IF NOT EXISTS tenant_task_projection"));
+  assert.ok(projectionMigration.includes("CREATE TABLE IF NOT EXISTS task_event_projection"));
+  assert.equal(TENANT_DIRECTORY_SHARD_COUNT, 16);
+});
+
+test("public Worker routes versioned model pricing and quota policy to stable durable owners", async () => {
+  const { env, providerQuotaCells, routingConfigCells } = createMockCloudflareCelldEnv();
+  const tenantId = "tenant-routing-1";
+  const routeConfig = {
+    tenantId,
+    policyVersion: "model-policy-7",
+    routes: [{
+      poolName: "DeepSeek",
+      provider: "openai-compatible",
+      modelId: "deepseek-v4",
+      quotaDomain: "shared-account-a",
+      quotaDemandTokensPerSecond: 40,
+      maxInputTokens: 8000,
+      maxOutputTokens: 2000,
+      pricing: { priceVersion: "usd-2026-10", currency: "USD", inputMinorPerMillionTokens: 125, outputMinorPerMillionTokens: 450 },
+    }],
+  };
+  const publish = (operationId: string, expectedVersion: number, configuration: unknown) => cloudflareCelldWorker.fetch(
+    new Request(`https://ansts.edge/v1beta1/tenants/${tenantId}/routing-config/versions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operationId, expectedVersion, configuration }),
+    }),
+    env,
+  );
+  const version1 = await publish("routing-publish-1", 0, routeConfig);
+  assert.equal(version1.status, 201, await version1.clone().text());
+  const replacement = { ...routeConfig, policyVersion: "model-policy-8", routes: routeConfig.routes.map((route) => ({
+    ...route,
+    pricing: { ...route.pricing, priceVersion: "usd-2026-11", inputMinorPerMillionTokens: 150 },
+  })) };
+  const version2 = await publish("routing-publish-2", 1, replacement);
+  assert.equal(version2.status, 201);
+  const historical = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tenants/${tenantId}/routing-config/versions/1`,
+  ), env);
+  assert.equal(((await historical.json()) as any).routes[0].pricing.priceVersion, "usd-2026-10");
+  assert.equal(routingConfigCells.size, 1);
+  const wrongTenant = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tenants/${tenantId}/routing-config/current?tenant_id=another-tenant`,
+  ), env);
+  assert.equal(wrongTenant.status, 404);
+
+  const policy = { requestsPerMinute: 120, tokensPerSecond: 800, grantTtlMs: 500 };
+  const configureQuota = (quotaDomain: string, operationId: string) => cloudflareCelldWorker.fetch(
+    new Request(`https://ansts.edge/v1beta1/providers/openai-compatible/quota-domains/${quotaDomain}/policy`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operationId, expectedVersion: 0, policy }),
+    }),
+    env,
+  );
+  assert.equal((await configureQuota("shared-account-a", "quota-policy-a")).status, 201);
+  assert.equal((await configureQuota("shared-account-b", "quota-policy-b")).status, 201);
+  assert.equal(providerQuotaCells.size, 2, "each provider quota domain has a separate durable Cell owner");
+  const keyA = providerQuotaCellKey("openai-compatible", "shared-account-a");
+  assert.equal(providerQuotaCells.get(keyA)?.owner.getPolicy()?.policy.tokensPerSecond, 800);
+
+  const grant = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/providers/openai-compatible/quota-domains/shared-account-a/grants`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestId: "tenant-routing-1:task-1:call-1", tenantId, provider: "openai-compatible", routeVersion: 2, requests: 1, tokensPerSecond: 40 }),
+    }),
+    env,
+  );
+  assert.equal(grant.status, 201, await grant.clone().text());
+  const queryGrant = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/providers/openai-compatible/quota-domains/shared-account-a/grants?request_id=tenant-routing-1%3Atask-1%3Acall-1`,
+  ), env);
+  assert.equal(((await queryGrant.json()) as any).routeVersion, 2);
 });
 
 test("08. TenantLedger admission + AnstsSchedulerCell 5D W-DRF & DAG Escrow", async () => {
@@ -282,7 +587,8 @@ test("08. TenantLedger admission + AnstsSchedulerCell 5D W-DRF & DAG Escrow", as
     env,
   );
   assert.equal(acked, true);
-  assert.equal(d1Rows.length, 1);
+  assert.equal(d1Rows.filter((row) => row[3] === "task.admitted").length, 1,
+    "the scheduled projection refresh may also write D1 before the synthetic queue event is consumed");
 });
 
 test("08B. Public task route resolves the logical TaskCell binding by stable task key", async () => {
@@ -543,7 +849,7 @@ test("independent SchedulerPool cells cannot reserve the same node capacity conc
   assert.equal(nodeCapacityCells.get("contended-node")!.capacity.getReservation(admitted.dispatches[0].dispatch_id)!.status, "RUNNING");
 });
 
-test("ordinary and DAG starts use the same durable NodeCapacity reservation path", async () => {
+test("scheduler rejects DAG starts that do not present a redeemed durable voucher", async () => {
   const { env, nodeCapacityCells } = createMockCloudflareCelldEnv();
   const resources = { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 };
   const candidates = ["ordinary", "dag"].map((kind) => ({
@@ -569,14 +875,472 @@ test("ordinary and DAG starts use the same durable NodeCapacity reservation path
   );
   assert.equal(response.status, 200);
   const body = (await response.json()) as any;
-  assert.deepEqual(body.dispatches.map((dispatch: any) => dispatch.stage), ["AUTHORIZED", "AUTHORIZED"]);
-  for (const dispatch of body.dispatches) {
-    const started = await simulateNodeStartReceipt(env, dispatch, `node-receipt-${dispatch.dispatch_id}`);
-    assert.equal(started.status, 200);
-  }
+  assert.equal(body.dispatches.filter((dispatch: any) => dispatch.stage === "AUTHORIZED").length, 1);
+  assert.equal(body.dispatches.filter((dispatch: any) => dispatch.status === "BLOCKED_DAG_VOUCHER").length, 1);
+  const ordinary = body.dispatches.find((dispatch: any) => dispatch.stage === "AUTHORIZED");
+  assert.equal((await simulateNodeStartReceipt(env, ordinary, `node-receipt-${ordinary.dispatch_id}`)).status, 200);
   const allocations = nodeCapacityCells.get("ordinary-dag-node")!.capacity.getReservations();
-  assert.deepEqual(allocations.map((allocation) => allocation.kind).sort(), ["dag", "ordinary"]);
-  assert.deepEqual(allocations.map((allocation) => allocation.status).sort(), ["RUNNING", "RUNNING"]);
+  assert.deepEqual(allocations.map((allocation) => allocation.kind), ["ordinary"]);
+  assert.deepEqual(allocations.map((allocation) => allocation.status), ["RUNNING"]);
+});
+
+test("public DagCell yields its parent before transferring allowance and gates DAG dispatch through NodeCapacity", async () => {
+  const { env, dagCells, tenantLedgerCells, nodeCapacityCells } = createMockCloudflareCelldEnv();
+  const tenantId = "tenant-dag-public";
+  const periodKey = "2026-11";
+  const parentTaskId = "dag-parent-public";
+  const childTaskId = "dag-child-public";
+  const tenantBase = `https://ansts.edge/v1beta1/tenants/${tenantId}`;
+  const ledgerRequest = (path: string, method: string, body?: unknown) => cloudflareCelldWorker.fetch(new Request(`${tenantBase}${path}`, {
+    method, headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }), env);
+  const admissionSpec = (taskId: string, idempotencyKey: string) => {
+    const spec = structuredClone(yaml.load(fs.readFileSync(path.join(__dirname, "..", "..", "specs", "taskspec_v1beta1_example.yaml"), "utf8")) as any);
+    spec.metadata.task_id = taskId;
+    spec.metadata.tenant_id = tenantId;
+    spec.metadata.idempotency_key = idempotencyKey;
+    return spec;
+  };
+  for (const [taskId, key] of [[parentTaskId, "dag-parent-idem"], [childTaskId, "dag-child-idem"]]) {
+    const accepted = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(admissionSpec(taskId, key)),
+    }), env);
+    assert.equal(accepted.status, 202, await accepted.clone().text());
+  }
+  assert.equal((await ledgerRequest(`/budget-periods/${periodKey}`, "PUT", { currency: "USD", hard_limit_minor: 1000, price_version: "dag-price-v1" })).status, 201);
+  assert.equal((await ledgerRequest("/budget-grants", "POST", { period_key: periodKey, task_id: parentTaskId, grant_id: "dag-parent-grant", amount_minor: 800, currency: "USD" })).status, 201);
+
+  const resources = { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 };
+  const parentDispatchResponse = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nodes: [{ node_id: "dag-parent-node", incarnation: "dag-parent-boot", capacity: resources }], candidates: [{
+      task_id: parentTaskId, tenant_id: tenantId, dispatch_id: "dag-parent-dispatch", node_id: "dag-parent-node",
+      node_incarnation: "dag-parent-boot", kind: "ordinary", resources,
+      task_spec: { metadata: { task_id: parentTaskId, tenant_id: tenantId }, spec: {} },
+    }] }),
+  }), env);
+  assert.equal(parentDispatchResponse.status, 200, await parentDispatchResponse.clone().text());
+  const parentDispatch = ((await parentDispatchResponse.json()) as any).dispatches[0];
+  assert.equal((await simulateNodeStartReceipt(env, parentDispatch, "dag-parent-start-receipt")).status, 200);
+
+  const ledgerCell = tenantLedgerCells.get(tenantId)!;
+  const originalLedgerFetch = ledgerCell.fetch.bind(ledgerCell);
+  let rejectFirstTransfer = true;
+  ledgerCell.fetch = async (request: Request) => {
+    if (rejectFirstTransfer && new URL(request.url).pathname === "/allowance-transfers") {
+      rejectFirstTransfer = false;
+      return new Response(JSON.stringify({ error: "INJECTED_TRANSFER_RESPONSE_LOSS" }), { status: 503 });
+    }
+    return originalLedgerFetch(request);
+  };
+
+  const createBody = {
+    tenant_id: tenantId, dag_id: "dag-public-1", parent_task_id: parentTaskId,
+    parent_epoch: parentDispatch.business_epoch, parent_turn_seq: 0, period_key: periodKey, currency: "USD",
+    children: [{ task_id: childTaskId, delegated_tps: 10, delegated_tokens: 1000, allowance_minor: 600 }],
+  };
+  const interruptedCreate = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/dags/${createBody.dag_id}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(createBody),
+  }), env);
+  assert.equal(interruptedCreate.status, 503, "a failed allowance transfer remains an unresolved durable DAG intent");
+  const interruptedState = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/dags/${createBody.dag_id}/state?tenant_id=${tenantId}`), env);
+  const interruptedDag = (await interruptedState.json()) as any;
+  assert.equal(interruptedDag.parent_yielded, true, "parent suspension is confirmed before any child allowance transfer");
+  assert.equal(interruptedDag.state, "TRANSFERRING");
+  const notYetTransferred = await ledgerRequest(`/budget-accounts/${childTaskId}?period_key=${periodKey}`, "GET");
+  assert.equal(((await notYetTransferred.json()) as any).available_minor, 0);
+
+  const resumedCreate = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/dags/${createBody.dag_id}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(createBody),
+  }), env);
+  assert.equal(resumedCreate.status, 200, await resumedCreate.clone().text());
+  const created = resumedCreate;
+  assert.equal(created.status, 200, await created.clone().text());
+  const createdBody = (await created.json()) as any;
+  assert.equal(createdBody.parent_yielded, true);
+  assert.equal(createdBody.state, "ACTIVE");
+  assert.equal(createdBody.children[0].transfer_status, "TRANSFERRED");
+  const parentAccount = await ledgerRequest(`/budget-accounts/${parentTaskId}?period_key=${periodKey}`, "GET");
+  assert.equal(parentAccount.status, 200);
+  assert.equal(((await parentAccount.json()) as any).available_minor, 200);
+  const childAccount = await ledgerRequest(`/budget-accounts/${childTaskId}?period_key=${periodKey}`, "GET");
+  assert.equal(((await childAccount.json()) as any).available_minor, 600);
+
+  const voucher = createdBody.children[0];
+  const redeemUrl = `https://ansts.edge/v1beta1/dags/${createBody.dag_id}/children/${childTaskId}/redeem`;
+  const invalidVoucher = await cloudflareCelldWorker.fetch(new Request(redeemUrl, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tenant_id: tenantId, voucher_id: voucher.voucher_id, signature: "invalid" }),
+  }), env);
+  assert.equal(invalidVoucher.status, 403);
+  const redeemed = await cloudflareCelldWorker.fetch(new Request(redeemUrl, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tenant_id: tenantId, voucher_id: voucher.voucher_id, signature: voucher.voucher_signature }),
+  }), env);
+  assert.equal(redeemed.status, 200, await redeemed.clone().text());
+  assert.equal(((await redeemed.json()) as any).status, "REDEEMED");
+
+  const childDispatchResponse = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nodes: [{ node_id: "dag-child-node", incarnation: "dag-child-boot", capacity: { ...resources, cpu: 2, memory_mb: 1024, sessions: 2, tps: 20 } }], candidates: [{
+      task_id: childTaskId, tenant_id: tenantId, dispatch_id: "dag-child-dispatch", node_id: "dag-child-node",
+      node_incarnation: "dag-child-boot", kind: "dag", dag_id: createBody.dag_id, voucher_id: voucher.voucher_id,
+      resources, task_spec: { metadata: { task_id: childTaskId, tenant_id: tenantId }, spec: {} },
+    }] }),
+  }), env);
+  assert.equal(childDispatchResponse.status, 200, await childDispatchResponse.clone().text());
+  const childDispatch = ((await childDispatchResponse.json()) as any).dispatches[0];
+  assert.equal(childDispatch.stage, "AUTHORIZED");
+  assert.equal((await simulateNodeStartReceipt(env, childDispatch, "dag-child-start-receipt")).status, 200);
+  assert.equal(nodeCapacityCells.get("dag-child-node")!.capacity.getReservation("dag-child-dispatch")!.status, "RUNNING");
+
+  const childComplete = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/tasks/${childTaskId}/complete?tenant_id=${tenantId}`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tenant_id: tenantId, epoch: childDispatch.business_epoch, status: "SUCCEEDED" }),
+  }), env);
+  assert.equal(childComplete.status, 200, await childComplete.clone().text());
+  const childObservation = () => cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/dags/${createBody.dag_id}/children/${childTaskId}/observations`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tenant_id: tenantId, event_id: "dag-child-succeeded-1", aggregate_version: 1, state: "SUCCEEDED" }),
+  }), env);
+  const joined = await childObservation();
+  assert.equal(joined.status, 200, await joined.clone().text());
+  assert.equal(((await joined.json()) as any).dag.state, "COMPLETED");
+  const duplicateJoin = await childObservation();
+  assert.equal(duplicateJoin.status, 200, await duplicateJoin.clone().text());
+  assert.equal(((await duplicateJoin.json()) as any).duplicate, true);
+
+  const stopped = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/stopped", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ dispatch_id: childDispatch.dispatch_id, task_id: childTaskId, tenant_id: tenantId,
+      node_id: childDispatch.node_id, node_incarnation: childDispatch.node_incarnation,
+      region: childDispatch.region, resource_pool: childDispatch.resource_pool, business_epoch: childDispatch.business_epoch,
+      evidence_type: "STOPPED", evidence_id: "dag-child-stop-proof" }),
+  }), env);
+  assert.equal(stopped.status, 200, await stopped.clone().text());
+  assert.equal(nodeCapacityCells.get("dag-child-node")!.capacity.getReservation("dag-child-dispatch")!.status, "RELEASED");
+  const returnUrl = `https://ansts.edge/v1beta1/dags/${createBody.dag_id}/children/${childTaskId}/return-allowance`;
+  const returned = await cloudflareCelldWorker.fetch(new Request(returnUrl, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tenant_id: tenantId }),
+  }), env);
+  assert.equal(returned.status, 200, await returned.clone().text());
+  assert.equal(((await returned.json()) as any).amount_minor, 600);
+  const duplicateReturn = await cloudflareCelldWorker.fetch(new Request(returnUrl, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tenant_id: tenantId }),
+  }), env);
+  assert.equal(duplicateReturn.status, 200);
+  assert.equal(((await duplicateReturn.json()) as any).amount_minor, 600);
+
+  const replayCreate = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/dags/${createBody.dag_id}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(createBody),
+  }), env);
+  assert.equal(replayCreate.status, 200);
+  const replayParentAccount = await ledgerRequest(`/budget-accounts/${parentTaskId}?period_key=${periodKey}`, "GET");
+  assert.equal(((await replayParentAccount.json()) as any).available_minor, 800);
+  const replayChildAccount = await ledgerRequest(`/budget-accounts/${childTaskId}?period_key=${periodKey}`, "GET");
+  assert.equal(((await replayChildAccount.json()) as any).available_minor, 0);
+  const crossTenant = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/dags/${createBody.dag_id}/state?tenant_id=another-tenant`), env);
+  assert.equal(crossTenant.status, 404);
+  assert.equal(dagCells.size, 1);
+
+  const resumedParentDispatch = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+      nodes: [{ node_id: "dag-parent-resume-node", incarnation: "dag-parent-resume-boot", capacity: resources }],
+      candidates: [{ task_id: parentTaskId, tenant_id: tenantId, dispatch_id: "dag-parent-resume-dispatch",
+        node_id: "dag-parent-resume-node", node_incarnation: "dag-parent-resume-boot", kind: "recovery",
+        resources, task_spec: { metadata: { task_id: parentTaskId, tenant_id: tenantId }, spec: {} } }],
+    }),
+  }), env);
+  assert.equal(resumedParentDispatch.status, 200, await resumedParentDispatch.clone().text());
+  assert.equal(((await resumedParentDispatch.json()) as any).dispatches[0].stage, "AUTHORIZED");
+});
+
+test("DAG boost retries a committed TenantLedger transfer under the same durable identity", async () => {
+  const { env, tenantLedgerCells } = createMockCloudflareCelldEnv();
+  const tenantId = "tenant-dag-boost-replay";
+  const periodKey = "2026-11";
+  const dagId = "dag-boost-replay";
+  const parentTaskId = "boost-parent";
+  const sourceTaskId = "boost-source";
+  const targetTaskId = "boost-target";
+  const request = (url: string, method = "GET", body?: unknown) => cloudflareCelldWorker.fetch(new Request(url, {
+    method,
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }), env);
+  const taskSpec = (taskId: string) => {
+    const spec = structuredClone(yaml.load(fs.readFileSync(path.join(__dirname, "..", "..", "specs", "taskspec_v1beta1_example.yaml"), "utf8")) as any);
+    spec.metadata.task_id = taskId;
+    spec.metadata.tenant_id = tenantId;
+    spec.metadata.idempotency_key = `${taskId}-admission`;
+    return spec;
+  };
+  for (const taskId of [parentTaskId, sourceTaskId, targetTaskId]) {
+    const accepted = await request("https://ansts.edge/v1beta1/tasks", "POST", taskSpec(taskId));
+    assert.equal(accepted.status, 202, await accepted.clone().text());
+  }
+  const tenantUrl = `${tenantId}`;
+  const budgetPeriod = await request(`https://ansts.edge/v1beta1/tenants/${tenantUrl}/budget-periods/${periodKey}`, "PUT", {
+    currency: "USD", hard_limit_minor: 1000, price_version: "dag-boost-test",
+  });
+  assert.equal(budgetPeriod.status, 201);
+  const grant = await request(`https://ansts.edge/v1beta1/tenants/${tenantId}/budget-grants`, "POST", {
+    period_key: periodKey, task_id: parentTaskId, grant_id: "boost-parent-grant", amount_minor: 800, currency: "USD",
+  });
+  assert.equal(grant.status, 201);
+
+  const resources = { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 };
+  const parentTick = await request("https://ansts.edge/v1beta1/scheduler/tick", "POST", {
+    nodes: [{ node_id: "boost-parent-node", incarnation: "boost-parent-boot", capacity: resources }],
+    candidates: [{ task_id: parentTaskId, tenant_id: tenantId, dispatch_id: "boost-parent-dispatch",
+      node_id: "boost-parent-node", node_incarnation: "boost-parent-boot", kind: "ordinary", resources,
+      task_spec: { metadata: { task_id: parentTaskId, tenant_id: tenantId }, spec: {} } }],
+  });
+  assert.equal(parentTick.status, 200, await parentTick.clone().text());
+  const parentDispatch = ((await parentTick.json()) as any).dispatches[0];
+  assert.equal((await simulateNodeStartReceipt(env, parentDispatch, "boost-parent-start")).status, 200);
+
+  const created = await request(`https://ansts.edge/v1beta1/dags/${dagId}`, "POST", {
+    tenant_id: tenantId, dag_id: dagId, parent_task_id: parentTaskId, parent_epoch: parentDispatch.business_epoch,
+    parent_turn_seq: 0, period_key: periodKey, currency: "USD",
+    children: [
+      { task_id: sourceTaskId, branch_id: "source", delegated_tps: 10, delegated_tokens: 1000, allowance_minor: 300 },
+      { task_id: targetTaskId, branch_id: "target", delegated_tps: 10, delegated_tokens: 1000, allowance_minor: 300 },
+    ],
+  });
+  assert.equal(created.status, 200, await created.clone().text());
+  const dag = await created.json() as any;
+  const sourceVoucher = dag.children.find((child: any) => child.task_id === sourceTaskId);
+  const targetVoucher = dag.children.find((child: any) => child.task_id === targetTaskId);
+  for (const [taskId, voucher] of [[sourceTaskId, sourceVoucher], [targetTaskId, targetVoucher]] as const) {
+    const redeemed = await request(`https://ansts.edge/v1beta1/dags/${dagId}/children/${taskId}/redeem`, "POST", {
+      tenant_id: tenantId, voucher_id: voucher.voucher_id, signature: voucher.voucher_signature,
+    });
+    assert.equal(redeemed.status, 200, await redeemed.clone().text());
+  }
+
+  const childTaskIds = [sourceTaskId, targetTaskId];
+  const childTick = await request("https://ansts.edge/v1beta1/scheduler/tick", "POST", {
+    nodes: childTaskIds.map((taskId) => ({ node_id: `${taskId}-node`, incarnation: `${taskId}-boot`,
+      capacity: { ...resources, cpu: 2, memory_mb: 1024, sessions: 2, tps: 20 } })),
+    candidates: childTaskIds.map((taskId) => ({ task_id: taskId, tenant_id: tenantId,
+      dispatch_id: `${taskId}-dispatch`, node_id: `${taskId}-node`, node_incarnation: `${taskId}-boot`,
+      kind: "dag", dag_id: dagId,
+      voucher_id: taskId === sourceTaskId ? sourceVoucher.voucher_id : targetVoucher.voucher_id,
+      resources, task_spec: { metadata: { task_id: taskId, tenant_id: tenantId }, spec: {} } })),
+  });
+  assert.equal(childTick.status, 200, await childTick.clone().text());
+  const dispatches = ((await childTick.json()) as any).dispatches;
+  const sourceDispatch = dispatches.find((dispatch: any) => dispatch.task_id === sourceTaskId);
+  const targetDispatch = dispatches.find((dispatch: any) => dispatch.task_id === targetTaskId);
+  assert.equal((await simulateNodeStartReceipt(env, sourceDispatch, "boost-source-start")).status, 200);
+  assert.equal((await simulateNodeStartReceipt(env, targetDispatch, "boost-target-start")).status, 200);
+  const targetRunning = await request(`https://ansts.edge/v1beta1/dags/${dagId}/children/${targetTaskId}/observations`, "POST", {
+    tenant_id: tenantId, event_id: "boost-target-running", aggregate_version: 1, state: "RUNNING",
+  });
+  assert.equal(targetRunning.status, 200, await targetRunning.clone().text());
+  const sourceComplete = await request(`https://ansts.edge/v1beta1/tasks/${sourceTaskId}/complete?tenant_id=${tenantId}`, "POST", {
+    tenant_id: tenantId, epoch: sourceDispatch.business_epoch, status: "SUCCEEDED",
+  });
+  assert.equal(sourceComplete.status, 200, await sourceComplete.clone().text());
+  const sourceSucceeded = await request(`https://ansts.edge/v1beta1/dags/${dagId}/children/${sourceTaskId}/observations`, "POST", {
+    tenant_id: tenantId, event_id: "boost-source-succeeded", aggregate_version: 1, state: "SUCCEEDED",
+  });
+  assert.equal(sourceSucceeded.status, 200, await sourceSucceeded.clone().text());
+  const sourceStopped = await request("https://ansts.edge/v1beta1/scheduler/stopped", "POST", {
+    dispatch_id: sourceDispatch.dispatch_id, task_id: sourceTaskId, tenant_id: tenantId,
+    node_id: sourceDispatch.node_id, node_incarnation: sourceDispatch.node_incarnation,
+    region: sourceDispatch.region, resource_pool: sourceDispatch.resource_pool, business_epoch: sourceDispatch.business_epoch,
+    evidence_type: "STOPPED", evidence_id: "boost-source-stopped",
+  });
+  assert.equal(sourceStopped.status, 200, await sourceStopped.clone().text());
+
+  const ledger = tenantLedgerCells.get(tenantId)!;
+  const originalLedgerFetch = ledger.fetch.bind(ledger);
+  let loseCommittedResponse = true;
+  ledger.fetch = async (ledgerRequest: Request) => {
+    const response = await originalLedgerFetch(ledgerRequest);
+    if (loseCommittedResponse && new URL(ledgerRequest.url).pathname === "/allowance-transfers") {
+      loseCommittedResponse = false;
+      return new Response(JSON.stringify({ error: "INJECTED_COMMITTED_TRANSFER_RESPONSE_LOSS" }), { status: 503 });
+    }
+    return response;
+  };
+  const boostUrl = `https://ansts.edge/v1beta1/dags/${dagId}/boosts`;
+  const boostBody = { tenant_id: tenantId, boost_id: "straggler-1", source_task_id: sourceTaskId,
+    target_task_id: targetTaskId, amount_minor: 100, delegated_tps: 2, delegated_tokens: 200 };
+  const interrupted = await request(boostUrl, "POST", boostBody);
+  assert.equal(interrupted.status, 503);
+  const pending = await request(`https://ansts.edge/v1beta1/dags/${dagId}/state?tenant_id=${tenantId}`);
+  assert.equal(((await pending.json()) as any).boosts[0].status, "PENDING");
+  const retried = await request(boostUrl, "POST", boostBody);
+  assert.equal(retried.status, 200, await retried.clone().text());
+  assert.equal(((await retried.json()) as any).boost.status, "TRANSFERRED");
+  const replay = await request(boostUrl, "POST", boostBody);
+  assert.equal(replay.status, 200);
+  const sourceAccount = await request(`https://ansts.edge/v1beta1/tenants/${tenantId}/budget-accounts/${sourceTaskId}?period_key=${periodKey}`);
+  const targetAccount = await request(`https://ansts.edge/v1beta1/tenants/${tenantId}/budget-accounts/${targetTaskId}?period_key=${periodKey}`);
+  assert.equal(((await sourceAccount.json()) as any).available_minor, 200);
+  assert.equal(((await targetAccount.json()) as any).available_minor, 400);
+});
+
+test("empty DAG barrier yields and resumes its parent exactly once", async () => {
+  const { env } = createMockCloudflareCelldEnv();
+  const taskId = "dag-empty-parent";
+  const tenantId = "tenant-dag-empty";
+  const resources = { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 };
+  const spec = { metadata: { task_id: taskId, tenant_id: tenantId }, spec: {} };
+  const firstDispatchResponse = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+      nodes: [{ node_id: "dag-empty-node", incarnation: "dag-empty-boot", capacity: resources }],
+      candidates: [{ task_id: taskId, tenant_id: tenantId, dispatch_id: "dag-empty-parent-first", node_id: "dag-empty-node",
+        node_incarnation: "dag-empty-boot", kind: "ordinary", task_spec: spec, resources }],
+    }),
+  }), env);
+  const firstDispatch = ((await firstDispatchResponse.json()) as any).dispatches[0];
+  assert.equal((await simulateNodeStartReceipt(env, firstDispatch, "dag-empty-first-start")).status, 200);
+
+  const createBody = { tenant_id: tenantId, dag_id: "dag-empty-1", parent_task_id: taskId,
+    parent_epoch: firstDispatch.business_epoch, parent_turn_seq: 0, period_key: "2026-11", currency: "USD", children: [] };
+  const create = () => cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/dags/${createBody.dag_id}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(createBody),
+  }), env);
+  const completed = await create();
+  assert.equal(completed.status, 200, await completed.clone().text());
+  const dag = (await completed.json()) as any;
+  assert.equal(dag.state, "COMPLETED");
+  assert.equal(dag.children.length, 0);
+  assert.equal(dag.parent_yielded, true);
+  const replay = await create();
+  assert.equal(replay.status, 200);
+  assert.equal(((await replay.json()) as any).state, "COMPLETED");
+
+  const resumedDispatch = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/scheduler/tick", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+      nodes: [{ node_id: "dag-empty-node-2", incarnation: "dag-empty-boot-2", capacity: resources }],
+      candidates: [{ task_id: taskId, tenant_id: tenantId, dispatch_id: "dag-empty-parent-resumed", node_id: "dag-empty-node-2",
+        node_incarnation: "dag-empty-boot-2", kind: "recovery", task_spec: spec, resources }],
+    }),
+  }), env);
+  assert.equal(resumedDispatch.status, 200, await resumedDispatch.clone().text());
+  assert.equal(((await resumedDispatch.json()) as any).dispatches[0].stage, "AUTHORIZED");
+});
+
+test("race winner is single, loser operations stay fenced, and allowance waits for stop evidence", async () => {
+  const { env, taskExecutorCalls, nodeCapacityCells } = createMockCloudflareCelldEnv();
+  const tenantId = "tenant-dag-race";
+  const periodKey = "2026-11";
+  const dagId = "dag-race-public";
+  const parentTaskId = "dag-race-parent";
+  const winnerTaskId = "dag-race-winner";
+  const loserTaskId = "dag-race-loser";
+  const base = `https://ansts.edge/v1beta1/tenants/${tenantId}`;
+  const request = (url: string, method = "GET", body?: unknown) => cloudflareCelldWorker.fetch(new Request(url, {
+    method, headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  }), env);
+  const ledger = (path: string, method: string, body?: unknown) => request(`${base}${path}`, method, body);
+  const admit = async (taskId: string, key: string) => {
+    const spec = structuredClone(yaml.load(fs.readFileSync(path.join(__dirname, "..", "..", "specs", "taskspec_v1beta1_example.yaml"), "utf8")) as any);
+    spec.metadata.task_id = taskId;
+    spec.metadata.tenant_id = tenantId;
+    spec.metadata.idempotency_key = key;
+    const response = await request("https://ansts.edge/v1beta1/tasks", "POST", spec);
+    assert.equal(response.status, 202, await response.clone().text());
+  };
+  await admit(parentTaskId, "race-parent-idem");
+  await admit(winnerTaskId, "race-winner-idem");
+  await admit(loserTaskId, "race-loser-idem");
+  assert.equal((await ledger(`/budget-periods/${periodKey}`, "PUT", { currency: "USD", hard_limit_minor: 1000, price_version: "race-price-v1" })).status, 201);
+  assert.equal((await ledger("/budget-grants", "POST", { period_key: periodKey, task_id: parentTaskId, grant_id: "race-parent-grant", amount_minor: 800, currency: "USD" })).status, 201);
+
+  const resources = { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 10 };
+  const policies = { tools_and_saga_config: { transactional_policies: [{ tool_name: "payments/submit", effect_class: ToolEffectClass.IDEMPOTENT_WRITE }] } };
+  const parentSpec = { metadata: { task_id: parentTaskId, tenant_id: tenantId }, spec: {} };
+  const candidates = [{ task_id: parentTaskId, tenant_id: tenantId, dispatch_id: "race-parent-dispatch", node_id: "race-parent-node",
+    node_incarnation: "race-parent-boot", kind: "ordinary", task_spec: parentSpec, resources }];
+  const parentDispatchResponse = await request("https://ansts.edge/v1beta1/scheduler/tick", "POST", {
+    nodes: [{ node_id: "race-parent-node", incarnation: "race-parent-boot", capacity: resources }], candidates,
+  });
+  const parentDispatch = ((await parentDispatchResponse.json()) as any).dispatches[0];
+  assert.equal((await simulateNodeStartReceipt(env, parentDispatch, "race-parent-start")).status, 200);
+
+  const children = [
+    { task_id: winnerTaskId, branch_id: "branch-winner", delegated_tps: 10, delegated_tokens: 500, allowance_minor: 300 },
+    { task_id: loserTaskId, branch_id: "branch-loser", delegated_tps: 10, delegated_tokens: 500, allowance_minor: 300 },
+  ];
+  const dagResponse = await request(`https://ansts.edge/v1beta1/dags/${dagId}`, "POST", {
+    tenant_id: tenantId, dag_id: dagId, parent_task_id: parentTaskId, parent_epoch: parentDispatch.business_epoch,
+    parent_turn_seq: 0, period_key: periodKey, currency: "USD", race_mode: true, children,
+  });
+  assert.equal(dagResponse.status, 200, await dagResponse.clone().text());
+  const dag = (await dagResponse.json()) as any;
+  const childDispatches = [] as any[];
+  for (const [index, child] of dag.children.entries()) {
+    const redeemed = await request(`https://ansts.edge/v1beta1/dags/${dagId}/children/${child.task_id}/redeem`, "POST", {
+      tenant_id: tenantId, voucher_id: child.voucher_id, signature: child.voucher_signature,
+    });
+    assert.equal(redeemed.status, 200);
+    const nodeId = `race-child-node-${index}`;
+    const bootId = `race-child-boot-${index}`;
+    const dispatchResponse = await request("https://ansts.edge/v1beta1/scheduler/tick", "POST", {
+      nodes: [{ node_id: nodeId, incarnation: bootId, capacity: resources }],
+      candidates: [{ task_id: child.task_id, tenant_id: tenantId, dispatch_id: `race-dispatch-${index}`,
+        node_id: nodeId, node_incarnation: bootId, kind: "dag", dag_id: dagId, voucher_id: child.voucher_id,
+        task_spec: { metadata: { task_id: child.task_id, tenant_id: tenantId }, spec: policies }, resources }],
+    });
+    const dispatch = ((await dispatchResponse.json()) as any).dispatches[0];
+    assert.equal(dispatch.stage, "AUTHORIZED");
+    assert.equal((await simulateNodeStartReceipt(env, dispatch, `race-child-start-${index}`)).status, 200);
+    childDispatches.push(dispatch);
+  }
+
+  const blocked = await request(`https://ansts.edge/v1beta1/tasks/${loserTaskId}/operations?tenant_id=${tenantId}`, "POST", {
+    tool_call_id: "loser-before-winner", tool_name: "payments/submit", effect_class: ToolEffectClass.IDEMPOTENT_WRITE,
+    args: { order_id: "order-1" }, epoch: childDispatches[1].business_epoch, turn_seq: 1,
+    race: { race_id: dagId, branch_id: "branch-loser" },
+  });
+  assert.equal(blocked.status, 202);
+  assert.equal(((await blocked.json()) as any).status, "RACE_BLOCKED");
+  assert.equal(taskExecutorCalls.execute, 0);
+
+  const winnerCompletion = await request(`https://ansts.edge/v1beta1/tasks/${winnerTaskId}/complete?tenant_id=${tenantId}`, "POST", {
+    tenant_id: tenantId, epoch: childDispatches[0].business_epoch, status: "SUCCEEDED",
+  });
+  assert.equal(winnerCompletion.status, 200, await winnerCompletion.clone().text());
+  const selected = await request(`https://ansts.edge/v1beta1/dags/${dagId}/children/${winnerTaskId}/observations`, "POST", {
+    tenant_id: tenantId, event_id: "race-winner-success", aggregate_version: 1, state: "SUCCEEDED",
+  });
+  assert.equal(selected.status, 409, "parent remains yielded while loser capacity has no stop evidence");
+  assert.equal(((await selected.json()) as any).error, "DAG_CHILD_STOP_UNCONFIRMED");
+
+  const loserOperation = await request(`https://ansts.edge/v1beta1/tasks/${loserTaskId}/operations?tenant_id=${tenantId}`, "GET");
+  const operations = (await loserOperation.json()) as any;
+  assert.equal(operations.operations[0].race.selectedWinner, "branch-winner");
+  const afterWinner = await request(`https://ansts.edge/v1beta1/tasks/${loserTaskId}/operations?tenant_id=${tenantId}`, "POST", {
+    tool_call_id: "loser-after-winner", tool_name: "payments/submit", effect_class: ToolEffectClass.IDEMPOTENT_WRITE,
+    args: { order_id: "order-2" }, epoch: childDispatches[1].business_epoch, turn_seq: 1,
+    race: { race_id: dagId, branch_id: "branch-loser" },
+  });
+  assert.equal(afterWinner.status, 409);
+  assert.equal(((await afterWinner.json()) as any).error, "DAG_RACE_LOST");
+  assert.equal(taskExecutorCalls.execute, 0);
+
+  const stopLoser = await request("https://ansts.edge/v1beta1/scheduler/stopped", "POST", {
+    dispatch_id: childDispatches[1].dispatch_id, task_id: loserTaskId, tenant_id: tenantId,
+    node_id: childDispatches[1].node_id, node_incarnation: childDispatches[1].node_incarnation,
+    region: childDispatches[1].region, resource_pool: childDispatches[1].resource_pool,
+    business_epoch: childDispatches[1].business_epoch, evidence_type: "STOPPED", evidence_id: "race-loser-stopped-proof",
+  });
+  assert.equal(stopLoser.status, 200, await stopLoser.clone().text());
+  const reconciled = await request(`https://ansts.edge/v1beta1/dags/${dagId}/reconcile`, "POST", { tenant_id: tenantId });
+  assert.equal(reconciled.status, 200, await reconciled.clone().text());
+  const raceState = (await reconciled.json()) as any;
+  assert.equal(raceState.winner_task_id, winnerTaskId);
+  assert.equal(raceState.state, "COMPLETED");
+  assert.equal(raceState.children.find((child: any) => child.task_id === loserTaskId).observed_state, "STOPPED");
+  assert.equal(nodeCapacityCells.get(childDispatches[1].node_id)!.capacity.getReservation(childDispatches[1].dispatch_id)!.release_evidence_id, "race-loser-stopped-proof");
 });
 
 test("SchedulerPool greedily orders weighted multi-resource demand against configured node capacity", async () => {
@@ -868,11 +1632,19 @@ test("public Worker budget routes conserve integer allowances across grant, hold
 });
 
 test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Burst, SQLite WAL & Fencing", async () => {
-  const { env, harnessCells, nodeCapacityCells } = createMockCloudflareCelldEnv();
+  const { env, harnessCells, nodeCapacityCells, taskExecutorCalls } = createMockCloudflareCelldEnv();
   const taskId = "tsk_celld_agent_01";
   const taskSpec = {
     metadata: { task_id: taskId, tenant_id: "fin-enterprise" },
-    spec: { execution_policy: { max_retries: 3, checkpoint: "turn-boundary" } },
+    spec: {
+      execution_policy: { max_retries: 3, checkpoint: "turn-boundary" },
+      tools_and_saga_config: {
+        transactional_policies: [
+          { tool_name: "git_branch_push", effect_class: ToolEffectClass.SAGA_COMPENSATABLE, compensation_tool: "git_branch_delete" },
+          { tool_name: "settlement_ledger_post", effect_class: ToolEffectClass.STAGED_COMMIT, require_human_approval: true },
+        ],
+      },
+    },
   };
   const dispatch = await cloudflareCelldWorker.fetch(
     new Request("https://ansts.edge/v1beta1/scheduler/tick", {
@@ -934,7 +1706,7 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
           tool_call_id: "call_02",
           tool_name: "git_branch_push",
           effect_class: ToolEffectClass.SAGA_COMPENSATABLE,
-          payload: "branch=feat-celld",
+          args: { branch: "feat-celld" },
           compensation_tool: "git_branch_delete",
           requires_heavy_container: true,
         },
@@ -943,10 +1715,102 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
     }),
     env,
   );
+  assert.equal(turn2Res.status, 200, await turn2Res.clone().text());
   const turn2Body = (await turn2Res.json()) as Record<string, any>;
   assert.equal(turn2Body.routed_model, "DeepSeek");
   assert.equal(turn2Body.container_burst_triggered, true);
   assert.equal(turn2Body.sqlite_wal_rows, 2);
+
+  const turn2OperationId = stableTaskOperationId(taskId, "call_02");
+  const listedOperations = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/operations?tenant_id=fin-enterprise`,
+  ), env);
+  assert.equal(listedOperations.status, 200);
+  const operationsBody = await listedOperations.json() as any;
+  assert.equal(operationsBody.operations[0].operationId, turn2OperationId);
+  assert.equal(operationsBody.operations[0].status, "SUCCEEDED");
+  assert.equal(operationsBody.operations[0].compensation.status, "PENDING");
+  assert.equal(taskExecutorCalls.execute, 1);
+
+  const existingCellState = harnessCells.get(taskId)!.ctx;
+  harnessCells.set(taskId, new AgentTaskHarnessCell(existingCellState, env));
+  const afterActivation = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/operations/${encodeURIComponent(turn2OperationId)}?tenant_id=fin-enterprise`,
+  ), env);
+  assert.equal(afterActivation.status, 200);
+  assert.equal(((await afterActivation.json()) as any).operation.status, "SUCCEEDED");
+
+  const stagedRequest = {
+    tool_call_id: "approval-call-01",
+    tool_name: "settlement_ledger_post",
+    args: { settlement_id: "settle-01", amount_minor: 500 },
+    epoch: 1,
+    turn_seq: 3,
+  };
+  const stagedResponse = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/operations?tenant_id=fin-enterprise`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(stagedRequest) },
+  ), env);
+  assert.equal(stagedResponse.status, 202);
+  const stagedBody = await stagedResponse.json() as any;
+  assert.equal(stagedBody.status, "APPROVAL_REQUIRED");
+  assert.equal(taskExecutorCalls.execute, 1, "staged operations must wait for approval before provider execution");
+  const stagedOperationId = stableTaskOperationId(taskId, stagedRequest.tool_call_id);
+
+  const crossTenantOperation = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/operations/${encodeURIComponent(stagedOperationId)}?tenant_id=another-tenant`,
+  ), env);
+  assert.equal(crossTenantOperation.status, 404);
+
+  const approval = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/operations/${encodeURIComponent(stagedOperationId)}/approval?tenant_id=fin-enterprise`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approval_id: "approval-01", approved_by: "tenant-admin", expires_at: Date.now() + 60_000 }),
+    },
+  ), env);
+  assert.equal(approval.status, 200, await approval.clone().text());
+  const executeApproved = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/operations?tenant_id=fin-enterprise`,
+    { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(stagedRequest) },
+  ), env);
+  assert.equal(executeApproved.status, 200, await executeApproved.clone().text());
+  assert.equal(((await executeApproved.json()) as any).status, "SUCCEEDED");
+  assert.equal(taskExecutorCalls.execute, 2);
+
+  const compensation = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/compensations/run?tenant_id=fin-enterprise`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ epoch: 1, turn_seq: 3, after_turn_exclusive: 1 }),
+    },
+  ), env);
+  assert.equal(compensation.status, 200, await compensation.clone().text());
+  assert.equal(taskExecutorCalls.compensate, 1);
+  const compensationList = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/compensations?tenant_id=fin-enterprise&after_turn_exclusive=1`,
+  ), env);
+  assert.equal(((await compensationList.json()) as any).compensations[0].status, "COMPENSATED");
+
+  env.TASK_OPERATION_EXECUTOR = undefined;
+  const unavailable = await cloudflareCelldWorker.fetch(new Request(
+    `https://ansts.edge/v1beta1/tasks/${taskId}/operations?tenant_id=fin-enterprise`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        tool_call_id: "no-executor-call",
+        tool_name: "git_branch_push",
+        args: { branch: "must-not-be-started" },
+        epoch: 1,
+        turn_seq: 3,
+      }),
+    },
+  ), env);
+  assert.equal(unavailable.status, 503);
+  assert.equal(taskExecutorCalls.execute, 2, "missing executor must persist intent without starting an external attempt");
 
   // Zero-Token Time-Travel Replay to Turn 1 directly from Cell state
   const replayRes = await cloudflareCelldWorker.fetch(
@@ -1049,6 +1913,188 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
   assert.equal(cell.task.state, "HIBERNATED");
 });
 
+
+test("public Worker meters a provider call, commits a verified snapshot, and recovers the same Turn after activation", async () => {
+  const { env, harnessCells, modelProviderCalls, tenantTaskProjections, taskEventProjections } = createMockCloudflareCelldEnv();
+  env.TEST_SIMULATOR_MODE = false;
+  const tenantId = "tenant-durable-turn";
+  const taskId = "task-durable-turn";
+  const periodKey = new Date().toISOString().slice(0, 7);
+  const base = "https://ansts.edge";
+  const request = (pathName: string, method = "GET", body?: unknown, headers: Record<string, string> = {}) =>
+    cloudflareCelldWorker.fetch(new Request(`${base}${pathName}`, {
+      method,
+      headers: { ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers },
+      body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+    }), env);
+
+  const routeConfig = {
+    tenantId,
+    policyVersion: "durable-turn-policy-v1",
+    routes: [{
+      poolName: "DeepSeek",
+      provider: "openai-compatible",
+      modelId: "test-deepseek",
+      quotaDomain: "shared-account-a",
+      quotaDemandTokensPerSecond: 8,
+      maxInputTokens: 1024,
+      maxOutputTokens: 64,
+      pricing: { priceVersion: "turn-price-v1", currency: "USD", inputMinorPerMillionTokens: 1_000_000, outputMinorPerMillionTokens: 1_000_000 },
+    }],
+  };
+  const routing = await request(`/v1beta1/tenants/${tenantId}/routing-config/versions`, "POST", {
+    operationId: "durable-turn-routing-v1", expectedVersion: 0, configuration: routeConfig,
+  });
+  assert.equal(routing.status, 201, await routing.clone().text());
+  const quotaPolicy = await request("/v1beta1/providers/openai-compatible/quota-domains/shared-account-a/policy", "PUT", {
+    operationId: "durable-turn-quota-v1", expectedVersion: 0,
+    policy: { requestsPerMinute: 100, tokensPerSecond: 1000, grantTtlMs: 60_000 },
+  });
+  assert.equal(quotaPolicy.status, 201, await quotaPolicy.clone().text());
+  const period = await request(`/v1beta1/tenants/${tenantId}/budget-periods/${periodKey}`, "PUT", {
+    currency: "USD", hard_limit_minor: 10_000, price_version: "turn-price-v1",
+  });
+  assert.equal(period.status, 201, await period.clone().text());
+  const grant = await request(`/v1beta1/tenants/${tenantId}/budget-grants`, "POST", {
+    period_key: periodKey, task_id: taskId, grant_id: "durable-turn-budget", amount_minor: 10_000, currency: "USD",
+  });
+  assert.equal(grant.status, 201, await grant.clone().text());
+
+  const taskSpec = {
+    metadata: { task_id: taskId, tenant_id: tenantId, idempotency_key: "durable-turn-admission" },
+    spec: {
+      cognitive_policy: {
+        primary_model: "DeepSeek", fast_utility_model: "GLM-5.3", fallback_models: ["Qwen-3.8"], default_reasoning_effort: "medium",
+      },
+      quota_and_dag_policy: { max_total_tokens: 2000, reserved_tps: 8 },
+      tools_and_saga_config: { transactional_policies: [] },
+    },
+  };
+  const admissionSpec = structuredClone(yaml.load(fs.readFileSync(path.join(__dirname, "..", "..", "specs", "taskspec_v1beta1_example.yaml"), "utf8")) as any);
+  admissionSpec.metadata.task_id = taskId;
+  admissionSpec.metadata.tenant_id = tenantId;
+  admissionSpec.metadata.idempotency_key = "durable-turn-admission";
+  const accepted = await request("/v1beta1/tasks", "POST", admissionSpec);
+  assert.equal(accepted.status, 202, await accepted.clone().text());
+  const dispatchResponse = await request("/v1beta1/scheduler/tick", "POST", {
+    nodes: [{ node_id: "durable-turn-node", incarnation: "durable-turn-boot", capacity: { cpu: 4, memory_mb: 2048, burst_cpu: 2, sessions: 2, tps: 100 } }],
+    candidates: [{
+      task_id: taskId, tenant_id: tenantId, dispatch_id: "durable-turn-dispatch", node_id: "durable-turn-node",
+      node_incarnation: "durable-turn-boot", kind: "ordinary", task_spec: taskSpec,
+      resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 8 },
+    }],
+  });
+  assert.equal(dispatchResponse.status, 200, await dispatchResponse.clone().text());
+  const dispatch = ((await dispatchResponse.json()) as any).dispatches[0];
+  assert.equal(dispatch.stage, "AUTHORIZED");
+  assert.equal((await simulateNodeStartReceipt(env, dispatch, "durable-turn-start-receipt")).status, 200);
+
+  const block = new TextEncoder().encode("workspace-at-turn-1");
+  const blockSha256 = createHash("sha256").update(block).digest("hex");
+  const upload = await request(`/v1beta1/tasks/${taskId}/turns/snapshot-uploads?tenant_id=${tenantId}`, "POST", {
+    epoch: 1,
+    turn_seq: 1,
+    upload_id: "durable-turn-upload-1",
+    chunks: [{ index: 0, sha256: blockSha256, size_bytes: block.byteLength }],
+  });
+  assert.equal(upload.status, 200, await upload.clone().text());
+  const turnPath = `/v1beta1/tasks/${taskId}/turn?tenant_id=${tenantId}`;
+  const turnBody = {
+    epoch: 1,
+    turn_seq: 1,
+    snapshot_upload_id: "durable-turn-upload-1",
+    messages: [{ role: "user", content: "Summarize the durable workspace." }],
+    max_output_tokens: 64,
+    workspace_merkle_hash: blockSha256,
+  };
+  const incompleteSnapshotTurn = await request(turnPath, "POST", turnBody);
+  assert.equal(incompleteSnapshotTurn.status, 409);
+  assert.equal(modelProviderCalls.calls, 0, "an incomplete snapshot must block before provider billing or execution");
+  const chunk = await cloudflareCelldWorker.fetch(new Request(
+    `${base}/v1beta1/tasks/${taskId}/turns/snapshot-uploads/durable-turn-upload-1/chunks/0?tenant_id=${tenantId}`,
+    { method: "PUT", headers: { "content-type": "application/octet-stream" }, body: block },
+  ), env);
+  assert.equal(chunk.status, 200, await chunk.clone().text());
+
+  const turn = await request(turnPath, "POST", turnBody);
+  assert.equal(turn.status, 200, await turn.clone().text());
+  const committed = await turn.json() as any;
+  assert.equal(committed.turn_committed, true);
+  assert.equal(committed.model_response.content_text, "durable answer");
+  assert.equal(modelProviderCalls.calls, 1);
+
+  const taskList = await request(`/v1beta1/tenants/${tenantId}/tasks`);
+  assert.equal(taskList.status, 200, await taskList.clone().text());
+  const listedTasks = await taskList.json() as any;
+  assert.equal(listedTasks.tasks[0].lifecycle_state, "RUNNING");
+  assert.equal(listedTasks.projection_stored, true);
+  const dashboardTasks = await request(`/v1beta1/tenants/${tenantId}/dashboard/tasks`);
+  assert.equal(dashboardTasks.status, 200, await dashboardTasks.clone().text());
+  assert.equal(((await dashboardTasks.json()) as any).tasks[0].task_id, taskId);
+  tenantTaskProjections.clear();
+  taskEventProjections.clear();
+  const lostProjection = await request(`/v1beta1/tenants/${tenantId}/dashboard/tasks`);
+  assert.deepEqual(((await lostProjection.json()) as any).tasks, [], "D1 projection loss does not erase authoritative task state");
+  const currentMinute = Math.floor(Date.now() / 60_000);
+  const shard = tenantDirectoryShardIndex(tenantId);
+  const scheduledMinute = currentMinute + ((shard - (currentMinute % TENANT_DIRECTORY_SHARD_COUNT) + TENANT_DIRECTORY_SHARD_COUNT) % TENANT_DIRECTORY_SHARD_COUNT);
+  await cloudflareCelldWorker.scheduled({ scheduledTime: scheduledMinute * 60_000, cron: "* * * * *" }, env);
+  assert.ok(Array.from(taskEventProjections.values()).some((event) => event.event_type === "task.turn.committed"), "retained TaskCell outbox rebuilds the D1 event view");
+  const rebuiltTaskView = await request(`/v1beta1/tenants/${tenantId}/dashboard/tasks`);
+  assert.equal(((await rebuiltTaskView.json()) as any).tasks[0].task_id, taskId);
+
+  const eventsPath = `/v1beta1/tasks/${taskId}/events?tenant_id=${tenantId}`;
+  const eventFeed = await request(eventsPath);
+  assert.equal(eventFeed.status, 200, await eventFeed.clone().text());
+  const feed = await eventFeed.json() as any;
+  assert.ok(feed.events.some((event: any) => event.eventType === "task.turn.committed"));
+  assert.ok(feed.next_cursor);
+  assert.ok(feed.events.some((event: any) => event.status === "DELIVERED"), "projection success durably acknowledges the source outbox event");
+  assert.ok(Array.from(taskEventProjections.values()).some((event) => event.event_type === "task.turn.committed"));
+  const eventStream = await request(`${eventsPath}&snapshot=1`, "GET", undefined, { accept: "text/event-stream" });
+  assert.equal(eventStream.status, 200);
+  assert.match(eventStream.headers.get("content-type") ?? "", /text\/event-stream/);
+  assert.match(await eventStream.text(), /event: task\.turn\.committed/);
+  const followStream = await request(eventsPath, "GET", undefined, { accept: "text/event-stream" });
+  assert.equal(followStream.status, 200);
+  const streamReader = followStream.body!.getReader();
+  let streamFrames = "";
+  for (let i = 0; i < feed.events.length; i += 1) {
+    const frame = await streamReader.read();
+    if (frame.done) break;
+    streamFrames += new TextDecoder().decode(frame.value);
+    if (streamFrames.includes("event: task.turn.committed")) break;
+  }
+  await streamReader.cancel();
+  assert.match(streamFrames, /event: task\.turn\.committed/);
+  const expiredCursor = `${feed.events[0].aggregateVersion}~${Date.now() - 8 * 24 * 60 * 60 * 1000}~old-event`;
+  const expiredFeed = await request(eventsPath, "GET", undefined, { "last-event-id": expiredCursor });
+  assert.equal(expiredFeed.status, 410);
+  assert.equal(((await expiredFeed.json()) as any).resync_required, true);
+
+  const recoveryPath = `/v1beta1/tasks/${taskId}/turns/recovery?tenant_id=${tenantId}`;
+  const recovery = await request(recoveryPath);
+  assert.equal(recovery.status, 200, await recovery.clone().text());
+  const recovered = await recovery.json() as any;
+  assert.equal(recovered.turnSeq, 1);
+  assert.equal(recovered.response.model_response.content_text, "durable answer");
+  assert.equal(recovered.snapshotBlocks.length, 1);
+
+  const crossTenant = await request(`/v1beta1/tasks/${taskId}/turns/recovery?tenant_id=other-tenant`);
+  assert.equal(crossTenant.status, 404);
+  const existingState = harnessCells.get(taskId)!.ctx;
+  harnessCells.set(taskId, new AgentTaskHarnessCell(existingState, env));
+  const afterActivation = await request(recoveryPath);
+  assert.equal(afterActivation.status, 200, await afterActivation.clone().text());
+  assert.equal(((await afterActivation.json()) as any).response.model_response.content_text, "durable answer");
+
+  const replay = await request(turnPath, "POST", turnBody);
+  assert.equal(replay.status, 200, await replay.clone().text());
+  assert.equal(((await replay.json()) as any).replayed, true);
+  assert.equal(modelProviderCalls.calls, 1, "replaying a committed Turn must not call the model again");
+  const changedInput = await request(turnPath, "POST", { ...turnBody, messages: [{ role: "user", content: "changed request" }] });
+  assert.equal(changedInput.status, 409);
+});
 
 test("10. RustFS + celld --bucket startup specimen & Docker Compose manifest verification", () => {
   const rootDir = path.join(__dirname, "..", "..");

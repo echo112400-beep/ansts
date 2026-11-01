@@ -35,6 +35,88 @@ export interface PendingCellOutboxEvent extends CellOutboxEvent {
   lastError: string | null;
 }
 
+export interface CellOutboxCursor {
+  aggregateVersion: number;
+  createdAt: number;
+  eventId: string;
+}
+
+export interface ReplayedCellOutboxEvent extends CellOutboxEvent {
+  createdAt: number;
+  status: "PENDING" | "DELIVERED";
+  cursor: string;
+}
+
+export interface CellOutboxReplayPage {
+  events: ReplayedCellOutboxEvent[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  cursorExpired: boolean;
+}
+
+export function encodeCellOutboxCursor(cursor: CellOutboxCursor): string {
+  if (!Number.isSafeInteger(cursor.aggregateVersion) || cursor.aggregateVersion < 1 || !Number.isSafeInteger(cursor.createdAt) || cursor.createdAt < 0 || !cursor.eventId) {
+    throw new TypeError("Outbox cursor identity is invalid.");
+  }
+  return `${cursor.aggregateVersion}~${cursor.createdAt}~${encodeURIComponent(cursor.eventId)}`;
+}
+
+export function decodeCellOutboxCursor(value: string): CellOutboxCursor {
+  const match = value.match(/^(\d+)~(\d+)~(.+)$/);
+  if (!match) throw new TypeError("Last-Event-ID must be a valid ANSTS task cursor.");
+  let eventId: string;
+  try { eventId = decodeURIComponent(match[3]); } catch { throw new TypeError("Last-Event-ID has an invalid event identity."); }
+  const aggregateVersion = Number(match[1]);
+  const createdAt = Number(match[2]);
+  if (!Number.isSafeInteger(aggregateVersion) || aggregateVersion < 1 || !Number.isSafeInteger(createdAt) || createdAt < 0 || !eventId) {
+    throw new TypeError("Last-Event-ID has an invalid position.");
+  }
+  return { aggregateVersion, createdAt, eventId };
+}
+
+/** Return a bounded, tenant-scoped replay page from the authoritative Cell outbox. */
+export function listCellOutboxReplay(
+  sql: PersistenceSqlStorage,
+  input: { tenantId: string; aggregateType: string; aggregateId: string; cutoff: number; after?: CellOutboxCursor; limit?: number },
+): CellOutboxReplayPage {
+  const limit = input.limit ?? 100;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new RangeError("Outbox replay limit must be 1..1000.");
+  if (input.after && input.after.createdAt < input.cutoff) return { events: [], nextCursor: null, hasMore: false, cursorExpired: true };
+  const rows = sql.exec<OutboxRow>(
+    `SELECT * FROM cell_outbox
+     WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ? AND created_at >= ?
+     ORDER BY aggregate_version ASC, created_at ASC, event_id ASC`,
+    input.tenantId, input.aggregateType, input.aggregateId, input.cutoff,
+  ).toArray();
+  const after = input.after;
+  const remaining = rows.filter((row) => !after
+    || Number(row.aggregate_version) > after.aggregateVersion
+    || (Number(row.aggregate_version) === after.aggregateVersion
+      && (Number(row.created_at) > after.createdAt
+        || (Number(row.created_at) === after.createdAt && row.event_id > after.eventId))));
+  const selected = remaining.slice(0, limit + 1);
+  const hasMore = selected.length > limit;
+  const pageRows = selected.slice(0, limit);
+  const events = pageRows.map((row) => {
+    const cursor = encodeCellOutboxCursor({ aggregateVersion: Number(row.aggregate_version), createdAt: Number(row.created_at), eventId: row.event_id });
+    return {
+      eventId: row.event_id,
+      operationId: row.operation_id,
+      eventType: row.event_type,
+      tenantId: row.tenant_id,
+      aggregateType: row.aggregate_type,
+      aggregateId: row.aggregate_id,
+      aggregateVersion: Number(row.aggregate_version),
+      payloadDigest: row.payload_digest,
+      payload: JSON.parse(row.payload_json),
+      createdAt: Number(row.created_at),
+      status: row.status,
+      cursor,
+    };
+  });
+  return { events, nextCursor: events.at(-1)?.cursor ?? null, hasMore, cursorExpired: false };
+}
+
 export interface PreparedCellOutboxEvent extends Omit<CellOutboxDraft, "payload"> {
   operationId: string;
   aggregateType: string;
@@ -157,9 +239,10 @@ export async function markCellOutboxDelivered(
   eventId: string,
   deliveredAt: number = Date.now(),
 ): Promise<boolean> {
-  const changed = withCellTransaction(storage.sql, () => {
+  const result = withCellTransaction(storage.sql, () => {
     const row = storage.sql.exec<OutboxRow>("SELECT * FROM cell_outbox WHERE event_id = ?", eventId).toArray()[0];
-    if (!row || row.status === "DELIVERED") return false;
+    if (!row) return { exists: false, changed: false };
+    if (row.status === "DELIVERED") return { exists: true, changed: false };
     storage.sql.exec(
       "UPDATE cell_outbox SET status = ?, delivered_at = ?, last_error = ? WHERE event_id = ?",
       "DELIVERED",
@@ -167,10 +250,62 @@ export async function markCellOutboxDelivered(
       null,
       eventId,
     );
-    return true;
+    return { exists: true, changed: true };
   });
-  if (changed) await confirmCellWrite(storage);
-  return changed;
+  // A prior call may have committed locally and then lost its sync acknowledgement. Reconfirm
+  // the durable row on an idempotent retry even though no SQL field changes this time.
+  if (result.exists) await confirmCellWrite(storage);
+  return result.changed;
+}
+
+/** Acknowledge one bounded consumer batch in one durable SQLite transaction. */
+export async function markCellOutboxBatchDelivered(
+  storage: PersistenceObjectStorage,
+  input: { eventIds: string[]; tenantId: string; aggregateType: string; aggregateId: string },
+  deliveredAt: number = Date.now(),
+): Promise<number> {
+  if (!Array.isArray(input.eventIds) || input.eventIds.length < 1 || input.eventIds.length > 1000 ||
+      input.eventIds.some((eventId) => typeof eventId !== "string" || !eventId.trim()) ||
+      new Set(input.eventIds).size !== input.eventIds.length) {
+    throw new TypeError("Outbox acknowledgment requires 1..1000 unique event IDs.");
+  }
+  if (!Number.isSafeInteger(deliveredAt) || deliveredAt < 0) throw new TypeError("deliveredAt must be a valid timestamp.");
+  const result = withCellTransaction(storage.sql, () => {
+    let changed = 0;
+    for (const eventId of input.eventIds) {
+      const row = storage.sql.exec<OutboxRow>("SELECT * FROM cell_outbox WHERE event_id = ?", eventId).toArray()[0];
+      if (!row || row.tenant_id !== input.tenantId || row.aggregate_type !== input.aggregateType || row.aggregate_id !== input.aggregateId) {
+        throw new CellOutboxConflictError(eventId);
+      }
+      if (row.status === "DELIVERED") continue;
+      storage.sql.exec("UPDATE cell_outbox SET status = ?, delivered_at = ?, last_error = ? WHERE event_id = ?",
+        "DELIVERED", deliveredAt, null, eventId);
+      changed += 1;
+    }
+    return { changed, exists: true };
+  });
+  if (result.exists) await confirmCellWrite(storage);
+  return result.changed;
+}
+
+/** Drop expired delivered event bodies while retaining identity/digest tombstones for operation replay. */
+export async function pruneDeliveredCellOutboxPayloads(
+  storage: PersistenceObjectStorage,
+  input: { tenantId: string; aggregateType: string; aggregateId: string; cutoff: number },
+): Promise<number> {
+  if (!Number.isSafeInteger(input.cutoff) || input.cutoff < 0) throw new TypeError("Outbox retention cutoff must be a valid timestamp.");
+  const expired = storage.sql.exec<OutboxRow>("SELECT * FROM cell_outbox WHERE tenant_id = ? AND aggregate_type = ? AND aggregate_id = ? AND status = ?",
+    input.tenantId, input.aggregateType, input.aggregateId, "DELIVERED")
+    .toArray().filter((row) => Number(row.created_at) < input.cutoff && row.payload_json !== "{}");
+  if (expired.length === 0) return 0;
+  withCellTransaction(storage.sql, () => {
+    for (const row of expired) {
+      storage.sql.exec("UPDATE cell_outbox SET payload_json = ? WHERE event_id = ? AND status = ?",
+        "{}", row.event_id, "DELIVERED");
+    }
+  });
+  await confirmCellWrite(storage);
+  return expired.length;
 }
 
 export async function recordCellOutboxFailure(

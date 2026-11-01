@@ -23,6 +23,22 @@ class_name = "TenantLedgerCell"
 name = "NODE_CAPACITY_CELL"
 class_name = "NodeCapacityCell"
 
+[[durable_objects.bindings]]
+name = "PROVIDER_QUOTA_CELL"
+class_name = "ProviderQuotaCell"
+
+[[durable_objects.bindings]]
+name = "ROUTING_CONFIG_CELL"
+class_name = "RoutingConfigCell"
+
+[[durable_objects.bindings]]
+name = "DAG_CELL"
+class_name = "DagCell"
+
+[[durable_objects.bindings]]
+name = "TENANT_DIRECTORY_CELL"
+class_name = "TenantDirectoryCell"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["AnstsSchedulerCell", "AgentTaskHarnessCell"]
@@ -34,6 +50,18 @@ new_sqlite_classes = ["TenantLedgerCell"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["NodeCapacityCell"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["ProviderQuotaCell", "RoutingConfigCell"]
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["DagCell"]
+
+[[migrations]]
+tag = "v6"
+new_sqlite_classes = ["TenantDirectoryCell"]
 
 [[d1_databases]]
 binding = "ANSTS_D1"

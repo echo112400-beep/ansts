@@ -67,6 +67,31 @@ export class AnstsSchedulerCell {
         return await this.recordNodeStart(body);
       }
 
+      if (request.method === "POST" && url.pathname === "/scheduler/stopped") {
+        const body = await request.json() as {
+          dispatch_id: string; task_id: string; tenant_id: string; node_id: string; node_incarnation: string;
+          business_epoch: number; evidence_type: "STOPPED" | "ISOLATED"; evidence_id: string;
+        };
+        const dispatch = this.schedulerPool.getDispatch(body.dispatch_id);
+        if (!dispatch || dispatch.task_id !== body.task_id || dispatch.tenant_id !== body.tenant_id ||
+            dispatch.node_id !== body.node_id || dispatch.node_incarnation !== body.node_incarnation ||
+            Number(dispatch.business_epoch) !== body.business_epoch) {
+          return json({ error: "NODE_STOP_DISPATCH_MISMATCH" }, 409);
+        }
+        const task = await requireOwner(persistenceCellStub(this.env, "task", body.task_id), "/execution/state", "GET");
+        if (task.tenant_id !== body.tenant_id || task.current_dispatch_id !== body.dispatch_id || Number(task.business_epoch) !== body.business_epoch) {
+          return json({ error: "NODE_STOP_TASK_MISMATCH" }, 409);
+        }
+        if (body.evidence_type === "STOPPED" && ["RUNNING", "STARTING", "SUSPECT"].includes(task.lifecycle_state)) {
+          return json({ error: "TASK_STOP_NOT_CONFIRMED", message: "TaskCell must be terminal or suspended before STOPPED evidence is accepted." }, 409);
+        }
+        return requireOwner(this.nodeStub(body.node_id), `/reservations/${encodeURIComponent(body.dispatch_id)}/release`, "POST", {
+          node_incarnation: body.node_incarnation,
+          evidence_type: body.evidence_type,
+          evidence_id: body.evidence_id,
+        }).then((reservation) => json({ reservation }));
+      }
+
       if (request.method === "POST" && url.pathname === "/tasks/submit") {
         const rawSpec = (await request.json()) as Record<string, any>;
         const res = this.cluster.apiGateway.submitTaskSpec(rawSpec, Date.now() / 1000.0);
@@ -190,6 +215,21 @@ export class AnstsSchedulerCell {
     const dispatchId = candidate.dispatch_id ?? `${candidate.kind ?? "ordinary"}:${candidate.task_id}:${candidate.expected_task_version ?? 0}`;
     const normalized: SchedulerCandidate = { ...candidate, dispatch_id: dispatchId };
     if (!candidate.node_incarnation) return { task_id: candidate.task_id, dispatch_id: dispatchId, status: "NODE_NOT_READY" };
+
+    if (candidate.kind === "dag") {
+      if (!candidate.dag_id || !candidate.voucher_id || !this.env.DAG_CELL) {
+        return { task_id: candidate.task_id, dispatch_id: dispatchId, status: "BLOCKED_DAG_VOUCHER" };
+      }
+      const dagStub = this.env.DAG_CELL.get(this.env.DAG_CELL.idFromName(candidate.dag_id));
+      const authority = await callOwner(dagStub, "/dags/dispatch-authority", "POST", {
+        tenant_id: candidate.tenant_id,
+        task_id: candidate.task_id,
+        voucher_id: candidate.voucher_id,
+      });
+      if (!authority.response.ok || authority.body?.authorized !== true) {
+        return { task_id: candidate.task_id, dispatch_id: dispatchId, status: "BLOCKED_DAG_VOUCHER", error: authority.body?.error };
+      }
+    }
 
     try {
       let dispatch = await this.schedulerPool.ensureIntent(normalized);

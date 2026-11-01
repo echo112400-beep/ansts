@@ -24,6 +24,7 @@ import {
   RustFsS3LtxDriver,
   S3CasPreconditionFailedError,
   TenantLedgerCell,
+  TenantDirectoryCell,
 } from "../src/index";
 import { NodeCapacityCell } from "../src/cloudflare/node_capacity_cell";
 
@@ -32,10 +33,12 @@ test("M10 (TASK-49): TenantLedger admission, scheduler scale-out, RPO=0 turn pro
   const schedulerShards = new Map<string, AnstsSchedulerCell>();
   const harnessCells = new Map<string, AgentTaskHarnessCell>();
   const tenantLedgerCells = new Map<string, TenantLedgerCell>();
+  const tenantDirectoryCells = new Map<string, TenantDirectoryCell>();
   const nodeCapacityCells = new Map<string, NodeCapacityCell>();
   const queuedEvents: any[] = [];
 
   const env: CloudflareCelldEnv = {
+    TEST_SIMULATOR_MODE: true,
     PRIMARY_MODEL_POOL: "DeepSeek",
     FAST_UTILITY_POOL: "GLM-5.3",
     FALLBACK_MODEL_POOL: "Qwen-3.8",
@@ -80,6 +83,20 @@ test("M10 (TASK-49): TenantLedger admission, scheduler scale-out, RPO=0 turn pro
           tenantLedgerCells.set(key, new TenantLedgerCell(new MockDurableObjectState(key), env));
         }
         const cell = tenantLedgerCells.get(key)!;
+        return {
+          fetch: (input: RequestInfo, init?: RequestInit) => {
+            const req = typeof input === "string" ? new Request(input, init) : input;
+            return cell.fetch(req);
+          },
+        };
+      },
+    },
+    TENANT_DIRECTORY_CELL: {
+      idFromName: (name: string) => ({ toString: () => name, name }),
+      get: (id: { toString(): string; name?: string }) => {
+        const key = id.name ?? id.toString();
+        if (!tenantDirectoryCells.has(key)) tenantDirectoryCells.set(key, new TenantDirectoryCell(new MockDurableObjectState(key), env));
+        const cell = tenantDirectoryCells.get(key)!;
         return {
           fetch: (input: RequestInfo, init?: RequestInit) => {
             const req = typeof input === "string" ? new Request(input, init) : input;

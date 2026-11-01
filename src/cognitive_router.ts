@@ -156,8 +156,10 @@ export class CognitiveRouter {
     task: AgentTask,
     fence: FenceToken,
     request: MeteredCognitiveTurnRequest,
+    executorOverride?: MeteredProviderCallExecutor,
   ): Promise<{ routedModel: ModelPoolName; effectiveEffort: ReasoningEffort; metering: MeteredProviderCallResult }> {
-    if (!this.meteredCallExecutor) {
+    const executor = executorOverride ?? this.meteredCallExecutor;
+    if (!executor) {
       throw new Error("A MeteredProviderCallExecutor must be injected before durable model calls are enabled.");
     }
     const now = request.now ?? 10.0;
@@ -183,7 +185,7 @@ export class CognitiveRouter {
       }
     }
 
-    const metering = await this.meteredCallExecutor.execute({
+    const metering = await executor.execute({
       callId: request.callId,
       tenantId: task.tenantId,
       taskId: task.taskId,

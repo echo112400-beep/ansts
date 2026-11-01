@@ -1,11 +1,11 @@
 import {
   CellOperationCommand,
   CellOutboxDraft,
-  CellOperationResult,
   PersistenceObjectStorage,
   PersistenceSqlStorage,
 } from "../contracts";
-import { executeCellOperation } from "../operations";
+import { CellOperationResult, executeCellOperation } from "../operations";
+import { confirmCellWrite } from "../transactions";
 
 export type TaskExecutionStatus =
   | "QUEUED"
@@ -485,6 +485,49 @@ export class TaskCore {
           turnSeq, Date.now(), Date.now(), taskId,
         );
         if (progress !== undefined) saveProgress(progress);
+        return readTaskExecution(sql, taskId)!;
+      },
+    });
+    return result.result;
+  }
+
+  /** Persist the executor's terminal result under its current business epoch. */
+  public async finish(taskId: string, tenantId: string, epoch: number, status: "SUCCEEDED" | "FAILED"): Promise<TaskExecutionRecord> {
+    const current = this.get(taskId);
+    if (!current) throw new TaskCoreError("TASK_NOT_INITIALIZED", `Task ${taskId} is not initialized.`, 404);
+    if (current.tenant_id !== tenantId) throw new TaskCoreError("TASK_TENANT_MISMATCH", "Task completion tenant does not own this task.", 403);
+    if (Number(current.business_epoch) !== epoch) throw new TaskCoreError("STALE_EXECUTION_EPOCH", "Cannot complete a task using a stale business epoch.");
+    if (current.lifecycle_state === status) {
+      await confirmCellWrite(this.storage);
+      return current;
+    }
+    if (["SUCCEEDED", "FAILED"].includes(current.lifecycle_state)) {
+      throw new TaskCoreError("TASK_TERMINAL_CONFLICT", `Task ${taskId} is already ${current.lifecycle_state}.`);
+    }
+    if (status === "SUCCEEDED" && current.lifecycle_state !== "RUNNING") {
+      throw new TaskCoreError("TASK_NOT_EXECUTING", `Task ${taskId} cannot succeed from ${current.lifecycle_state}.`);
+    }
+    const command = taskCommand(taskId, tenantId, `task:${taskId}:finish:${epoch}:${status}`, "task.execution.finished", { taskId, epoch, status }, current.execution_version);
+    const result = await runTaskTransaction({
+      storage: this.storage,
+      command,
+      outboxEvents: [{
+        eventId: `task-finished:${taskId}:${epoch}:${status.toLowerCase()}`,
+        eventType: "task.execution.finished",
+        tenantId,
+        payload: { task_id: taskId, business_epoch: epoch, status },
+      }],
+      apply: ({ sql }) => {
+        const task = readTaskExecution(sql, taskId)!;
+        if (Number(task.business_epoch) !== epoch) throw new TaskCoreError("STALE_EXECUTION_EPOCH", "Task epoch changed before terminal state was committed.");
+        if (["SUCCEEDED", "FAILED"].includes(task.lifecycle_state)) {
+          if (task.lifecycle_state !== status) throw new TaskCoreError("TASK_TERMINAL_CONFLICT", `Task ${taskId} is already ${task.lifecycle_state}.`);
+          return task;
+        }
+        if (status === "SUCCEEDED" && task.lifecycle_state !== "RUNNING") {
+          throw new TaskCoreError("TASK_NOT_EXECUTING", `Task ${taskId} cannot succeed from ${task.lifecycle_state}.`);
+        }
+        sql.exec("UPDATE task_execution SET lifecycle_state = ?, updated_at = ? WHERE task_id = ?", status, Date.now(), taskId);
         return readTaskExecution(sql, taskId)!;
       },
     });

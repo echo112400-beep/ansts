@@ -15,16 +15,22 @@ import {
   FenceToken,
   MockDurableObjectState,
   TaskState,
-  ToolEffectClass,
 } from "../src/index";
 import { NodeCapacityCell } from "../src/cloudflare/node_capacity_cell";
 
 test("Audit Fix #1: celld / Durable Object Cold-Start & Hibernation Wakeup SQLite Rehydration", async () => {
   const sharedState = new MockDurableObjectState("tsk_rehydrate_01");
   const mockEnv = {
+    TEST_SIMULATOR_MODE: true,
     PRIMARY_MODEL_POOL: "DeepSeek",
     FAST_UTILITY_POOL: "GLM-5.3",
     FALLBACK_MODEL_POOL: "Qwen-3.8",
+    ANSTS_CHECKPOINTS_R2: {
+      put: async (key: string) => ({ key }),
+      get: async () => null,
+      list: async () => ({ objects: [] }),
+      delete: async () => {},
+    },
   } as CloudflareCelldEnv;
 
   const nodeCells = new Map<string, NodeCapacityCell>();
@@ -89,7 +95,7 @@ test("Audit Fix #1: celld / Durable Object Cold-Start & Hibernation Wakeup SQLit
   activeHarness = cellInstance1;
   const firstDispatch = await dispatch("ordinary", "rehydrate-node-1", "rehydrate-boot-1", "rehydrate-initial");
   assert.equal(cellInstance1.taskCore.getDispatch(firstDispatch.dispatch_id)!.stage, "STARTED");
-  await cellInstance1.fetch(
+  const firstTurn = await cellInstance1.fetch(
     new Request("http://harness.internal/turn", {
       method: "POST",
       body: JSON.stringify({
@@ -99,23 +105,19 @@ test("Audit Fix #1: celld / Durable Object Cold-Start & Hibernation Wakeup SQLit
       }),
     }),
   );
-  await cellInstance1.fetch(
+  assert.equal(firstTurn.status, 200, await firstTurn.clone().text());
+  const secondTurn = await cellInstance1.fetch(
     new Request("http://harness.internal/turn", {
       method: "POST",
       body: JSON.stringify({
         epoch: 1,
         turn_seq: 2,
-        tool_call: {
-          tool_call_id: "c2",
-          tool_name: "git_branch_push",
-          effect_class: ToolEffectClass.SAGA_COMPENSATABLE,
-          payload: "branch=hotfix",
-          compensation_tool: "git_branch_delete",
-        },
+        is_read_only_turn: true,
         workspace_merkle_hash: "hash_turn_2",
       }),
     }),
   );
+  assert.equal(secondTurn.status, 200, await secondTurn.clone().text());
   await cellInstance1.alarm();
   assert.equal(cellInstance1.task.state, TaskState.HIBERNATED);
 

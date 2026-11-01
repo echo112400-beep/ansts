@@ -275,6 +275,9 @@ export class TenantLedgerCell {
       if (url.pathname === "/allowance-transfers" && request.method === "POST") {
         return await this.transferAllowance(request);
       }
+      if (url.pathname === "/tasks" && request.method === "GET") {
+        return this.listTasks(url.searchParams.get("tenant_id"), Number(url.searchParams.get("limit") ?? 100));
+      }
       const taskMatch = url.pathname.match(/^\/tasks\/([^/]+)$/);
       if (request.method === "GET" && taskMatch) {
         return this.getTask(decodeURIComponent(taskMatch[1]), url.searchParams.get("tenant_id"));
@@ -780,6 +783,21 @@ export class TenantLedgerCell {
     });
   }
 
+  private listTasks(requestedTenant: string | null, limit: number): Response {
+    this.assertTenant(requestedTenant);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      throw new TenantLedgerError("TASK_LIST_LIMIT_INVALID", "limit must be an integer from 1 through 500.", 400);
+    }
+    const rows = this.ctx.storage.sql.exec<AdmissionRow>(
+      "SELECT * FROM tenant_admissions WHERE tenant_id = ? ORDER BY accepted_at DESC LIMIT ?",
+      this.tenantId,
+      limit,
+    ).toArray();
+    return json({ tenant_id: this.tenantId, tasks: rows.map((row) => ({ task_id: row.task_id,
+      tenant_id: row.tenant_id, status: row.status, runnable_status: row.runnable_status,
+      accepted_at: Number(row.accepted_at), operation_id: row.operation_id })) });
+  }
+
   private getAdmission(idempotencyKey: string, requestedTenant: string | null): Response {
     this.assertTenant(requestedTenant);
     const row = this.ctx.storage.sql
@@ -839,7 +857,8 @@ export class TenantLedgerCell {
 
   private errorResponse(error: unknown): Response {
     if (error instanceof TenantLedgerError) {
-      return json({ error: error.code, message: error.message }, error.status);
+      return json({ error: error.code, message: error.message,
+        ...(error.code === "OUTCOME_UNKNOWN" ? { outcome: "UNKNOWN" } : {}) }, error.status);
     }
     if (error instanceof TaskSpecValidationError) {
       return json({ error: "INVALID_TASK_SPEC", field: error.fieldPath, message: error.message }, 400);
@@ -848,7 +867,7 @@ export class TenantLedgerCell {
       return json({ error: "IDEMPOTENCY_CONFLICT", message: error.message }, 409);
     }
     if (error instanceof CellDurabilityUnavailableError) {
-      return json({ error: "OUTCOME_UNKNOWN", message: error.message }, 503);
+      return json({ error: "OUTCOME_UNKNOWN", outcome: "UNKNOWN", message: error.message }, 503);
     }
     return json({ error: "TENANT_LEDGER_FAILURE", message: "Tenant ledger operation failed." }, 500);
   }

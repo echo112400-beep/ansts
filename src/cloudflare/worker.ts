@@ -28,8 +28,14 @@ import { persistenceCellStub } from "../persistence/registry";
 import { TenantLedgerCell } from "../persistence/tenant";
 import { schedulerPoolCellKey } from "../persistence/scheduler-pool";
 import { NodeCapacityCell } from "./node_capacity_cell";
+import { ProviderQuotaCell } from "./provider_quota_cell";
+import { RoutingConfigCell } from "./routing_config_cell";
+import { DagCell } from "./dag_cell";
+import { TenantDirectoryCell, TENANT_DIRECTORY_SHARD_COUNT, tenantDirectoryShardKey, tenantDirectoryShardIndex } from "./tenant_directory_cell";
+import { providerQuotaCellKey } from "../persistence/provider-quota";
+import { listProjectedTenants, projectTaskEvents, projectTenantTasks, pruneTaskEventProjection, readTenantTaskProjection } from "../dashboard/durable_query_adapter";
 
-export { AnstsSchedulerCell, AgentTaskHarnessCell, NodeCapacityCell, TenantLedgerCell };
+export { AnstsSchedulerCell, AgentTaskHarnessCell, NodeCapacityCell, TenantLedgerCell, ProviderQuotaCell, RoutingConfigCell, DagCell, TenantDirectoryCell };
 
 const globalSchedulerRouter = new PartitionedSchedulerRouter({
   initialShardCount: 8,
@@ -105,6 +111,18 @@ export default {
         });
       }
       try {
+        const directoryKey = tenantDirectoryShardKey(tenantDirectoryShardIndex(tenantId));
+        const directoryStub = persistenceCellStub(env, "tenant-directory", directoryKey);
+        const registryResponse = await directoryStub.fetch("http://tenant-directory.internal/tenants/register", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ tenant_id: tenantId }),
+        });
+        if (!registryResponse.ok) return registryResponse;
+      } catch {
+        return jsonResponse({ error: "TENANT_DIRECTORY_UNAVAILABLE", outcome: "NOT_ACCEPTED", tenant_id: tenantId }, 503);
+      }
+      try {
         const tenantStub = persistenceCellStub(env, "tenant-ledger", tenantId);
         return await tenantStub.fetch("http://tenant-ledger.internal/admissions", {
           method: "POST",
@@ -145,6 +163,121 @@ export default {
       }
     }
 
+    const tenantTaskListMatch = url.pathname.match(/^\/v1beta1\/tenants\/([^/]+)\/tasks$/);
+    if (request.method === "GET" && tenantTaskListMatch) {
+      const tenantId = decodeURIComponent(tenantTaskListMatch[1]);
+      const requestedTenant = url.searchParams.get("tenant_id");
+      if (requestedTenant && requestedTenant !== tenantId) return jsonResponse({ error: "TENANT_SCOPE_MISMATCH" }, 404);
+      return await rebuildTenantTaskProjection(env, tenantId, Number(url.searchParams.get("limit") ?? 100));
+    }
+
+    const dashboardTaskListMatch = url.pathname.match(/^\/v1beta1\/tenants\/([^/]+)\/dashboard\/tasks$/);
+    if (request.method === "GET" && dashboardTaskListMatch) {
+      const tenantId = decodeURIComponent(dashboardTaskListMatch[1]);
+      const requestedTenant = url.searchParams.get("tenant_id");
+      if (requestedTenant && requestedTenant !== tenantId) return jsonResponse({ error: "TENANT_SCOPE_MISMATCH" }, 404);
+      if (url.searchParams.get("rebuild") === "1") return await rebuildTenantTaskProjection(env, tenantId, Number(url.searchParams.get("limit") ?? 100));
+      const limit = Number(url.searchParams.get("limit") ?? 500);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) return jsonResponse({ error: "TASK_LIST_LIMIT_INVALID" }, 400);
+      try {
+        const tasks = await readTenantTaskProjection(env.ANSTS_D1, tenantId, limit);
+        return jsonResponse({ tenant_id: tenantId, source: "d1_projection", rebuildable: true,
+          tasks, rebuild_url: `/v1beta1/tenants/${encodeURIComponent(tenantId)}/dashboard/tasks?rebuild=1` });
+      } catch {
+        return jsonResponse({ tenant_id: tenantId, source: "d1_projection", tasks: [], projection_unavailable: true,
+          rebuild_url: `/v1beta1/tenants/${encodeURIComponent(tenantId)}/dashboard/tasks?rebuild=1` }, 503);
+      }
+    }
+
+    const taskEventsMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)\/events$/);
+    if (request.method === "GET" && taskEventsMatch) {
+      const tenantId = url.searchParams.get("tenant_id");
+      if (!tenantId) return jsonResponse({ error: "TENANT_REQUIRED", message: "tenant_id is required." }, 400);
+      const taskId = decodeURIComponent(taskEventsMatch[1]);
+      let cellStub;
+      try { cellStub = persistenceCellStub(env, "task", taskId); }
+      catch { return jsonResponse({ error: "TASK_CELL_UNAVAILABLE", outcome: "UNKNOWN", task_id: taskId }, 503); }
+      const poll = (cursor?: string) => {
+        const internalUrl = new URL("http://harness.internal/events");
+        internalUrl.searchParams.set("tenant_id", tenantId);
+        for (const [key, value] of url.searchParams) if (key !== "tenant_id" && key !== "after_cursor") internalUrl.searchParams.set(key, value);
+        const lastEventId = cursor ?? request.headers.get("last-event-id") ?? url.searchParams.get("after_cursor");
+        const headers = new Headers(request.headers);
+        headers.delete("last-event-id");
+        if (lastEventId) internalUrl.searchParams.set("after_cursor", lastEventId);
+        return cellStub.fetch(internalUrl.toString(), { method: "GET", headers });
+      };
+      const acceptsSse = request.headers.get("accept")?.includes("text/event-stream") ?? false;
+      if (!acceptsSse) {
+        try {
+          const response = await poll();
+          if (response.ok) {
+            const page = await response.clone().json() as { events: Array<Record<string, any>> };
+            await projectFeedPage(env, page.events, cellStub);
+          }
+          return response;
+        }
+        catch { return jsonResponse({ error: "TASK_CELL_UNAVAILABLE", outcome: "UNKNOWN", task_id: taskId }, 503); }
+      }
+      let firstResponse: Response;
+      try { firstResponse = await poll(); }
+      catch { return jsonResponse({ error: "TASK_CELL_UNAVAILABLE", outcome: "UNKNOWN", task_id: taskId }, 503); }
+      if (!firstResponse.ok) return firstResponse;
+      const firstPage = await firstResponse.json() as { events: Array<Record<string, any>>; next_cursor: string | null; has_more: boolean };
+      await projectFeedPage(env, firstPage.events, cellStub);
+      const snapshotOnly = url.searchParams.get("snapshot") === "1";
+      if (snapshotOnly) return sseResponse(firstPage.events, false);
+      let active = true;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const encoder = new TextEncoder();
+          let cursor = request.headers.get("last-event-id") ?? url.searchParams.get("after_cursor") ?? undefined;
+          const emit = (event: Record<string, any>) => {
+            const data = JSON.stringify({ event_id: event.eventId, operation_id: event.operationId,
+              aggregate_version: event.aggregateVersion, payload_digest: event.payloadDigest,
+              tenant_id: event.tenantId, task_id: event.aggregateId, payload: event.payload });
+            controller.enqueue(encoder.encode(`id: ${event.cursor}\nevent: ${event.eventType}\ndata: ${data}\n\n`));
+            cursor = event.cursor;
+          };
+          const pump = async () => {
+            try {
+              for (const event of firstPage.events) emit(event);
+              if (firstPage.next_cursor) cursor = firstPage.next_cursor;
+              while (active) {
+                await new Promise((resolve) => setTimeout(resolve, 2_000));
+                if (!active) break;
+                let response: Response;
+                try { response = await poll(cursor); }
+                catch { controller.enqueue(encoder.encode(": source temporarily unavailable\n\n")); continue; }
+                if (response.status === 410) {
+                  const details = await response.json().catch(() => ({ error: "CURSOR_EXPIRED", resync_required: true }));
+                  controller.enqueue(encoder.encode(`event: resync-required\ndata: ${JSON.stringify(details)}\n\n`));
+                  active = false;
+                  controller.close();
+                  return;
+                }
+                if (!response.ok) { controller.enqueue(encoder.encode(": source temporarily unavailable\n\n")); continue; }
+                const page = await response.json() as { events: Array<Record<string, any>>; next_cursor: string | null };
+                await projectFeedPage(env, page.events, cellStub);
+                for (const event of page.events) emit(event);
+                if (page.next_cursor && page.events.length === 0) cursor = page.next_cursor;
+                if (page.events.length === 0) controller.enqueue(encoder.encode(`: heartbeat ${Date.now()}\n\n`));
+              }
+            } catch {
+              active = false;
+              try { controller.close(); } catch { /* stream was already cancelled */ }
+            }
+          };
+          void pump();
+        },
+        cancel() { active = false; },
+      });
+      return new Response(stream, { status: 200, headers: {
+        "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform",
+        "x-accel-buffering": "no", "x-ansts-cursor-scope": "task",
+      } });
+    }
+
     // Tenant budget commands and queries share the same per-tenant authority as admission.
     const budgetRouteMatch = url.pathname.match(/^\/v1beta1\/tenants\/([^/]+)(\/.*)$/);
     if (
@@ -172,6 +305,72 @@ export default {
           JSON.stringify({ error: "TENANT_LEDGER_UNAVAILABLE", outcome: "UNKNOWN", tenant_id: tenantId }),
           { status: 503, headers: { "content-type": "application/json" } },
         );
+      }
+    }
+
+    const routingConfigMatch = url.pathname.match(/^\/v1beta1\/tenants\/([^/]+)\/routing-config(\/.*)?$/);
+    if (routingConfigMatch) {
+      const tenantId = decodeURIComponent(routingConfigMatch[1]);
+      const requestedTenant = url.searchParams.get("tenant_id");
+      if (requestedTenant && requestedTenant !== tenantId) return jsonResponse({ error: "TENANT_SCOPE_MISMATCH" }, 404);
+      try {
+        const stub = persistenceCellStub(env, "routing-config", tenantId);
+        const internalUrl = new URL(`http://routing-config.internal/routing-config${routingConfigMatch[2] ?? ""}`);
+        for (const [key, value] of url.searchParams) internalUrl.searchParams.set(key, value);
+        const init: RequestInit = { method: request.method, headers: request.headers };
+        if (request.method !== "GET" && request.method !== "HEAD") init.body = await request.arrayBuffer();
+        return await stub.fetch(internalUrl.toString(), init);
+      } catch {
+        return jsonResponse({ error: "ROUTING_CONFIG_UNAVAILABLE", outcome: "UNKNOWN", tenant_id: tenantId }, 503);
+      }
+    }
+
+    const providerQuotaMatch = url.pathname.match(/^\/v1beta1\/providers\/([^/]+)\/quota-domains\/([^/]+)(\/.*)?$/);
+    if (providerQuotaMatch) {
+      const provider = decodeURIComponent(providerQuotaMatch[1]);
+      const quotaDomain = decodeURIComponent(providerQuotaMatch[2]);
+      try {
+        const stub = persistenceCellStub(env, "provider-quota", providerQuotaCellKey(provider, quotaDomain));
+        const internalUrl = new URL(`http://provider-quota.internal/provider-quota${providerQuotaMatch[3] ?? "/policy"}`);
+        for (const [key, value] of url.searchParams) internalUrl.searchParams.set(key, value);
+        const init: RequestInit = { method: request.method, headers: request.headers };
+        if (request.method !== "GET" && request.method !== "HEAD") init.body = await request.arrayBuffer();
+        return await stub.fetch(internalUrl.toString(), init);
+      } catch {
+        return jsonResponse({ error: "PROVIDER_QUOTA_UNAVAILABLE", outcome: "UNKNOWN", provider, quota_domain: quotaDomain }, 503);
+      }
+    }
+
+    const durableDagMatch = url.pathname.match(/^\/v1beta1\/dags\/([^/]+)(?:\/(state|reconcile|boosts|children\/([^/]+)\/(redeem|observations|return-allowance)))?$/);
+    if (durableDagMatch) {
+      const [, encodedDagId, section, encodedChildId, childAction] = durableDagMatch;
+      const dagId = decodeURIComponent(encodedDagId);
+      let rawBody: string | undefined;
+      let bodyTenant: string | undefined;
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        rawBody = await request.text();
+        try { bodyTenant = (JSON.parse(rawBody) as { tenant_id?: string }).tenant_id; } catch { /* DagCell reports invalid JSON. */ }
+      }
+      const isCreate = !section && request.method === "POST";
+      const isState = section === "state" && request.method === "GET";
+      const isReconcile = section === "reconcile" && request.method === "POST";
+      const isBoost = section === "boosts" && request.method === "POST";
+      const isChildCommand = Boolean(encodedChildId && ["redeem", "observations", "return-allowance"].includes(childAction ?? "") && request.method === "POST");
+      if (!isCreate && !isState && !isReconcile && !isBoost && !isChildCommand) return jsonResponse({ error: "NotFound" }, 404);
+      const tenantId = url.searchParams.get("tenant_id") ?? bodyTenant;
+      if (!isCreate && !tenantId) return jsonResponse({ error: "TENANT_REQUIRED", message: "tenant_id is required." }, 400);
+      try {
+        const stub = persistenceCellStub(env, "dag", dagId);
+        const internalPath = isCreate ? "/dags" : isState ? "/dags/state" : isReconcile ? "/dags/reconcile" : isBoost ? "/dags/boosts" : `/dags/children/${encodeURIComponent(decodeURIComponent(encodedChildId!))}/${childAction}`;
+        const internalUrl = new URL(`http://dag.internal${internalPath}`);
+        if (tenantId) internalUrl.searchParams.set("tenant_id", tenantId);
+        return await stub.fetch(internalUrl.toString(), {
+          method: request.method,
+          headers: request.headers,
+          body: rawBody,
+        });
+      } catch {
+        return jsonResponse({ error: "DAG_CELL_UNAVAILABLE", outcome: "UNKNOWN", dag_id: dagId }, 503);
       }
     }
 
@@ -342,6 +541,17 @@ export default {
       }
     }
 
+    if (url.pathname === "/v1beta1/scheduler/stopped" && request.method === "POST") {
+      let body: Record<string, any>;
+      try { body = await request.json() as Record<string, any>; }
+      catch { return jsonResponse({ error: "INVALID_JSON" }, 400); }
+      try {
+        return callSchedulerPool(env, schedulerPoolCellKey(body.region, body.resource_pool), "/scheduler/stopped", "POST", body);
+      } catch (error) {
+        return jsonResponse({ error: "INVALID_SCHEDULER_POOL", message: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+
     if (url.pathname === "/v1beta1/dag/spawn-escrow" && request.method === "POST") {
       let body: Record<string, any>;
       try { body = await request.json() as Record<string, any>; }
@@ -393,17 +603,79 @@ export default {
       return callSchedulerPool(env, targetShard, "/cluster/top", "GET");
     }
 
+    const taskDurableStateMatch = url.pathname.match(
+      /^\/v1beta1\/tasks\/([^/]+)\/(operations|compensations)(?:\/([^/]+))?(?:\/([^/]+))?$/,
+    );
+    if (taskDurableStateMatch) {
+      const [, encodedTaskId, owner, encodedPart, encodedAction] = taskDurableStateMatch;
+      const tenantId = url.searchParams.get("tenant_id");
+      if (!tenantId) return jsonResponse({ error: "TENANT_REQUIRED", message: "tenant_id is required." }, 400);
+      const allowedRoute = owner === "operations"
+        ? (!encodedPart || (Boolean(encodedPart) && !encodedAction) || (Boolean(encodedPart) && encodedAction === "approval"))
+        : (!encodedPart || (!encodedAction && encodedPart === "run"));
+      if (!allowedRoute) return jsonResponse({ error: "NotFound" }, 404);
+      const taskId = decodeURIComponent(encodedTaskId);
+      const internalPath = `/${owner}${encodedPart ? `/${encodeURIComponent(decodeURIComponent(encodedPart))}` : ""}${encodedAction ? `/${encodeURIComponent(decodeURIComponent(encodedAction))}` : ""}`;
+      const internalUrl = new URL(`http://harness.internal${internalPath}`);
+      for (const [key, value] of url.searchParams) internalUrl.searchParams.set(key, value);
+      const cellStub = persistenceCellStub(env, "task", taskId);
+      try {
+        return await cellStub.fetch(internalUrl.toString(), {
+          method: request.method,
+          headers: request.headers,
+          body: request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer(),
+        });
+      } catch {
+        return jsonResponse({ error: "TASK_CELL_UNAVAILABLE", outcome: "UNKNOWN", task_id: taskId }, 503);
+      }
+    }
+
+    const taskTurnsMatch = url.pathname.match(
+      /^\/v1beta1\/tasks\/([^/]+)\/turns(?:\/(recovery|snapshot-uploads)(?:\/([^/]+)(?:\/chunks\/([^/]+))?)?)?$/,
+    );
+    if (taskTurnsMatch) {
+      const [, encodedTaskId, section, encodedUploadId, encodedChunkIndex] = taskTurnsMatch;
+      const tenantId = url.searchParams.get("tenant_id");
+      if (!tenantId) return jsonResponse({ error: "TENANT_REQUIRED", message: "tenant_id is required." }, 400);
+      const isRecovery = section === "recovery" && request.method === "GET" && !encodedUploadId;
+      const isBeginUpload = section === "snapshot-uploads" && request.method === "POST" && !encodedUploadId;
+      const isWriteChunk = section === "snapshot-uploads" && request.method === "PUT" && Boolean(encodedUploadId) && Boolean(encodedChunkIndex);
+      if (!isRecovery && !isBeginUpload && !isWriteChunk) return jsonResponse({ error: "NotFound" }, 404);
+      const taskId = decodeURIComponent(encodedTaskId);
+      const internalPath = isRecovery
+        ? "/turns/recovery"
+        : isBeginUpload
+          ? "/turns/snapshot-uploads"
+          : `/turns/snapshot-uploads/${encodeURIComponent(decodeURIComponent(encodedUploadId!))}/chunks/${encodeURIComponent(decodeURIComponent(encodedChunkIndex!))}`;
+      const internalUrl = new URL(`http://harness.internal${internalPath}`);
+      for (const [key, value] of url.searchParams) internalUrl.searchParams.set(key, value);
+      const cellStub = persistenceCellStub(env, "task", taskId);
+      try {
+        return await cellStub.fetch(internalUrl.toString(), {
+          method: request.method,
+          headers: request.headers,
+          body: request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer(),
+        });
+      } catch {
+        return jsonResponse({ error: "TASK_CELL_UNAVAILABLE", outcome: "UNKNOWN", task_id: taskId }, 503);
+      }
+    }
+
     // Route 3: Per-Task AgentTaskHarnessCell operations and pending start commands.
-    const taskMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)\/(turn|workflow|replay|failover|start-commands)$/);
+    const taskMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)\/(turn|workflow|replay|failover|start-commands|complete)$/);
     if (taskMatch) {
       const [, taskId, action] = taskMatch;
       if (action === "start-commands" && request.method !== "GET") return jsonResponse({ error: "MethodNotAllowed" }, 405);
+      if (action === "complete" && request.method !== "POST") return jsonResponse({ error: "MethodNotAllowed" }, 405);
       const cellStub = persistenceCellStub(env, "task", taskId);
-      const internalPath = action === "start-commands" ? "/execution/start-commands" : `/${action}`;
+      const internalPath = action === "start-commands" ? "/execution/start-commands" : action === "complete" ? "/execution/complete" : `/${action}`;
       let resp: Response;
       try {
-        resp = await cellStub.fetch(`http://harness.internal${internalPath}`, {
+        const internalUrl = new URL(`http://harness.internal${internalPath}`);
+        for (const [key, value] of url.searchParams) internalUrl.searchParams.set(key, value);
+        resp = await cellStub.fetch(internalUrl.toString(), {
           method: action === "start-commands" ? "GET" : request.method,
+          headers: request.headers,
           body: action === "start-commands" ? undefined : await request.text(),
         });
       } catch {
@@ -458,6 +730,24 @@ export default {
   ): Promise<void> {
     const schedStub = persistenceCellStub(env, "scheduler-pool", "global-5d-scheduler");
     await schedStub.fetch("http://scheduler.internal/scheduler/tick", { method: "POST" });
+    try {
+      await pruneTaskEventProjection(env.ANSTS_D1);
+      const tenants = await listProjectedTenants(env.ANSTS_D1, 20);
+      for (const tenantId of tenants) await rebuildTenantTaskProjection(env, tenantId, 500);
+    } catch { /* D1 discovery is a projection repair loop, not an authority for task state. */ }
+    // The sharded durable registry is independent of D1 and eventually rediscovers tenants
+    // even after the entire query projection has been deleted.
+    const firstShard = Math.floor(_controller.scheduledTime / 60_000) % TENANT_DIRECTORY_SHARD_COUNT;
+    for (let offset = 0; offset < 4; offset += 1) {
+      const shard = (firstShard + offset) % TENANT_DIRECTORY_SHARD_COUNT;
+      try {
+        const directoryStub = persistenceCellStub(env, "tenant-directory", tenantDirectoryShardKey(shard));
+        const response = await directoryStub.fetch("http://tenant-directory.internal/tenants/scan?limit=20", { method: "GET" });
+        if (!response.ok) continue;
+        const scan = await response.json() as { tenants: string[] };
+        for (const tenantId of scan.tenants) await rebuildTenantTaskProjection(env, tenantId, 500);
+      } catch { /* One unavailable directory shard does not prevent later scheduled passes. */ }
+    }
   },
 };
 
@@ -498,4 +788,124 @@ async function callSchedulerPool(
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+async function rebuildTenantTaskProjection(env: CloudflareCelldEnv, tenantId: string, limit: number): Promise<Response> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) return jsonResponse({ error: "TASK_LIST_LIMIT_INVALID" }, 400);
+  try {
+    const tenantStub = persistenceCellStub(env, "tenant-ledger", tenantId);
+    const ledgerUrl = new URL("http://tenant-ledger.internal/tasks");
+    ledgerUrl.searchParams.set("tenant_id", tenantId);
+    ledgerUrl.searchParams.set("limit", String(limit));
+    const ledgerResponse = await tenantStub.fetch(ledgerUrl.toString(), { method: "GET" });
+    if (!ledgerResponse.ok) return ledgerResponse;
+    const ledger = await ledgerResponse.json() as { tenant_id: string; tasks: Array<Record<string, any>> };
+    const rebuilt = await Promise.all(ledger.tasks.map(async (task) => {
+      let execution: Record<string, any> | null = null;
+      const events: Array<Record<string, any>> = [];
+      let eventsComplete = true;
+      let afterCursor: string | undefined;
+      try {
+        const taskStub = persistenceCellStub(env, "task", String(task.task_id));
+        const response = await taskStub.fetch(`http://task.internal/execution/state?tenant_id=${encodeURIComponent(tenantId)}`, { method: "GET" });
+        if (response.ok) execution = await response.json() as Record<string, any>;
+        let pages = 0;
+        while (pages < 100) {
+          const eventsUrl = new URL("http://task.internal/events");
+          eventsUrl.searchParams.set("tenant_id", tenantId);
+          eventsUrl.searchParams.set("limit", "1000");
+          if (afterCursor) eventsUrl.searchParams.set("after_cursor", afterCursor);
+          const eventResponse = await taskStub.fetch(eventsUrl.toString(), { method: "GET" });
+          if (eventResponse.status === 404) break;
+          if (!eventResponse.ok) { eventsComplete = false; break; }
+          const page = await eventResponse.json() as { events: Array<Record<string, any>>; next_cursor: string | null; has_more: boolean };
+          events.push(...page.events);
+          pages += 1;
+          if (!page.has_more || !page.next_cursor) break;
+          afterCursor = page.next_cursor;
+        }
+        if (pages === 100) eventsComplete = false;
+      } catch { /* TaskCell creation and projection can lag admission; ledger state remains authoritative. */ }
+      return { projection: {
+          tenant_id: tenantId,
+          task_id: String(task.task_id),
+          admission_status: String(task.status),
+          runnable_status: String(task.runnable_status),
+          accepted_at: Number(task.accepted_at),
+          lifecycle_state: String(execution?.lifecycle_state ?? "UNINITIALIZED"),
+          business_epoch: Number(execution?.business_epoch ?? 0),
+          last_turn_seq: Number(execution?.last_turn_seq ?? 0),
+          execution_version: Number(execution?.execution_version ?? 0),
+        }, events, eventsComplete, hasTaskCell: execution !== null };
+    }));
+    const projected = rebuilt.map((item) => item.projection);
+    let projectionStored = rebuilt.every((item) => item.eventsComplete);
+    try {
+      await projectTenantTasks(env.ANSTS_D1, projected);
+      await projectTaskEvents(env.ANSTS_D1, rebuilt.flatMap((item) => item.events.map((event) => ({
+        event_id: String(event.eventId), tenant_id: String(event.tenantId), task_id: String(event.aggregateId),
+        event_type: String(event.eventType), aggregate_version: Number(event.aggregateVersion),
+        payload_digest: String(event.payloadDigest), payload: event.payload, created_at: Number(event.createdAt),
+      }))));
+      for (const item of rebuilt) {
+        const taskStub = persistenceCellStub(env, "task", String(item.projection.task_id));
+        const eventIds = item.events.map((event) => String(event.eventId));
+        for (let offset = 0; offset < eventIds.length; offset += 1000) {
+          const ack = await taskStub.fetch("http://task.internal/events/ack", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ tenant_id: tenantId, event_ids: eventIds.slice(offset, offset + 1000) }),
+          });
+          if (!ack.ok) projectionStored = false;
+        }
+        if (item.eventsComplete && item.hasTaskCell) {
+          const prune = await taskStub.fetch("http://task.internal/events/prune", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ tenant_id: tenantId }),
+          });
+          if (!prune.ok) projectionStored = false;
+        }
+      }
+    }
+    catch { projectionStored = false; }
+    return jsonResponse({ tenant_id: tenantId, source: "tenant_and_task_cells", rebuildable: true,
+      projection_stored: projectionStored, tasks: projected });
+  } catch {
+    return jsonResponse({ error: "TENANT_LEDGER_UNAVAILABLE", outcome: "UNKNOWN", tenant_id: tenantId }, 503);
+  }
+}
+
+async function projectFeedPage(env: CloudflareCelldEnv, events: Array<Record<string, any>>, taskCell?: { fetch(input: RequestInfo, init?: RequestInit): Promise<Response> }): Promise<void> {
+  if (events.length === 0) return;
+  try {
+    await projectTaskEvents(env.ANSTS_D1, events.map((event) => ({
+      event_id: String(event.eventId), tenant_id: String(event.tenantId), task_id: String(event.aggregateId),
+      event_type: String(event.eventType), aggregate_version: Number(event.aggregateVersion),
+      payload_digest: String(event.payloadDigest), payload: event.payload, created_at: Number(event.createdAt),
+    })));
+    if (taskCell) {
+      const eventIds = events.map((event) => String(event.eventId));
+      const tenantId = String(events[0].tenantId);
+      const ack = await taskCell.fetch("http://task.internal/events/ack", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ tenant_id: tenantId, event_ids: eventIds }),
+      });
+      if (ack.ok) await taskCell.fetch("http://task.internal/events/prune", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ tenant_id: tenantId }),
+      });
+    }
+  } catch { /* D1 is a rebuildable view; the authoritative TaskCell feed remains queryable. */ }
+}
+
+function sseResponse(events: Array<Record<string, any>>, replayOnly: boolean): Response {
+  const frames = events.map((event) => {
+    const data = JSON.stringify({ event_id: event.eventId, operation_id: event.operationId,
+      aggregate_version: event.aggregateVersion, payload_digest: event.payloadDigest,
+      tenant_id: event.tenantId, task_id: event.aggregateId, payload: event.payload });
+    return `id: ${event.cursor}\nevent: ${event.eventType}\ndata: ${data}\n\n`;
+  }).join("");
+  return new Response(frames || ": no retained events\n\n", { status: 200, headers: {
+    "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform",
+    "x-ansts-cursor-scope": "task", "x-ansts-stream-mode": replayOnly ? "replay" : "follow",
+  } });
 }

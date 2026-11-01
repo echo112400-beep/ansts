@@ -19,6 +19,22 @@
       {
         "name": "NODE_CAPACITY_CELL",
         "class_name": "NodeCapacityCell"
+      },
+      {
+        "name": "PROVIDER_QUOTA_CELL",
+        "class_name": "ProviderQuotaCell"
+      },
+      {
+        "name": "ROUTING_CONFIG_CELL",
+        "class_name": "RoutingConfigCell"
+      },
+      {
+        "name": "DAG_CELL",
+        "class_name": "DagCell"
+      },
+      {
+        "name": "TENANT_DIRECTORY_CELL",
+        "class_name": "TenantDirectoryCell"
       }
     ]
   },
@@ -40,6 +56,25 @@
       "tag": "v3",
       "new_sqlite_classes": [
         "NodeCapacityCell"
+      ]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": [
+        "ProviderQuotaCell",
+        "RoutingConfigCell"
+      ]
+    },
+    {
+      "tag": "v5",
+      "new_sqlite_classes": [
+        "DagCell"
+      ]
+    },
+    {
+      "tag": "v6",
+      "new_sqlite_classes": [
+        "TenantDirectoryCell"
       ]
     }
   ],
