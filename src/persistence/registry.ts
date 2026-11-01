@@ -26,6 +26,9 @@ export function persistenceCellIdentity(type: PersistenceCellType, key: string):
   if (typeof key !== "string" || key.trim().length === 0 || /[\u0000-\u001f\u007f]/.test(key)) {
     throw new TypeError("Cell routing key must be a non-empty string without control characters.");
   }
+  if (new TextEncoder().encode(key).byteLength > 1024) {
+    throw new TypeError("Cell routing key must be at most 1024 UTF-8 bytes so Celld retains its logical name.");
+  }
   return { type, key };
 }
 

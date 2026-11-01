@@ -24,7 +24,7 @@ import { FederationRegionId, MultiRegionFederationRouter } from "./federation_ro
 import { AgentTaskHarnessCell } from "./harness_cell";
 import { DynamicQueueAutoSharder, PartitionedSchedulerRouter } from "./horizontal_scaler";
 import { AnstsSchedulerCell } from "./scheduler_cell";
-import { persistenceCellStub } from "../persistence/registry";
+import { persistenceCellIdentity, persistenceCellStub } from "../persistence/registry";
 import { TenantLedgerCell } from "../persistence/tenant";
 import { schedulerPoolCellKey } from "../persistence/scheduler-pool";
 import { NodeCapacityCell } from "./node_capacity_cell";
@@ -110,6 +110,8 @@ export default {
           headers: { "content-type": "application/json" },
         });
       }
+      try { persistenceCellIdentity("tenant-ledger", tenantId); }
+      catch (error) { return jsonResponse({ error: "INVALID_TENANT_ID", message: error instanceof Error ? error.message : String(error) }, 400); }
       try {
         const directoryKey = tenantDirectoryShardKey(tenantDirectoryShardIndex(tenantId));
         const directoryStub = persistenceCellStub(env, "tenant-directory", directoryKey);
@@ -851,7 +853,8 @@ async function rebuildTenantTaskProjection(env: CloudflareCelldEnv, tenantId: st
       }))));
       for (const item of rebuilt) {
         const taskStub = persistenceCellStub(env, "task", String(item.projection.task_id));
-        const eventIds = item.events.map((event) => String(event.eventId));
+        const eventIds = item.events.filter((event) => event.eventType !== "task.execution.start_requested")
+          .map((event) => String(event.eventId));
         for (let offset = 0; offset < eventIds.length; offset += 1000) {
           const ack = await taskStub.fetch("http://task.internal/events/ack", {
             method: "POST", headers: { "content-type": "application/json" },
@@ -885,7 +888,11 @@ async function projectFeedPage(env: CloudflareCelldEnv, events: Array<Record<str
       payload_digest: String(event.payloadDigest), payload: event.payload, created_at: Number(event.createdAt),
     })));
     if (taskCell) {
-      const eventIds = events.map((event) => String(event.eventId));
+      // D1 observing a start command is not proof that the NodeAgent started it.
+      // Only the start receipt may retire this command from the durable outbox.
+      const eventIds = events.filter((event) => event.eventType !== "task.execution.start_requested")
+        .map((event) => String(event.eventId));
+      if (eventIds.length === 0) return;
       const tenantId = String(events[0].tenantId);
       const ack = await taskCell.fetch("http://task.internal/events/ack", {
         method: "POST", headers: { "content-type": "application/json" },

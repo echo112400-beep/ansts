@@ -28,6 +28,29 @@ import { stableTaskOperationId } from "../src/persistence/task-operations";
 import { providerQuotaCellKey } from "../src/persistence/provider-quota";
 import { TENANT_DIRECTORY_SHARD_COUNT, tenantDirectoryShardIndex } from "../src/cloudflare/tenant_directory_cell";
 
+test("admission rejects names beyond Celld's UTF-8 limit and preserves boundary-length task identity", async () => {
+  const sample = yaml.load(fs.readFileSync(path.join(__dirname, "../../specs/taskspec_v1beta1_example.yaml"), "utf8")) as any;
+  for (const field of ["tenant_id", "task_id"]) {
+    const { env } = createMockCloudflareCelldEnv();
+    const spec = JSON.parse(JSON.stringify(sample));
+    spec.metadata[field] = "界".repeat(400);
+    const result = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks", {
+      method: "POST", body: JSON.stringify(spec),
+    }), env);
+    assert.equal(result.status, 400, `${field} must reject before accepting an identity Celld cannot retain`);
+  }
+  const { env } = createMockCloudflareCelldEnv();
+  const boundary = JSON.parse(JSON.stringify(sample));
+  boundary.metadata.task_id = "界".repeat(341) + "x";
+  const accepted = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks", {
+    method: "POST", body: JSON.stringify(boundary),
+  }), env);
+  assert.equal(accepted.status, 202);
+  const task = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/tasks/${encodeURIComponent(boundary.metadata.task_id)}?tenant_id=${encodeURIComponent(boundary.metadata.tenant_id)}`), env);
+  assert.equal(task.status, 200);
+  assert.equal(((await task.json()) as any).task_id, boundary.metadata.task_id);
+});
+
 test("scheduled query repair survives an unavailable scheduler owner", async () => {
   const { env } = createMockCloudflareCelldEnv();
   const spec = yaml.load(fs.readFileSync(path.join(__dirname, "../../specs/taskspec_v1beta1_example.yaml"), "utf8")) as any;
@@ -674,8 +697,16 @@ test("scheduler tick replays dispatch stages and reserves shared node capacity o
   assert.equal(startCommandBody.commands[0].payload.authorization_token, firstBody.dispatches[0].authorization_token);
   assert.equal(startCommandBody.commands[0].payload.region, "us-west-1");
   assert.equal(startCommandBody.commands[0].payload.resource_pool, "cpu-small");
+  const eventProjection = await cloudflareCelldWorker.fetch(new Request(
+    "https://ansts.edge/v1beta1/tasks/dispatch-task-1/events?tenant_id=tenant-a"), env);
+  assert.equal(eventProjection.status, 200);
   const commandReplay = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks/dispatch-task-1/start-commands"), env);
   assert.deepEqual(((await commandReplay.json()) as any).commands[0], startCommandBody.commands[0]);
+  const projectionAckForStart = await taskCell.fetch(new Request("http://task.internal/events/ack", {
+    method: "POST", body: JSON.stringify({ tenant_id: candidate.tenant_id,
+      event_ids: [startCommandBody.commands[0].eventId] }),
+  }));
+  assert.equal(projectionAckForStart.status, 409, "only a NodeAgent start receipt can acknowledge a start command");
   const authorizationReplay = await tick();
   const authorizationReplayBody = await authorizationReplay.json() as any;
   assert.equal(authorizationReplayBody.dispatches[0].authorization_token, firstBody.dispatches[0].authorization_token);

@@ -1,6 +1,7 @@
 /**
  * TASK-01: Strict TaskSpec v1beta1 Validator and Default Value Injector across 7 spec blocks.
  */
+import { persistenceCellIdentity } from "../persistence/registry";
 
 export class TaskSpecValidationError extends Error {
   constructor(public readonly fieldPath: string, message: string) {
@@ -39,6 +40,8 @@ export class TaskSpecValidator {
       if (!meta[reqField]) {
         throw new TaskSpecValidationError(`metadata.${reqField}`, "Field is required");
       }
+      try { persistenceCellIdentity(reqField === "task_id" ? "task" : "tenant-ledger", meta[reqField]); }
+      catch (error) { throw new TaskSpecValidationError(`metadata.${reqField}`, error instanceof Error ? error.message : String(error)); }
     }
     meta.idempotency_key = meta.idempotency_key ?? `idem-${meta.task_id}`;
     meta.priority_class = meta.priority_class ?? "P1";
