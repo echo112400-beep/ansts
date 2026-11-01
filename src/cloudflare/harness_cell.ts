@@ -8,6 +8,7 @@
  */
 
 import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel";
+import { UnifiedComponentPersistenceStore } from "../checkpoint/unified_state_store";
 import { CognitiveRouter } from "../cognitive_router";
 import { LeaseCoordinator, StaleFenceError } from "../lease_coordinator";
 import {
@@ -36,6 +37,7 @@ export class AgentTaskHarnessCell {
   public readonly replayer = new DeterministicTimeTravelReplayer();
   public readonly durabilityEngine = new RpoZeroDurabilityEngine("bucket", 10000);
   public readonly workflowCtx: DurableWorkflowContext;
+  public readonly stateStore: UnifiedComponentPersistenceStore;
   public currentOwnerNodeId: string = "celld-node-01";
   public task: AgentTask;
   public clientCreditWindow: number = 100;
@@ -58,6 +60,7 @@ export class AgentTaskHarnessCell {
       phase: SandboxPhase.COGNITIVE,
     });
     this.workflowCtx = new DurableWorkflowContext(`wf-${taskId}`, 3600_000);
+    this.stateStore = new UnifiedComponentPersistenceStore(this.ctx.storage.sql);
 
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS turn_wal_frames (turn_seq INTEGER, epoch INTEGER, routed_model TEXT, effective_effort TEXT, tokens_used INTEGER, workspace_hash TEXT, pass_rate REAL, error_count INTEGER, diff_entropy REAL)",
@@ -71,6 +74,7 @@ export class AgentTaskHarnessCell {
   }
 
   public rehydrateFromSql(): void {
+    this.stateStore.rehydrateWorkflowContext(this.workflowCtx);
     const taskId = this.task.taskId;
     const walRows = this.ctx.storage.sql.exec("SELECT * FROM turn_wal_frames").toArray();
     if (walRows.length === 0) {
@@ -293,6 +297,7 @@ export class AgentTaskHarnessCell {
         return { executed: true, model: this.task.primaryModel };
       });
       await this.workflowCtx.sleep("post-turn-cooldown", body.sleep_duration_ms ?? 5_000);
+      this.stateStore.persistWorkflowContext(this.workflowCtx);
 
       return new Response(
         JSON.stringify({

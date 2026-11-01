@@ -51,3 +51,4 @@ export * from "./cloudflare/horizontal_scaler";
 export * from "./cloudflare/celld_admin_client";
 export * from "./cloudflare/federation_router";
 export { default as cloudflareCelldWorker } from "./cloudflare/worker";
+export * from "./checkpoint/unified_state_store";

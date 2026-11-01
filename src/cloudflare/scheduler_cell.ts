@@ -1,11 +1,12 @@
 /**
  * AnstsSchedulerCell: Durable Object / celld Cell implementing 5D Phase & Effort-Aware W-DRF,
- * Multi-Tenant Queueing, DAG Quota Escrow Vouchers, and SQLite/LTX-backed CAS Fencing.
+ * Multi-Tenant Queueing, DAG Quota Escrow Vouchers, Bayesian Profiler Persistence,
+ * and SQLite/LTX-backed CAS Fencing with full cold-start / hibernation `rehydrateSchedulerFromSql()`.
  */
 
 import { AnstsClusterRuntime } from "../cli/anstsctl";
 import { ClusterPressureSignals } from "../cluster/backpressure_loop";
-import { AgentTask } from "../models";
+import { AgentTask, FenceToken, TaskState } from "../models";
 import { CloudflareCelldEnv, DurableObjectState } from "./env";
 
 export class AnstsSchedulerCell {
@@ -16,12 +17,85 @@ export class AnstsSchedulerCell {
     public readonly env: CloudflareCelldEnv,
   ) {
     this.cluster = new AnstsClusterRuntime();
-    // Initialize celld/DO private SQLite tables for LTX RPO=0 lease & queue persistence
+    // Initialize celld/DO private SQLite tables for LTX RPO=0 lease, queue, task & profiler persistence
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS cell_tasks (task_id TEXT, tenant_id TEXT, priority_class TEXT, state TEXT, primary_model TEXT, epoch INTEGER, turn_seq INTEGER, raw_spec_json TEXT)",
+    );
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS cell_leases (task_id TEXT, node_id TEXT, model_pool TEXT, epoch INTEGER, turn_seq INTEGER)",
     );
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS cell_dag_vouchers (child_task_id TEXT, parent_task_id TEXT, delegated_tps INTEGER, delegated_tokens INTEGER)",
+    );
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS cell_profiler_snapshots (snapshot_id TEXT, profiler_json TEXT)",
+    );
+
+    // Rehydrate queued/running tasks, leases, DAG vouchers & Bayesian priors from SQLite on cold start / wakeup
+    this.rehydrateSchedulerFromSql();
+  }
+
+  /**
+   * Reconstructs queued tasks, active running tasks, CAS leases, DAG escrow vouchers, and Bayesian priors
+   * from embedded SQLite so `AnstsSchedulerCell` survives node restarts or Isolate hibernation with 0 state loss.
+   */
+  public rehydrateSchedulerFromSql(): void {
+    const profilerRows = this.ctx.storage.sql.exec("SELECT * FROM cell_profiler_snapshots").toArray();
+    if (profilerRows.length > 0) {
+      const latest = profilerRows[profilerRows.length - 1];
+      this.cluster.profiler.loadFromJSONString(String(latest.profiler_json));
+    }
+
+    const taskRows = this.ctx.storage.sql.exec("SELECT * FROM cell_tasks").toArray();
+    for (const r of taskRows) {
+      const taskId = String(r.task_id);
+      if (!this.cluster.scheduler.tasks.has(taskId)) {
+        const t = new AgentTask({
+          taskId,
+          tenantId: String(r.tenant_id),
+          priorityClass: String(r.priority_class ?? "P1"),
+          primaryModel: (r.primary_model as any) ?? "DeepSeek",
+          state: (r.state as TaskState) ?? TaskState.QUEUED,
+        });
+        t.fence = new FenceToken(Number(r.epoch ?? 0), Number(r.turn_seq ?? 0), taskId);
+        this.cluster.scheduler.tasks.set(taskId, t);
+        if (t.state === TaskState.QUEUED) {
+          this.cluster.queueMgr.enqueue(t);
+        }
+      }
+    }
+
+    const leaseRows = this.ctx.storage.sql.exec("SELECT * FROM cell_leases").toArray();
+    for (const lr of leaseRows) {
+      const taskId = String(lr.task_id);
+      const nodeId = String(lr.node_id);
+      const modelPool = String(lr.model_pool);
+      const epoch = Number(lr.epoch ?? 1);
+      const turnSeq = Number(lr.turn_seq ?? 0);
+
+      this.cluster.leaseCoord.acquireOrIncrementEpoch(taskId, nodeId, modelPool);
+      for (let ep = 1; ep < epoch; ep++) {
+        this.cluster.leaseCoord.acquireOrIncrementEpoch(taskId, nodeId, modelPool);
+      }
+      const fence = new FenceToken(epoch, turnSeq, taskId);
+      this.cluster.leaseCoord.verifyAndAdvanceFence(fence);
+
+      const t = this.cluster.scheduler.tasks.get(taskId);
+      if (t) {
+        t.state = TaskState.RUNNING;
+        t.assignedNodeId = nodeId;
+        t.assignedModelPool = modelPool;
+        t.fence = fence;
+      }
+    }
+  }
+
+  public persistProfilerSnapshot(): void {
+    this.ctx.storage.sql.exec("DELETE FROM cell_profiler_snapshots WHERE snapshot_id = ?", "latest");
+    this.ctx.storage.sql.exec(
+      "INSERT INTO cell_profiler_snapshots (snapshot_id, profiler_json) VALUES (?, ?)",
+      "latest",
+      this.cluster.profiler.toJSONString(),
     );
   }
 
@@ -32,6 +106,24 @@ export class AnstsSchedulerCell {
     if (request.method === "POST" && url.pathname === "/tasks/submit") {
       const rawSpec = (await request.json()) as Record<string, any>;
       const res = this.cluster.apiGateway.submitTaskSpec(rawSpec, now);
+      if (res.statusCode === 202) {
+        const taskId = String(res.body.task_id);
+        const task = this.cluster.scheduler.tasks.get(taskId);
+        if (task) {
+          this.ctx.storage.sql.exec(
+            "INSERT INTO cell_tasks (task_id, tenant_id, priority_class, state, primary_model, epoch, turn_seq, raw_spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            task.taskId,
+            task.tenantId,
+            task.priorityClass,
+            task.state,
+            task.primaryModel,
+            task.fence.epoch,
+            task.fence.turnSeq,
+            JSON.stringify(rawSpec),
+          );
+          this.persistProfilerSnapshot();
+        }
+      }
       return new Response(JSON.stringify(res.body), {
         status: res.statusCode,
         headers: { "content-type": "application/json", ...res.headers },
@@ -128,10 +220,12 @@ export class AnstsSchedulerCell {
     if (request.method === "GET" && url.pathname === "/cluster/top") {
       const snap = this.cluster.clusterTopSnapshot();
       const persistedLeases = this.ctx.storage.sql.exec("SELECT * FROM cell_leases").toArray();
+      const persistedTasks = this.ctx.storage.sql.exec("SELECT * FROM cell_tasks").toArray();
       return new Response(
         JSON.stringify({
           ...snap,
           celld_sqlite_leases_count: persistedLeases.length,
+          celld_sqlite_tasks_count: persistedTasks.length,
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
