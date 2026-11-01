@@ -328,3 +328,10 @@ Zombie Node-01         ansts-lease-coordinator         Healthy Node-02         a
 | **增量快照、时光机重放与通知** | `src/checkpoint/wal_engine.ts`<br>`src/checkpoint/compactor.ts`<br>`src/checkpoint/time_travel.ts`<br>`src/telemetry/cloudevents.ts`<br>`src/telemetry/outbox_webhook.ts` | `TurnWalEngine`, `WalCompactorAndPagedRestorer`, `DeterministicTimeTravelReplayer`, `CloudEventsBus`, `TransactionalOutboxDispatcher` | `chaos_benchmarks.test.ts` |
 | **`celld` & Cloudflare 边缘协同层** | `src/cloudflare/worker.ts`<br>`src/cloudflare/scheduler_cell.ts`<br>`src/cloudflare/harness_cell.ts`<br>`src/cloudflare/env.ts`<br>`wrangler.json` / `migrations/0001_init_ansts.sql` | `cloudflareCelldWorker`, `AnstsSchedulerCell`, `AgentTaskHarnessCell` (`rehydrateFromSql`), `CloudflareCelldEnv` | `celld_cloudflare.test.ts`<br>`code_audit_improvements.test.ts` |
 | **`RustFS` + `celld` 生产部署标本** | `deploy/rustfs-celld/start-rustfs-celld.sh`<br>`deploy/rustfs-celld/docker-compose.rustfs-celld.yml`<br>`deploy/rustfs-celld/systemd/celld.service` | RustFS (`:9000` S3 API / `:9001` Console, UID `10001`) + 3 节点 `celld` (`--bucket s3://ansts-fleet --endpoint http://rustfs:9000`) | `celld_cloudflare.test.ts` |
+
+---
+
+## 9. v2.2 微服务持久化与无 K8s 手动扩容部署补遗 (`M8 ~ M14`)
+
+- **全微服务状态持久化 (`src/checkpoint/unified_state_store.ts`)**：所有 11 个核心微服务组件的状态均通过 `celld` Cell 内嵌 SQLite（`cell_tasks`、`cell_leases`、`cell_dag_vouchers`、`cell_profiler_snapshots`、`turn_wal_frames`、`saga_journal`、`ansts_kv_snapshots`）与 LiteFS LTX 增量帧实时落盘至 **4 节点 $\times$ 4 盘（16 驱动器 `EC:4`）`RustFS` S3 集群**，并在冷启动时自动执行 `rehydrateSchedulerFromSql()` / `rehydrateFromSql()`。
+- **无 K8s 裸金属 / Systemd 手动横向扩容 (`src/cluster/manual_scale_controller.ts` & `deploy/manual-fleet/`)**：微服务集群直接通过 `systemd`（`celld.service`、`ansts-node-daemon.service`）与 `docker-compose.rustfs-ha.yml` 部署，通过 `scale-fleet.sh`、`anstsctl fleet scale-out` 与 `POST /v1beta1/fleet/scale` 实现大脑节点、沙箱躯体主机与调度/队列分片的在线手动水平扩缩容。

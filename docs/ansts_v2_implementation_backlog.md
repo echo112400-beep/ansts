@@ -3,7 +3,7 @@
 | 文档属性 (Document Metadata) | 详细内容 (Details) |
 | :--- | :--- |
 | **项目名称 (Project)** | **Agent-Native Sandbox Task Scheduler (ANSTS v2.2 — `celld` HA, Scale-Out & Cloud-Native Production Edition)** |
-| **当前代码仓基线 (Baseline)** | **ALL M1 ~ M13 (`TASK-01` ~ `TASK-64`) 100% COMPLETED**（**61 个 TypeScript 模块**通过 AST 与编译校验，**46/46** 项单元、集成、混沌、高可用、横向扩容与生产治理测试 100% 通过） |
+| **当前代码仓基线 (Baseline)** | **ALL M1 ~ M14 (`TASK-01` ~ `TASK-68`) 100% COMPLETED**（**63 个 TypeScript 模块**通过 AST 与编译校验，**49/49** 项单元、集成、混沌、高可用、横向扩容与生产治理测试 100% 通过） |
 | **持久化与高可用基座 (HA Core)** | 基于 [`denoland/celld`](https://github.com/denoland/celld/blob/main/docs/README.md) + `RustFS` 16 盘纠删码 (`EC:4`) 构建，严格满足 `RPO = 0` 双模式输出门控、可恢复工作流与分片水平扩展 |
 | **核心模型池 (Model Pools)** | `DeepSeek`（旗舰深度推理池）、`GLM-5.3`（多步工具编排与轻量高速分流池）、`Qwen-3.8`（高频语法修复与高可用热备容灾池） |
 
@@ -66,3 +66,14 @@
 | **`TASK-62`** | **多租户 FinOps 实时成本归因账本与日/月预算硬顶熔断器** | `src/finops/budget_controller.ts` | `test 39` (`PASS`) | 实时核算三大模型池输入/CoT/输出 Token 与沙箱活跃 CPU 成本，80% 触发软告警、100% 自动触发 `GRACEFUL_DRAINING` 保存快照并冻结新准入 |
 | **`TASK-63`** | **实时管控台 (`dashboard`) 升级：分片拓扑热力图与高危工具在线审批** | `src/dashboard/server.ts` | `test 40` (`PASS`) | 新增 `/api/v1/shards/heatmap` 分片负载热力图接口与 `handleStageCommitDecision` 在线批准/驳回原子 Flush 接口 |
 | **`TASK-64`** | **多区域双活联邦调度器（Multi-Region Active-Active Federation）** | `src/cloudflare/federation_router.ts` | `test 40` (`PASS`) | 跨 `us-west`、`eu-central`、`ap-east` 严格执行数据驻留合规（如 `GDPR` 锁定欧洲区），主区域故障 `< 1s` 自动跨区切流 |
+
+---
+
+### 2.5 阶段十四（M14）：无 K8s 手动扩容改造与全组件统一持久化闭环 (`TASK-65` ~ `TASK-68` — ✅ 已完成)
+
+| 任务 ID | 任务名称 | 交付代码路径 | 验收测试编号 | 核心实现与验证结果 |
+| :--- | :--- | :--- | :--- | :--- |
+| **`TASK-65`** | **无 K8s 裸金属/Systemd 手动扩容控制器与运维脚本体系** | `src/cluster/manual_scale_controller.ts`<br>`deploy/manual-fleet/scale-fleet.sh`<br>`deploy/manual-fleet/fleet-topology.yaml`<br>`deploy/manual-fleet/systemd/ansts-node-daemon.service` | `test 41` (`PASS`) | 移除 Kubernetes 依赖，支持通过 `scale-fleet.sh`、`anstsctl fleet scale-out \| scale-in` 与 `POST /v1beta1/fleet/scale` 手动在线扩缩 `celld` 脑节点、沙箱宿主机与调度分片，前置强制校验 `restoring === 0` 并自动触发 32-Cell 重平衡 |
+| **`TASK-66`** | **分片调度器 (`AnstsSchedulerCell`) 全状态 SQLite 持久化与冷启动重水化** | `src/cloudflare/scheduler_cell.ts` | `test 21` (`PASS`) | 新增 `cell_tasks` 与 `cell_profiler_snapshots` 表及构造函数 `rehydrateSchedulerFromSql()`，跨冷启动/休眠唤醒 100% 恢复排队中任务、运行租约、DAG 支票与贝叶斯先验分布 |
+| **`TASK-67`** | **全组件统一状态持久化引擎 (`UnifiedComponentPersistenceStore`)** | `src/checkpoint/unified_state_store.ts`<br>`src/cloudflare/harness_cell.ts` | `test 22, 23` (`PASS`) | 将 `DurableWorkflowContext`、`ShardedQueueBrokerPool`、`TransactionalOutboxDispatcher`、`FinOpsBudgetController`、`McpDynamicToolRegistry` 与 `PartitionedSchedulerRouter` / `ManualFleetScaleController` 全部接入 SQLite `ansts_kv_snapshots` 持久化与重水化 |
+| **`TASK-68`** | **生产整体部署架构设计规范（无 K8s 手动扩容版）与全组件持久化验证套件** | `docs/ansts_production_deployment_architecture_design.md`<br>`tests/full_component_persistence.test.ts` | `test 20..23` (`PASS`) | 完成四层五平面无 K8s 生产部署规范、三档硬件 BOM 清单及 11 大有状态组件跨重启恢复测试，全仓 **63 个 TypeScript 模块编译通过、49/49 项测试 100% 通过** |

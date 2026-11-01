@@ -772,3 +772,16 @@ celld d1 migrations apply ansts-audit-ledger --bucket "${CELLD_BUCKET}" --endpoi
 # 3. 执行无侵入集群健康与租约体检 (确认 restoring=0 且 CAS/Read-after-write 正常)
 celld diagnose --bucket "${CELLD_BUCKET}" --endpoint "${S3_ENDPOINT}"
 ```
+
+---
+
+## 13. v2.2 架构演进补遗：无 K8s 手动横向扩容与全组件 `RPO = 0` 持久化闭环 (`M8 ~ M14`)
+
+在 v2.2 生产版本（对应代码仓 `M8 ~ M14`、`TASK-41` ~ `TASK-68`，共 **63 个 TypeScript 模块、49/49 项自动化测试通过**）中，系统进一步完成了以下核心生产架构演进：
+
+1. **基于 `denoland/celld` 与 `RustFS` 16 盘纠删码 (`EC:4`) 的零数据丢失持久化 (`RPO = 0`)**：
+   - `RpoZeroDurabilityEngine`（`src/cloudflare/celld_ha_engine.ts`）与 `RustFsS3LtxDriver`（`src/checkpoint/s3_ltx_driver.ts`）严格实现 `celld` 单写者排他租约（`CELLD_TTL_MS=10000`、`1/3 TTL` 续期、S3 `If-Match` CAS）与双模式输出确认门控（`fleet` 模式 1~2 节点 `fsync` + 接管封存 `SessionSealed`；`bucket` 模式上传 LTX 后二次复核 `ownership.json`）。
+2. **全栈 11 大有状态组件 100% SQLite/LTX 持久化与冷启动重水化 (`UnifiedComponentPersistenceStore`)**：
+   - 除 `AgentTaskHarnessCell.rehydrateFromSql()` 外，新增 `AnstsSchedulerCell.rehydrateSchedulerFromSql()` 与 `src/checkpoint/unified_state_store.ts`，将调度分片队列、CAS 租约、DAG 支票、贝叶斯先验、`DurableWorkflowContext` 步骤缓存、`ShardedQueueBrokerPool`、`TransactionalOutboxDispatcher`、`FinOpsBudgetController`、`McpDynamicToolRegistry` 及分片路由拓扑全部持久化至嵌入式 SQLite 并同步至 `RustFS`。
+3. **无 K8s（裸金属 / VM + `Systemd` + `Docker Compose`）手动横向扩容架构 (`ManualFleetScaleController`)**：
+   - 摒弃复杂的 Kubernetes Operator，利用 `celld` 原生基于共享存储桶（`fleet/capacity-v1.json`）的去中心化节点自发现机制，提供 `deploy/manual-fleet/scale-fleet.sh`、`anstsctl fleet scale-out | scale-in` 与 `POST /v1beta1/fleet/scale` 接口，支持运维人员按需手动追加 `celld` 大脑节点、沙箱躯体宿主机（`ansts-node-daemon.service`）与调度/队列分片，并在 `restoring === 0` 门禁保护下自动按每 `5s` 最多 `32` 个休眠 Cell 执行平滑重平衡。

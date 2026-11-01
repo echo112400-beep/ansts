@@ -160,3 +160,25 @@
 | **小型生产集群 (Starter)** | **1,000 ~ 3,000 并发任务**<br>（约 100 并发工具脉冲） | 2 $\times$ `4C 8GB` Linux VM | **3 台物理机/VM**（跨 3 AZ）<br>`8 vCPU / 16GB RAM / 200GB NVMe` | **6 台裸金属/KVM 主机**（每机 20 脉冲）<br>`32 vCPU / 64GB RAM / 1TB NVMe` | **4 台存储主机 $\times$ 4 盘 (16 盘 `EC:4`)**<br>`16 vCPU / 32GB RAM / 4x2TB NVMe` |
 | **中型生产集群 (Standard)** | **10,000 ~ 25,000 并发任务**<br>（约 600 并发工具脉冲） | 4 $\times$ `8C 16GB` Linux VM | **8 台物理机/VM**（16 调度分片 + 32 队列分片）<br>`16 vCPU / 32GB RAM / 500GB NVMe` | **36 台裸金属/KVM 主机**（含 25% Warm Pool）<br>`64 vCPU / 128GB RAM / 2TB NVMe` | **4 台存储主机 $\times$ 4 盘 (16 盘 `EC:4`)**<br>`32 vCPU / 64GB RAM / 4x4TB NVMe / 25GbE` |
 | **大型跨区联邦集群 (Enterprise)** | **100,000+ 并发任务**<br>（跨 `us-west` / `eu-central` / `ap-east`） | 每区 8 台 `16C 32GB` 边缘路由主机 | **每区 12~16 台主机**（64 调度/队列分片）<br>`32 vCPU / 64GB RAM / 1TB NVMe` | **每区 80~120 台裸金属主机**（CPU + GPU 池）<br>`96 vCPU / 256GB RAM / 4TB NVMe` | **每区 8 台存储主机 $\times$ 4 盘 (32 盘 `EC:4`)**<br>`64 vCPU / 128GB RAM / 4x8TB NVMe / 2x25GbE` |
+
+---
+
+## 5. 全组件持久化存储映射与多级故障自愈矩阵（Persistence Mapping & Recovery SLA）
+
+### 5.1 全栈 11 大有状态服务组件的持久化落盘映射
+在无 K8s 生产部署架构下，所有组件的内存状态均通过嵌入式 SQLite + LiteFS LTX 事务流或本地磁盘 OverlayFS 实时落盘至 **4 节点 $\times$ 4 NVMe 盘（16 盘 `EC:4`）`RustFS` S3 集群**：
+- **调度分片层 (`AnstsSchedulerCell`)**：任务入队与 5D W-DRF 选主租约实时写入 `cell_tasks`、`cell_leases`、`cell_dag_vouchers` 与 `cell_profiler_snapshots` 表；节点重启或迁移时由 `rehydrateSchedulerFromSql()` 自动还原队列与租约。
+- **任务大脑层 (`AgentTaskHarnessCell`)**：每轮模型路由结果与工具副作用写入 `turn_wal_frames` 与 `saga_journal`，长周期工作流步骤写入 `ansts_kv_snapshots (workflow:<id>)`，提交前由 `RpoZeroDurabilityEngine.commitAndProveRpoZero` 完成双模式确认。
+- **控制面治理层 (`UnifiedComponentPersistenceStore`)**：分片队列池（`ShardedQueueBrokerPool`）、事务发件箱（`TransactionalOutboxDispatcher`）、多租 FinOps 账本（`FinOpsBudgetController`）、MCP 动态工具表（`McpDynamicToolRegistry`）及手动扩容拓扑（`ManualFleetScaleController`）统一通过 `ansts_kv_snapshots` 持久化并支持一键重水化。
+- **沙箱躯体层 (`CompanionContainerAndOverlayDriver`)**：每个 Turn 的代码修改保存在宿主机 `/var/lib/ansts/overlay/<id>/upper` 并生成确定性 SHA-256 Merkle 快照，支持 `< 50ms` 跨机热迁移与回溯恢复。
+
+### 5.2 生产环境六级故障自愈 SLA 汇总表
+
+| 故障等级与场景 | 自动检测机制 | 自愈与容灾动作 | 恢复时间目标 (RTO) | 数据恢复点目标 (RPO) |
+| :--- | :--- | :--- | :--- | :--- |
+| **L1：单模型池限流或超时 (`DeepSeek` HTTP 429 / TTFT > 15s)** | `ThreeStateCircuitBreaker` (30s 窗口错误率 `>25%`) | 熔断器切 `OPEN`，`CognitiveRouter` 与 `LiveOpenAiCompatibleSseAdapter` 当轮毫秒级无感切换至 `Qwen-3.8` / `GLM-5.3` | **`< 50ms`** | **`RPO = 0`** |
+| **L2：Agent 陷入语法死循环或原地踏步 ($\mathcal{V}_k < 0.10$)** | `SyntacticAndVelocityBreaker` (连续 3 次同 AST 或 4 轮进展率低) | `SagaCompensatorEngine` 按 LIFO 逆序回滚外部副作用，`CompanionContainerAndOverlayDriver` 恢复 `upperdir` 至历史最优 Turn 快照并提权至 `DeepSeek (max)` | **`< 100ms`** | **`RPO = 0`（零脏写）** |
+| **L3：单台 `celld` 脑节点原地重启 / 配置热更新** | `./deploy/manual-fleet/scale-fleet.sh remove-brain-node <url> preserve` | 取消排队冷启动、刷盘已停止 SQLite DB、保留 `RustFS` 中的 `ownership.json` 租约，新进程原地接管 | **`< 1.5s`** | **`RPO = 0`** |
+| **L4：单台 `celld` 脑节点或沙箱宿主机硬宕机 (`SIGKILL` / 断电)** | `CELLD_TTL_MS=10000` 租约过期 / 12s 心跳超时 | 存活节点通过 S3 `If-Match` CAS 抢占所有权、递增 `epoch + 1`、封存旧节点日志会话（`SessionSealed`），通过 HTTP `206 Range` 热页优先恢复 SQLite 与 `TurnWAL` 并执行 `rehydrateFromSql()` / `rehydrateSchedulerFromSql()` 从精确断点续跑 | **`< 10s`** | **`RPO = 0`** |
+| **L5：单台或两台 `RustFS` 存储节点硬宕机（最多坏 8 块 NVMe 盘）** | `RustFS` 16 盘 `EC:4` 纠删码健康探针 | 纠删码引擎自动利用剩余 $\ge 8~12$ 块健康盘在线重构数据块，上层 `celld` 无感知继续读写 | **`0s`（无中断）** | **`RPO = 0`** |
+| **L6：单一地理区域整体中断（如 `us-west` 全区光纤/电力故障）** | `MultiRegionFederationRouter` 区域健康探针 | 全球边缘层自动将新任务与可迁移任务切流至 `ap-east` 或 `eu-central`（严格遵守 `GDPR` 等合规约束） | **`< 1s`** | **`RPO = 0`** |

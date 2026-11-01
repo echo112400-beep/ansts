@@ -2,7 +2,7 @@
 
 - **文档版本**：v2.2 (`celld` Durable & Recoverable HA Edition)
 - **参考规范**：[`denoland/celld` Documentation (`docs/README.md`)](https://github.com/denoland/celld/blob/main/docs/README.md)、[`docs/guarantees.md`](https://github.com/denoland/celld/blob/main/docs/guarantees.md)、[`docs/services/workflows.md`](https://github.com/denoland/celld/blob/main/docs/services/workflows.md)、[`docs/services/queues.md`](https://github.com/denoland/celld/blob/main/docs/services/queues.md)、[`docs/services/containers.md`](https://github.com/denoland/celld/blob/main/docs/services/containers.md)
-- **关联代码实现**：`src/cloudflare/celld_ha_engine.ts`、`src/cloudflare/scheduler_cell.ts`、`src/cloudflare/harness_cell.ts`、`tests/celld_ha_durability.test.ts`（全量 **46/46** 集成、混沌与高可用持久化测试 100% 通过）
+- **关联代码实现**：`src/cloudflare/celld_ha_engine.ts`、`src/cloudflare/scheduler_cell.ts`、`src/cloudflare/harness_cell.ts`、`tests/celld_ha_durability.test.ts`（全量 **49/49** 集成、混沌与高可用持久化测试 100% 通过）
 
 ---
 
@@ -148,7 +148,7 @@
 | `HA-05` | `ShardedQueueBrokerPool` 突破单队列 `256` 并发限制、自适应指数退避 (`delaySeconds`) 与死信队列隔离 | **PASS** |
 | `HA-06` | `SafeEpochGarbageCollector` 写入 `retired.json` 并严格保留 `current`、`current-1` 及保留期内纪元 | **PASS** |
 | `HA-07` | `FleetHaAndAutoscalerController` 32-Cell 限速重平衡、`handoff=preserve` 原地保留升级与 `restoring=0` 滚动门禁 | **PASS** |
-| **总计** | **全量 61 个 TypeScript 模块编译 + 46 项全链路单元/集成/混沌/高可用/一致性测试** | **46 / 46 PASS** |
+| **总计** | **全量 63 个 TypeScript 模块编译 + 49 项全链路单元/集成/混沌/高可用/一致性测试** | **49 / 49 PASS** |
 
 ---
 
@@ -354,7 +354,7 @@ flowchart TB
 
 ## 10. 设计规范与代码交付 100% 一致性追溯矩阵（Design-to-Deliverable Traceability Matrix）
 
-下表汇总了从 **M1 ~ M13（`TASK-01` ~ `TASK-64`）** 全量设计规范、TypeScript 核心实现类/方法、部署清单文件与自动化验收测试（**61 个 TypeScript 模块、46/46 项 CI 测试**）的一一对应关系：
+下表汇总了从 **M1 ~ M13（`TASK-01` ~ `TASK-64`）** 全量设计规范、TypeScript 核心实现类/方法、部署清单文件与自动化验收测试（**63 个 TypeScript 模块、49/49 项 CI 测试**）的一一对应关系：
 
 | 架构设计模块 | 设计规范章节 | 交付代码路径 | 核心实现类与精确方法签名 | 对应测试文件与状态 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -368,3 +368,58 @@ flowchart TB
 | **热路径装配与真实 S3/LLM 协议** | HA Doc §2–§6 / M10 (`TASK-49..52`) | `src/checkpoint/s3_ltx_driver.ts`<br>`src/cloudflare/celld_admin_client.ts`<br>`src/router/live_llm_adapter.ts`<br>`src/cli/anstsctl.ts` | `RustFsS3LtxDriver.signAwsV4Headers / acquireOrRenewOwnershipCas / uploadLtxFrameWithRpoZeroProof / fetchLtxPageRange`<br>`CelldAdminClient.fetchNodeState / triggerPreserveShutdown / executeRollingRestart`<br>`LiveOpenAiCompatibleSseAdapter.streamChatCompletionTurn` | `m10_hotpath_protocols.test.ts` (**PASS**) |
 | **Linux 内核 Cgroups/PSI 与热迁移** | Design Doc §8 / M11 (`TASK-53..56`) | `src/runtime/linux_cgroup_psi.ts`<br>`src/runtime/container_driver.ts`<br>`src/runtime/vsock_daemon.ts`<br>`src/runtime/live_migration.ts` | `LinuxCgroupV2AndPsiDriver.initSandboxCgroup / applyPhaseLimits / sampleHostPsiPressure`<br>`CompanionContainerAndOverlayDriver.captureUpperDirSnapshot / restoreUpperDirSnapshot`<br>`ZeroTrustVsockHostDaemon.listenTcpLoopback`<br>`EphemeralHeavyExecutorMigrator.migrateAndExecuteTurnBurst` | `m11_linux_runtime_primitives.test.ts` (**PASS**) |
 | **无 K8s 手动扩容、`RustFS` EC:4、MCP 与多活** | HA Doc §9 / M12–M13 (`TASK-57..64`) | `src/cluster/manual_scale_controller.ts`<br>`src/telemetry/otel_prometheus.ts`<br>`src/saga/mcp_registry.ts`<br>`src/finops/budget_controller.ts`<br>`src/dashboard/server.ts`<br>`src/cloudflare/federation_router.ts`<br>`deploy/manual-fleet/fleet-topology.yaml & scale-fleet.sh`<br>`deploy/rustfs-celld/docker-compose.rustfs-ha.yml` | `ManualFleetScaleController.executeManualScaleOut / executeManualNodeDrain`<br>`OtelAndPrometheusExporter.renderPrometheusMetrics`<br>`McpDynamicToolRegistry.registerMcpServerTools / invokeMcpTool`<br>`FinOpsBudgetController.recordTurnSpend`<br>`DashboardBackendServer.handleGetShardHeatmap / handleStageCommitDecision`<br>`MultiRegionFederationRouter.routeGlobalTask` | `m12_m13_production_suite.test.ts`<br>`design_deliverable_consistency.test.ts` (**PASS**) |
+
+---
+
+## 11. 全量有状态服务组件持久化与冷启动重水化架构（Full-Component Persistence & Rehydration）
+
+为确保集群中**没有任何一个有状态服务组件因 V8 Isolate 休眠驱逐或进程重启而丢失内存状态**，系统通过 `AnstsSchedulerCell.rehydrateSchedulerFromSql()`、`AgentTaskHarnessCell.rehydrateFromSql()` 以及统一状态存储引擎 `UnifiedComponentPersistenceStore`（`src/checkpoint/unified_state_store.ts`）实现了全栈 11 大有状态组件的 100% 持久化覆盖：
+
+### 11.1 SQLite 持久化表结构与组件映射
+
+```sql
+-- 1. AnstsSchedulerCell 私有 SQLite 表 (src/cloudflare/scheduler_cell.ts)
+CREATE TABLE IF NOT EXISTS cell_tasks (
+  task_id TEXT, tenant_id TEXT, priority_class TEXT, state TEXT,
+  primary_model TEXT, epoch INTEGER, turn_seq INTEGER, raw_spec_json TEXT
+);
+CREATE TABLE IF NOT EXISTS cell_leases (
+  task_id TEXT, node_id TEXT, model_pool TEXT, epoch INTEGER, turn_seq INTEGER
+);
+CREATE TABLE IF NOT EXISTS cell_dag_vouchers (
+  child_task_id TEXT, parent_task_id TEXT, delegated_tps INTEGER, delegated_tokens INTEGER
+);
+CREATE TABLE IF NOT EXISTS cell_profiler_snapshots (
+  snapshot_id TEXT, profiler_json TEXT
+);
+
+-- 2. AgentTaskHarnessCell 私有 SQLite 表 (src/cloudflare/harness_cell.ts)
+CREATE TABLE IF NOT EXISTS turn_wal_frames (
+  turn_seq INTEGER, epoch INTEGER, routed_model TEXT, effective_effort TEXT,
+  tokens_used INTEGER, workspace_hash TEXT, pass_rate REAL, error_count INTEGER, diff_entropy REAL
+);
+CREATE TABLE IF NOT EXISTS saga_journal (
+  turn_seq INTEGER, epoch INTEGER, tool_name TEXT, effect_class TEXT, compensation_tool TEXT, payload TEXT
+);
+
+-- 3. 统一组件状态快照表 (src/checkpoint/unified_state_store.ts)
+CREATE TABLE IF NOT EXISTS ansts_kv_snapshots (
+  component_key TEXT, state_json TEXT, updated_at_ms INTEGER
+);
+```
+
+### 11.2 十一大有状态服务组件持久化与恢复机制对照表
+
+| 序号 | 有状态服务组件 | 对应源码模块 | 持久化主键 / 表名 | 冷启动 / 休眠唤醒恢复方法 (`RPO = 0`) | 验证测试编号 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1** | **分片调度器单元 (`AnstsSchedulerCell`)** | `src/cloudflare/scheduler_cell.ts` | `cell_tasks` / `cell_leases` / `cell_dag_vouchers` / `cell_profiler_snapshots` | `rehydrateSchedulerFromSql()`（自动恢复排队任务、运行租约、DAG 支票与贝叶斯先验） | `test 21` (**PASS**) |
+| **2** | **任务级大脑单元 (`AgentTaskHarnessCell`)** | `src/cloudflare/harness_cell.ts` | `turn_wal_frames` / `saga_journal` | `rehydrateFromSql()`（自动恢复 `Fence(epoch, turn_seq)`、全量 `TurnWAL` 帧与 Saga 补偿账本） | `test 15` (**PASS**) |
+| **3** | **可恢复工作流上下文 (`DurableWorkflowContext`)** | `src/cloudflare/celld_ha_engine.ts`<br>`src/checkpoint/unified_state_store.ts` | `ansts_kv_snapshots` (`workflow:<id>`) | `persistWorkflowContext()` / `rehydrateWorkflowContext()`（恢复 `completedSteps`、`sleepDeadlinesMs` 与 `earlyEventBuffer`） | `test 22` (**PASS**) |
+| **4** | **分片消息队列池 (`ShardedQueueBrokerPool`)** | `src/cloudflare/celld_ha_engine.ts`<br>`src/checkpoint/unified_state_store.ts` | `ansts_kv_snapshots` (`queue_pool:<prefix>`) | `persistQueuePool()` / `rehydrateQueuePool()`（恢复各分片在途消息、重试计数与 `deadLetterQueue`） | `test 23` (**PASS**) |
+| **5** | **事务性事件发件箱 (`TransactionalOutboxDispatcher`)** | `src/telemetry/outbox_webhook.ts`<br>`src/checkpoint/unified_state_store.ts` | `ansts_kv_snapshots` (`outbox:global_outbox`) + D1 `task_audit_events` | `persistOutbox()` / `rehydrateOutbox()`（恢复待投递 CloudEvents 1.0 队列与 Webhook DLQ） | `test 23` (**PASS**) |
+| **6** | **多租 FinOps 成本账本 (`FinOpsBudgetController`)** | `src/finops/budget_controller.ts`<br>`src/checkpoint/unified_state_store.ts` | `ansts_kv_snapshots` (`finops:budgets`) | `persistFinOpsLedger()` / `rehydrateFinOpsLedger()`（恢复各租户当日累计模型/沙箱消费与硬顶熔断状态） | `test 23` (**PASS**) |
+| **7** | **MCP 工具动态注册表 (`McpDynamicToolRegistry`)** | `src/saga/mcp_registry.ts`<br>`src/checkpoint/unified_state_store.ts` | `ansts_kv_snapshots` (`mcp:descriptors`) | `persistMcpRegistry()` / `rehydrateMcpRegistry()`（恢复外部 MCP 工具 Schema 与四级事务契约） | `test 23` (**PASS**) |
+| **8** | **分片路由器与手动扩容拓扑 (`PartitionedSchedulerRouter` & `ManualFleetScaleController`)** | `src/cloudflare/horizontal_scaler.ts`<br>`src/cluster/manual_scale_controller.ts` | `ansts_kv_snapshots` (`control_plane:router_and_fleet`) + `fleet-topology.yaml` | `persistFleetAndRouterState()` / `rehydrateFleetAndRouterState()`（恢复在线扩容的调度分片数、脑节点与沙箱宿主机列表） | `test 23` (**PASS**) |
+| **9** | **边缘幂等去重缓存 (`ANSTS_KV`)** | `src/cloudflare/worker.ts` | KV `idem:<tenant_id>:<idempotency_key>` | 边缘 Worker 无状态重启后直接读取分布式 KV 拦截 24h 内重复请求 | `test 2` (**PASS**) |
+| **10** | **沙箱工作区文件树 (`CompanionContainerAndOverlayDriver`)** | `src/runtime/container_driver.ts` | 宿主机磁盘 OverlayFS `upperdir` + CoW 快照包 | `captureUpperDirSnapshot()` / `restoreUpperDirSnapshot()`（SHA-256 Merkle Root 校验与文件树精确回滚） | `test 38` (**PASS**) |
+| **11** | **底层对象存储与租约基座 (`RustFsS3LtxDriver`)** | `src/checkpoint/s3_ltx_driver.ts` | `RustFS` 16 盘 `EC:4` (`ownership.json`, `*.ltx`, `retired.json`) | AWS SigV4 `If-Match` CAS + 上传后二次复核 `ownership.json` + HTTP `206 Range` 热页优先分页恢复 | `test 34` (**PASS**) |
