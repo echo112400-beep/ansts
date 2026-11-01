@@ -7,7 +7,7 @@
 ## Verified in this branch
 
 - `npm run build` completed successfully.
-- `npm test` passed **111/111** integration and chaos tests, with zero skipped tests on Node **24.21.0**.
+- Latest merged integration validation passed **123/123** tests, with zero skipped tests on Node **24.21.0** (integration commit `356ee09`).
 - `rtk bypass npm run lint` passed the repository AST and schema checks.
 - `git diff --check` passed.
 - Tests exercise durable task turns and snapshot references, DAG allowance transfer/retry, tenant task queries, rebuild of D1 projections, task event replay, SSE snapshot/follow setup, and expired-cursor resynchronization through the Worker HTTP surface with test Durable Object, D1, and R2 bindings.
@@ -20,13 +20,15 @@ SQLite tests still use a simulated `storage.sync` binding, and file close/reopen
 
 ## Runtime evidence available from T9/T1 work
 
+The complete ANSTS Worker was also exercised against Celld 0.6.3 and an isolated same-host RustFS 1.0.4 bucket on this date. The application returned 202 for admission; after a controlled SIGKILL (exit -9) and removal of the marked compute directory, a new node restored the identical full TaskSpec and original idempotency result. See [application admission recovery evidence](celld-app-admission-recovery-2026-11-01.md). This advances beyond the minimal fixture but covers admission only, not budget/operation/snapshot DR. The exercise also exposed and led to correction of the runtime transaction API mismatch: transactions belong to `storage.transactionSync`, not `storage.sql.transactionSync`.
+
 Earlier runtime work recorded Celld **0.6.3** with RustFS **1.0.4** and exercised exact-range object reads, awaited persistence synchronization, process restart, restore after loss of the Celld compute directory, object-store outage behavior, and `celld diagnose`. The runtime and RustFS were hosted on the same machine/container environment. This supports the tested local restart and compute-directory-loss cases only; it does **not** prove survival of an independent host/storage failure or restore from an independently retained backup. The runtime exercise was not rerun as part of this report.
 
 ## Open release gates
 
 | Gate | Status | Remaining evidence |
 |---|---|---|
-| Confirmed admission survives loss of every compute-node disk while the bucket remains independently available | Partial | Prior evidence lost a compute directory in a same-host setup, not all disks across a fleet with a separate storage failure domain. |
+| Confirmed admission survives loss of every compute-node disk while the bucket remains independently available | Partial | Complete application admission/TaskSpec/idempotency now survives controlled process SIGKILL and compute-directory loss with same-host RustFS. Full budget/operation/snapshot recovery and a separate storage failure domain remain unproven. |
 | Independent backup restore into an isolated fleet | Not demonstrated | Create a verifiable backup cut, restore it independently, then reconcile tasks, ledger entries, operations, and all live snapshot references. |
 | Migration rehearsal | Not demonstrated | Verify imported history and emit an explicit unresolved-state list without inventing outcomes. |
 | Retention and reference-safe garbage collection | Incomplete | Seven-day task event projection pruning and payload removal for delivered task outbox rows exist; stable event IDs/digests remain for operation replay and pending deliveries are protected. The full policy is not enforced end to end: 30-day task content/snapshots, 365-day summaries/settlements/operation audits, tenant overrides, and unresolved references/holds/compensation need implementation and recovery tests. |
