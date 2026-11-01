@@ -327,6 +327,16 @@ export class AgentTaskHarnessCell {
     if (request.method === "POST" && url.pathname === "/events/ack") {
       const body = await request.json() as { tenant_id?: string; event_ids?: string[] };
       const execution = this.requireTenantExecution(body.tenant_id ?? null);
+      if (Array.isArray(body.event_ids)) {
+        for (const eventId of body.event_ids) {
+          const event = this.ctx.storage.sql.exec<{ event_type: string }>(
+            "SELECT event_type FROM cell_outbox WHERE event_id = ?", eventId,
+          ).toArray()[0];
+          if (event?.event_type === "task.execution.start_requested") {
+            throw new TaskCoreError("NODE_START_RECEIPT_REQUIRED", "A projection acknowledgment cannot retire a NodeAgent start command.", 409);
+          }
+        }
+      }
       const acknowledged = await markCellOutboxBatchDelivered(this.ctx.storage, {
         eventIds: body.event_ids ?? [],
         tenantId: execution.tenant_id,

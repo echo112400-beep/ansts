@@ -674,8 +674,16 @@ test("scheduler tick replays dispatch stages and reserves shared node capacity o
   assert.equal(startCommandBody.commands[0].payload.authorization_token, firstBody.dispatches[0].authorization_token);
   assert.equal(startCommandBody.commands[0].payload.region, "us-west-1");
   assert.equal(startCommandBody.commands[0].payload.resource_pool, "cpu-small");
+  const eventProjection = await cloudflareCelldWorker.fetch(new Request(
+    "https://ansts.edge/v1beta1/tasks/dispatch-task-1/events?tenant_id=tenant-a"), env);
+  assert.equal(eventProjection.status, 200);
   const commandReplay = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks/dispatch-task-1/start-commands"), env);
   assert.deepEqual(((await commandReplay.json()) as any).commands[0], startCommandBody.commands[0]);
+  const projectionAckForStart = await taskCell.fetch(new Request("http://task.internal/events/ack", {
+    method: "POST", body: JSON.stringify({ tenant_id: candidate.tenant_id,
+      event_ids: [startCommandBody.commands[0].eventId] }),
+  }));
+  assert.equal(projectionAckForStart.status, 409, "only a NodeAgent start receipt can acknowledge a start command");
   const authorizationReplay = await tick();
   const authorizationReplayBody = await authorizationReplay.json() as any;
   assert.equal(authorizationReplayBody.dispatches[0].authorization_token, firstBody.dispatches[0].authorization_token);
