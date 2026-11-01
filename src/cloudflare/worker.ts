@@ -24,7 +24,7 @@ import { FederationRegionId, MultiRegionFederationRouter } from "./federation_ro
 import { AgentTaskHarnessCell } from "./harness_cell";
 import { DynamicQueueAutoSharder, PartitionedSchedulerRouter } from "./horizontal_scaler";
 import { AnstsSchedulerCell } from "./scheduler_cell";
-import { persistenceCellStub } from "../persistence/registry";
+import { persistenceCellIdentity, persistenceCellStub } from "../persistence/registry";
 import { TenantLedgerCell } from "../persistence/tenant";
 import { schedulerPoolCellKey } from "../persistence/scheduler-pool";
 import { NodeCapacityCell } from "./node_capacity_cell";
@@ -110,6 +110,8 @@ export default {
           headers: { "content-type": "application/json" },
         });
       }
+      try { persistenceCellIdentity("tenant-ledger", tenantId); }
+      catch (error) { return jsonResponse({ error: "INVALID_TENANT_ID", message: error instanceof Error ? error.message : String(error) }, 400); }
       try {
         const directoryKey = tenantDirectoryShardKey(tenantDirectoryShardIndex(tenantId));
         const directoryStub = persistenceCellStub(env, "tenant-directory", directoryKey);

@@ -28,6 +28,29 @@ import { stableTaskOperationId } from "../src/persistence/task-operations";
 import { providerQuotaCellKey } from "../src/persistence/provider-quota";
 import { TENANT_DIRECTORY_SHARD_COUNT, tenantDirectoryShardIndex } from "../src/cloudflare/tenant_directory_cell";
 
+test("admission rejects names beyond Celld's UTF-8 limit and preserves boundary-length task identity", async () => {
+  const sample = yaml.load(fs.readFileSync(path.join(__dirname, "../../specs/taskspec_v1beta1_example.yaml"), "utf8")) as any;
+  for (const field of ["tenant_id", "task_id"]) {
+    const { env } = createMockCloudflareCelldEnv();
+    const spec = JSON.parse(JSON.stringify(sample));
+    spec.metadata[field] = "界".repeat(400);
+    const result = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks", {
+      method: "POST", body: JSON.stringify(spec),
+    }), env);
+    assert.equal(result.status, 400, `${field} must reject before accepting an identity Celld cannot retain`);
+  }
+  const { env } = createMockCloudflareCelldEnv();
+  const boundary = JSON.parse(JSON.stringify(sample));
+  boundary.metadata.task_id = "界".repeat(341) + "x";
+  const accepted = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks", {
+    method: "POST", body: JSON.stringify(boundary),
+  }), env);
+  assert.equal(accepted.status, 202);
+  const task = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/tasks/${encodeURIComponent(boundary.metadata.task_id)}?tenant_id=${encodeURIComponent(boundary.metadata.tenant_id)}`), env);
+  assert.equal(task.status, 200);
+  assert.equal(((await task.json()) as any).task_id, boundary.metadata.task_id);
+});
+
 test("scheduled query repair survives an unavailable scheduler owner", async () => {
   const { env } = createMockCloudflareCelldEnv();
   const spec = yaml.load(fs.readFileSync(path.join(__dirname, "../../specs/taskspec_v1beta1_example.yaml"), "utf8")) as any;
