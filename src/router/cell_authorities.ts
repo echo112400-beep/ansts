@@ -133,13 +133,30 @@ export class TenantLedgerBudgetAuthorityClient implements TenantBudgetAuthority 
 
   public async settle(input: Parameters<TenantBudgetAuthority["settle"]>[0]): Promise<unknown> {
     const usage = parseUsageReference(input.usageReference);
-    return readBody(await this.stub.fetch(cellRequest(`/budget-holds/${encodeURIComponent(input.holdId)}/settlements`, "POST", {
+    const submit = async (settlementId: string) => readBody(await this.stub.fetch(cellRequest(`/budget-holds/${encodeURIComponent(input.holdId)}/settlements`, "POST", {
       tenant_id: this.tenantId,
-      settlement_id: input.settlementId,
+      settlement_id: settlementId,
       actual_minor: input.actualMinor,
       currency: input.currency,
       usage_reference: JSON.stringify(usage),
     })));
+    try { return await submit(input.settlementId); }
+    catch (error) {
+      if (!(error instanceof CellAuthorityError) || error.code !== "BUDGET_HOLD_ALREADY_SETTLED") throw error;
+      if (!input.periodKey) throw settlementReconciliationRequired();
+      const query = `/budget-holds?tenant_id=${encodeURIComponent(this.tenantId)}&period_key=${encodeURIComponent(input.periodKey)}&status=SETTLED`;
+      const ledger = await readBody(await this.stub.fetch(cellRequest(query)));
+      if (ledger.tenant_id !== this.tenantId || ledger.period_key !== input.periodKey || !Array.isArray(ledger.holds)) {
+        throw settlementReconciliationRequired();
+      }
+      const hold = ledger.holds.find((candidate: Record<string, unknown>) => candidate.hold_id === input.holdId);
+      if (!hold || hold.tenant_id !== this.tenantId || hold.period_key !== input.periodKey || hold.status !== "SETTLED"
+        || hold.currency !== input.currency || typeof hold.settlement_id !== "string" || !hold.settlement_id.trim()
+        || hold.settlement_id === input.settlementId) throw settlementReconciliationRequired();
+      // Reuse only the owner's recorded identity. The immutable operation replay
+      // checks actual amount, currency, hold and usage evidence before returning.
+      return submit(hold.settlement_id);
+    }
   }
 
   public async markUnknown(input: Parameters<TenantBudgetAuthority["markUnknown"]>[0]): Promise<unknown> {
@@ -148,6 +165,11 @@ export class TenantLedgerBudgetAuthorityClient implements TenantBudgetAuthority 
       reason: input.reason,
     })));
   }
+}
+
+function settlementReconciliationRequired(): CellAuthorityError {
+  return new CellAuthorityError("BUDGET_SETTLEMENT_RECONCILIATION_REQUIRED",
+    "The hold is settled but its original settlement identity cannot be verified; reconcile the recorded evidence before retrying.", 409);
 }
 
 export class CellAuthorityError extends Error {

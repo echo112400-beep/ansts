@@ -55,6 +55,7 @@ export interface TenantBudgetAuthority {
     actualMinor: number;
     currency: string;
     usageReference: string;
+    periodKey?: string;
   }): Promise<unknown>;
   markUnknown(input: { holdId: string; reason: string }): Promise<unknown>;
 }
@@ -177,6 +178,7 @@ export class MeteredProviderCallExecutor {
     const callId = normalizeText(request.callId, "callId");
     const tenantId = normalizeText(request.tenantId, "tenantId");
     const taskId = normalizeText(request.taskId, "taskId");
+    const providerIdempotencyKey = `provider-call:${(await digestJson({ tenantId, taskId, callId })).sha256}`;
     const requestDigest = (await digestJson({
       payload: request.payload,
       poolName: request.poolName,
@@ -184,7 +186,7 @@ export class MeteredProviderCallExecutor {
       requestedMaxOutputTokens: request.requestedMaxOutputTokens ?? null,
       routingVersion: request.routingVersion ?? null,
     })).sha256;
-    const requestId = `${tenantId}:${taskId}:${callId}`;
+    const requestId = `${encodeURIComponent(tenantId)}:${encodeURIComponent(taskId)}:${encodeURIComponent(callId)}`;
 
     const pin = await this.dependencies.routingConfig.pinCall(tenantId, requestId, request.poolName, request.routingVersion);
     const snapshot = await this.dependencies.routingConfig.getVersion(tenantId, pin.routingVersion);
@@ -199,6 +201,11 @@ export class MeteredProviderCallExecutor {
     const providerQuota = this.dependencies.providerQuotaForRoute?.(route) ?? this.dependencies.providerQuota;
     if (!providerQuota) throw new MeteredProviderCallError("PROVIDER_QUOTA_AUTHORITY_REQUIRED", "A quota authority for the selected provider domain must be injected.", 500);
     const existingGrant = await providerQuota.getGrantByRequestId(requestId);
+    const legacyRequestId = `${tenantId}:${taskId}:${callId}`;
+    if (!existingGrant && legacyRequestId !== requestId && await providerQuota.getGrantByRequestId(legacyRequestId)) {
+      throw new MeteredProviderCallError("PROVIDER_CALL_IDENTITY_RECONCILIATION_REQUIRED",
+        "A legacy provider quota identity exists. Reconcile its recorded outcome before assigning the canonical call identity.", 409);
+    }
     if (existingGrant && existingGrant.routeVersion !== snapshot.version) {
       throw new MeteredProviderCallError("PROVIDER_QUOTA_ROUTE_VERSION_CONFLICT", "The durable quota grant is pinned to another routing version.", 409);
     }
@@ -237,7 +244,8 @@ export class MeteredProviderCallExecutor {
       if (hasCode(error, "PROVIDER_QUOTA_EXCEEDED")) {
         await this.dependencies.budget.settle({
           holdId,
-          settlementId: `release:${callId}`,
+          settlementId: `release:${holdId}`,
+          periodKey: request.periodKey,
           actualMinor: 0,
           currency: quote.currency,
           usageReference: JSON.stringify({
@@ -279,6 +287,7 @@ export class MeteredProviderCallExecutor {
         usage,
         response: stagedResult.response,
         recovered: true,
+        periodKey: request.periodKey,
         providerQuota,
       });
     }
@@ -287,7 +296,8 @@ export class MeteredProviderCallExecutor {
     if (begin.state === "EXPIRED") {
       await this.dependencies.budget.settle({
         holdId,
-        settlementId: `release:${callId}`,
+        settlementId: `release:${holdId}`,
+        periodKey: request.periodKey,
         actualMinor: 0,
         currency: quote.currency,
         usageReference: JSON.stringify({
@@ -307,14 +317,14 @@ export class MeteredProviderCallExecutor {
       return unknownResult(callId, holdId, grant.grantId, snapshot.version, quote, reason);
     }
     if (begin.state === "COMPLETED") {
-      return this.settleUsage({ callId, holdId, grant, snapshot, quote, usage: begin.usage, recovered: true, providerQuota });
+      return this.settleUsage({ callId, holdId, grant, snapshot, quote, usage: begin.usage, recovered: true, providerQuota, periodKey: request.periodKey });
     }
 
     let providerResult: { response?: unknown; usage?: ProviderUsageEvidence };
     try {
       providerResult = await this.dependencies.provider.call({
         callId,
-        idempotencyKey: callId,
+        idempotencyKey: providerIdempotencyKey,
         tenantId,
         taskId,
         route,
@@ -362,7 +372,7 @@ export class MeteredProviderCallExecutor {
       }
     }
     await providerQuota.completeCall(grant.grantId, requestId, usage);
-    return this.settleUsage({ callId, holdId, grant, snapshot, quote, usage, response: providerResult.response, recovered: false, providerQuota });
+    return this.settleUsage({ callId, holdId, grant, snapshot, quote, usage, response: providerResult.response, recovered: false, providerQuota, periodKey: request.periodKey });
   }
 
   private async settleUsage(params: {
@@ -375,6 +385,7 @@ export class MeteredProviderCallExecutor {
     response?: unknown;
     recovered: boolean;
     providerQuota: ProviderQuotaAuthority;
+    periodKey: string;
   }): Promise<MeteredProviderCallResult> {
     const usage = validateUsageWithinBound(params.usage, params.quote);
     if (!usage) {
@@ -386,7 +397,8 @@ export class MeteredProviderCallExecutor {
     const actualMinor = computeMinorCost(usage.inputTokens, usage.outputTokens, params.quote.pricing);
     await this.dependencies.budget.settle({
       holdId: params.holdId,
-      settlementId: `settle:${params.callId}`,
+      settlementId: `settle:${params.holdId}`,
+      periodKey: params.periodKey,
       actualMinor,
       currency: params.quote.currency,
       usageReference: JSON.stringify({
