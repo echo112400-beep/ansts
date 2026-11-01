@@ -128,7 +128,63 @@ export class RpoZeroDurabilityEngine {
     }
     return { acknowledged: true, proofType: "bucket", objectKey };
   }
+
+  /**
+   * Q4 Production Enhancement: Selects up to `desiredReplicaCount` (default 2) healthy,
+   * non-draining Peer nodes via consistent hashing. If no healthy peers are reachable,
+   * seamlessly degrades the current transaction from `fleet` mode to `bucket` mode
+   * (direct S3 write + post-upload `ownership.json` verification) with zero downtime.
+   */
+  public selectHealthyPeersAndCommitRpoZero(params: {
+    cellScope: string;
+    nodeId: string;
+    fence: FenceToken;
+    ltxPayload: string;
+    clusterNodes: CelldNodeLoadBlock[];
+    desiredReplicaCount?: number;
+    writeCursorConsumed?: boolean;
+  }): {
+    acknowledged: boolean;
+    proofType: CelldDurabilityMode;
+    degradedToBucketMode: boolean;
+    selectedPeers: string[];
+    objectKey: string;
+  } {
+    const replicaTarget = params.desiredReplicaCount ?? 2;
+    const healthyCandidates = params.clusterNodes
+      .filter((n) => n.node_id !== params.nodeId && !n.draining && n.restoring === 0 && !n.pressured)
+      .sort((a, b) => a.node_id.localeCompare(b.node_id));
+
+    const selectedPeers: string[] = [];
+    if (healthyCandidates.length > 0) {
+      const ringSeed = crypto
+        .createHash("sha256")
+        .update(`${params.cellScope}:${params.fence.epoch}:${params.fence.turnSeq}`, "utf8")
+        .digest()[0];
+      const count = Math.min(replicaTarget, healthyCandidates.length);
+      for (let i = 0; i < count; i++) {
+        const peer = healthyCandidates[(ringSeed + i) % healthyCandidates.length];
+        selectedPeers.push(peer.node_id);
+      }
+    }
+
+    const res = this.commitAndProveRpoZero({
+      cellScope: params.cellScope,
+      nodeId: params.nodeId,
+      fence: params.fence,
+      ltxPayload: params.ltxPayload,
+      peerFollowerIds: selectedPeers,
+      writeCursorConsumed: params.writeCursorConsumed,
+    });
+
+    return {
+      ...res,
+      degradedToBucketMode: this.durabilityMode === "fleet" && res.proofType === "bucket",
+      selectedPeers,
+    };
+  }
 }
+
 
 // ==================== 2. DURABLE WORKFLOW ENTRYPOINT (step.do, step.sleep, step.waitForEvent) ====================
 

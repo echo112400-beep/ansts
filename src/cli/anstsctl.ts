@@ -1,3 +1,6 @@
+import { ProductionPreflightGate } from "../runtime/preflight_gate";
+import { CrossHostMtlsTunnelBridge } from "../runtime/mtls_tunnel_bridge";
+import { S3TopologyCasCoordinator } from "../cluster/topology_cas_coordinator";
 /**
  * TASK-30, TASK-51 & M12-M13 Unified Cluster Facade (`AnstsClusterRuntime`) and `anstsctl` CLI Tool.
  * Supports Non-K8s Bare-Metal / Systemd / Docker Compose manual scale-out (`anstsctl fleet scale-out | scale-in`).
@@ -151,6 +154,9 @@ export class AnstsClusterRuntime {
 
 export function runCli(argv: string[]): Record<string, any> {
   const cluster = new AnstsClusterRuntime();
+  if (argv[0] === "preflight") {
+    return ProductionPreflightGate.evaluate({ profile: (argv[1] as any) ?? "test", role: "all" });
+  }
   if (argv[0] === "top") {
     return cluster.clusterTopSnapshot();
   }

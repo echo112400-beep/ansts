@@ -53,3 +53,6 @@ export * from "./cloudflare/federation_router";
 export { default as cloudflareCelldWorker } from "./cloudflare/worker";
 export * from "./checkpoint/unified_state_store";
 export * from "./cloudflare/celld_native_optimizations";
+export * from "./runtime/mtls_tunnel_bridge";
+export * from "./cluster/topology_cas_coordinator";
+export * from "./runtime/preflight_gate";

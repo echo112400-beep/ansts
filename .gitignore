@@ -3,3 +3,6 @@ dist/
 coverage/
 *.log
 .DS_Store
+
+# Windows alternate data streams copied alongside files
+*Zone.Identifier*

@@ -353,3 +353,112 @@ export class BrainBodyContainerPoolScaler {
     };
   }
 }
+
+
+// ==================== Q3: 256 FIXED VIRTUAL HASH SLOTS & 3-PHASE ATOMIC MIGRATION ====================
+
+export type VirtualSlotMigrationPhase = "STEADY" | "DRAINING" | "SNAPSHOT_TRANSFERRED" | "CUTOVER";
+
+export interface VirtualHashSlotEntry {
+  slotIndex: number; // 0..255
+  ownerShardId: string;
+  pendingTargetShardId?: string;
+  phase: VirtualSlotMigrationPhase;
+  generation: number;
+}
+
+export interface SlotLedgerSnapshot {
+  slotIndex: number;
+  fromShardId: string;
+  toShardId: string;
+  generation: number;
+  tenantWdrfShares: Record<string, number>;
+  queuedTaskIds: string[];
+  dagEscrowVoucherIds: string[];
+}
+
+export class VirtualHashSlotRingManager {
+  public static readonly TOTAL_VIRTUAL_SLOTS = 256;
+  public readonly slots = new Map<number, VirtualHashSlotEntry>();
+  public readonly transferredSnapshots = new Map<number, SlotLedgerSnapshot>();
+  public generation: number = 1;
+
+  constructor(initialShardIds: string[]) {
+    const shardList = initialShardIds.length > 0 ? initialShardIds : ["scheduler-cell-shard-00"];
+    for (let slot = 0; slot < VirtualHashSlotRingManager.TOTAL_VIRTUAL_SLOTS; slot++) {
+      this.slots.set(slot, {
+        slotIndex: slot,
+        ownerShardId: shardList[slot % shardList.length],
+        phase: "STEADY",
+        generation: 1,
+      });
+    }
+  }
+
+  public computeSlotForTenant(tenantId: string): number {
+    let hash = 2166136261;
+    for (let i = 0; i < tenantId.length; i++) {
+      hash ^= tenantId.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0) % VirtualHashSlotRingManager.TOTAL_VIRTUAL_SLOTS;
+  }
+
+  public resolveOwnerShardForTenant(tenantId: string): {
+    slotIndex: number;
+    ownerShardId: string;
+    phase: VirtualSlotMigrationPhase;
+    generation: number;
+  } {
+    const slotIdx = this.computeSlotForTenant(tenantId);
+    const entry = this.slots.get(slotIdx)!;
+    return {
+      slotIndex: slotIdx,
+      ownerShardId: entry.ownerShardId,
+      phase: entry.phase,
+      generation: entry.generation,
+    };
+  }
+
+  /**
+   * Phase 1: Drain in-flight scheduling transactions on the source shard for `slotIndex`.
+   */
+  public beginSlotDrain(slotIndex: number, targetShardId: string): VirtualHashSlotEntry {
+    const entry = this.slots.get(slotIndex);
+    if (!entry) {
+      throw new Error(`Invalid virtual slot index: ${slotIndex}`);
+    }
+    entry.pendingTargetShardId = targetShardId;
+    entry.phase = "DRAINING";
+    return { ...entry };
+  }
+
+  /**
+   * Phase 2: Export W-DRF shares, queued tasks, and DAG vouchers from old shard & persist into new shard.
+   */
+  public transferSlotSnapshot(snapshot: SlotLedgerSnapshot): VirtualHashSlotEntry {
+    const entry = this.slots.get(snapshot.slotIndex);
+    if (!entry || entry.phase !== "DRAINING" || entry.pendingTargetShardId !== snapshot.toShardId) {
+      throw new Error(`Slot ${snapshot.slotIndex} must be in DRAINING state targeting ${snapshot.toShardId}`);
+    }
+    this.transferredSnapshots.set(snapshot.slotIndex, snapshot);
+    entry.phase = "SNAPSHOT_TRANSFERRED";
+    return { ...entry };
+  }
+
+  /**
+   * Phase 3: Atomic CAS cutover of the virtual slot pointer to the new shard.
+   */
+  public commitSlotCutover(slotIndex: number): VirtualHashSlotEntry {
+    const entry = this.slots.get(slotIndex);
+    if (!entry || entry.phase !== "SNAPSHOT_TRANSFERRED" || !entry.pendingTargetShardId) {
+      throw new Error(`Slot ${slotIndex} cannot cutover before SNAPSHOT_TRANSFERRED`);
+    }
+    this.generation += 1;
+    entry.ownerShardId = entry.pendingTargetShardId;
+    entry.pendingTargetShardId = undefined;
+    entry.phase = "STEADY";
+    entry.generation = this.generation;
+    return { ...entry };
+  }
+}
