@@ -459,6 +459,14 @@ export class TaskTurns {
       return !block || row.chunk_index !== block.index || row.object_key !== block.objectKey ||
         row.sha256 !== block.sha256 || Number(row.size_bytes) !== block.sizeBytes;
     })) throw new TaskTurnError("SNAPSHOT_UPLOAD_CHANGED", `Snapshot upload ${request.uploadId} no longer matches its manifest.`);
+    // A staged SQL row alone does not prove the external response blocks remain
+    // recoverable. Verify every referenced model response before acknowledging a Turn.
+    for (const callId of modelCallRefs) {
+      const call = await this.getModelCallResult(request.taskId, callId);
+      if (call.tenantId !== request.tenantId || call.turnSeq !== request.fence.turnSeq) {
+        throw new TaskTurnError("MODEL_CALL_RESULT_NOT_STAGED", `Model call result ${callId} is not staged for Turn ${request.fence.turnSeq}.`);
+      }
+    }
     const manifestDigested = await digestJson(manifest);
     const manifestDigest = manifestDigested.sha256;
     const manifestId = stableManifestId(request.taskId, request.fence.turnSeq);
@@ -571,6 +579,7 @@ export class TaskTurns {
     const existingRow = this.storage.sql.exec<ModelCallRow>("SELECT * FROM task_model_call_results WHERE task_id = ? AND call_id = ?", request.taskId, request.callId).toArray()[0];
     if (existingRow) {
       assertSameModelCall(existingRow, request, response.sha256, usage.canonicalJson, routeRefs.canonicalJson);
+      await confirmCellWrite(this.storage);
       return this.getModelCallResult(request.taskId, request.callId);
     }
     const existingTask = requireTask(this.storage.sql, request.taskId, request.tenantId);
@@ -633,6 +642,13 @@ export class TaskTurns {
       response, responseSha256: row.response_sha256, usage: JSON.parse(row.usage_json),
       routeRefs: JSON.parse(row.route_refs_json), createdAt: Number(row.created_at),
     };
+  }
+
+  /** Confirm the staged result before an external quota/settlement effect relies on it. */
+  public async getConfirmedModelCallResult(taskId: string, callId: string): Promise<ModelCallResultRecord> {
+    const result = await this.getModelCallResult(taskId, callId);
+    await confirmCellWrite(this.storage);
+    return result;
   }
 
   /** Read the latest committed Turn. A damaged latest snapshot blocks recovery visibly; it never falls back silently. */
@@ -740,6 +756,14 @@ export class TaskTurns {
         continue;
       }
       try {
+        // An earlier attempt may have committed the tombstone locally but lost its
+        // bucket acknowledgment. Reconfirm revocation before every physical retry.
+        await confirmCellWrite(this.storage);
+        const current = this.storage.sql.exec<ReferenceRow>("SELECT * FROM task_snapshot_refs WHERE ref_id = ?", ref.ref_id).toArray()[0];
+        if (!current || current.status !== "TOMBSTONED" || !this.garbageSafety(ref.task_id, now, retention).safe) {
+          retained += 1;
+          continue;
+        }
         await this.blockStore.delete(ref.object_key);
         withCellTransaction(this.storage, () => {
           this.storage.sql.exec("UPDATE task_snapshot_refs SET status = ?, tombstoned_at = ?, delete_after = ? WHERE ref_id = ? AND status = ?",
@@ -773,6 +797,8 @@ export class TaskTurns {
       const chunks = this.storage.sql.exec<UploadChunkRow>("SELECT * FROM task_turn_upload_chunks WHERE upload_id = ?", upload.upload_id).toArray();
       for (const chunk of chunks) {
         try {
+          await confirmCellWrite(this.storage);
+          if (this.readUpload(upload.upload_id)?.status !== "ABORTED") { retained += 1; continue; }
           await this.blockStore.delete(chunk.object_key);
           withCellTransaction(this.storage, () => {
             this.storage.sql.exec("DELETE FROM task_turn_upload_chunks WHERE upload_id = ? AND chunk_index = ?", chunk.upload_id, chunk.chunk_index);
