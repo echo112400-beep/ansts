@@ -501,6 +501,10 @@ export class TaskOperations {
       "task.compensation.begin", { operationId: input.operationId, attemptId: input.attemptId });
     const committed = await executeCellOperation(this.storage, command, (sql) => {
       const task = assertAuthorizedTask(sql, row.task_id, tenantId, input.fence, true);
+      const forward = readOperation(sql, input.operationId);
+      if (!forward || forward.status !== "SUCCEEDED") {
+        throw new TaskOperationError("TASK_COMPENSATION_FORWARD_UNRESOLVED", "Compensation requires a confirmed successful forward effect.");
+      }
       const current = sql.exec<CompensationRow>("SELECT * FROM task_compensations WHERE operation_id = ?", input.operationId).toArray()[0];
       if (!current || !["PENDING", "COMPENSATION_FAILED"].includes(current.status)) {
         throw new TaskOperationError("TASK_COMPENSATION_NOT_READY", `Compensation is ${current?.status ?? "missing"}.`);
@@ -527,7 +531,8 @@ export class TaskOperations {
       "SELECT * FROM task_compensation_attempts WHERE attempt_id = ?", input.attemptId,
     ).toArray()[0];
     if (!attempt || attempt.operation_id !== input.operationId) throw new TaskOperationError("TASK_COMPENSATION_ATTEMPT_NOT_FOUND", `Attempt ${input.attemptId} was not found.`, 404);
-    if (attempt.status !== "RUNNING") {
+    const resolvesUnknown = attempt.status === "OUTCOME_UNKNOWN" && input.outcome !== "OUTCOME_UNKNOWN";
+    if (attempt.status !== "RUNNING" && !resolvesUnknown) {
       if (attempt.status !== input.outcome || attempt.error_text !== (input.error ?? null)) {
         throw new TaskOperationError("TASK_COMPENSATION_RESULT_CONFLICT", `Attempt ${input.attemptId} already has another outcome.`);
       }
@@ -535,10 +540,14 @@ export class TaskOperations {
       return row.status;
     }
     const tenantId = this.readTaskTenant(row.task_id);
-    const command = this.command(row.task_id, tenantId, `task-compensation:${input.operationId}:attempt:${input.attemptId}:outcome`,
+    const command = this.command(row.task_id, tenantId, `task-compensation:${input.operationId}:attempt:${input.attemptId}:outcome:${input.outcome}`,
       "task.compensation.record_outcome", { operationId: input.operationId, attemptId: input.attemptId, outcome: input.outcome, error: input.error ?? null });
     await executeCellOperation(this.storage, command, (sql) => {
       assertAuthorizedTask(sql, row.task_id, tenantId, input.fence, false);
+      const fresh = sql.exec<{ status: string }>("SELECT status FROM task_compensation_attempts WHERE attempt_id = ?", input.attemptId).toArray()[0];
+      if (!fresh || (fresh.status !== "RUNNING" && !(fresh.status === "OUTCOME_UNKNOWN" && input.outcome !== "OUTCOME_UNKNOWN"))) {
+        throw new TaskOperationError("TASK_COMPENSATION_ATTEMPT_STATE", "Compensation attempt is no longer awaiting this outcome.");
+      }
       const now = Date.now();
       sql.exec("UPDATE task_compensation_attempts SET status = ?, error_text = ?, completed_at = ? WHERE attempt_id = ?",
         input.outcome, input.error ?? null, now, input.attemptId);
@@ -547,6 +556,17 @@ export class TaskOperations {
       return input.operationId;
     });
     return input.outcome;
+  }
+
+  /** A retry cannot prove that a previously started external compensation stopped. */
+  public async markInterruptedCompensation(input: { operationId: string; fence: FenceToken }): Promise<TaskCompensationStatus> {
+    const attempt = this.storage.sql.exec<{ attempt_id: string }>(
+      "SELECT attempt_id FROM task_compensation_attempts WHERE operation_id = ? AND status = ? ORDER BY started_at DESC LIMIT 1",
+      input.operationId, "RUNNING",
+    ).toArray()[0];
+    if (!attempt) return this.getOperation(input.operationId)?.compensation?.status ?? "OUTCOME_UNKNOWN";
+    return this.recordCompensationOutcome({ ...input, attemptId: attempt.attempt_id,
+      outcome: "OUTCOME_UNKNOWN", error: "Previous compensation is still in flight or its outcome was lost; do not repeat without evidence." });
   }
 
   private insertCompensation(sql: PersistenceSqlStorage, taskId: string, request: TaskOperationRequest, argsJson: string): void {
