@@ -44,6 +44,8 @@ import { CloudflareTaskOperationProvider } from "./task_operation_provider";
 import { R2SnapshotBlockStore } from "./r2_snapshot_block_store";
 import { createTaskMeteredProviderCallExecutor } from "./metered_call";
 import { normalizeChatMessages } from "./metered_provider";
+import { SerializedPayloadTokenUpperBoundEstimator } from "./metered_provider";
+import { DelegatedTaskQuota } from "../persistence/task-core/delegated_quota";
 import { CellAuthorityError } from "../router/cell_authorities";
 import { MeteredProviderCallError, ProviderCallResultJournal } from "../router/provider_call";
 import { digestJson } from "../persistence/digest";
@@ -63,6 +65,7 @@ export class AgentTaskHarnessCell {
   public task: AgentTask;
   public clientCreditWindow: number = 100;
   public readonly taskCore: TaskCore;
+  private readonly delegatedQuota: DelegatedTaskQuota;
   public readonly taskOperations: TaskOperations;
   public readonly taskTurns: TaskTurns;
 
@@ -78,6 +81,7 @@ export class AgentTaskHarnessCell {
       taskTurnsMigration,
     ]);
     this.taskCore = new TaskCore(this.ctx.storage);
+    this.delegatedQuota = new DelegatedTaskQuota(this.ctx.storage, taskId);
     this.taskOperations = new TaskOperations(this.ctx.storage);
     this.taskTurns = new TaskTurns(this.ctx.storage, new R2SnapshotBlockStore(env.ANSTS_CHECKPOINTS_R2), this.taskOperations);
     this.sagaGw = new SagaToolGateway(this.leaseCoord, this.taskOperations);
@@ -185,6 +189,11 @@ export class AgentTaskHarnessCell {
     if (request.method === "POST" && url.pathname === "/execution/prepare") {
       const body = await request.json() as TaskDispatchRequest;
       const dispatch = await this.taskCore.prepareDispatch(body);
+      if (body.kind === "dag") {
+        if (!body.dag_id || !body.voucher_id) throw new TaskCoreError("DAG_QUOTA_ASSIGNMENT_REQUIRED", "DAG dispatch requires its durable voucher identity.");
+        await this.delegatedQuota.assign(body.dag_id, body.voucher_id);
+        await this.delegatedQuota.refresh(Number(body.delegated_tokens), Number(body.delegated_tps), 0);
+      }
       this.applyTaskExecution(this.taskCore.get(this.task.taskId)!);
       return json({ dispatch });
     }
@@ -236,7 +245,8 @@ export class AgentTaskHarnessCell {
 
     if (request.method === "GET" && url.pathname === "/execution/state") {
       const execution = this.taskCore.get(this.task.taskId);
-      return execution ? json(execution) : json({ error: "TASK_NOT_INITIALIZED" }, 404);
+      if (execution?.lifecycle_state === "RUNNING" && this.delegatedQuota.assignment()) await this.refreshDelegatedQuota(execution);
+      return execution ? json({ ...execution, ...this.delegatedQuota.state() }) : json({ error: "TASK_NOT_INITIALIZED" }, 404);
     }
 
     if (request.method === "POST" && url.pathname === "/race/winner") {
@@ -788,7 +798,24 @@ export class AgentTaskHarnessCell {
     await this.taskTurns.assertSnapshotReady({ uploadId, taskId: execution.task_id, tenantId: execution.tenant_id, fence });
 
     const callId = `turn:${fence.turnSeq}:model:0`;
-    const executor = createTaskMeteredProviderCallExecutor(this.env, execution.tenant_id, this.modelCallResultJournal(fence.turnSeq));
+    const executor = createTaskMeteredProviderCallExecutor(this.env, execution.tenant_id, this.modelCallResultJournal(fence.turnSeq), {
+      preflight: async ({ route }) => {
+        const quota = await this.refreshDelegatedQuota(execution);
+        if (quota && route.quotaDemandTokensPerSecond > Number(quota.effective_delegated_tps)) {
+          throw new TaskCoreError("DAG_TPS_QUOTA_EXCEEDED", "Provider rate demand exceeds the delegated physical TPS grant.");
+        }
+      },
+      beforeCall: async (input) => {
+        const quota = await this.refreshDelegatedQuota(execution);
+        if (!quota) return;
+        if (input.route.quotaDemandTokensPerSecond > Number(quota.effective_delegated_tps)) throw new TaskCoreError("DAG_TPS_QUOTA_EXCEEDED", "Provider rate demand exceeds the delegated physical TPS grant.");
+        const estimate = await new SerializedPayloadTokenUpperBoundEstimator().estimateUpperBound(input.payload, input.route);
+        await this.delegatedQuota.reserve(input.callId, estimate.upperBoundTokens + input.maxOutputTokens, fence.epoch);
+      },
+      afterCall: async (input, result) => {
+        if (this.delegatedQuota.assignment() && result.usage) await this.delegatedQuota.settle(input.callId, result.usage.inputTokens + result.usage.outputTokens);
+      },
+    });
     const routed = await this.cogRouter.routeMeteredTurn(this.task, fence, {
       callId,
       periodKey: currentBillingPeriodKey(),
@@ -877,6 +904,10 @@ export class AgentTaskHarnessCell {
         try {
           const record = await this.taskTurns.getConfirmedModelCallResult(taskId, callId);
           if (record.tenantId !== tenantId) throw new TaskTurnError("MODEL_CALL_TENANT_MISMATCH", "Model call result belongs to another tenant.", 404);
+          if (this.delegatedQuota.assignment()) {
+            const usage = record.usage as { inputTokens: number; outputTokens: number };
+            await this.delegatedQuota.settle(callId, usage.inputTokens + usage.outputTokens);
+          }
           return {
             response: record.response,
             usage: record.usage as import("../persistence/provider-quota").ProviderUsageEvidence,
@@ -889,6 +920,30 @@ export class AgentTaskHarnessCell {
       },
       recordModelCallResult: async (input) => this.taskTurns.recordModelCallResult({ ...input, turnSeq }),
     };
+  }
+
+  private async refreshDelegatedQuota(execution: ReturnType<TaskCore["get"]> & {}): Promise<Record<string, unknown> | null> {
+    const assignment = this.delegatedQuota.assignment();
+    if (!assignment) {
+      const dispatch = execution.current_dispatch_id ? this.taskCore.getDispatch(execution.current_dispatch_id) : null;
+      if (dispatch?.kind === "dag") throw new TaskCoreError("DAG_QUOTA_RECONCILIATION_REQUIRED", "Legacy DAG execution lacks a confirmed quota assignment.");
+      return null;
+    }
+    if (!this.env.DAG_CELL || !execution.current_node_id || !execution.current_dispatch_id) throw new TaskCoreError("DAG_QUOTA_AUTHORITY_UNAVAILABLE", "DAG execution requires allocation and physical capacity authorities.");
+    const dag = this.env.DAG_CELL.get(this.env.DAG_CELL.idFromName(assignment.dag_id));
+    const response = await dag.fetch("http://dag.internal/dags/dispatch-authority", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tenant_id: execution.tenant_id, task_id: execution.task_id, voucher_id: assignment.voucher_id }) });
+    if (!response.ok) throw new TaskCoreError("DAG_QUOTA_AUTHORITY_DENIED", "DagCell did not confirm the delegated quota.");
+    const authority = await response.json() as any;
+    if (!authority.authorized || authority.task_id !== execution.task_id || authority.voucher_id !== assignment.voucher_id) throw new TaskCoreError("DAG_QUOTA_AUTHORITY_DENIED", "Delegated quota identity mismatch.");
+    const physical = await this.callNodeCapacity(execution.current_node_id, `/reservations/${encodeURIComponent(execution.current_dispatch_id)}`, "GET");
+    const current = this.taskCore.get(execution.task_id);
+    if (!physical.ok || !current || current.business_epoch !== execution.business_epoch || current.current_dispatch_id !== execution.current_dispatch_id ||
+        physical.body.node_incarnation !== execution.node_incarnation || physical.body.task_id !== execution.task_id ||
+        !["RUNNING", "STARTING"].includes(physical.body.status)) throw new TaskCoreError("DAG_PHYSICAL_QUOTA_UNAVAILABLE", "Delegated execution has no matching live physical grant.");
+    const resources = typeof physical.body.resources_json === "string" ? JSON.parse(physical.body.resources_json) : physical.body.resources;
+    await this.delegatedQuota.refresh(Number(authority.delegated_tokens), Number(authority.delegated_tps), Number(resources.tps));
+    return this.delegatedQuota.state();
   }
 
   public async webSocketMessage(ws: WebSocketLike, message: string): Promise<void> {

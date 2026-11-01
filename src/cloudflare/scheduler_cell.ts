@@ -215,6 +215,7 @@ export class AnstsSchedulerCell {
     const dispatchId = candidate.dispatch_id ?? `${candidate.kind ?? "ordinary"}:${candidate.task_id}:${candidate.expected_task_version ?? 0}`;
     const normalized: SchedulerCandidate = { ...candidate, dispatch_id: dispatchId };
     if (!candidate.node_incarnation) return { task_id: candidate.task_id, dispatch_id: dispatchId, status: "NODE_NOT_READY" };
+    let delegatedQuota: { delegated_tokens: number; delegated_tps: number } | undefined;
 
     if (candidate.kind === "dag") {
       if (!candidate.dag_id || !candidate.voucher_id || !this.env.DAG_CELL) {
@@ -229,6 +230,12 @@ export class AnstsSchedulerCell {
       if (!authority.response.ok || authority.body?.authorized !== true) {
         return { task_id: candidate.task_id, dispatch_id: dispatchId, status: "BLOCKED_DAG_VOUCHER", error: authority.body?.error };
       }
+      const tokens = Number(authority.body.delegated_tokens);
+      const tps = Number(authority.body.delegated_tps);
+      if (!Number.isSafeInteger(tokens) || tokens < 0 || !Number.isSafeInteger(tps) || tps < 0 || candidate.resources.tps < tps) {
+        return { task_id: candidate.task_id, dispatch_id: dispatchId, status: "BLOCKED_DAG_QUOTA" };
+      }
+      delegatedQuota = { delegated_tokens: tokens, delegated_tps: tps };
     }
 
     try {
@@ -245,6 +252,7 @@ export class AnstsSchedulerCell {
         resource_pool: candidate.resource_pool ?? "default",
         task_spec: candidate.task_spec,
         execution_policy: candidate.execution_policy,
+        ...(delegatedQuota ? { dag_id: candidate.dag_id, voucher_id: candidate.voucher_id, ...delegatedQuota } : {}),
       };
 
       await requireOwner(taskStub, "/execution/prepare", "POST", taskBase);
