@@ -68,5 +68,10 @@
     "PRIMARY_MODEL_POOL": "DeepSeek",
     "FAST_UTILITY_POOL": "GLM-5.3",
     "FALLBACK_MODEL_POOL": "Qwen-3.8"
-  }
+  },
+  "worker_loaders": [
+    {
+      "binding": "ANSTS_DYNAMIC_WORKER_LOADER"
+    }
+  ]
 }

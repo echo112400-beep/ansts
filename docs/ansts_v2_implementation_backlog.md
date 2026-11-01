@@ -3,7 +3,7 @@
 | 文档属性 (Document Metadata) | 详细内容 (Details) |
 | :--- | :--- |
 | **项目名称 (Project)** | **Agent-Native Sandbox Task Scheduler (ANSTS v2.2 — `celld` HA, Scale-Out & Cloud-Native Production Edition)** |
-| **当前代码仓基线 (Baseline)** | **ALL M1 ~ M14 (`TASK-01` ~ `TASK-68`) 100% COMPLETED**（**63 个 TypeScript 模块**通过 AST 与编译校验，**49/49** 项单元、集成、混沌、高可用、横向扩容与生产治理测试 100% 通过） |
+| **当前代码仓基线 (Baseline)** | **ALL M1 ~ M15 (`TASK-01` ~ `TASK-74`) 100% COMPLETED**（**65 个 TypeScript 模块**通过 AST 与编译校验，**53/53** 项单元、集成、混沌、高可用、横向扩容与生产治理测试 100% 通过） |
 | **持久化与高可用基座 (HA Core)** | 基于 [`denoland/celld`](https://github.com/denoland/celld/blob/main/docs/README.md) + `RustFS` 16 盘纠删码 (`EC:4`) 构建，严格满足 `RPO = 0` 双模式输出门控、可恢复工作流与分片水平扩展 |
 | **核心模型池 (Model Pools)** | `DeepSeek`（旗舰深度推理池）、`GLM-5.3`（多步工具编排与轻量高速分流池）、`Qwen-3.8`（高频语法修复与高可用热备容灾池） |
 
@@ -76,4 +76,17 @@
 | **`TASK-65`** | **无 K8s 裸金属/Systemd 手动扩容控制器与运维脚本体系** | `src/cluster/manual_scale_controller.ts`<br>`deploy/manual-fleet/scale-fleet.sh`<br>`deploy/manual-fleet/fleet-topology.yaml`<br>`deploy/manual-fleet/systemd/ansts-node-daemon.service` | `test 41` (`PASS`) | 移除 Kubernetes 依赖，支持通过 `scale-fleet.sh`、`anstsctl fleet scale-out \| scale-in` 与 `POST /v1beta1/fleet/scale` 手动在线扩缩 `celld` 脑节点、沙箱宿主机与调度分片，前置强制校验 `restoring === 0` 并自动触发 32-Cell 重平衡 |
 | **`TASK-66`** | **分片调度器 (`AnstsSchedulerCell`) 全状态 SQLite 持久化与冷启动重水化** | `src/cloudflare/scheduler_cell.ts` | `test 21` (`PASS`) | 新增 `cell_tasks` 与 `cell_profiler_snapshots` 表及构造函数 `rehydrateSchedulerFromSql()`，跨冷启动/休眠唤醒 100% 恢复排队中任务、运行租约、DAG 支票与贝叶斯先验分布 |
 | **`TASK-67`** | **全组件统一状态持久化引擎 (`UnifiedComponentPersistenceStore`)** | `src/checkpoint/unified_state_store.ts`<br>`src/cloudflare/harness_cell.ts` | `test 22, 23` (`PASS`) | 将 `DurableWorkflowContext`、`ShardedQueueBrokerPool`、`TransactionalOutboxDispatcher`、`FinOpsBudgetController`、`McpDynamicToolRegistry` 与 `PartitionedSchedulerRouter` / `ManualFleetScaleController` 全部接入 SQLite `ansts_kv_snapshots` 持久化与重水化 |
-| **`TASK-68`** | **生产整体部署架构设计规范（无 K8s 手动扩容版）与全组件持久化验证套件** | `docs/ansts_production_deployment_architecture_design.md`<br>`tests/full_component_persistence.test.ts` | `test 20..23` (`PASS`) | 完成四层五平面无 K8s 生产部署规范、三档硬件 BOM 清单及 11 大有状态组件跨重启恢复测试，全仓 **63 个 TypeScript 模块编译通过、49/49 项测试 100% 通过** |
+| **`TASK-68`** | **生产整体部署架构设计规范（无 K8s 手动扩容版）与全组件持久化验证套件** | `docs/ansts_production_deployment_architecture_design.md`<br>`tests/full_component_persistence.test.ts` | `test 20..23` (`PASS`) | 完成四层五平面无 K8s 生产部署规范、三档硬件 BOM 清单及 11 大有状态组件跨重启恢复测试，全仓 **65 个 TypeScript 模块编译通过、53/53 项测试 100% 通过** |
+
+---
+
+### 2.6 阶段十五（M15）：基于 `celld` 原生服务组件（Facets / Dynamic Workers / KV / Heap & SQL Guard）的深度优化 (`TASK-69` ~ `TASK-74` — ✅ 已完成)
+
+| 任务 ID | 任务名称 | 交付代码路径 | 验收测试编号 | 核心实现与验证结果 |
+| :--- | :--- | :--- | :--- | :--- |
+| **`TASK-69`** | **基于 `Durable Object Facets` (`ctx.facets`) 的子智能体与高危工具隔离器** | `src/cloudflare/celld_native_optimizations.ts`<br>`src/cloudflare/harness_cell.ts` | `test 45, 48` (`PASS`) | 实现 `DurableObjectFacetSupervisor`（`getFacet`/`abortFacet`/`deleteFacet`），支持最多 4 层嵌套、独立 SQLite 库、零额外租约开销、根对象 Alarm 委托（拦截 Facet 内 `setAlarm` 异常）及 `1001` WebSocket 关闭防休眠阻塞 |
+| **`TASK-70`** | **基于 `Dynamic Workers` (`worker_loaders`) 的轻量级动态代码/WASM 沙箱加载器** | `src/cloudflare/celld_native_optimizations.ts`<br>`wrangler.json` | `test 46` (`PASS`) | 在 `wrangler.json` 配置 `ANSTS_DYNAMIC_WORKER_LOADER`，实现 `DynamicWorkerSandboxLoader`：强制校验 `compatibilityDate`、执行 `limits: { cpuMs, subrequests }` 硬熔断、透传 `AbortSignal`、自定义出网 `fetch` 防火墙、提取 `getDurableObjectClass()` 供 Facet 运行并输出 Tail Worker 报告 |
+| **`TASK-71`** | **`celld` KV 单写者 Cell 瓶颈消除器与流式/TTL 边界守卫** | `src/cloudflare/celld_native_optimizations.ts` | `test 47` (`PASS`) | 针对 `celld` KV 单 Namespace 单写者 Cell 且无边缘缓存（`cacheStatus: null`）的特性，实现多 Namespace 哈希写分片、请求级本地 L1 缓存，并严格前置校验 `expirationTtl >= 60s`、`<= 100` 批量读与 `> 1 MiB` Fleet Bucket 规则 |
+| **`TASK-72`** | **V8 Isolate `128 MB` 堆水位守卫与单条 SQL 语句时间预算看门狗** | `src/cloudflare/celld_native_optimizations.ts` | `test 47` (`PASS`) | 实现 `V8HeapAndSqlBudgetGuard`：在堆内存 $\ge 75\%$ 时触发主动 GC、$\ge 90\%$ 时拦截新 WebSocket 与全量 `.toArray()` 物化；实施 `CELLD_SQL_STATEMENT_BUDGET_MS` 语句级看门狗，防止慢 SQL 触发 30 秒事务重置或阻塞同节点新 Cell 激活 |
+| **`TASK-73`** | **`AgentTaskHarnessCell` `/facet` 端点与 Edge Worker 全链路集成** | `src/cloudflare/worker.ts`<br>`src/cloudflare/harness_cell.ts` | `test 48` (`PASS`) | 打通 `POST /v1beta1/tasks/:taskId/facet` 接口，支持在线派生 DAG 子任务 Facet、执行独立 SQLite 查询、委托根 Cell 定时器及一键 `abort` / `delete` |
+| **`TASK-74`** | **M15 架构规范更新与全仓 65 模块 / 53 项 CI 测试验证** | `docs/celld_persistent_recoverable_ha_scheduler_design.md`<br>`tests/m15_celld_facets_dynamic_workers.test.ts` | `test 1..53` (`PASS`) | 全仓 **65 个 TypeScript 模块**编译通过，**53/53 项**单元、集成、混沌、高可用、横向扩容、全组件持久化与 `celld` 原生优化测试 100% 通过 |

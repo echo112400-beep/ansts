@@ -27,6 +27,11 @@ import {
   DurableWorkflowContext,
   RpoZeroDurabilityEngine,
 } from "./celld_ha_engine";
+import {
+  DurableObjectFacetSupervisor,
+  DynamicWorkerSandboxLoader,
+  V8HeapAndSqlBudgetGuard,
+} from "./celld_native_optimizations";
 import { CloudflareCelldEnv, DurableObjectState, WebSocketLike } from "./env";
 
 export class AgentTaskHarnessCell {
@@ -38,6 +43,9 @@ export class AgentTaskHarnessCell {
   public readonly durabilityEngine = new RpoZeroDurabilityEngine("bucket", 10000);
   public readonly workflowCtx: DurableWorkflowContext;
   public readonly stateStore: UnifiedComponentPersistenceStore;
+  public readonly facetSupervisor: DurableObjectFacetSupervisor;
+  public readonly dynamicWorkerLoader = new DynamicWorkerSandboxLoader();
+  public readonly heapSqlGuard = new V8HeapAndSqlBudgetGuard();
   public currentOwnerNodeId: string = "celld-node-01";
   public task: AgentTask;
   public clientCreditWindow: number = 100;
@@ -61,6 +69,7 @@ export class AgentTaskHarnessCell {
     });
     this.workflowCtx = new DurableWorkflowContext(`wf-${taskId}`, 3600_000);
     this.stateStore = new UnifiedComponentPersistenceStore(this.ctx.storage.sql);
+    this.facetSupervisor = new DurableObjectFacetSupervisor(taskId, 1, 1);
 
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS turn_wal_frames (turn_seq INTEGER, epoch INTEGER, routed_model TEXT, effective_effort TEXT, tokens_used INTEGER, workspace_hash TEXT, pass_rate REAL, error_count INTEGER, diff_entropy REAL)",
@@ -309,6 +318,54 @@ export class AgentTaskHarnessCell {
             sleepInfo: { hibernatedIsolate: this.workflowCtx.isolateHibernated },
           },
           cached_step_count: this.workflowCtx.completedSteps.size,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    // TASK-69 & TASK-70: Spawn / Invoke a child Durable Object Facet or Dynamic Worker inside AgentTaskHarnessCell
+    if (request.method === "POST" && url.pathname.endsWith("/facet")) {
+      const body = (await request.json()) as {
+        facet_name: string;
+        action?: "exec" | "abort" | "delete";
+        props?: Record<string, any>;
+        sql_query?: string;
+        delegate_alarm_ms?: number;
+        reason?: string;
+      };
+      if (body.action === "abort") {
+        return new Response(
+          JSON.stringify(this.facetSupervisor.abortFacet(body.facet_name, body.reason ?? "OperatorAbort")),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (body.action === "delete") {
+        return new Response(
+          JSON.stringify(this.facetSupervisor.deleteFacet(body.facet_name)),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      const handle = this.facetSupervisor.getFacet(body.facet_name, () => ({
+        className: "SubAgentFacet",
+        id: `${this.task.taskId}:${body.facet_name}`,
+        props: body.props ?? {},
+      }));
+      handle.execSql("CREATE TABLE IF NOT EXISTS facet_kv (k TEXT, v TEXT)");
+      if (body.sql_query) {
+        handle.execSql(body.sql_query);
+      }
+      if (body.delegate_alarm_ms) {
+        handle.delegateAlarmToRoot(body.delegate_alarm_ms);
+      }
+      const rows = handle.execSql("SELECT * FROM facet_kv");
+      return new Response(
+        JSON.stringify({
+          root_task_id: this.task.taskId,
+          facet_name: handle.facet.name,
+          facet_depth: handle.facet.depth,
+          facet_props: handle.facet.props,
+          facet_rows_count: rows.length,
+          root_alarms_count: this.facetSupervisor.rootAlarmScheduleMs.size,
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );

@@ -288,7 +288,7 @@ export default {
     }
 
     // Route 3: Per-Task AgentTaskHarnessCell Operations (/v1beta1/tasks/:taskId/turn | /workflow | /replay | /failover)
-    const taskMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)\/(turn|workflow|replay|failover)$/);
+    const taskMatch = url.pathname.match(/^\/v1beta1\/tasks\/([^/]+)\/(turn|workflow|facet|replay|failover)$/);
     if (taskMatch) {
       const [, taskId, action] = taskMatch;
       const cellId = env.AGENT_HARNESS_CELL.idFromName(taskId);

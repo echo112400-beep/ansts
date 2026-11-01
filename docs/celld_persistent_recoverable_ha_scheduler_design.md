@@ -423,3 +423,41 @@ CREATE TABLE IF NOT EXISTS ansts_kv_snapshots (
 | **9** | **边缘幂等去重缓存 (`ANSTS_KV`)** | `src/cloudflare/worker.ts` | KV `idem:<tenant_id>:<idempotency_key>` | 边缘 Worker 无状态重启后直接读取分布式 KV 拦截 24h 内重复请求 | `test 2` (**PASS**) |
 | **10** | **沙箱工作区文件树 (`CompanionContainerAndOverlayDriver`)** | `src/runtime/container_driver.ts` | 宿主机磁盘 OverlayFS `upperdir` + CoW 快照包 | `captureUpperDirSnapshot()` / `restoreUpperDirSnapshot()`（SHA-256 Merkle Root 校验与文件树精确回滚） | `test 38` (**PASS**) |
 | **11** | **底层对象存储与租约基座 (`RustFsS3LtxDriver`)** | `src/checkpoint/s3_ltx_driver.ts` | `RustFS` 16 盘 `EC:4` (`ownership.json`, `*.ltx`, `retired.json`) | AWS SigV4 `If-Match` CAS + 上传后二次复核 `ownership.json` + HTTP `206 Range` 热页优先分页恢复 | `test 34` (**PASS**) |
+
+---
+
+## 12. 基于 `celld` 原生高级组件（Facets / Dynamic Workers / KV / V8 Heap Guard）的深度优化架构 (`M15: TASK-69 ~ TASK-74`)
+
+通过深入剖析 [`docs/services/durable-object-facets.md`](https://github.com/denoland/celld/blob/main/docs/services/durable-object-facets.md)、[`docs/services/durable-objects.md`](https://github.com/denoland/celld/blob/main/docs/services/durable-objects.md)、[`docs/services/kv.md`](https://github.com/denoland/celld/blob/main/docs/services/kv.md)、[`docs/services/queues.md`](https://github.com/denoland/celld/blob/main/docs/services/queues.md) 以及 [`denoland/celld` Dynamic Workers (`worker_loaders`) 规范](https://github.com/denoland/celld/releases)，我们识别出传统实现中的 **4 处性能与隔离瓶颈**，并在 `src/cloudflare/celld_native_optimizations.ts` 中落地了以下 4 大原生优化机制：
+
+### 12.1 优化一：采用 `Durable Object Facets` (`ctx.facets`) 重构子智能体与高危工具暂存隔离 (`TASK-69`)
+- **文档原语特性**（[`docs/services/durable-object-facets.md`](https://github.com/denoland/celld/blob/main/docs/services/durable-object-facets.md)）：
+  1. Facet 是运行在父级 Supervisor Durable Object（如 `AgentTaskHarnessCell`）内部的**轻量级子对象**（`ctx.facets.get(name, () => ({ class, id }))`），最大支持 **4 层嵌套深度**（含根对象），名称上限 `256 bytes`。
+  2. **独立 SQLite + 零额外租约开销**：每个 Facet 拥有**完全独立的 SQLite 数据库**（在存储桶中共享根 Cell 的前缀并以独立 LTX 流复制），但**不产生独立的 `ownership.json` 租约或 Fencing Epoch**，直接复用根 Cell 的所有权与纪元；集群发生驱逐（Eviction）或负载均衡迁移（Move）时，根对象与其下属全部 Facet **作为单一原子组同节点迁移**。
+  3. **独立提交与快速清理**：Facet 写操作在自身 SQLite 中独立提交，子任务崩溃不会回滚或污染父任务的 `turn_wal_frames`；当 DAG Race 投机分支被剪枝或回溯时，调用 `ctx.facets.delete(name)` 即可一键销毁该子分支的数据库及其所有下级子 Facet（调用 `ctx.facets.abort(name, reason)` 则停止运行但保留其数据库供事后审计）。
+  4. **必须规避的两个 `celld` Facet 限制**：
+     - **限制 A（Alarm 禁止）**：在 Facet 内部调用 `storage.setAlarm()` 会直接抛出异常——必须由根对象 `AgentTaskHarnessCell` 统一持有定时器调度表（`DurableObjectFacetSupervisor.delegateAlarmToRoot()`）。
+     - **限制 B（WebSocket 不休眠）**：Facet 内部接受或打开的 WebSocket **不支持休眠（Does Not Hibernate）**，只要未关闭就会一直将根 Cell 钉在内存中（`isRootCellPinnedByFacetWebSockets()`）；因此长连接客户端流必须保留在根 `AgentTaskHarnessCell` 上，且在 `abort()` / `delete()` 时自动以状态码 `1001` 关闭 Facet 套接字以释放根 Cell 进入休眠。
+
+### 12.2 优化二：采用 `Dynamic Workers` (`worker_loaders`) 卸载轻量级 AI 生成代码与 MCP 插件 (`TASK-70`)
+- **文档原语特性**（[`denoland/celld` Releases — Dynamic Workers](https://github.com/denoland/celld/releases)）：
+  1. 在 `wrangler.json` 中声明 `worker_loaders` 绑定（`ANSTS_DYNAMIC_WORKER_LOADER`，单模块包上限 `CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES = 64 MiB`），支持在运行时动态加载 AI 生成的 JS/TS 代码或 `{ wasm: bytes }` 模块（强制要求 `compatibilityDate`）。
+  2. **毫秒级 CPU 与子请求硬熔断（`limits: { cpuMs, subrequests }`）**：通过 `WorkerCode.limits` 或 `getEntrypoint(name, { props, limits })` 对不受信任的动态代码实施精确到毫秒的 V8 CPU 时间上限（如 `cpuMs: 50`）与子请求数上限（如 `subrequests: 2`），同时透传调用方的 `AbortSignal.timeout()` 并挂载**自定义出网 `fetch` 防火墙拦截器**。
+  3. **`Dynamic Worker + Facet` 黄金组合**：通过 `worker.getDurableObjectClass("ToolPlugin")` 从动态加载的 Worker 中提取类定义，并传入 `ctx.facets.get()` 启动——使每一个 AI 动态生成的工具插件既拥有**受 `cpuMs` 限制的沙箱执行环境**，又拥有**独立的持久化 SQLite 数据库**，从而将大量纯 JS/WASM 工具轮次从笨重的 Linux 容器中卸载出来（冷启动从数十毫秒降至 `< 1ms`），执行完毕后调用 `dispose()` 立即释放内存，并向 **Tail Worker** 输出带 OTLP 级别（`DEBUG`/`INFO`/`WARN`/`ERROR`）的结构化调用报告。
+
+### 12.3 优化三：消除 `celld` KV 单写者 Cell 瓶颈与大对象流式护栏 (`TASK-71`)
+- **文档原语特性**（[`docs/services/kv.md`](https://github.com/denoland/celld/blob/main/docs/services/kv.md)）：
+  1. **核心差异**：与 Cloudflare 公有云最终一致性的边缘缓存 KV 不同，**在 `celld` 中，每一个 KV Namespace 底层就是一个单写者 Cell（Single-Writer Cell），且没有任何边缘缓存（`cacheTtl` 无效，`cacheStatus` 恒为 `null`）**！
+  2. **原实现瓶颈**：若每次任务提交都对同一个全局 `ANSTS_KV` 执行 `put(idemKey)`，所有并发写请求都会串行排队到持有该 KV Namespace 的唯一节点上，形成新的单点写瓶颈；且每次 `get()` 都消耗一次跨 Cell RPC 调度。
+  3. **优化实现（`CelldKvOptimizerAndGuard`）**：
+     - **写分片 + 下沉至 `SchedulerCell`**：将高频幂等写分散至多个 KV Namespace 分片（或直接由目标 `AnstsSchedulerCell` 的 `cell_tasks` 表顺带完成幂等校验），彻底消除单 KV Cell 串行瓶颈；
+     - **请求级本地内存缓存（Request-Local L1 Cache）**：针对同一次请求内多次读取的配置项缓存在局部变量中，规避无边缘缓存带来的重复 Cell Dispatch；
+     - **严格前置校验 `celld` KV 限制**：Key $\le 512\text{ B}$、Value $\le 25\text{ MiB}$（超过 `1 MiB` 强制校验已配置 Fleet Bucket 否则拒绝并提示 `KV large values need a fleet bucket`）、Metadata $\le 1024\text{ B}$、`expirationTtl >= 60s`、单次批量 `get()` $\le 100$ 个 Key。
+
+### 12.4 优化四：V8 Isolate `128 MB` 堆水位守卫与单条 SQL 语句时间预算看门狗 (`TASK-72`)
+- **文档原语特性**（[`docs/services/durable-objects.md`](https://github.com/denoland/celld/blob/main/docs/services/durable-objects.md) & [`denoland/celld` Issue #274](https://github.com/denoland/celld/issues/274)）：
+  1. **V8 堆内存双阈值（`CELLD_V8_HEAP_LIMIT_MB = 128 MB`）**：当单 Cell 的 V8 堆占用超过 **`90%`** 时，`celld` 会拒绝接受新的可休眠 WebSocket 连接，并直接中止 `SqlStorage.Cursor.toArray()` 的结果集物化；当堆占用超过 **`75%`** 时，需要在事件间隙主动触发 GC，待回落至 `< 75%` 后恢复全量服务。
+  2. **30 秒事务硬限制与慢 SQL 阻塞防御**：在 `celld` 中，`transactionSync()` 与 `blockConcurrencyWhile()` 具有 **30 秒硬超时**（超时会直接重置整个 Cell 实例）；且由于同节点多个 Cell 可能共享底层运行时线程池，一条失控的慢 SQL（如深度递归 CTE）会阻塞同节点其他新 Cell 的激活。
+  3. **优化实现（`V8HeapAndSqlBudgetGuard`）**：
+     - 实时监测 Isolate 堆水位：$\ge 75\%$ 触发主动 GC 与游标分页迭代（禁止一次性 `.toArray()` 全表拉取），$\ge 90\%$ 优雅暂停新 WebSocket 接入；
+     - 实施单条 SQL 语句级看门狗（`CELLD_SQL_STATEMENT_BUDGET_MS`，默认 `250ms`）：超时的慢查询立即抛出可捕获的 `CelldSqlBudgetExceeded` 并通过嵌套事务（Nested Savepoint）仅回滚当前子步骤，绝不触发 30 秒级 Cell Reset 或污染同节点其他任务。
