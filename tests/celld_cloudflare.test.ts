@@ -28,6 +28,21 @@ import { stableTaskOperationId } from "../src/persistence/task-operations";
 import { providerQuotaCellKey } from "../src/persistence/provider-quota";
 import { TENANT_DIRECTORY_SHARD_COUNT, tenantDirectoryShardIndex } from "../src/cloudflare/tenant_directory_cell";
 
+test("scheduled query repair survives an unavailable scheduler owner", async () => {
+  const { env } = createMockCloudflareCelldEnv();
+  const spec = yaml.load(fs.readFileSync(path.join(__dirname, "../../specs/taskspec_v1beta1_example.yaml"), "utf8")) as any;
+  const accepted = await cloudflareCelldWorker.fetch(new Request("https://ansts.edge/v1beta1/tasks", {
+    method: "POST", body: JSON.stringify(spec),
+  }), env);
+  assert.equal(accepted.status, 202);
+  env.SCHEDULER_CELL = { idFromName: (name) => ({ name, toString: () => name }),
+    get: () => ({ fetch: async () => { throw new Error("scheduler offline"); } }) };
+  await cloudflareCelldWorker.scheduled({ scheduledTime: tenantDirectoryShardIndex(spec.metadata.tenant_id) * 60_000, cron: "* * * * *" }, env);
+  const dashboard = await cloudflareCelldWorker.fetch(new Request(`https://ansts.edge/v1beta1/tenants/${encodeURIComponent(spec.metadata.tenant_id)}/dashboard/tasks`), env);
+  assert.equal(dashboard.status, 200);
+  assert.equal(((await dashboard.json()) as any).tasks[0].task_id, spec.metadata.task_id);
+});
+
 test("admission response loss remains UNKNOWN and retries recover the original accepted task", async () => {
   const { env, tenantLedgerCells } = createMockCloudflareCelldEnv();
   const spec = yaml.load(fs.readFileSync(path.join(__dirname, "../../specs/taskspec_v1beta1_example.yaml"), "utf8")) as any;
