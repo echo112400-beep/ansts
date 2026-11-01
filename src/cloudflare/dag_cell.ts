@@ -20,7 +20,7 @@ export class DagCell {
 
   constructor(public readonly ctx: DurableObjectState, public readonly env: CloudflareCelldEnv) {
     this.dagId = ctx.id.name ?? ctx.id.toString();
-    initializeCellProtocol(ctx.storage.sql, { type: "dag", key: this.dagId }, [dagMigration, dagBoostMigration]);
+    initializeCellProtocol(ctx.storage, { type: "dag", key: this.dagId }, [dagMigration, dagBoostMigration]);
     this.dag = new DagStore(ctx.storage, this.dagId);
   }
 

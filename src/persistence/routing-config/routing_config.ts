@@ -118,7 +118,7 @@ export class RoutingConfigCell {
     private readonly now: () => number = Date.now,
   ) {
     this.tenantId = requireText(ctx.id.name ?? ctx.id.toString(), "routing config key");
-    initializeCellProtocol(ctx.storage.sql, { type: "routing-config", key: this.tenantId }, [routingConfigMigration]);
+    initializeCellProtocol(ctx.storage, { type: "routing-config", key: this.tenantId }, [routingConfigMigration]);
   }
 
   public async publish(input: PublishRoutingConfigInput): Promise<RoutingConfigSnapshot> {
@@ -197,7 +197,7 @@ export class RoutingConfigCell {
     if (input.routingVersion !== undefined) validateVersion(input.routingVersion, "routingVersion");
     const now = this.now();
     validateTimestamp(now);
-    const pinned = withCellTransaction(this.ctx.storage.sql, () => {
+    const pinned = withCellTransaction(this.ctx.storage, () => {
       const existing = this.ctx.storage.sql
         .exec<RoutingCallPinRow>("SELECT * FROM routing_config_call_pins WHERE call_id = ?", callId)
         .toArray()[0];

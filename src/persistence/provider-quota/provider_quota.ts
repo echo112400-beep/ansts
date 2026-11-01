@@ -156,7 +156,7 @@ export class ProviderQuotaCell {
     private readonly now: () => number = Date.now,
   ) {
     this.quotaDomainKey = requireText(ctx.id.name ?? ctx.id.toString(), "provider quota domain key");
-    initializeCellProtocol(ctx.storage.sql, { type: "provider-quota", key: this.quotaDomainKey }, [providerQuotaMigration]);
+    initializeCellProtocol(ctx.storage, { type: "provider-quota", key: this.quotaDomainKey }, [providerQuotaMigration]);
   }
 
   public async configurePolicy(input: ConfigureProviderQuotaPolicyInput): Promise<{ version: number; policy: ProviderQuotaPolicy }> {
@@ -213,7 +213,7 @@ export class ProviderQuotaCell {
     const normalized = validateGrantRequest(input);
     const digest = (await digestJson(normalized)).sha256;
     const now = this.readNow();
-    const decision = withCellTransaction(this.ctx.storage.sql, () => {
+    const decision = withCellTransaction(this.ctx.storage, () => {
       const existing = this.ctx.storage.sql
         .exec<GrantRow>("SELECT * FROM provider_quota_grants WHERE request_id = ?", normalized.requestId)
         .toArray()[0];
@@ -305,7 +305,7 @@ export class ProviderQuotaCell {
     validateText(grantId, "grantId");
     validateText(requestId, "requestId");
     const now = this.readNow();
-    const outcome = withCellTransaction(this.ctx.storage.sql, () => {
+    const outcome = withCellTransaction(this.ctx.storage, () => {
       const row = requireGrant(this.ctx.storage.sql, grantId, requestId);
       if (row.status === "DENIED") throw new ProviderQuotaError("PROVIDER_QUOTA_EXCEEDED", row.denial_reason ?? "Provider quota request was denied.", 429);
       if (row.status === "COMPLETED") return { state: "COMPLETED" as const, usage: parseUsage(row.usage_json) };
@@ -323,7 +323,7 @@ export class ProviderQuotaCell {
     validateText(requestId, "requestId");
     const normalized = validateUsage(usage);
     const now = this.readNow();
-    const grant = withCellTransaction(this.ctx.storage.sql, () => {
+    const grant = withCellTransaction(this.ctx.storage, () => {
       const row = requireGrant(this.ctx.storage.sql, grantId, requestId);
       if (row.status === "COMPLETED") {
         if (!row.usage_json || JSON.stringify(validateUsage(JSON.parse(row.usage_json) as ProviderUsageEvidence)) !== JSON.stringify(normalized)) {
@@ -349,7 +349,7 @@ export class ProviderQuotaCell {
     validateText(requestId, "requestId");
     const unknownReason = requireText(reason, "reason");
     const now = this.readNow();
-    const result = withCellTransaction(this.ctx.storage.sql, () => {
+    const result = withCellTransaction(this.ctx.storage, () => {
       const row = requireGrant(this.ctx.storage.sql, grantId, requestId);
       if (row.status === "COMPLETED") return grantFromRow(row);
       if (row.status === "UNKNOWN") return grantFromRow(row);

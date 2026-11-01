@@ -24,7 +24,7 @@ export class AnstsSchedulerCell {
   ) {
     this.cluster = new AnstsClusterRuntime();
     const poolKey = ctx.id.name ?? ctx.id.toString();
-    initializeCellProtocol(this.ctx.storage.sql, { type: "scheduler-pool", key: poolKey }, [schedulerPoolMigration]);
+    initializeCellProtocol(this.ctx.storage, { type: "scheduler-pool", key: poolKey }, [schedulerPoolMigration]);
     this.schedulerPool = new SchedulerPool(this.ctx.storage, poolKey);
   }
 

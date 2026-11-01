@@ -12,7 +12,7 @@ export class NodeCapacityCell {
     public readonly env: CloudflareCelldEnv,
   ) {
     this.nodeId = ctx.id.name ?? ctx.id.toString();
-    initializeCellProtocol(ctx.storage.sql, { type: "node-capacity", key: this.nodeId }, [nodeCapacityMigration]);
+    initializeCellProtocol(ctx.storage, { type: "node-capacity", key: this.nodeId }, [nodeCapacityMigration]);
     this.capacity = new NodeCapacity(ctx.storage, this.nodeId);
   }
 

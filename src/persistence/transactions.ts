@@ -23,8 +23,12 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 }
 
 /** Run only local SQL mutations atomically. The callback cannot await another Cell or service. */
-export function withCellTransaction<T>(storage: PersistenceSqlStorage, callback: () => T): T {
-  return storage.transactionSync(() => {
+export function withCellTransaction<T>(storage: PersistenceObjectStorage | PersistenceSqlStorage, callback: () => T): T {
+  // Celld/Cloudflare transactions belong to storage, not storage.sql. Accept the
+  // old SQL-only adapter for existing isolated tests, but prefer the runtime owner.
+  const owner = typeof storage.transactionSync === "function" ? storage : ("sql" in storage ? storage.sql : storage);
+  if (typeof owner.transactionSync !== "function") throw new TypeError("Cell storage.transactionSync is unavailable.");
+  return owner.transactionSync(() => {
     const result = callback();
     if (isThenable(result)) {
       throw new AsyncCellTransactionError();

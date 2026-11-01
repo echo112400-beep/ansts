@@ -46,12 +46,16 @@ export class CloudflareTaskOperationProvider implements TaskOperationProvider<un
     } catch {
       return { status: "UNKNOWN" };
     }
+    // Error responses cannot establish either completion or authoritative absence.
+    // A proxy/service failure may carry a body that resembles a normal lookup result.
+    if (!response.ok) return { status: "UNKNOWN" };
     let body: Record<string, unknown>;
     try {
       body = await response.json() as Record<string, unknown>;
     } catch {
       return { status: "UNKNOWN" };
     }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return { status: "UNKNOWN" };
     if (body.status === "FOUND" && "result" in body) return { status: "FOUND", result: body.result };
     if (body.status === "NOT_FOUND" && body.authoritative === true) return { status: "NOT_FOUND" };
     return { status: "UNKNOWN" };
