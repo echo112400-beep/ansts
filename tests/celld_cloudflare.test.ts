@@ -1960,11 +1960,15 @@ test("09. AgentTaskHarnessCell Brain-Body Disaggregation, Companion Container Bu
 });
 
 
-test("public Worker meters a provider call, commits a verified snapshot, and recovers the same Turn after activation", async () => {
+for (const dagRuntime of [false, true]) test(`public Worker meters a provider call, commits a verified snapshot, and recovers the same Turn after activation${dagRuntime ? " with delegated DAG quota" : ""}`, async () => {
   const { env, harnessCells, modelProviderCalls, tenantTaskProjections, taskEventProjections } = createMockCloudflareCelldEnv();
   env.TEST_SIMULATOR_MODE = false;
   const tenantId = "tenant-durable-turn";
   const taskId = "task-durable-turn";
+  const delegation = { delegated_tokens: 2000, delegated_tps: 8 };
+  if (dagRuntime) env.DAG_CELL = { idFromName: (name: string) => ({ name, toString: () => name }),
+    get: () => ({ fetch: async () => new Response(JSON.stringify({ authorized: true, dag_id: "runtime-dag",
+      task_id: taskId, voucher_id: "runtime-voucher", ...delegation })) }) };
   const periodKey = new Date().toISOString().slice(0, 7);
   const base = "https://ansts.edge";
   const request = (pathName: string, method = "GET", body?: unknown, headers: Record<string, string> = {}) =>
@@ -2026,7 +2030,8 @@ test("public Worker meters a provider call, commits a verified snapshot, and rec
     nodes: [{ node_id: "durable-turn-node", incarnation: "durable-turn-boot", capacity: { cpu: 4, memory_mb: 2048, burst_cpu: 2, sessions: 2, tps: 100 } }],
     candidates: [{
       task_id: taskId, tenant_id: tenantId, dispatch_id: "durable-turn-dispatch", node_id: "durable-turn-node",
-      node_incarnation: "durable-turn-boot", kind: "ordinary", task_spec: taskSpec,
+      node_incarnation: "durable-turn-boot", kind: dagRuntime ? "dag" : "ordinary", task_spec: taskSpec,
+      ...(dagRuntime ? { dag_id: "runtime-dag", voucher_id: "runtime-voucher" } : {}),
       resources: { cpu: 1, memory_mb: 512, burst_cpu: 1, sessions: 1, tps: 8 },
     }],
   });
@@ -2140,6 +2145,29 @@ test("public Worker meters a provider call, commits a verified snapshot, and rec
   assert.equal(modelProviderCalls.calls, 1, "replaying a committed Turn must not call the model again");
   const changedInput = await request(turnPath, "POST", { ...turnBody, messages: [{ role: "user", content: "changed request" }] });
   assert.equal(changedInput.status, 409);
+  if (dagRuntime) {
+    const state = async () => (await (await harnessCells.get(taskId)!.fetch(new Request("http://task/execution/state"))).json()) as any;
+    assert.equal((await state()).quota_tokens_used, 10);
+    delegation.delegated_tps = 16;
+    assert.equal((await state()).effective_delegated_tps, 8);
+    assert.equal((await state()).pending_delegated_tps, 8, "a monetary boost cannot create physical TPS capacity");
+    const upload2 = await request(`/v1beta1/tasks/${taskId}/turns/snapshot-uploads?tenant_id=${tenantId}`, "POST", {
+      epoch: 1, turn_seq: 2, upload_id: "dag-upload-2", chunks: [{ index: 0, sha256: blockSha256, size_bytes: block.byteLength }],
+    });
+    assert.equal(upload2.status, 200);
+    await cloudflareCelldWorker.fetch(new Request(`${base}/v1beta1/tasks/${taskId}/turns/snapshot-uploads/dag-upload-2/chunks/0?tenant_id=${tenantId}`,
+      { method: "PUT", body: block }), env);
+    let unknownCalls = 0;
+    env.MODEL_PROVIDER_PROXY = { fetch: async () => { unknownCalls += 1; throw new Error("provider accepted; usage unknown"); } };
+    const unknownBody = { ...turnBody, turn_seq: 2, snapshot_upload_id: "dag-upload-2" };
+    assert.equal((await request(turnPath, "POST", unknownBody)).status, 503);
+    const reserved = (await state()).quota_tokens_reserved;
+    assert.ok(reserved > 0);
+    harnessCells.set(taskId, new AgentTaskHarnessCell(existingState, env));
+    assert.equal((await request(turnPath, "POST", unknownBody)).status, 503);
+    assert.equal(unknownCalls, 1, "unknown consumption cannot refill tokens or retry an outward provider attempt");
+    assert.equal((await state()).quota_tokens_reserved, reserved);
+  }
 });
 
 test("10. RustFS + celld --bucket startup specimen & Docker Compose manifest verification", () => {

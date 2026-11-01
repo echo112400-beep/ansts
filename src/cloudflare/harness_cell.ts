@@ -245,8 +245,13 @@ export class AgentTaskHarnessCell {
 
     if (request.method === "GET" && url.pathname === "/execution/state") {
       const execution = this.taskCore.get(this.task.taskId);
-      if (execution?.lifecycle_state === "RUNNING" && this.delegatedQuota.assignment()) await this.refreshDelegatedQuota(execution);
-      return execution ? json({ ...execution, ...this.delegatedQuota.state() }) : json({ error: "TASK_NOT_INITIALIZED" }, 404);
+      let quotaAuthorityError: string | undefined;
+      if (execution?.lifecycle_state === "RUNNING" && this.delegatedQuota.assignment()) {
+        try { await this.refreshDelegatedQuota(execution); }
+        catch (error) { quotaAuthorityError = error instanceof TaskCoreError ? error.code : "DAG_QUOTA_AUTHORITY_UNAVAILABLE"; }
+      }
+      return execution ? json({ ...execution, ...this.delegatedQuota.state(), ...(quotaAuthorityError
+        ? { quota_authority_error: quotaAuthorityError, effective_delegated_tps: 0 } : {}) }) : json({ error: "TASK_NOT_INITIALIZED" }, 404);
     }
 
     if (request.method === "POST" && url.pathname === "/race/winner") {
