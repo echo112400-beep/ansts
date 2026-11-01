@@ -5,12 +5,15 @@ import {
   DagPersistenceError,
   DagRecord,
   DagBoostVoucher,
+  DagBoostRecord,
   DagStore,
   DagVoucher,
   dagBoostMigration,
   dagMigration,
+  dagReturnMigration,
 } from "../persistence/dag/dag";
 import { initializeCellProtocol } from "../persistence/schema";
+import { confirmCellWrite } from "../persistence/transactions";
 import { CloudflareCelldEnv, DurableObjectState } from "./env";
 
 /** Durable coordinator for one tenant DAG. Monetary balances remain owned by TenantLedgerCell. */
@@ -20,7 +23,7 @@ export class DagCell {
 
   constructor(public readonly ctx: DurableObjectState, public readonly env: CloudflareCelldEnv) {
     this.dagId = ctx.id.name ?? ctx.id.toString();
-    initializeCellProtocol(ctx.storage, { type: "dag", key: this.dagId }, [dagMigration, dagBoostMigration]);
+    initializeCellProtocol(ctx.storage, { type: "dag", key: this.dagId }, [dagMigration, dagBoostMigration, dagReturnMigration]);
     this.dag = new DagStore(ctx.storage, this.dagId);
   }
 
@@ -87,6 +90,17 @@ export class DagCell {
           }
           await this.verifyStoppedChild(source);
           await this.assertChildSettled(dag, sourceTaskId);
+          const used = Number(sourceExecution.quota_tokens_used);
+          const reserved = Number(sourceExecution.quota_tokens_reserved);
+          if (delegatedTokens > 0 && (sourceExecution.quota_dag_id !== dag.dag_id || sourceExecution.quota_voucher_id !== source.voucher_id ||
+              !Number.isSafeInteger(used) || used < 0 || !Number.isSafeInteger(reserved) || reserved < 0)) {
+            throw new DagPersistenceError("DAG_BOOST_SOURCE_USAGE_UNKNOWN", "Source token consumption must be reconciled before delegating unused tokens.", 409);
+          }
+          const outgoing = this.dag.boosts().filter((entry) => entry.source_task_id === sourceTaskId);
+          const delegated = outgoing.reduce((sum, entry) => sum + Number(entry.delegated_tokens), 0);
+          if (delegatedTokens > 0 && delegated + delegatedTokens + used + reserved > Number(source.delegated_tokens)) {
+            throw new DagPersistenceError("DAG_BOOST_QUOTA_EXCEEDED", "Boost exceeds the source's unconsumed delegated tokens.", 409);
+          }
         }
         const boost = await this.dag.beginBoost({
           boost_id: boostId,
@@ -98,18 +112,7 @@ export class DagCell {
           voucher,
           signature,
         });
-        if (boost.status === "PENDING") {
-          await this.ownerJson("tenant-ledger", dag.tenant_id, "/allowance-transfers", "POST", {
-            tenant_id: dag.tenant_id,
-            period_key: dag.period_key,
-            transfer_id: boost.transfer_id,
-            source_task_id: boost.source_task_id,
-            target_task_id: boost.target_task_id,
-            amount_minor: boost.amount_minor,
-            currency: dag.currency,
-          });
-          await this.dag.finishBoost(boostId);
-        }
+        if (boost.status === "PENDING") await this.transferBoost(dag, boost);
         return json({
           boost: this.publicBoost(this.dag.boosts().find((entry) => entry.boost_id === boostId)!),
           dag: this.publicDag(this.dag.get()!),
@@ -160,9 +163,11 @@ export class DagCell {
         const body = await request.json() as { tenant_id?: string; task_id?: string; voucher_id?: string };
         const dag = this.requireTenant(body.tenant_id);
         const authorized = await this.dag.isDispatchAuthorized(String(body.task_id ?? ""), String(body.voucher_id ?? ""));
+        const child = authorized ? this.requireChild(String(body.task_id)) : null;
         const raceAllowsDispatch = !dag.race_mode || !dag.winner_task_id || dag.winner_task_id === body.task_id;
         return authorized && raceAllowsDispatch
-          ? json({ authorized: true, dag_id: this.dagId, task_id: body.task_id, voucher_id: body.voucher_id })
+          ? json({ authorized: true, dag_id: this.dagId, task_id: body.task_id, voucher_id: body.voucher_id,
+            delegated_tokens: Number(child!.delegated_tokens), delegated_tps: Number(child!.delegated_tps) })
           : json({ error: "DAG_DISPATCH_NOT_AUTHORIZED", authorized: false }, 403);
       }
 
@@ -208,6 +213,7 @@ export class DagCell {
   }
 
   private needsReconcile(dag: DagRecord): boolean {
+    if (this.dag.boosts().some((boost) => boost.status === "PENDING") || this.dag.allowanceReturns().some((entry) => entry.status === "PENDING")) return true;
     if (["PREPARING", "TRANSFERRING", "RESUMING"].includes(dag.state)) return true;
     if (dag.state !== "ACTIVE") return false;
     if (dag.race_mode) return !dag.winner_task_id && dag.children.some((child) => child.observed_state === "SUCCEEDED");
@@ -216,6 +222,13 @@ export class DagCell {
 
   private async reconcile(tenantId: string): Promise<DagRecord> {
     let dag = this.requireTenant(tenantId);
+    for (const boost of this.dag.boosts().filter((entry) => entry.status === "PENDING")) await this.transferBoost(dag, boost);
+    for (const intent of this.dag.allowanceReturns().filter((entry) => entry.status === "PENDING")) await this.returnAllowance(dag, this.requireChild(intent.task_id));
+    dag = this.dag.get()!;
+    if (dag.state === "COMPLETED") {
+      await confirmCellWrite(this.ctx.storage);
+      return dag;
+    }
     if (!dag.parent_yielded) {
       for (const child of dag.children) {
         const admission = await this.ownerJson("tenant-ledger", dag.tenant_id, `/tasks/${encodeURIComponent(child.task_id)}?tenant_id=${encodeURIComponent(dag.tenant_id)}`, "GET");
@@ -270,6 +283,18 @@ export class DagCell {
       await this.dag.setState("COMPLETED", "parent-resumed");
     }
     return this.dag.get()!;
+  }
+
+  private async transferBoost(dag: DagRecord, boost: DagBoostRecord): Promise<void> {
+    // A PENDING intent may exist locally after a failed proof. Reconfirm it before
+    // sending its stable cross-Cell operation identity to the budget authority.
+    await confirmCellWrite(this.ctx.storage);
+    await this.ownerJson("tenant-ledger", dag.tenant_id, "/allowance-transfers", "POST", {
+      tenant_id: dag.tenant_id, period_key: dag.period_key, transfer_id: boost.transfer_id,
+      source_task_id: boost.source_task_id, target_task_id: boost.target_task_id,
+      amount_minor: boost.amount_minor, currency: dag.currency,
+    });
+    await this.dag.finishBoost(boost.boost_id);
   }
 
   private async reconcileRace(dag: DagRecord): Promise<void> {
@@ -369,9 +394,11 @@ export class DagCell {
     }
 
     const account = await this.assertChildSettled(dag, child.task_id);
-    const amount = Number(account.available_minor);
+    const existingReturn = this.dag.allowanceReturn(child.task_id);
+    const amount = existingReturn?.amount_minor ?? Number(account.available_minor);
     if (!Number.isSafeInteger(amount) || amount < 0) throw new DagPersistenceError("DAG_CHILD_ACCOUNT_INVALID", "TenantLedger returned an invalid available balance.", 503);
     const transferId = `dag-return:${dag.dag_id}:${encodeURIComponent(child.task_id)}`;
+    await this.dag.beginAllowanceReturn(child.task_id, transferId, amount);
     if (amount > 0) {
       await this.ownerJson("tenant-ledger", dag.tenant_id, "/allowance-transfers", "POST", {
         tenant_id: dag.tenant_id, period_key: dag.period_key, transfer_id: transferId,
@@ -452,7 +479,7 @@ export class DagCell {
   }
 
   private publicDag(dag: DagRecord): Record<string, unknown> {
-    return { ...dag, children: dag.children.map((child) => this.publicChild(child)), boosts: this.dag.boosts().map((boost) => this.publicBoost(boost)) };
+    return { ...dag, children: dag.children.map((child) => this.publicChild(child)), boosts: this.dag.boosts().map((boost) => this.publicBoost(boost)), allowance_returns: this.dag.allowanceReturns() };
   }
   private publicBoost(boost: ReturnType<DagStore["boosts"]>[number]): Record<string, unknown> {
     return { ...boost, voucher: JSON.parse(boost.voucher_json) };

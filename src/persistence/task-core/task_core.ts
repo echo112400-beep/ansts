@@ -59,6 +59,10 @@ export interface TaskDispatchRecord {
 }
 
 export interface TaskDispatchRequest {
+  dag_id?: string;
+  voucher_id?: string;
+  delegated_tokens?: number;
+  delegated_tps?: number;
   dispatch_id: string;
   task_id: string;
   tenant_id: string;
