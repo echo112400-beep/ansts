@@ -391,7 +391,7 @@ test("Saga gateway uses the injected TaskCell ledger and compensates in persiste
   assert.equal(gatewayResult.status, "SUCCEEDED");
   assert.equal(gatewayResult.operation.operationId, stableTaskOperationId("task-saga-adapter", "call-gateway"));
 
-  const makeAction = (toolCallId: string, sku: string) => operations.prepareOperation({
+  const makeAction = (toolCallId: string, sku: string) => operations.executeOperation({
     operationId: stableTaskOperationId("task-saga-adapter", toolCallId),
     tenantId: "tenant-7",
     fence,
@@ -399,7 +399,7 @@ test("Saga gateway uses the injected TaskCell ledger and compensates in persiste
     effectClass: ToolEffectClass.SAGA_COMPENSATABLE,
     args: { sku },
     compensation: { toolName: `inventory/release/${sku}`, args: { sku } },
-  });
+  }, { supportsIdempotency: true, async execute() { return { reserved: true }; } });
   await makeAction("call-next-1", "sku-2");
   await makeAction("call-next-2", "sku-3");
   const executorOrder: string[] = [];

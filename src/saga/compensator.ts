@@ -45,7 +45,13 @@ export class SagaCompensatorEngine {
     const pending = this.taskOperations.listCompensations(taskId, afterTurnExclusive);
     const results: DurableCompensationResult[] = [];
     for (const item of pending) {
-      if (item.status !== "PENDING" && item.status !== "COMPENSATION_FAILED") {
+      if (item.status === "RUNNING") {
+        const status = await this.taskOperations.markInterruptedCompensation({ operationId: item.operationId, fence });
+        results.push({ operationId: item.operationId, status: status === "OUTCOME_UNKNOWN" ? status : "SKIPPED" });
+        continue;
+      }
+      const forward = this.taskOperations.getOperation(item.operationId);
+      if (forward?.status !== "SUCCEEDED" || (item.status !== "PENDING" && item.status !== "COMPENSATION_FAILED")) {
         results.push({ operationId: item.operationId, status: "SKIPPED" });
         continue;
       }
