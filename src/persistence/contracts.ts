@@ -26,12 +26,14 @@ export interface PersistenceSqlCursor<T> {
 /** Only synchronous SQL belongs inside a Cell transaction. */
 export interface PersistenceSqlStorage {
   exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): PersistenceSqlCursor<T>;
-  transactionSync<T>(callback: () => T): T;
+  /** Legacy test adapter only; Celld exposes transactions on DurableObjectStorage. */
+  transactionSync?<T>(callback: () => T): T;
 }
 
 /** storage.sync is Celld-specific and waits for the configured durability proof. */
 export interface PersistenceObjectStorage {
   sql: PersistenceSqlStorage;
+  transactionSync?<T>(callback: () => T): T;
   sync?(): Promise<void>;
 }
 

@@ -57,7 +57,7 @@ export class TenantDirectoryCell {
       throw new TypeError("TenantDirectoryCell requires a canonical numeric shard key.");
     }
     this.shardIndex = index;
-    initializeCellProtocol(ctx.storage.sql, { type: "tenant-directory", key: this.shardKey }, [tenantDirectoryMigration]);
+    initializeCellProtocol(ctx.storage, { type: "tenant-directory", key: this.shardKey }, [tenantDirectoryMigration]);
   }
 
   public async fetch(request: Request): Promise<Response> {
@@ -78,7 +78,7 @@ export class TenantDirectoryCell {
     if (tenantDirectoryShardIndex(tenantId) !== this.shardIndex) return json({ error: "TENANT_DIRECTORY_SHARD_MISMATCH" }, 409);
 
     const now = Date.now();
-    withCellTransaction(this.ctx.storage.sql, () => {
+    withCellTransaction(this.ctx.storage, () => {
       this.ctx.storage.sql.exec(`INSERT INTO tenant_directory (tenant_id, first_seen_at, last_seen_at)
         VALUES (?, ?, ?)
         ON CONFLICT(tenant_id) DO UPDATE SET last_seen_at = MAX(tenant_directory.last_seen_at, excluded.last_seen_at)`,
@@ -92,7 +92,7 @@ export class TenantDirectoryCell {
     const limit = Number(rawLimit ?? 20);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) return json({ error: "TENANT_SCAN_LIMIT_INVALID" }, 400);
 
-    const result = withCellTransaction(this.ctx.storage.sql, () => {
+    const result = withCellTransaction(this.ctx.storage, () => {
       const state = this.ctx.storage.sql.exec<{ scan_after_tenant_id: string }>(
         "SELECT scan_after_tenant_id FROM tenant_directory_scan WHERE singleton = ?", 1,
       ).toArray()[0];
