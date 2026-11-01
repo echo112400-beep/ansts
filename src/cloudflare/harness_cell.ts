@@ -865,7 +865,7 @@ export class AgentTaskHarnessCell {
     return {
       getModelCallResult: async ({ taskId, tenantId, callId }) => {
         try {
-          const record = await this.taskTurns.getModelCallResult(taskId, callId);
+          const record = await this.taskTurns.getConfirmedModelCallResult(taskId, callId);
           if (record.tenantId !== tenantId) throw new TaskTurnError("MODEL_CALL_TENANT_MISMATCH", "Model call result belongs to another tenant.", 404);
           return {
             response: record.response,
