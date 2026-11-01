@@ -239,7 +239,7 @@ export async function markCellOutboxDelivered(
   eventId: string,
   deliveredAt: number = Date.now(),
 ): Promise<boolean> {
-  const result = withCellTransaction(storage.sql, () => {
+  const result = withCellTransaction(storage, () => {
     const row = storage.sql.exec<OutboxRow>("SELECT * FROM cell_outbox WHERE event_id = ?", eventId).toArray()[0];
     if (!row) return { exists: false, changed: false };
     if (row.status === "DELIVERED") return { exists: true, changed: false };
@@ -270,7 +270,7 @@ export async function markCellOutboxBatchDelivered(
     throw new TypeError("Outbox acknowledgment requires 1..1000 unique event IDs.");
   }
   if (!Number.isSafeInteger(deliveredAt) || deliveredAt < 0) throw new TypeError("deliveredAt must be a valid timestamp.");
-  const result = withCellTransaction(storage.sql, () => {
+  const result = withCellTransaction(storage, () => {
     let changed = 0;
     for (const eventId of input.eventIds) {
       const row = storage.sql.exec<OutboxRow>("SELECT * FROM cell_outbox WHERE event_id = ?", eventId).toArray()[0];
@@ -298,7 +298,7 @@ export async function pruneDeliveredCellOutboxPayloads(
     input.tenantId, input.aggregateType, input.aggregateId, "DELIVERED")
     .toArray().filter((row) => Number(row.created_at) < input.cutoff && row.payload_json !== "{}");
   if (expired.length === 0) return 0;
-  withCellTransaction(storage.sql, () => {
+  withCellTransaction(storage, () => {
     for (const row of expired) {
       storage.sql.exec("UPDATE cell_outbox SET payload_json = ? WHERE event_id = ? AND status = ?",
         "{}", row.event_id, "DELIVERED");
@@ -315,7 +315,7 @@ export async function recordCellOutboxFailure(
   error: unknown,
 ): Promise<boolean> {
   if (!Number.isSafeInteger(nextAttemptAt) || nextAttemptAt < 0) throw new TypeError("nextAttemptAt must be a valid timestamp.");
-  const changed = withCellTransaction(storage.sql, () => {
+  const changed = withCellTransaction(storage, () => {
     const row = storage.sql.exec<OutboxRow>("SELECT * FROM cell_outbox WHERE event_id = ?", eventId).toArray()[0];
     if (!row || row.status === "DELIVERED") return false;
     const lastError = String(error instanceof Error ? error.message : error).slice(0, 1000);

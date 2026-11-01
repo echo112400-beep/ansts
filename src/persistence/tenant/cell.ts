@@ -227,7 +227,7 @@ export class TenantLedgerCell {
     public readonly env: CloudflareCelldEnv,
   ) {
     this.tenantId = ctx.id.name ?? ctx.id.toString();
-    initializeCellProtocol(ctx.storage.sql, { type: "tenant-ledger", key: this.tenantId }, [tenantLedgerMigration]);
+    initializeCellProtocol(ctx.storage, { type: "tenant-ledger", key: this.tenantId }, [tenantLedgerMigration]);
   }
 
   public async fetch(request: Request): Promise<Response> {

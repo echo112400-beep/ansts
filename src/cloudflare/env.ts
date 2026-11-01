@@ -326,6 +326,7 @@ export class MockDurableObjectState implements DurableObjectState {
     this.id = { toString: () => `cell_${name}`, name };
     this.storage = {
       sql: this.sqlStore,
+      transactionSync: <T>(callback: () => T): T => this.sqlStore.transactionSync(callback),
       // This is a no-op proof counter in the simulator; it does not model Celld replication or bucket durability.
       sync: async () => {
         this.durableSyncCalls += 1;

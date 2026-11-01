@@ -1,4 +1,4 @@
-import { CellMigration, PERSISTENCE_CELL_TYPES, PersistenceCellIdentity, PersistenceSqlStorage } from "./contracts";
+import { CellMigration, PERSISTENCE_CELL_TYPES, PersistenceCellIdentity, PersistenceSqlStorage, PersistenceObjectStorage } from "./contracts";
 import { withCellTransaction } from "./transactions";
 
 export class CellIdentityMismatchError extends Error {
@@ -86,10 +86,11 @@ const protocolMigration: CellMigration = {
 
 /** Create the shared tables and apply contiguous, versioned owner migrations. */
 export function initializeCellProtocol(
-  sql: PersistenceSqlStorage,
+  storage: PersistenceObjectStorage | PersistenceSqlStorage,
   identity: PersistenceCellIdentity,
   ownerMigrations: CellMigration[] = [],
 ): number {
+  const sql = "sql" in storage ? storage.sql : storage;
   validateIdentity(identity);
   const migrations = [protocolMigration, ...ownerMigrations].sort((a, b) => a.version - b.version);
   const versions = new Set<number>();
@@ -105,7 +106,7 @@ export function initializeCellProtocol(
     }
   });
 
-  withCellTransaction(sql, () => {
+  withCellTransaction(storage, () => {
     sql.exec(`
       CREATE TABLE IF NOT EXISTS cell_registry (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -145,7 +146,7 @@ export function initializeCellProtocol(
     if (migration.version !== currentVersion + 1) {
       throw new CellSchemaError(`Cannot apply Cell schema ${migration.version} after ${currentVersion}.`);
     }
-    withCellTransaction(sql, () => {
+    withCellTransaction(storage, () => {
       migration.up(sql);
       if (currentVersion === 0 && migration.version === 1) {
         sql.exec("INSERT INTO cell_schema_version (singleton, version) VALUES (?, ?)", 1, migration.version);

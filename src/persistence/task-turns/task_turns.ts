@@ -299,7 +299,7 @@ export class TaskTurns {
     const expectedDigest = (await sha256Text(expectedJson));
     let result!: { uploadId: string; turnSeq: number; status: string; chunks: SnapshotChunk[] };
 
-    withCellTransaction(this.storage.sql, () => {
+    withCellTransaction(this.storage, () => {
       const task = requireTask(this.storage.sql, request.taskId, request.tenantId);
       const byId = this.storage.sql.exec<UploadRow>("SELECT * FROM task_turn_uploads WHERE upload_id = ?", request.uploadId).toArray()[0];
       const byTurn = this.storage.sql.exec<UploadRow>("SELECT * FROM task_turn_uploads WHERE task_id = ? AND turn_seq = ?", request.taskId, request.fence.turnSeq).toArray()[0];
@@ -356,7 +356,7 @@ export class TaskTurns {
     if (bytes.byteLength !== Number(expected.size_bytes)) throw new TaskTurnError("SNAPSHOT_CHUNK_SIZE_MISMATCH", `Chunk ${input.index} has size ${bytes.byteLength}, expected ${expected.size_bytes}.`);
     if (await sha256Hex(bytes) !== expected.sha256) throw new TaskTurnError("SNAPSHOT_CHUNK_DIGEST_MISMATCH", `Chunk ${input.index} does not match its declared SHA-256.`);
     await putAndVerifyBlock(this.blockStore, expected.object_key, bytes, expected.sha256);
-    withCellTransaction(this.storage.sql, () => {
+    withCellTransaction(this.storage, () => {
       const fresh = this.storage.sql.exec<UploadChunkRow>(
         "SELECT * FROM task_turn_upload_chunks WHERE upload_id = ? AND chunk_index = ?", input.uploadId, input.index,
       ).toArray()[0];
@@ -408,7 +408,7 @@ export class TaskTurns {
   }
 
   public async abortSnapshotUpload(input: { uploadId: string; taskId: string; tenantId: string }): Promise<void> {
-    withCellTransaction(this.storage.sql, () => {
+    withCellTransaction(this.storage, () => {
       const upload = this.readUpload(input.uploadId);
       if (!upload || upload.task_id !== input.taskId || upload.tenant_id !== input.tenantId) {
         throw new TaskTurnError("SNAPSHOT_UPLOAD_NOT_FOUND", `Snapshot upload ${input.uploadId} was not found.`, 404);
@@ -580,7 +580,7 @@ export class TaskTurns {
     const bytes = new TextEncoder().encode(response.canonicalJson);
     const chunks = await this.putModelResponseBlocks(request, bytes, owner.sha256);
     const now = Date.now();
-    withCellTransaction(this.storage.sql, () => {
+    withCellTransaction(this.storage, () => {
       const task = requireTask(this.storage.sql, request.taskId, request.tenantId);
       if (turnSeq > Number(task.last_turn_seq) + 1) throw new TaskTurnError("MODEL_CALL_TURN_GAP", `Model call Turn ${turnSeq} is ahead of the next TaskCell Turn.`);
       const existing = this.storage.sql.exec<ModelCallRow>("SELECT * FROM task_model_call_results WHERE task_id = ? AND call_id = ?", request.taskId, request.callId).toArray()[0];
@@ -688,7 +688,7 @@ export class TaskTurns {
   public async markReferenceUnknown(refId: string, reason: string): Promise<void> {
     validateIdentity(refId, "refId");
     validateIdentity(reason, "reason");
-    withCellTransaction(this.storage.sql, () => {
+    withCellTransaction(this.storage, () => {
       const ref = this.storage.sql.exec<ReferenceRow>("SELECT * FROM task_snapshot_refs WHERE ref_id = ?", refId).toArray()[0];
       if (!ref || ref.status === "DELETED") throw new TaskTurnError("SNAPSHOT_REFERENCE_NOT_FOUND", `Snapshot reference ${refId} was not found.`, 404);
       this.storage.sql.exec("UPDATE task_snapshot_refs SET status = ?, tombstoned_at = ?, delete_after = ?, unknown_reason = ? WHERE ref_id = ?",
@@ -709,7 +709,7 @@ export class TaskTurns {
     for (const taskId of tasks) safety.set(taskId, this.garbageSafety(taskId, now, retention));
 
     let tombstoned = 0;
-    withCellTransaction(this.storage.sql, () => {
+    withCellTransaction(this.storage, () => {
       for (const ref of allRefs) {
         if (ref.status !== "ACTIVE") continue;
         const state = safety.get(ref.task_id)!;
@@ -731,7 +731,7 @@ export class TaskTurns {
       const state = this.garbageSafety(ref.task_id, now, retention);
       if (!state.safe || isCurrentRecoveryReference(ref, state.latestTurn, state.latestModelCalls) ||
           Number(ref.turn_seq) >= state.latestTurn || Number(ref.created_at) > now - retention) {
-        withCellTransaction(this.storage.sql, () => {
+        withCellTransaction(this.storage, () => {
           this.storage.sql.exec("UPDATE task_snapshot_refs SET status = ?, tombstoned_at = ?, delete_after = ? WHERE ref_id = ? AND status = ?",
             "ACTIVE", null, null, ref.ref_id, "TOMBSTONED");
         });
@@ -741,7 +741,7 @@ export class TaskTurns {
       }
       try {
         await this.blockStore.delete(ref.object_key);
-        withCellTransaction(this.storage.sql, () => {
+        withCellTransaction(this.storage, () => {
           this.storage.sql.exec("UPDATE task_snapshot_refs SET status = ?, tombstoned_at = ?, delete_after = ? WHERE ref_id = ? AND status = ?",
             "DELETED", ref.tombstoned_at, ref.delete_after, ref.ref_id, "TOMBSTONED");
         });
@@ -758,7 +758,7 @@ export class TaskTurns {
       return state.safe && Number(upload.updated_at) <= now - retention;
     });
     if (orphanUploads.length > 0) {
-      withCellTransaction(this.storage.sql, () => {
+      withCellTransaction(this.storage, () => {
         for (const upload of orphanUploads) {
           this.storage.sql.exec("UPDATE task_turn_uploads SET status = ?, updated_at = ? WHERE upload_id = ? AND status = ?",
             "ABORTED", now, upload.upload_id, "UPLOADING");
@@ -774,7 +774,7 @@ export class TaskTurns {
       for (const chunk of chunks) {
         try {
           await this.blockStore.delete(chunk.object_key);
-          withCellTransaction(this.storage.sql, () => {
+          withCellTransaction(this.storage, () => {
             this.storage.sql.exec("DELETE FROM task_turn_upload_chunks WHERE upload_id = ? AND chunk_index = ?", chunk.upload_id, chunk.chunk_index);
           });
           await confirmCellWrite(this.storage);

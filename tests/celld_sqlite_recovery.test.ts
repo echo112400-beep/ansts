@@ -65,7 +65,9 @@ test("public admission survives lost sync acknowledgment and reopening every own
         const db = new DatabaseSync(path.join(folder, `${encodeURIComponent(key)}.sqlite`));
         db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
         const state = new MockDurableObjectState(id.name);
-        state.storage.sql = sqliteStorage(db);
+        const sql = sqliteStorage(db);
+        state.storage.sql = { exec: sql.exec } as any;
+        (state.storage as any).transactionSync = sql.transactionSync;
         state.storage.sync = async () => {
           if (kind === "ledger" && loseLedgerSync) {
             loseLedgerSync = false; throw new Error("confirmation acknowledgment lost");
@@ -115,7 +117,9 @@ test("SQLite directory deduplicates registration and resumes its scan cursor aft
     db = new DatabaseSync(file);
     db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
     const state = new MockDurableObjectState("0");
-    state.storage.sql = sqliteStorage(db);
+    const sql = sqliteStorage(db);
+    state.storage.sql = { exec: sql.exec } as any;
+    (state.storage as any).transactionSync = sql.transactionSync;
     return new TenantDirectoryCell(state, {} as any);
   }
   try {

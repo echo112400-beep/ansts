@@ -70,7 +70,7 @@ export async function executeCellOperation<T>(
   const preparedEvents: PreparedCellOutboxEvent[] = await Promise.all(
     outboxEvents.map((draft) => prepareCellOutboxEvent(command, draft)),
   );
-  const committed = withCellTransaction(storage.sql, () => {
+  const committed = withCellTransaction(storage, () => {
     const existing = storage.sql
       .exec<OperationRow>("SELECT * FROM cell_operations WHERE operation_id = ?", command.operationId)
       .toArray()[0];

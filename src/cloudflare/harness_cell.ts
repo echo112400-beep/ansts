@@ -71,7 +71,7 @@ export class AgentTaskHarnessCell {
     public readonly env: CloudflareCelldEnv,
   ) {
     const taskId = ctx.id.name ?? ctx.id.toString();
-    initializeCellProtocol(this.ctx.storage.sql, { type: "task", key: taskId }, [
+    initializeCellProtocol(this.ctx.storage, { type: "task", key: taskId }, [
       taskCoreMigration,
       taskOperationsMigration,
       taskTurnUploadMigration,

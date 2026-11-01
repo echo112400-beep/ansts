@@ -34,7 +34,7 @@ export async function consumeCellInboxEvent(
   if (actualDigest !== event.payloadDigest.toLowerCase()) {
     throw new CellInboxConflictError(event.eventId);
   }
-  const outcome = withCellTransaction(storage.sql, () => {
+  const outcome = withCellTransaction(storage, () => {
     const existing = storage.sql.exec<InboxRow>("SELECT * FROM cell_inbox WHERE event_id = ?", event.eventId).toArray()[0];
     if (existing) {
       if (!sameEvent(existing, event)) throw new CellInboxConflictError(event.eventId);
