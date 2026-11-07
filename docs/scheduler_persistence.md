@@ -87,7 +87,7 @@ Cron（Worker `scheduled()`）每次先调 `/scheduler/recover` 再调 `/schedul
 
 ## 验证
 
-`npm run build && npm test` 覆盖真实 SQLite 文件关闭/重开、并发重复提交、事务中途失败、事件发送与确认之间的崩溃、DAG 引用恢复、节点失联及 epoch 递增、损坏/旧格式拒绝恢复。Node.js 的 `node:sqlite` 测试需要支持 DatabaseSync 的 Node 版本（已在 Node 24 验证）。
+`npm run build && npm test` 覆盖真实 SQLite 文件关闭/重开、并发重复提交、事务中途失败、事件发送与确认之间的崩溃、DAG 引用恢复、节点失联及 epoch 递增、损坏/旧格式拒绝恢复。这些测试加载 Node.js 内置 `node:sqlite` 的 `DatabaseSync`。该模块从 Node.js 22.13.0 起默认可用，不再需要 `--experimental-sqlite`；Node.js 18 与 20 没有这个内置模块。CI 与 `Dockerfile.dev` 使用 Node.js 22。
 
 `node scripts/verify_scheduler_recovery.mjs` 使用独立临时目录启动本机 celld，两次 SIGKILL 后验证任务、幂等记录和 lease。它不会修改实际部署数据。这项本机验证不等价于多节点 fleet、对象存储中断或网络分区测试；上线前应在部署使用的 bucket 和隔离故障域中演练所有权接管及 peer/bucket 丢失。
 
