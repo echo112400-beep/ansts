@@ -81,4 +81,32 @@ export class LeaseCoordinator {
   public getLease(taskId: string): TaskLeaseRecord | undefined {
     return this.leases.get(taskId);
   }
+
+  /** Drops a lease (task completion / terminal state): no later fence can validate against it. */
+  public releaseLease(taskId: string): void {
+    this.leases.delete(taskId);
+  }
+
+  /** Detached copy of every live lease, used to roll back a failed scheduling transaction. */
+  public snapshotLeases(): TaskLeaseRecord[] {
+    return Array.from(this.leases.values()).map((r) => ({
+      taskId: r.taskId,
+      nodeId: r.nodeId,
+      modelPool: r.modelPool,
+      fence: new FenceToken(r.fence.epoch, r.fence.turnSeq, r.fence.taskId),
+    }));
+  }
+
+  /** Restores a lease snapshot by replacing the whole map. */
+  public restoreLeases(records: TaskLeaseRecord[]): void {
+    this.leases.clear();
+    for (const r of records) {
+      this.leases.set(r.taskId, {
+        taskId: r.taskId,
+        nodeId: r.nodeId,
+        modelPool: r.modelPool,
+        fence: new FenceToken(r.fence.epoch, r.fence.turnSeq, r.fence.taskId),
+      });
+    }
+  }
 }

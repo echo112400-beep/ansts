@@ -1,10 +1,11 @@
+/**
+ * @fileoverview TASK-30, TASK-51 & M12-M13 Unified Cluster Facade (`AnstsClusterRuntime`) and `anstsctl` CLI Tool.
+ * Supports Non-K8s Bare-Metal / Systemd / Docker Compose manual scale-out (`anstsctl fleet scale-out | scale-in`).
+ */
+
 import { ProductionPreflightGate } from "../runtime/preflight_gate";
 import { CrossHostMtlsTunnelBridge } from "../runtime/mtls_tunnel_bridge";
 import { S3TopologyCasCoordinator } from "../cluster/topology_cas_coordinator";
-/**
- * TASK-30, TASK-51 & M12-M13 Unified Cluster Facade (`AnstsClusterRuntime`) and `anstsctl` CLI Tool.
- * Supports Non-K8s Bare-Metal / Systemd / Docker Compose manual scale-out (`anstsctl fleet scale-out | scale-in`).
- */
 
 import { WalCompactorAndPagedRestorer } from "../checkpoint/compactor";
 import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel";

@@ -107,8 +107,10 @@ export class NodeDaemon {
     }
     if (this.consecutiveSaturatedTurns >= 3) {
       this.consecutiveSaturatedTurns = 0;
+      const startHr = process.hrtime.bigint();
       const newFence = this.failoverTaskToNode(task, targetNodeId);
-      return { migrated: true, newFence, migrationLatencyMs: 38 };
+      const migrationLatencyMs = Number(Math.max(0.01, Number(process.hrtime.bigint() - startHr) / 1_000_000).toFixed(3));
+      return { migrated: true, newFence, migrationLatencyMs };
     }
     return { migrated: false };
   }

@@ -90,3 +90,41 @@
 | **`TASK-72`** | **V8 Isolate `128 MB` 堆水位守卫与单条 SQL 语句时间预算看门狗** | `src/cloudflare/celld_native_optimizations.ts` | `test 47` (`PASS`) | 实现 `V8HeapAndSqlBudgetGuard`：在堆内存 $\ge 75\%$ 时触发主动 GC、$\ge 90\%$ 时拦截新 WebSocket 与全量 `.toArray()` 物化；实施 `CELLD_SQL_STATEMENT_BUDGET_MS` 语句级看门狗，防止慢 SQL 触发 30 秒事务重置或阻塞同节点新 Cell 激活 |
 | **`TASK-73`** | **`AgentTaskHarnessCell` `/facet` 端点与 Edge Worker 全链路集成** | `src/cloudflare/worker.ts`<br>`src/cloudflare/harness_cell.ts` | `test 48` (`PASS`) | 打通 `POST /v1beta1/tasks/:taskId/facet` 接口，支持在线派生 DAG 子任务 Facet、执行独立 SQLite 查询、委托根 Cell 定时器及一键 `abort` / `delete` |
 | **`TASK-74`** | **M15 架构规范更新与全仓 65 模块 / 53 项 CI 测试验证** | `docs/celld_persistent_recoverable_ha_scheduler_design.md`<br>`tests/m15_celld_facets_dynamic_workers.test.ts` | `test 1..53` (`PASS`) | 全仓 **65 个 TypeScript 模块**编译通过，**53/53 项**单元、集成、混沌、高可用、横向扩容、全组件持久化与 `celld` 原生优化测试 100% 通过 |
+
+
+---
+
+## 十七、 阶段十七至二十（M17 ~ M20）：v2.3 规格容量准入、可观测性恢复、生产灰度发布与混沌演练（`TASK-83` ~ `TASK-100`）
+
+| 任务编号 | 阶段 | 模块 / 特性名称 | 核心工程指标与验收断言 | 源码与测试路径 | 状态 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`TASK-83`** | **M16+** | `EdgeTunnelHaDynamicRouter`（双归属反向隧道集群动态路由） | 边缘 `NodeDaemon` 主备双归属外拨、0-Hop/1-Hop 路由、`<15ms` 热备自动切换与 Make-Before-Break 排水 | `src/runtime/edge_tunnel_ha_router.ts`<br>`test 59` | ✅ 已交付 |
+| **`TASK-84`** | **M17** | `CapacitySlaEnforcer`（规格容量与 SLA 准入强制器） | Brain `128MB` 堆水位（75% GC / 90% 熔断）与 `RTO < 3s`、Body 单机 `32` 沙箱上限、网关 `20,000` 流上限、RustFS `EC:4` 容灾仲裁 | `src/cluster/capacity_sla_enforcer.ts`<br>`test 61` | ✅ 已交付 |
+| **`TASK-85`** | **M17** | `AgentStreamQueuePublisher`（排队系统流式事件发布器） | 排队状态机与 `TurnWalEngine` 条件写、`SseEventStreamGateway` 信用窗口流控原子绑定 | `src/gateway/stream_queue_publisher.ts`<br>`test 62` | ✅ 已交付 |
+| **`TASK-86`** | **M17** | 断线重连 `Last-Event-ID` 增量追赶协调器 | 基于 `lastReceivedTurnSeq` 自动切片未消费 `TurnWalFrame` 并按单调顺序补发后恢复实时流 | `src/gateway/stream_queue_publisher.ts`<br>`test 62` | ✅ 已交付 |
+| **`TASK-87`** | **M17** | `TunnelGatewayCell` 系统 Cell 与防惊群退避守卫 | 同构托管 `celld` 网关 Cell、Full-Jitter 指数退避防惊群、丢失 3 次心跳（`>15s`）自动摘除并切备 | `src/cloudflare/tunnel_gateway_cell.ts`<br>`test 63` | ✅ 已交付 |
+| **`TASK-88`** | **M17** | `ConsoleBffController`（TanStack 控制台 BFF 接口层） | 提供集群概览、Geo-Routing 状态、一键 Make-Before-Break 排水与 TurnWAL 增量重放 API | `src/dashboard/console_bff_api.ts`<br>`docs/ansts_console_prototype.html` | ✅ 已交付 |
+| **`TASK-89`** | **M17** | M17 容量、流式恢复与控制台全链路测试套件 | 覆盖 `test 61` ~ `test 63` 全套断言 | `tests/m17_reliability_capacity_console_suite.test.ts` | ✅ 已交付 |
+| **`TASK-90`** | **M18** | 可观测性状态 SQLite `RPO = 0` 持久化与崩溃恢复 | `UnifiedComponentPersistenceStore` 新增 `persistObservabilityState` / `rehydrateObservabilityState` | `src/checkpoint/unified_state_store.ts`<br>`test 64` | ✅ 已交付 |
+| **`TASK-91`** | **M18** | `ObservabilityRingSpooler`（Collector 宕机有界环形溢写池） | 远端 Collector `503` 时本地有界环形缓存（默认 5,000 条），恢复 `200 OK` 后自动分批重传清空 | `src/telemetry/observability_recovery.ts`<br>`test 64` | ✅ 已交付 |
+| **`TASK-92`** | **M18** | `W3cTraceContinuityPropagator`（跨故障转移因果 Trace 缝合） | 在主备网关切换与 SSE 重连时继承根 `traceId` 并自动挂载 `OtelSpanLink`，杜绝 Jaeger/Tempo 断链 | `src/telemetry/observability_recovery.ts`<br>`test 65` | ✅ 已交付 |
+| **`TASK-93`** | **M19** | 存量会话版本钉死器（Session Version Pinning） | 存量活跃任务 100% 路由至初始版本节点，仅新建任务或白名单租户进入 Canary | `src/cluster/canary_rollout_controller.ts`<br>`test 66` | ✅ 已交付 |
+| **`TASK-94`** | **M19** | 四阶段 256 虚拟哈希槽渐进式切流控制器 | 支持 `1 槽 (0.4%) -> 8 槽 (3.1%) -> 64 槽 (25%) -> 256 槽 (100%)` 三阶段原子迁移与 Epoch 递增 | `src/cluster/canary_rollout_controller.ts`<br>`test 66` | ✅ 已交付 |
+| **`TASK-95`** | **M19** | SLA 实时健康门禁与 `<50ms` 自动回滚 | 监测堆水位、RTO、慢 SQL、`409` 栅栏冲突与隧道延迟，违约即刻原子切回 Stable 并触发网关平滑排水 | `src/cluster/canary_rollout_controller.ts`<br>`test 67` | ✅ 已交付 |
+| **`TASK-96`** | **M19** | Expand-and-Contract N-1 WAL 兼容性校验器 | 校验金丝雀扩展字段向后兼容及边缘宿主机 `CORDONED` 脱离式热升级 | `src/cluster/canary_rollout_controller.ts`<br>`test 67` | ✅ 已交付 |
+| **`TASK-97..100`** | **M20** | `ProductionChaosDrillRunner`（四大生产混沌故障注入演练套件） | 自动化演练主网关黑洞、RustFS 4 盘并发損坏、金丝雀内存泄漏秒级回滚、Collector 宕机叠加 Cell 崩溃恢复 | `src/cluster/chaos_drill_runner.ts`<br>`scripts/run_chaos_drills.mjs`<br>`test 68` | ✅ 已交付 |
+
+| **`TASK-101`** | **M21** | 256 虚拟槽确定性寻址与 0-Hop/1-Hop 投递 (`HaPartitionedSchedulerMeshCoordinator`) | $\text{SHA256}(\text{tenantId}) \bmod 256$ 槽位计算、`idFromName` 对象寻址与同机/跨机自动判别 | `src/cloudflare/ha_scheduler_shard_coordinator.ts`<br>`test 69` | ✅ 已交付 |
+| **`TASK-102`** | **M21** | 三阶段在线扩容与 `DRAINING` 微缓冲防双花 (`migrateSlotOnlineAndFlushBuffer`) | 迁移窗口期请求自动入 `drainMicroBuffer` 挂起，`CUTOVER` 后按新 `epoch` 刷入目标分片 | `src/cloudflare/ha_scheduler_shard_coordinator.ts`<br>`test 69` | ✅ 已交付 |
+| **`TASK-103`** | **M21** | 分片宕机 Failover 与 SQLite `RPO = 0` 重水化 (`failoverCrashedSchedulerShard`) | 备用分片在 `RTO < 3000ms` 内恢复排队任务、5D W-DRF 份额与 DAG 支票并原子接管槽位 | `src/cloudflare/ha_scheduler_shard_coordinator.ts`<br>`test 70` | ✅ 已交付 |
+| **`TASK-104`** | **M21** | L1 陈旧路由缓存 `409` 拦截与单次调用内自愈 (`verifyShardEpochGate`) | 捕获 `409 StaleSlotEpochError` 后自动从 L2 权威拓扑刷新 L1 缓存并透明重发 | `src/cloudflare/ha_scheduler_shard_coordinator.ts`<br>`test 70` | ✅ 已交付 |
+| **`TASK-105..106`** | **M22** | `SandboxBranchForker`（`<80ms` CoW 沙箱分支克隆与择优合流） | 基于父快照派生 CoW `upperDir` 分支、计算真实文件 SHA-256 Merkle Root、合流优胜分支并清理兄弟分支 | `src/runtime/sandbox_branch_forker.ts`<br>`test 71` | ✅ 已交付 |
+| **`TASK-107..108`** | **M22** | `ZeroTrustSecurityGuard`（VSOCK 无盘凭据代填、出网微隔离与 `cgroup.freeze=1`） | 动态注入短期令牌、拦截非白名单出网域名、eBPF 违规时真实写入 `cgroup.freeze="1"` 文件 | `src/runtime/zero_trust_security_guard.ts`<br>`test 72` | ✅ 已交付 |
+| **`TASK-109..112`** | **M23** | `A2aBlackboardBus`、`GitConflictArbiterCell` 与 `WorkStealingQuotaBroker` | 带 Fence 校验的 A2A 协同黑板、同一文件不交集 AST 符号自动 3-Way 合流、跨分片空闲配额借贷 | `src/a2a/blackboard_and_git_arbiter.ts`<br>`test 73` | ✅ 已交付 |
+| **`TASK-113..114`** | **M24** | `PrefixCacheAffinityRouter`（算力与大模型 KV-Cache 联合亲和路由） | 滚动 SHA-256 前缀指纹路由，命中缓存降低 65% TTFT、享 80% FinOps 折扣并支持过载溢出回退 | `src/router/prefix_cache_affinity.ts`<br>`test 74` | ✅ 已交付 |
+| **`TASK-115..116`** | **M24** | `HierarchicalContextCompactor`（L1/L2/L3 三级上下文压缩与 `pread` 分页回查） | 自动将旧 Turn 折叠为 L2 语义摘要并落盘至 L3 冷归档，通过 `fs.readSync` 按字节偏移切片回查 | `src/harness/context_compactor.ts`<br>`test 75` | ✅ 已交付 |
+| **`TASK-117..118`** | **M25** | `SandboxProvenanceAttestor`（SLSA v1.0 供应链溯源签名与合流门禁） | 生成 SPIFFE 签名的 in-toto / SLSA v1.0 证明，100% 拒止篡改或安全污染分支补丁 | `src/runtime/slsa_provenance_attestor.ts`<br>`test 76` | ✅ 已交付 |
+| **`TASK-119..120`** | **M25** | `OnlineContinuousProfiler`（原生 `node:inspector` 免重启在线 V8 火焰图剖析器） | 75% 堆水位或 50ms 延迟自动触发真实 V8 调用栈采样（损耗 `<1%`）并落盘 `.collapsed` 火焰图 | `src/telemetry/continuous_profiler.ts`<br>`test 77` | ✅ 已交付 |
+| **`TASK-121..130`** | **M26~M27** | 全仓去 Mock 与去简化硬化改造（Real OS I/O, `O_EXCL` WAL, `pread`, Real Saga） | 消除全部内存替身与硬编码延迟，全面替换为真实内核文件锁、`fsyncSync`、磁盘 Cgroup 与纳秒级实测 | `src/checkpoint/wal_engine.ts` 等<br>`test 78` & `test 79` | ✅ 已交付 |
+| **`TASK-131..132`** | **M28~M30** | 11 容器多实例 Docker Compose 集群、TanStack 控制台与 Prometheus/Grafana 集成 | `MultiNodeClusterDaemonServer` 跨容器 HTTP RPC 分发、TanStack BFF 矩阵、`/metrics` 暴露与验证报告页面 | `src/cluster/multi_node_dev_server.ts`<br>`deploy/dev-cluster/*`<br>`test 80` & `test 81` | ✅ 已交付 |
+

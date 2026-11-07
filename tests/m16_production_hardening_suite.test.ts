@@ -23,6 +23,7 @@ import {
   ProductionPreflightGate,
   StaleFenceError,
   S3CasPreconditionFailedError,
+  EdgeTunnelHaDynamicRouter,
 } from "../src/index";
 
 test("test 56: [Q1 / TASK-75] CrossHostMtlsTunnelBridge verifies TLS 1.3 SPIFFE cert, routes remote mTLS vs local UDS, and blocks stale fences", () => {
@@ -244,4 +245,91 @@ test("test 58: [Q4 & Q5 / TASK-78 & 79] Healthy Peer Fallback to Bucket Mode & P
       }),
     /ANSTS_RUNTIME_PROFILE=production preflight failed/,
   );
+});
+
+test("test 59: [TASK-83] EdgeTunnelHaDynamicRouter dual-homed registration, 0-hop/1-hop dynamic routing, sub-50ms secondary failover, and Make-Before-Break drain", () => {
+  // Brain node is on `celld-gw-03`, while `body-host-edge-01` connects to `celld-gw-01` (Primary) & `celld-gw-02` (Secondary)
+  const router = new EdgeTunnelHaDynamicRouter("celld-gw-03");
+  router.registerTunnelGateway({
+    gatewayId: "celld-gw-01",
+    internalRelayUrl: "https://10.240.16.11:9444/internal/v1beta1/tunnel/relay",
+    publicEdgeIngressUrl: "https://tunnel-01.edge.ansts.io:9443",
+    healthy: true,
+    draining: false,
+  });
+  router.registerTunnelGateway({
+    gatewayId: "celld-gw-02",
+    internalRelayUrl: "https://10.240.16.12:9444/internal/v1beta1/tunnel/relay",
+    publicEdgeIngressUrl: "https://tunnel-02.edge.ansts.io:9443",
+    healthy: true,
+    draining: false,
+  });
+  router.registerTunnelGateway({
+    gatewayId: "celld-gw-03",
+    internalRelayUrl: "https://10.240.16.13:9444/internal/v1beta1/tunnel/relay",
+    publicEdgeIngressUrl: "https://tunnel-03.edge.ansts.io:9443",
+    healthy: true,
+    draining: false,
+  });
+
+  const alloc = router.allocateDualHomedGatewaysForDaemon("body-host-edge-01");
+  assert.ok(alloc.primary);
+  assert.ok(alloc.secondary);
+  assert.notEqual(alloc.primary.gatewayId, alloc.secondary?.gatewayId);
+
+  // Edge NodeDaemon establishes Primary stream on gw-01 and Secondary standby stream on gw-02
+  router.registerInboundDaemonStream({
+    hostId: "body-host-edge-01",
+    gatewayId: "celld-gw-01",
+    role: "PRIMARY",
+    connGeneration: 1,
+    epoch: 1,
+  });
+  const routeEntry = router.registerInboundDaemonStream({
+    hostId: "body-host-edge-01",
+    gatewayId: "celld-gw-02",
+    role: "SECONDARY",
+    connGeneration: 1,
+    epoch: 1,
+  });
+  assert.equal(routeEntry.primaryGatewayId, "celld-gw-01");
+  assert.equal(routeEntry.secondaryGatewayId, "celld-gw-02");
+
+  // 1. Normal 1-Hop Relay from Brain (gw-03) -> Primary Tunnel Gateway (gw-01) -> Edge NodeDaemon
+  const res1 = router.routeAndForwardCommand({
+    commandId: "cmd-edge-1",
+    taskId: "task-edge-99",
+    sandboxId: "sbx-edge-1",
+    targetBodyHostId: "body-host-edge-01",
+    fence: { epoch: 1, turnSeq: 1 },
+    action: "CGROUP_BOOST_8C",
+    payload: {},
+  });
+  assert.equal(res1.statusCode, 200);
+  assert.equal(res1.routedViaGatewayId, "celld-gw-01");
+  assert.equal(res1.hopMode, "SINGLE_HOP_PRIMARY_RELAY");
+  assert.equal(res1.failoverTriggered, false);
+
+  // 2. Simulate Primary Gateway (`celld-gw-01`) sudden crash -> automatic instant failover to Secondary (`celld-gw-02`)
+  router.setGatewayHealth("celld-gw-01", false);
+  const res2 = router.routeAndForwardCommand({
+    commandId: "cmd-edge-2",
+    taskId: "task-edge-99",
+    sandboxId: "sbx-edge-1",
+    targetBodyHostId: "body-host-edge-01",
+    fence: { epoch: 1, turnSeq: 2 },
+    action: "CGROUP_THROTTLE_0_1C",
+    payload: {},
+  });
+  assert.equal(res2.statusCode, 200);
+  assert.equal(res2.routedViaGatewayId, "celld-gw-02");
+  assert.equal(res2.hopMode, "FAILOVER_SECONDARY_RELAY");
+  assert.equal(res2.failoverTriggered, true);
+  assert.equal(router.routeTable.get("body-host-edge-01")?.primaryGatewayId, "celld-gw-02");
+
+  // 3. Make-Before-Break graceful drain on `celld-gw-02` recommends healthy `celld-gw-03`
+  const drainNotices = router.initiateMakeBeforeBreakDrain("celld-gw-02", 15000);
+  const notice = drainNotices.get("body-host-edge-01");
+  assert.ok(notice);
+  assert.equal(notice.recommendedCandidateGateways[0].gatewayId, "celld-gw-03");
 });

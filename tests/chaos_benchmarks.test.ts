@@ -226,7 +226,9 @@ test("M4 (TASK-18..23): Warm Pool, 20-Sandbox Burst Semaphore, Linux PSI Guard, 
 });
 
 test("M5 & M6 (TASK-24..32): TurnWAL, Time-Travel Replay, Outbox, 4-Stage Backpressure & CLI", () => {
-  const wal = new TurnWalEngine();
+  // Per-run WAL root: the engine enforces create-once (`If-None-Match`) semantics per task frame,
+  // so a shared persistent root would 412 on every re-run of this suite.
+  const wal = new TurnWalEngine(fs.mkdtempSync(path.join(os.tmpdir(), "ansts-m5m6-wal-")));
   for (let seq = 1; seq <= 8; seq++) {
     wal.writeWalFrameIfNoneMatch({
       taskId: "tsk_wal_1",

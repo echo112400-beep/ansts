@@ -461,3 +461,37 @@ CREATE TABLE IF NOT EXISTS ansts_kv_snapshots (
   3. **优化实现（`V8HeapAndSqlBudgetGuard`）**：
      - 实时监测 Isolate 堆水位：$\ge 75\%$ 触发主动 GC 与游标分页迭代（禁止一次性 `.toArray()` 全表拉取），$\ge 90\%$ 优雅暂停新 WebSocket 接入；
      - 实施单条 SQL 语句级看门狗（`CELLD_SQL_STATEMENT_BUDGET_MS`，默认 `250ms`）：超时的慢查询立即抛出可捕获的 `CelldSqlBudgetExceeded` 并通过嵌套事务（Nested Savepoint）仅回滚当前子步骤，绝不触发 30 秒级 Cell Reset 或污染同节点其他任务。
+
+## 九、 可靠性设计与故障容错模型 (Reliability & Fault Tolerance)
+
+### 9.1 数据持久性与 RPO/RTO 保证
+* **控制面状态 RPO = 0（零数据丢失）**：
+  * 利用 `celld` 内置的 `RpoZeroDurabilityEngine` 与私有 SQLite 存储，结合 `RustFS` 底座的 `EC:4`（纠删码 4 校验块）存储桶或对等 Peer 组 `fsync` 同步[cite: 12]。
+  * 所有状态变更（Task State、TurnWAL、Saga 事务日志）均强制执行 `If-Match` ETag CAS 条件写与 Fence Token 单调递增校验，彻底根除脑裂与双写冲突[cite: 14]。
+* **控制面恢复时间 RTO < 3s**：
+  * 当某台 Brain 节点（`AgentTaskHarnessCell`）因硬件故障崩溃或被 Cloudflare Workers 驱逐时，系统通过 `rehydrateFromSql()` 从底层 SQLite 与 WAL 增量日志瞬间重水化（Rehydrate）恢复内存对象，恢复耗时控制在 `3 秒以内`。
+
+### 9.2 网络与边缘网关高可用 (Tunnel HA & Failover)
+* **主备多归属（Dual-Homed Active-Standby）长连接**：
+  * 边缘端 `NodeDaemon` 采用双归属外拨机制，同时与 2 台独立的 `TunnelControllerServer` 建立 mTLS 1.3 HTTP/2 逆向长连接（1主1备），确保单网关宕机时实现 `<15ms` 的同次调用内自动 Failover[cite: 14]。
+* **平滑滚动维护（Make-Before-Break Drain）**：
+  * 网关在滚动升级或下线前，通过 `TUNNEL_DRAIN_PRE_MIGRATE` 控制帧引导边缘节点“先建后断”，升级期间在途控制指令零丢包、零闪断。
+
+---
+
+## 十、 规格容量设计与系统基准约束 (Capacity Planning & Sizing Specifications)
+
+为了支撑大规模 AI Agent 平台及高并发边缘沙箱舰队的稳定运行，ANSTS v2.3 规范对控制面与数据面做出了严格的容量规划与规格约束：
+
+### 10.1 单机与集群资源规格矩阵
+
+| 维度 / 组件 | 推荐单节点规格 (VM / 裸金属) | 最大并发 / 容量上限约束 | 核心性能指标 (SLA) |
+| :--- | :--- | :--- | :--- |
+| **Brain 节点 (`celld`)** | 2 vCPU, 4GB RAM, NVMe SSD | 单 Isolate 堆上限 `128MB`[cite: 12]（$\ge 75\%$ 触发 GC，$\ge 90\%$ 熔断） | 任务重水化 RTO < 3s<br>本地内存占用 ~0.47 MB/Cell |
+| **Body 宿主机 (`NodeDaemon`)** | 16 vCPU, 64GB RAM, NVMe SSD | 单机最大承载 `32` 个并发隔离沙箱（基于 Cgroups v2 + OverlayFS） | 算力相变提频延迟 < 1.5ms<br>UDS/VSOCK 快路径延迟 < 0.15ms[cite: 14] |
+| **Tunnel 转发集群 (`TunnelController`)** | 4 vCPU, 8GB RAM, 高吞吐网卡 | 单网关实例稳定支撑 `20,000` 个并发逆向 mTLS 长连接流 | 1-Hop 转发延迟 < 0.95ms<br>主备 Failover 耗时 < 15ms |
+| **RustFS 存储底座 (S3 / EC:4)** | 3 节点集群（每节点 4 盘） | 单集群吞吐支持 `10 GB/s`，支持 `100万+` 状态对象并发存储 | ETag CAS 写入延迟 < 12ms<br>纠删码冗余度 4 校验块容灾 |
+
+### 10.2 内存与存储预算守卫 (Budgets & Guards)
+* **V8 堆内存预算保护**：每个 `celld` 运行实例内置 `V8HeapAndSqlBudgetGuard`，实时监控 V8 堆水位。当堆内存占用超过 `75%` 时自动触发垃圾回收；超过 `90%` 时主动拒绝新的 WebSocket 入站与全表物化操作，防止发生 Out-Of-Memory (OOM) 崩溃。
+* **慢 SQL 时间预算**：所有调度 SQLite 事务实施严格的时间预算守卫（`250ms` 超时中断并自动回滚保存点），杜绝慢查询拖垮整个控制面。

@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ANSTS v2.3 Enterprise Console (TanStack Architecture)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        code, pre, .mono { font-family: 'JetBrains Mono', monospace; }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(51, 65, 85, 0.5); }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
+
+    <!-- Top Navbar -->
+    <header class="h-16 border-b border-slate-800 bg-slate-900/80 backdrop-blur px-6 flex items-center justify-between z-20 sticky top-0">
+        <div class="flex items-center space-x-4">
+            <div class="flex items-center space-x-2">
+                <div class="w-8 h-8 rounded-lg bg-cyan-500/20 border border-cyan-500/40 flex items-center justify-center text-cyan-400 font-bold">A</div>
+                <span class="font-bold text-lg tracking-tight bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">ANSTS v2.3</span>
+            </div>
+            <span class="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-400 border border-slate-700">TanStack Console</span>
+        </div>
+
+        <div class="flex items-center space-x-6">
+            <div class="flex items-center space-x-2 bg-slate-800/60 px-3 py-1.5 rounded-lg border border-slate-700/60 text-xs">
+                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span class="text-slate-300">Cluster: <strong class="text-emerald-400">Healthy (RPO=0)</strong></span>
+            </div>
+            <div class="flex items-center space-x-2 bg-slate-800/60 px-3 py-1.5 rounded-lg border border-slate-700/60 text-xs">
+                <span class="text-slate-400">Region:</span>
+                <select id="regionSelect" class="bg-transparent text-cyan-400 font-medium focus:outline-none cursor-pointer">
+                    <option value="us-west-2" class="bg-slate-900">US-West (Primary)</option>
+                    <option value="eu-central-1" class="bg-slate-900">EU-Central (Failover)</option>
+                    <option value="ap-northeast-1" class="bg-slate-900">AP-Northeast</option>
+                </select>
+            </div>
+            <div class="flex items-center space-x-3 border-l border-slate-800 pl-6">
+                <button class="p-2 text-slate-400 hover:text-slate-200 transition relative">
+                    <i data-lucide="bell" class="w-5 h-5"></i>
+                    <span class="absolute top-1.5 right-1.5 w-2 h-2 bg-cyan-500 rounded-full"></span>
+                </button>
+                <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-cyan-600 to-blue-600 flex items-center justify-center font-bold text-xs">AD</div>
+            </div>
+        </div>
+    </header>
+
+    <div class="flex-1 flex overflow-hidden">
+        
+        <!-- Sidebar -->
+        <aside class="w-64 border-r border-slate-800 bg-slate-900/50 flex flex-col justify-between p-4">
+            <nav class="space-y-1">
+                <button onclick="switchTab('overview')" id="nav-overview" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                    <i data-lucide="layout-dashboard" class="w-4 h-4"></i>
+                    <span>Overview 概览</span>
+                </button>
+                <button onclick="switchTab('fleet')" id="nav-fleet" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
+                    <i data-lucide="server" class="w-4 h-4"></i>
+                    <span>Body Fleet 裸金属躯体</span>
+                </button>
+                <button onclick="switchTab('harness')" id="nav-harness" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
+                    <i data-lucide="cpu" class="w-4 h-4"></i>
+                    <span>Agent Harness (Brain)</span>
+                </button>
+                <button onclick="switchTab('tunnels')" id="nav-tunnels" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
+                    <i data-lucide="git-merge" class="w-4 h-4"></i>
+                    <span>mTLS & Dual-Homed Tunnels</span>
+                </button>
+                <button onclick="switchTab('wal')" id="nav-wal" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
+                    <i data-lucide="database" class="w-4 h-4"></i>
+                    <span>TurnWAL & Persistence</span>
+                </button>
+            </nav>
+
+            <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-3 text-xs text-slate-400 space-y-2">
+                <div class="flex justify-between font-mono">
+                    <span>S3 CAS Gen:</span>
+                    <span class="text-cyan-400">v1-gen-418</span>
+                </div>
+                <div class="flex justify-between font-mono">
+                    <span>Active Sessions:</span>
+                    <span class="text-emerald-400">1,248</span>
+                </div>
+                <div class="pt-2 border-t border-slate-800 flex items-center justify-between text-[10px] text-slate-500">
+                    <span>ANSTS Enterprise</span>
+                    <span>v2.3.0-stable</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area (TanStack-like reactive view container) -->
+        <main class="flex-1 overflow-y-auto p-8 bg-slate-950" id="main-content">
+            
+            <!-- OVERVIEW TAB -->
+            <div id="tab-overview" class="space-y-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h1 class="text-2xl font-bold tracking-tight text-white">集群全景监控 (Cluster Overview)</h1>
+                        <p class="text-sm text-slate-400 mt-1">控制面大脑与端侧裸金属沙箱躯体的实时运行状态与高可用指标。</p>
+                    </div>
+                    <button onclick="refreshData()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs font-medium flex items-center space-x-2 transition">
+                        <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
+                        <span>Sync State</span>
+                    </button>
+                </div>
+
+                <!-- Metrics Grid -->
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                    <div class="glass-panel p-5 rounded-xl border-l-4 border-l-cyan-500">
+                        <div class="text-slate-400 text-xs font-medium">Active Sandboxes</div>
+                        <div class="text-3xl font-bold font-mono mt-2 text-white">32 / 32</div>
+                        <div class="text-[11px] text-emerald-400 mt-1 flex items-center">
+                            <i data-lucide="trending-up" class="w-3 h-3 mr-1"></i> 100% Cgroups v2 Enforced
+                        </div>
+                    </div>
+                    <div class="glass-panel p-5 rounded-xl border-l-4 border-l-emerald-500">
+                        <div class="text-slate-400 text-xs font-medium">Global Uptime</div>
+                        <div class="text-3xl font-bold font-mono mt-2 text-white">99.98%</div>
+                        <div class="text-[11px] text-slate-400 mt-1">Zero Brain-Split Incidents</div>
+                    </div>
+                    <div class="glass-panel p-5 rounded-xl border-l-4 border-l-blue-500">
+                        <div class="text-slate-400 text-xs font-medium">Average mTLS RTT</div>
+                        <div class="text-3xl font-bold font-mono mt-2 text-white">0.95ms</div>
+                        <div class="text-[11px] text-cyan-400 mt-1">TLS 1.3 + SPIFFE Verified</div>
+                    </div>
+                    <div class="glass-panel p-5 rounded-xl border-l-4 border-l-amber-500">
+                        <div class="text-slate-400 text-xs font-medium">TurnWAL Checkpoints</div>
+                        <div class="text-3xl font-bold font-mono mt-2 text-white">14.2k</div>
+                        <div class="text-[11px] text-amber-400 mt-1">If-Match ETag CAS Sync</div>
+                    </div>
+                </div>
+
+                <!-- Interactive Table Section -->
+                <div class="glass-panel rounded-xl overflow-hidden mt-6">
+                    <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
+                        <h2 class="font-semibold text-sm text-slate-200 flex items-center">
+                            <i data-lucide="hard-drive" class="w-4 h-4 mr-2 text-cyan-400"></i>
+                            Edge Body Hosts & Dual-Homed Tunnel Routing (TanStack Table View)
+                        </h2>
+                        <div class="flex space-x-2">
+                            <input type="text" placeholder="Filter hostId..." class="bg-slate-900 border border-slate-700 px-3 py-1 text-xs rounded-lg text-slate-200 focus:outline-none focus:border-cyan-500">
+                        </div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse text-xs">
+                            <thead>
+                                <tr class="bg-slate-900/60 text-slate-400 border-b border-slate-800 font-medium">
+                                    <th class="py-3 px-6">Host ID / IP</th>
+                                    <th class="py-3 px-6">Primary Gateway</th>
+                                    <th class="py-3 px-6">Secondary Standby</th>
+                                    <th class="py-3 px-6">Conn Generation</th>
+                                    <th class="py-3 px-6">Status / Fence</th>
+                                    <th class="py-3 px-6 text-right">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-800/60 font-mono">
+                                <tr class="hover:bg-slate-800/30 transition">
+                                    <td class="py-4 px-6 font-semibold text-slate-200">body-host-edge-01<div class="text-[10px] text-slate-500">10.240.32.13:9443</div></td>
+                                    <td class="py-4 px-6 text-cyan-400">celld-gw-01 (Active)</td>
+                                    <td class="py-4 px-6 text-slate-400">celld-gw-02 (Hot-Standby)</td>
+                                    <td class="py-4 px-6">Gen #412</td>
+                                    <td class="py-4 px-6"><span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px]">CONNECTED (Epoch 3)</span></td>
+                                    <td class="py-4 px-6 text-right">
+                                        <button onclick="triggerDrain('body-host-edge-01')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-cyan-400 rounded border border-slate-700 text-[11px] transition">Drain & Migrate</button>
+                                    </td>
+                                </tr>
+                                <tr class="hover:bg-slate-800/30 transition">
+                                    <td class="py-4 px-6 font-semibold text-slate-200">body-host-edge-02<div class="text-[10px] text-slate-500">10.240.32.14:9443</div></td>
+                                    <td class="py-4 px-6 text-cyan-400">celld-gw-02 (Active)</td>
+                                    <td class="py-4 px-6 text-slate-400">celld-gw-03 (Hot-Standby)</td>
+                                    <td class="py-4 px-6">Gen #398</td>
+                                    <td class="py-4 px-6"><span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px]">CONNECTED (Epoch 3)</span></td>
+                                    <td class="py-4 px-6 text-right">
+                                        <button onclick="triggerDrain('body-host-edge-02')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-cyan-400 rounded border border-slate-700 text-[11px] transition">Drain & Migrate</button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- FLEET TAB -->
+            <div id="tab-fleet" class="space-y-6 hidden">
+                <h1 class="text-2xl font-bold tracking-tight text-white">裸金属沙箱躯体拓扑 (Body Fleet Management)</h1>
+                <p class="text-sm text-slate-400">管理端侧宿主机 Cgroups v2 统一层级资源分配与 OverlayFS 差异包快照。</p>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="glass-panel p-6 rounded-xl space-y-4">
+                        <h3 class="font-semibold text-slate-200 text-sm flex items-center"><i data-lucide="cpu" class="w-4 h-4 mr-2 text-red-400"></i> Host Resource Allocator</h3>
+                        <div class="space-y-3 text-xs">
+                            <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+                                <span class="text-slate-400">CPU Max Burst (8.0C Pulse):</span>
+                                <span class="font-mono text-emerald-400">800,000 / 100,000 us</span>
+                            </div>
+                            <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+                                <span class="text-slate-400">Kernel PSI Pressure:</span>
+                                <span class="font-mono text-cyan-400">some avg10=0.02</span>
+                            </div>
+                            <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+                                <span class="text-slate-400">AF_VSOCK Fastpath:</span>
+                                <span class="font-mono text-emerald-400">Active (/var/run/ansts/vsock.sock)</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="glass-panel p-6 rounded-xl space-y-4">
+                        <h3 class="font-semibold text-slate-200 text-sm flex items-center"><i data-lucide="shield-alert" class="w-4 h-4 mr-2 text-amber-400"></i> Preflight Gate Status</h3>
+                        <div class="bg-slate-900/80 p-4 rounded-xl border border-slate-800 font-mono text-[11px] text-slate-300 space-y-1">
+                            <div class="text-emerald-400">[PASS] ANSTS_RUNTIME_PROFILE=production</div>
+                            <div class="text-emerald-400">[PASS] Cgroups v2 unified hierarchy mounted</div>
+                            <div class="text-emerald-400">[PASS] RustFS S3 EC:4 connectivity verified</div>
+                            <div class="text-emerald-400">[PASS] TLS 1.3 SPIFFE cert bundle loaded</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- HARNESS TAB -->
+            <div id="tab-harness" class="space-y-6 hidden">
+                <h1 class="text-2xl font-bold tracking-tight text-white">大模型会话调度中心 (Agent Harness Cells)</h1>
+                <p class="text-sm text-slate-400">Celld Durable Object 单元、DurableObjectFacetSupervisor 与时间旅行重播器控制面板。</p>
+                <div class="glass-panel p-6 rounded-xl">
+                    <div class="text-xs font-mono text-slate-400 mb-4">Active Cell State: <span class="text-cyan-400">AgentTaskHarnessCell_#task-prod-101</span></div>
+                    <div class="p-4 bg-slate-900 rounded-xl border border-slate-800 text-xs font-mono space-y-2">
+                        <div class="flex justify-between"><span>Heap Usage:</span> <span class="text-emerald-400">42.8 MB / 128 MB (Safe)</span></div>
+                        <div class="flex justify-between"><span>SQLite State:</span> <span class="text-cyan-400">Synced (RPO=0 Bucket Archive)</span></div>
+                        <div class="flex justify-between"><span>Active Fence:</span> <span class="text-amber-400">Epoch 3, TurnSeq 14</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TUNNELS TAB -->
+            <div id="tab-tunnels" class="space-y-6 hidden">
+                <h1 class="text-2xl font-bold tracking-tight text-white">mTLS 双归属隧道与动态路由 (Edge Tunnel HA)</h1>
+                <p class="text-sm text-slate-400">管理反向代理集群与边缘 NodeDaemon 之间的 HTTP/2 多路复用隧道和自动故障转移。</p>
+                <div class="glass-panel p-6 rounded-xl space-y-4">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs font-semibold text-slate-300 uppercase tracking-wider">Gateway Instances</span>
+                        <span class="text-xs text-emerald-400">3 / 3 Healthy</span>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 font-mono text-xs">
+                        <div class="p-4 bg-slate-900 rounded-xl border border-cyan-500/30">
+                            <div class="font-bold text-cyan-400 mb-1">celld-gw-01</div>
+                            <div class="text-[11px] text-slate-400">10.240.16.11:9444</div>
+                            <div class="mt-3 pt-3 border-t border-slate-800 text-emerald-400 text-[10px]">Status: Active Primary</div>
+                        </div>
+                        <div class="p-4 bg-slate-900 rounded-xl border border-slate-700">
+                            <div class="font-bold text-slate-200 mb-1">celld-gw-02</div>
+                            <div class="text-[11px] text-slate-400">10.240.16.12:9444</div>
+                            <div class="mt-3 pt-3 border-t border-slate-800 text-cyan-400 text-[10px]">Status: Hot Standby</div>
+                        </div>
+                        <div class="p-4 bg-slate-900 rounded-xl border border-slate-700">
+                            <div class="font-bold text-slate-200 mb-1">celld-gw-03</div>
+                            <div class="text-[11px] text-slate-400">10.240.16.13:9444</div>
+                            <div class="mt-3 pt-3 border-t border-slate-800 text-cyan-400 text-[10px]">Status: Hot Standby</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- WAL TAB -->
+            <div id="tab-wal" class="space-y-6 hidden">
+                <h1 class="text-2xl font-bold tracking-tight text-white">回合预写日志与断线增量恢复 (TurnWAL & Catch-up)</h1>
+                <p class="text-sm text-slate-400">通过 Last-Event-ID / turn_seq 游标在 Stream 中断后无缝重放丢失的 Message 事件。</p>
+                <div class="glass-panel p-6 rounded-xl space-y-4">
+                    <div class="text-xs font-mono text-slate-300">Simulate Reconnection & Incremental Catch-up:</div>
+                    <div class="flex space-x-3">
+                        <input type="number" id="lastSeenSeq" value="14" class="bg-slate-900 border border-slate-700 px-3 py-2 text-xs rounded-lg text-slate-200 w-36 font-mono">
+                        <button onclick="simulateReplay()" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-semibold transition">Fetch Missed TurnWAL Frames</button>
+                    </div>
+                    <div id="replayResult" class="p-4 bg-slate-900 rounded-xl border border-slate-800 text-xs font-mono text-slate-400 hidden">
+                        <!-- Dynamic output -->
+                    </div>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <script>
+        lucide.createIcons();
+
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.className = "tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50";
+            });
+            const activeBtn = document.getElementById('nav-' + tabId);
+            if (activeBtn) {
+                activeBtn.className = "tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition bg-cyan-500/10 text-cyan-400 border border-cyan-500/20";
+            }
+
+            ['overview', 'fleet', 'harness', 'tunnels', 'wal'].forEach(id => {
+                const el = document.getElementById('tab-' + id);
+                if (el) el.classList.add('hidden');
+            });
+            const target = document.getElementById('tab-' + tabId);
+            if (target) target.classList.remove('hidden');
+        }
+
+        function refreshData() {
+            alert("ANSTS v2.3 cluster state synchronized successfully via S3 CAS topology.");
+        }
+
+        function triggerDrain(hostId) {
+            if(confirm(`Initiate Make-Before-Break graceful drain & migrate for ${hostId}?`)) {
+                alert(`Make-Before-Break drain notice dispatched successfully for ${hostId}. Zero packet loss ensured.`);
+            }
+        }
+
+        function simulateReplay() {
+            const seq = document.getElementById('lastSeenSeq').value;
+            const resBox = document.getElementById('replayResult');
+            resBox.classList.remove('hidden');
+            resBox.innerHTML = `<span class="text-cyan-400">[REPLAY SUCCESS]</span> Fetched 3 missed TurnWAL frames for client (turnSeq > ${seq}):\n` +
+                `- Frame #15: { action: "REASONING_CHUNK", tokens: 128 }
+` +
+                `- Frame #16: { action: "TOOL_EXEC_PULSE", sandbox: "sbx-01" }
+` +
+                `- Frame #17: { action: "FINAL_ANSWER", status: "RESUMED" }`;
+        }
+    </script>
+</body>
+</html>

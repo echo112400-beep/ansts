@@ -3,7 +3,7 @@
  */
 
 import { DagEscrowCoordinator } from "./dag/escrow";
-import { AgentTask, EscrowVoucher, ResourceVector5D, SandboxPhase, TaskState } from "./models";
+import { AgentTask, EscrowVoucher, FenceToken, ResourceVector5D, SandboxPhase, TaskState } from "./models";
 
 export interface TenantQueueQuota {
   tenantId: string;
@@ -62,7 +62,10 @@ export class MultiTenantQueueManager {
   public enqueue(task: AgentTask): void {
     task.state = TaskState.QUEUED;
     const q = this.tenantQueues.get(task.tenantId) ?? [];
-    q.push(task);
+    // Rehydration and dead-lease recovery may re-admit an already-queued task; queue identity is 1:1.
+    if (!q.includes(task)) {
+      q.push(task);
+    }
     this.tenantQueues.set(task.tenantId, q);
   }
 
@@ -123,8 +126,7 @@ export class MultiTenantQueueManager {
     return vouchers;
   }
 
-  public evaluateDagBarriers(): string[] {
-    const actions: string[] = [];
+  public evaluateDagBarriers(): string[] {    const actions: string[] = [];
     for (const dag of this.activeDags.values()) {
       if (dag.speculativeRaceMode) {
         const winners = dag.children.filter((c) => c.state === TaskState.SUCCEEDED);
@@ -165,5 +167,57 @@ export class MultiTenantQueueManager {
       }
     }
     return actions;
+  }
+
+  /** Delegated-quota vouchers, keyed by child task id (owned by the escrow coordinator). */
+  public get issuedVouchers(): Map<string, EscrowVoucher> {
+    return this.escrowCoordinator.issuedVouchers;
+  }
+
+  /**
+   * Rebuilds an active DAG after a restart. `children` must be the already-rehydrated task instances so
+   * that `dag.children[i]` stays reference-identical to `scheduler.tasks.get(childId)`.
+   */
+  public restoreDagGroup(
+    dagId: string,
+    parent: AgentTask,
+    children: AgentTask[],
+    raceMode: boolean = false,
+  ): void {
+    this.activeDags.set(dagId, new SubAgentDagGroup(dagId, parent, children, raceMode));
+  }
+
+  /** Removes a task from its tenant queue (it belongs to a DAG fast queue instead). */
+  public removeFromTenantQueue(taskId: string): void {
+    for (const q of this.tenantQueues.values()) {
+      const idx = q.findIndex((t) => t.taskId === taskId);
+      if (idx >= 0) q.splice(idx, 1);
+    }
+  }
+
+  /** Re-queues a DAG child on the fast path (idempotent by child id). */
+  public enqueueEscrowChild(child: AgentTask): void {
+    if (!this.escrowCoordinator.issuedVouchers.has(child.taskId)) return;
+    if (this.escrowFastQueue.some((item) => item.child.taskId === child.taskId)) return;
+    this.escrowFastQueue.push({ child, voucher: this.escrowCoordinator.issuedVouchers.get(child.taskId)! });
+  }
+
+  /** Re-registers a persisted escrow voucher so delegated quota survives a cold start. */
+  public restoreEscrowVoucher(init: {
+    parentTaskId: string;
+    childTaskId: string;
+    delegatedTps: number;
+    delegatedTokens: number;
+    dagId?: string;
+  }): void {
+    const parent = this.activeDags.get(init.dagId ?? "")?.parentTask;
+    const voucher: EscrowVoucher = {
+      parentTaskId: init.parentTaskId,
+      parentFence: parent ? parent.fence : new FenceToken(0, 0, init.parentTaskId),
+      childTaskId: init.childTaskId,
+      delegatedTps: init.delegatedTps,
+      delegatedTokens: init.delegatedTokens,
+    };
+    this.escrowCoordinator.issuedVouchers.set(init.childTaskId, voucher);
   }
 }

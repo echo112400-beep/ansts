@@ -27,6 +27,7 @@ import { ManualFleetScaleController } from "../cluster/manual_scale_controller";
 import { FinOpsBudgetController, TenantFinOpsBudget } from "../finops/budget_controller";
 import { McpDynamicToolRegistry, McpToolDescriptor } from "../saga/mcp_registry";
 import { TransactionalOutboxDispatcher } from "../telemetry/outbox_webhook";
+import { FaultTolerantObservabilityCoordinator, ContinuitySpanRecord, OtelSpanLink } from "../telemetry/observability_recovery";
 
 export class UnifiedComponentPersistenceStore {
   constructor(public readonly sql: SqlStorage) {
@@ -188,6 +189,55 @@ export class UnifiedComponentPersistenceStore {
     manualScale.bodyHosts.clear();
     for (const [k, v] of data.bodyHosts) {
       manualScale.bodyHosts.set(k, v);
+    }
+    return true;
+  }
+
+  // ==================== 7. Fault-Tolerant Observability Pipeline Persistence (TASK-90) ====================
+
+  public persistObservabilityState(
+    obs: FaultTolerantObservabilityCoordinator,
+    key = "global_observability",
+  ): void {
+    this.saveComponentSnapshot(`observability:${key}`, {
+      exportedSpans: obs.otelExporter.exportedSpans,
+      cloudEvents: obs.cloudEventsBus.events,
+      spooledSpans: obs.spooler.spooledSpans,
+      spooledCloudEvents: obs.spooler.spooledCloudEvents,
+      droppedSpansCount: obs.spooler.droppedSpansCount,
+      droppedCloudEventsCount: obs.spooler.droppedCloudEventsCount,
+      activeTaskTraceMap: Array.from(obs.tracePropagator.activeTaskTraceMap.entries()),
+    });
+  }
+
+  public rehydrateObservabilityState(
+    obs: FaultTolerantObservabilityCoordinator,
+    key = "global_observability",
+  ): boolean {
+    const data = this.loadComponentSnapshot<{
+      exportedSpans: ContinuitySpanRecord[];
+      cloudEvents: Array<Record<string, any>>;
+      spooledSpans: ContinuitySpanRecord[];
+      spooledCloudEvents: Array<Record<string, any>>;
+      droppedSpansCount: number;
+      droppedCloudEventsCount: number;
+      activeTaskTraceMap: Array<[string, { traceId: string; lastSpanId: string }]>;
+    }>(`observability:${key}`);
+    if (!data) return false;
+
+    obs.otelExporter.exportedSpans.length = 0;
+    obs.otelExporter.exportedSpans.push(...data.exportedSpans);
+
+    obs.cloudEventsBus.events = [...data.cloudEvents];
+
+    obs.spooler.spooledSpans = [...data.spooledSpans];
+    obs.spooler.spooledCloudEvents = [...data.spooledCloudEvents];
+    obs.spooler.droppedSpansCount = data.droppedSpansCount;
+    obs.spooler.droppedCloudEventsCount = data.droppedCloudEventsCount;
+
+    obs.tracePropagator.activeTaskTraceMap.clear();
+    for (const [k, v] of data.activeTaskTraceMap) {
+      obs.tracePropagator.activeTaskTraceMap.set(k, v);
     }
     return true;
   }

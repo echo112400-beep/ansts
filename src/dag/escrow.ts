@@ -8,6 +8,8 @@ import { AgentTask, EscrowVoucher, SandboxPhase, TaskState } from "../models";
 export class DagEscrowCoordinator {
   private secret: Buffer;
   private signatures: Map<string, string> = new Map();
+  /** childTaskId -> issued voucher. The single source of truth for delegated quota. */
+  public issuedVouchers: Map<string, EscrowVoucher> = new Map();
 
   constructor(clusterSecret: string = "ansts-escrow-hmac-secret-v2") {
     this.secret = Buffer.from(clusterSecret, "utf8");
@@ -47,6 +49,7 @@ export class DagEscrowCoordinator {
         delegatedTokens: perTok,
       };
       this.signVoucher(v);
+      this.issuedVouchers.set(child.taskId, v);
       vouchers.push(v);
     }
     return vouchers;

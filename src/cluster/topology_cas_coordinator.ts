@@ -1,12 +1,11 @@
 /**
- * @fileoverview TASK-76 (Q2): Global S3 CAS Topology Coordinator (`s3://ansts-fleet/control/topology-v1.json`).
- *
- * Provides a Single Source of Truth for Non-K8s manual scale-out fleets:
- * - Conditional ETag CAS updates (`If-Match` / `If-None-Match`) on `control/topology-v1.json`
- * - Short-interval ETag polling (`304 Not Modified` fast-path) + active push broadcast to Edge Workers & `celld` nodes
+ * @fileoverview TASK-76 & M27 (TASK-130): Global S3 CAS Topology Coordinator (`control/topology-v1.json`)
+ * with Real Atomic Disk File Persistence (`topology-v1.json` + `.etag`).
  */
 
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { S3CasPreconditionFailedError } from "../checkpoint/s3_ltx_driver";
 
 export interface ClusterTopologyManifestV1 {
@@ -36,11 +35,19 @@ export class S3TopologyCasCoordinator {
   private storedJson: string | null = null;
   private storedEtag: string | null = null;
   private readonly pushSubscribers: Array<(manifest: ClusterTopologyManifestV1, etag: string) => void> = [];
+  public readonly topologyFilePath: string;
 
-  constructor(initialManifest?: ClusterTopologyManifestV1) {
+  constructor(
+    initialManifest?: ClusterTopologyManifestV1,
+    public readonly storageDir: string = "/tmp/ansts_topology_cas",
+  ) {
+    fs.mkdirSync(path.join(this.storageDir, "control"), { recursive: true });
+    this.topologyFilePath = path.join(this.storageDir, S3TopologyCasCoordinator.TOPOLOGY_OBJECT_KEY);
+
     if (initialManifest) {
-      this.storedJson = JSON.stringify(initialManifest);
+      this.storedJson = JSON.stringify(initialManifest, null, 2);
       this.storedEtag = this.computeEtag(this.storedJson);
+      this.writeTopologyToDisk(this.storedJson, this.storedEtag);
     }
   }
 
@@ -49,6 +56,10 @@ export class S3TopologyCasCoordinator {
     etag: string | null;
     manifest: ClusterTopologyManifestV1 | null;
   } {
+    if (!this.storedJson && fs.existsSync(this.topologyFilePath)) {
+      this.storedJson = fs.readFileSync(this.topologyFilePath, "utf8");
+      this.storedEtag = this.computeEtag(this.storedJson);
+    }
     if (!this.storedJson || !this.storedEtag) {
       return { statusCode: 404, etag: null, manifest: null };
     }
@@ -72,10 +83,11 @@ export class S3TopologyCasCoordinator {
       );
     }
 
-    const serialized = JSON.stringify(nextManifest);
+    const serialized = JSON.stringify(nextManifest, null, 2);
     const newEtag = this.computeEtag(serialized);
     this.storedJson = serialized;
     this.storedEtag = newEtag;
+    this.writeTopologyToDisk(serialized, newEtag);
 
     for (const subscriber of this.pushSubscribers) {
       subscriber(nextManifest, newEtag);
@@ -92,6 +104,13 @@ export class S3TopologyCasCoordinator {
     listener: (manifest: ClusterTopologyManifestV1, etag: string) => void,
   ): void {
     this.pushSubscribers.push(listener);
+  }
+
+  private writeTopologyToDisk(jsonText: string, etag: string): void {
+    const tmpPath = `${this.topologyFilePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpPath, jsonText, "utf8");
+    fs.renameSync(tmpPath, this.topologyFilePath);
+    fs.writeFileSync(`${this.topologyFilePath}.etag`, etag, "utf8");
   }
 
   private computeEtag(payload: string): string {

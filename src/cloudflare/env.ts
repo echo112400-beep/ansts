@@ -27,6 +27,16 @@ export interface DurableObjectStorage {
   delete(key: string): Promise<boolean>;
   setAlarm(scheduledTime: number | Date): Promise<void>;
   getAlarm(): Promise<number | null>;
+  /**
+   * Optional SQLite transaction wrapper. When present, all state mutations inside `callback` are
+   * atomic: a throw rolls the whole unit back (RPO=0 durability contract).
+   */
+  transactionSync?<T>(callback: () => T): T;
+  /**
+   * Optional write-ahead-log flush. Implementations without real WAL semantics may override this
+   * to reject when durability cannot be confirmed, in which case callers must fail closed.
+   */
+  sync?(): Promise<void>;
 }
 
 export interface DurableObjectState {
@@ -111,6 +121,11 @@ export interface CloudflareCelldEnv {
   ANSTS_KV: KVNamespaceBinding;
   ANSTS_CHECKPOINTS_R2: R2BucketBinding;
   ANSTS_EVENTS_QUEUE: QueueBinding;
+  /**
+   * Stable scheduler cluster identity. Every scheduler RPC must resolve to this single logical cell;
+   * falling back to per-shard ids silently splits one cluster into several schedulers.
+   */
+  SCHEDULER_CLUSTER_ID?: string;
   PRIMARY_MODEL_POOL?: string;
   FAST_UTILITY_POOL?: string;
   FALLBACK_MODEL_POOL?: string;
@@ -156,15 +171,16 @@ export class InMemoryCellSqlStorage implements SqlStorage {
     }
 
     if (upper.startsWith("DELETE FROM")) {
-      const match = q.match(/DELETE\s+FROM\s+([a-zA-Z0-9_]+)(?:\s+WHERE\s+([a-zA-Z0-9_]+)\s*>\s*\?)?/i);
+      const match = q.match(/DELETE\s+FROM\s+([a-zA-Z0-9_]+)(?:\s+WHERE\s+([a-zA-Z0-9_]+)\s*([>=])\s*\?)?/i);
       if (match) {
         const tableName = match[1];
         const col = match[2];
+        const operator = match[3] ?? "=";
         const rows = this.tables.get(tableName) ?? [];
         if (col && bindings.length > 0) {
           this.tables.set(
             tableName,
-            rows.filter((r) => !(r[col] > bindings[0])),
+            rows.filter((r) => (operator === ">" ? r[col] > bindings[0] : r[col] !== bindings[0])),
           );
         } else {
           this.tables.set(tableName, []);
@@ -186,6 +202,13 @@ export class InMemoryCellSqlStorage implements SqlStorage {
     return { toArray: () => [], one: () => null };
   }
 }
+
+/**
+ * Alias kept for the scheduler / chaos-drill modules that refer to the in-memory SQLite
+ * double as `InMemorySqlStorage`. Same implementation as {@link InMemoryCellSqlStorage}.
+ */
+export const InMemorySqlStorage = InMemoryCellSqlStorage;
+export type InMemorySqlStorage = InMemoryCellSqlStorage;
 
 export class MockDurableObjectState implements DurableObjectState {
   public id: { toString(): string; name?: string };

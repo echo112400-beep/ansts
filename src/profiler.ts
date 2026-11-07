@@ -103,6 +103,20 @@ export class BayesianTaskProfiler {
     return stats;
   }
 
+  /**
+   * Detached view of the conjugate priors, used by durable checkpoints and cluster health endpoints.
+   * Cold-start reservations must survive a restart, so the snapshot is what gets persisted.
+   */
+  public snapshot(): FingerprintStatsData[] {
+    return Array.from(this.profiles.values()).map((v) => ({
+      sampleCount: v.sampleCount,
+      muLogTokens: v.muLogTokens,
+      sigmaLogTokens: v.sigmaLogTokens,
+      alphaCog: v.alphaCog,
+      betaExec: v.betaExec,
+    }));
+  }
+
   public toJSONString(): string {
     const obj: Record<string, FingerprintStatsData> = {};
     for (const [k, v] of this.profiles.entries()) {

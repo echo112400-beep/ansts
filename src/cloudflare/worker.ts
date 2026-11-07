@@ -68,6 +68,8 @@ export default {
     _ctx?: { waitUntil(p: Promise<any>): void },
   ): Promise<Response> {
     const url = new URL(request.url);
+    // One logical scheduler cluster per deployment: every scheduler RPC below must resolve here.
+    const schedulerClusterName = env.SCHEDULER_CLUSTER_ID ?? "global-5d-scheduler";
 
     // Route 0: Prometheus / OpenMetrics Telemetry Endpoint (`GET /metrics` — TASK-59)
     if (request.method === "GET" && url.pathname === "/metrics") {
@@ -104,7 +106,7 @@ export default {
         );
       }
 
-      const cachedTask = await env.ANSTS_KV.get(kvKey, "json");
+      const cachedTask = env.ANSTS_KV ? await env.ANSTS_KV.get(kvKey, "json") : null;
       if (cachedTask) {
         return new Response(JSON.stringify({ ...cachedTask, deduplicated: true }), {
           status: 200,
@@ -123,7 +125,7 @@ export default {
       globalSchedulerRouter.recordShardDispatchStart(routeDecision.targetShardId);
 
       const startMs = performance.now();
-      const schedId = env.SCHEDULER_CELL.idFromName(routeDecision.targetShardId);
+      const schedId = env.SCHEDULER_CELL.idFromName(schedulerClusterName);
       const schedStub = env.SCHEDULER_CELL.get(schedId);
       const resp = await schedStub.fetch("http://scheduler.internal/tasks/submit", {
         method: "POST",
@@ -166,7 +168,9 @@ export default {
 
         const kvShardInfo = globalKvOptimizer.putSharded(kvKey, JSON.stringify(enrichedBody), { expirationTtl: 86400 });
         (enrichedBody as any).kv_namespace_shard_id = kvShardInfo.namespaceShardId;
-        await env.ANSTS_KV.put(kvKey, JSON.stringify(enrichedBody), { expirationTtl: 86400 });
+        if (env.ANSTS_KV) {
+          await env.ANSTS_KV.put(kvKey, JSON.stringify(enrichedBody), { expirationTtl: 86400 });
+        }
         await env.ANSTS_EVENTS_QUEUE.send(eventPayload);
 
         return new Response(JSON.stringify(enrichedBody), {
@@ -313,14 +317,17 @@ export default {
       });
     }
 
-    // Route 2: Trigger 5D W-DRF Scheduler Tick or Inspect Cluster Top
+    // Route 2: Scheduler Cluster RPCs (Tick, Recover, Heartbeat, Lease Validation, DAG Escrow, Cluster Top)
     if (
       url.pathname === "/v1beta1/scheduler/tick" ||
+      url.pathname === "/v1beta1/scheduler/recover" ||
+      url.pathname === "/v1beta1/nodes/heartbeat" ||
+      url.pathname === "/v1beta1/leases/validate" ||
       url.pathname === "/v1beta1/cluster/top" ||
-      url.pathname === "/v1beta1/dag/spawn-escrow"
+      url.pathname === "/v1beta1/dag/spawn-escrow" ||
+      url.pathname === "/v1beta1/tasks/complete"
     ) {
-      const targetShard = url.searchParams.get("shard") ?? "global-5d-scheduler";
-      const schedId = env.SCHEDULER_CELL.idFromName(targetShard);
+      const schedId = env.SCHEDULER_CELL.idFromName(schedulerClusterName);
       const schedStub = env.SCHEDULER_CELL.get(schedId);
       const internalPath = url.pathname.replace("/v1beta1", "");
       return schedStub.fetch(`http://scheduler.internal${internalPath}`, {
@@ -386,7 +393,7 @@ export default {
     _controller: { scheduledTime: number; cron: string },
     env: CloudflareCelldEnv,
   ): Promise<void> {
-    const schedId = env.SCHEDULER_CELL.idFromName("global-5d-scheduler");
+    const schedId = env.SCHEDULER_CELL.idFromName(env.SCHEDULER_CLUSTER_ID ?? "global-5d-scheduler");
     const schedStub = env.SCHEDULER_CELL.get(schedId);
     await schedStub.fetch("http://scheduler.internal/scheduler/tick", { method: "POST" });
   },
