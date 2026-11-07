@@ -50,6 +50,8 @@ export class AnstsSchedulerCell {
   private readonly idempotencyIndex: Map<string, string> = new Map();
   /** taskId -> last time the holding node proved liveness (lease renewal watermark). */
   private readonly leaseRenewals: Map<string, number> = new Map();
+  /** Monotonic checkpoint revision; monotonicity survives restarts because it is stored in the payload. */
+  private revision: number = 0;
   private outboxSeq: number = 1;
 
   constructor(
@@ -130,11 +132,12 @@ export class AnstsSchedulerCell {
       .toArray()
       .map((r) => ({ task_id: String(r.task_id), node_id: String(r.node_id), epoch: Number(r.epoch) }))
       .sort((a, b) => a.task_id.localeCompare(b.task_id));
-    return JSON.stringify({ schema: 2, tasks, leases });
+    return JSON.stringify({ schema: 2, revision: this.revision, tasks, leases });
   }
 
   /** Writes the single-row checkpoint (delete+insert keeps it host-agnostic and idempotent). */
   private writeCheckpoint(): void {
+    this.revision += 1;
     const payload = this.buildCheckpointPayload();
     this.ctx.storage.sql.exec("DELETE FROM scheduler_checkpoint");
     this.ctx.storage.sql.exec(
@@ -145,32 +148,24 @@ export class AnstsSchedulerCell {
     );
   }
 
-  private persistTasks(): void {
-    // DAG children and escrow fast-queue members are real tasks that may not be in `scheduler.tasks` yet.
-    const byId = new Map<string, AgentTask>();
-    for (const t of this.cluster.scheduler.tasks.values()) byId.set(t.taskId, t);
-    for (const dag of this.cluster.queueMgr.activeDags.values()) {
-      byId.set(dag.parentTask.taskId, dag.parentTask);
-      for (const child of dag.children) byId.set(child.taskId, child);
-    }
-    for (const item of this.cluster.queueMgr.escrowFastQueue) byId.set(item.child.taskId, item.child);
-
-    this.ctx.storage.sql.exec("DELETE FROM cell_tasks");
-    for (const t of byId.values()) {
-      this.ctx.storage.sql.exec(
-        "INSERT INTO cell_tasks (task_id, tenant_id, priority_class, state, primary_model, epoch, turn_seq, enqueue_ts, deadline_ts, raw_spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        t.taskId,
-        t.tenantId,
-        t.priorityClass,
-        t.state,
-        t.primaryModel,
-        t.fence.epoch,
-        t.fence.turnSeq,
-        t.enqueueTs,
-        t.deadlineTs,
-        JSON.stringify({ taskId: t.taskId, tenantId: t.tenantId }),
-      );
-    }
+  /** Upserts exactly one task row: cost is per changed task, not per cluster size. */
+  private persistTask(t: AgentTask): void {
+    this.ctx.storage.sql.exec("DELETE FROM cell_tasks WHERE task_id = ?", t.taskId);
+    this.ctx.storage.sql.exec(
+      "INSERT INTO cell_tasks (task_id, tenant_id, priority_class, state, primary_model, epoch, turn_seq, enqueue_ts, deadline_ts, raw_spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      t.taskId,
+      t.tenantId,
+      t.priorityClass,
+      t.state,
+      t.primaryModel,
+      t.fence.epoch,
+      t.fence.turnSeq,
+      t.enqueueTs,
+      t.deadlineTs,
+      // Full task payload: after a restart the 5D demand vector, token reservations, locality and
+      // isolation fields must be the ones that were accepted, not constructor defaults.
+      JSON.stringify(t),
+    );
   }
 
   private persistLease(taskId: string): void {
@@ -287,15 +282,19 @@ export class AnstsSchedulerCell {
     }).rows;
     for (const r of taskRows) {
       const taskId = String(r.task_id);
-      const t = new AgentTask({
-        taskId,
-        tenantId: String(r.tenant_id),
-        priorityClass: String(r.priority_class ?? "P1"),
-        primaryModel: (r.primary_model as any) ?? "DeepSeek",
-        state: (r.state as TaskState) ?? TaskState.QUEUED,
-        enqueueTs: Number(r.enqueue_ts ?? 0),
-        deadlineTs: Number(r.deadline_ts ?? 0),
-      });
+      // Rebuild the accepted task from its persisted payload, then re-assert the projection columns
+      // (state / fence / timestamps) which are authoritative for scheduling decisions.
+      const raw = JSON.parse(String(r.raw_spec_json ?? "{}")) as Record<string, any>;
+      const t = Object.assign(
+        new AgentTask({ taskId, tenantId: String(r.tenant_id) }),
+        raw,
+      ) as AgentTask;
+      t.taskId = taskId;
+      t.tenantId = String(r.tenant_id);
+      t.state = (r.state as TaskState) ?? t.state ?? TaskState.QUEUED;
+      t.primaryModel = (r.primary_model as any) ?? t.primaryModel;
+      t.enqueueTs = Number(r.enqueue_ts ?? t.enqueueTs ?? 0);
+      t.deadlineTs = Number(r.deadline_ts ?? t.deadlineTs ?? 0);
       if (t.deadlineTs <= 0) {
         t.deadlineTs = t.enqueueTs + 300.0;
       }
@@ -403,12 +402,13 @@ export class AnstsSchedulerCell {
           "refusing to boot an empty scheduler over damaged durable state",
       );
     }
-    const parsed = JSON.parse(payload) as { schema?: number };
+    const parsed = JSON.parse(payload) as { schema?: number; revision?: number };
     if (Number(parsed.schema ?? 0) < 2) {
       throw new Error(
         "SchedulerCheckpointCorrupt: checkpoint schema predates v2; operator migration required",
       );
     }
+    this.revision = Math.max(this.revision, Number(parsed.revision ?? 0));
   }
 
   private verifyLeaseSchemaVersion(): void {
@@ -499,7 +499,7 @@ export class AnstsSchedulerCell {
       durableKey,
       task.taskId,
     );
-    this.persistTasks();
+    this.persistTask(task);
     this.persistLease(task.taskId);
     this.persistProfilerSnapshot();
     this.enqueueOutboxEvent(`evt_${task.taskId}_queued`, task);
@@ -536,8 +536,8 @@ export class AnstsSchedulerCell {
       this.cluster.leaseCoord.recordNodeHeartbeat(nodeId, nowSec);
       this.leaseRenewals.set(t.taskId, nowSec);
       this.persistLease(t.taskId);
+      this.persistTask(t);
     }
-    this.persistTasks();
     this.writeCheckpoint();
     return {
       dispatched_count: dispatched.length,
@@ -588,6 +588,7 @@ export class AnstsSchedulerCell {
           task.fence = this.cluster.leaseCoord.getLease(task.taskId)!.fence;
           this.cluster.queueMgr.enqueue(task);
           this.persistLease(task.taskId);
+          this.persistTask(task);
           recovered.push(task.taskId);
         }
 
@@ -596,7 +597,6 @@ export class AnstsSchedulerCell {
           if (node) node.alive = false;
         }
         if (recovered.length > 0) {
-          this.persistTasks();
           this.writeCheckpoint();
         }
         return { recovered_tasks: recovered };
@@ -702,7 +702,7 @@ export class AnstsSchedulerCell {
           if (idx >= 0) q.splice(idx, 1);
         }
         this.persistLease(taskId);
-        this.persistTasks();
+        this.persistTask(task);
         this.writeCheckpoint();
         return { statusCode: 200, body: { task_id: taskId, state: task.state, deduplicated: false } };
       });
@@ -777,7 +777,8 @@ export class AnstsSchedulerCell {
             v.delegatedTokens,
           );
         }
-        this.persistTasks();
+        this.persistTask(parent);
+        for (const child of children) this.persistTask(child);
         this.writeCheckpoint();
         return {
           statusCode: 200,
@@ -941,6 +942,7 @@ export class AnstsSchedulerCell {
           celld_sqlite_leases_count: persistedLeases.length,
           celld_sqlite_tasks_count: persistedTasks.length,
           pending_outbox_events: pendingOutbox.length,
+          scheduler_revision: this.revision,
         },
         200,
       );

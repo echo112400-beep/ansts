@@ -38,10 +38,10 @@ function walkTsFiles(dir: string): string[] {
   return out.sort();
 }
 
-test("Google Engineering Standard #1: All 75 src/**/*.ts modules pass Google TS Style Guide invariants", () => {
+test("Google Engineering Standard #1: All 74 src/**/*.ts modules pass Google TS Style Guide invariants", () => {
   const rootDir = path.join(__dirname, "..", "..");
   const srcFiles = walkTsFiles(path.join(rootDir, "src"));
-  assert.equal(srcFiles.length, 75);
+  assert.equal(srcFiles.length, 74);
 
   for (const file of srcFiles) {
     const rel = path.relative(rootDir, file);

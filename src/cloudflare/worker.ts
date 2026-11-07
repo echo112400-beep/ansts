@@ -395,6 +395,9 @@ export default {
   ): Promise<void> {
     const schedId = env.SCHEDULER_CELL.idFromName(env.SCHEDULER_CLUSTER_ID ?? "global-5d-scheduler");
     const schedStub = env.SCHEDULER_CELL.get(schedId);
+    // Reclaim leases whose holder stopped renewing before dispatching, so a crashed node cannot keep
+    // its tasks forever; both endpoints are idempotent, so an overlapping alarm is harmless.
+    await schedStub.fetch("http://scheduler.internal/scheduler/recover", { method: "POST" });
     await schedStub.fetch("http://scheduler.internal/scheduler/tick", { method: "POST" });
   },
 };
