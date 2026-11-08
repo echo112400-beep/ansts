@@ -19,7 +19,7 @@ describe("Google Engineering Standards & 74-Task Full-Lifecycle Audit", () => {
       return out;
     };
     const srcFiles = walk(path.join(process.cwd(), "src"));
-    assert.equal(srcFiles.length, 52);
+    assert.equal(srcFiles.length, 54);
     for (const f of srcFiles) {
       const content = fs.readFileSync(f, "utf-8");
       assert.ok(content.includes("@fileoverview"), `Missing @fileoverview in ${f}`);

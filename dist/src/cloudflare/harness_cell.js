@@ -73,6 +73,28 @@ class AgentTaskHarnessCell {
     };
   }
 
+  /**
+   * M16 TASK-81: Auto-Healing Container Execution across Cell Migration (`OperationInterruptedError` recovery).
+   */
+  async executeInCompanionContainerWithAutoHeal(
+  action,
+  onContainerRestartAndRehydrate)
+  {
+    try {
+      const output = await action();
+      return { output, recoveredFromMigrationInterrupt: false };
+    } catch (err) {
+      if (err.name === "OperationInterruptedError" || err.message.includes("OperationInterruptedError")) {
+        const history = this.getTurnHistory();
+        const latestTurn = history.length > 0 ? history[history.length - 1] : null;
+        await onContainerRestartAndRehydrate(latestTurn);
+        const retryOutput = await action();
+        return { output: retryOutput, recoveredFromMigrationInterrupt: true };
+      }
+      throw err;
+    }
+  }
+
   getTurnHistory() {
     const rows = this.ctx.storage.sql.
     exec("SELECT * FROM harness_turns").

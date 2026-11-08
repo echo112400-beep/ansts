@@ -1,13 +1,35 @@
 /**
- * @fileoverview M12 TASK-46: `anstsctl` Operational CLI (Submit, Inspect, Time-Travel Fork, Approval & Manual Scale).
+ * @fileoverview M12 TASK-46 & M16 TASK-82: `anstsctl` Operational CLI
+ * (Submit, Status, Scale-Out, `diagnose` Fleet Lease Probe & `gc-audit` Safe Epoch GC Dry-Run).
  */
 import { CoreScheduler5D } from "../scheduler.js";
 import { TaskPriority, TaskSpec } from "../models.js";
 import { ManualFleetScaleController } from "../cluster/manual_scale_controller.js";
 
+export interface FleetPeerProbeInput {
+  nodeId: string;
+  leaseExpired: boolean;
+  reachable: boolean;
+  protocolVersion: string;
+  restoringCount: number;
+}
+
+export interface CellEpochGcCandidate {
+  cellScope: string;
+  epochId: number;
+  ownerCurrentEpoch: number;
+  ageSeconds: number;
+  isFacetStream: boolean;
+  isPagedCell: boolean;
+  hydrateMbps: number;
+  bytes: number;
+}
+
 export class AnstsClusterRuntime {
   public readonly scheduler = new CoreScheduler5D();
   public readonly fleetController = new ManualFleetScaleController();
+  public peerProbes: FleetPeerProbeInput[] = [];
+  public epochCandidates: CellEpochGcCandidate[] = [];
 }
 
 export function runCli(argv: string[], runtime = new AnstsClusterRuntime()): { exitCode: number; stdout: string } {
@@ -39,6 +61,54 @@ export function runCli(argv: string[], runtime = new AnstsClusterRuntime()): { e
     const ip = rest[1] ?? "10.20.1.99";
     const res = runtime.fleetController.scaleOutNode(nodeId, ip, "worker");
     return { exitCode: 0, stdout: JSON.stringify(res) };
+  }
+  if (cmd === "diagnose") {
+    const expectedProtocol = rest[0] ?? "v0.6.3";
+    const expiredLeases = runtime.peerProbes.filter((p) => p.leaseExpired).map((p) => p.nodeId);
+    const unreachablePeers = runtime.peerProbes.filter((p) => !p.reachable).map((p) => p.nodeId);
+    const protocolMismatches = runtime.peerProbes
+      .filter((p) => p.protocolVersion !== expectedProtocol)
+      .map((p) => p.nodeId);
+    const totalRestoring = runtime.peerProbes.reduce((acc, p) => acc + p.restoringCount, 0);
+    const rollingUpgradeSafe =
+      expiredLeases.length === 0 &&
+      unreachablePeers.length === 0 &&
+      protocolMismatches.length === 0 &&
+      totalRestoring === 0;
+    return {
+      exitCode: rollingUpgradeSafe ? 0 : 2,
+      stdout: JSON.stringify({
+        expiredLeases,
+        unreachablePeers,
+        protocolMismatches,
+        totalRestoring,
+        rollingUpgradeSafe,
+      }),
+    };
+  }
+  if (cmd === "gc-audit") {
+    const graceSecs = Number(rest[0] ?? 3600);
+    const deletableEpochs: CellEpochGcCandidate[] = [];
+    for (const c of runtime.epochCandidates) {
+      if (c.isFacetStream) continue;
+      if (c.isPagedCell && c.hydrateMbps === 0) continue;
+      if (c.epochId >= c.ownerCurrentEpoch - 1) continue;
+      if (c.ageSeconds < graceSecs) continue;
+      if (deletableEpochs.length < 64) {
+        deletableEpochs.push(c);
+      }
+    }
+    const reclaimableBytes = deletableEpochs.reduce((acc, c) => acc + c.bytes, 0);
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        dryRun: true,
+        graceSecs,
+        deletableEpochCount: deletableEpochs.length,
+        reclaimableBytes,
+        deletableScopes: deletableEpochs.map((e) => `${e.cellScope}@epoch-${e.epochId}`),
+      }),
+    };
   }
   return { exitCode: 1, stdout: JSON.stringify({ error: `Unknown command: ${cmd ?? ""}` }) };
 }

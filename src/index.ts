@@ -52,3 +52,5 @@ export { default as cloudflareCelldWorker } from "./cloudflare/worker.js";
 export * from "./finops/budget_controller.js";
 export * from "./cli/anstsctl.js";
 export * from "./dashboard/server.js";
+export * from "./cloudflare/celld_container_bridge.js";
+export * from "./cloudflare/hot_cell_overload_guard.js";

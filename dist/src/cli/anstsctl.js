@@ -1,13 +1,35 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.AnstsClusterRuntime = void 0;exports.runCli = runCli;
 
 
+
 var _scheduler = require("../scheduler.js");
 var _models = require("../models.js");
 var _manual_scale_controller = require("../cluster/manual_scale_controller.js"); /**
- * @fileoverview M12 TASK-46: `anstsctl` Operational CLI (Submit, Inspect, Time-Travel Fork, Approval & Manual Scale).
- */class AnstsClusterRuntime {
+ * @fileoverview M12 TASK-46 & M16 TASK-82: `anstsctl` Operational CLI
+ * (Submit, Status, Scale-Out, `diagnose` Fleet Lease Probe & `gc-audit` Safe Epoch GC Dry-Run).
+ */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class AnstsClusterRuntime {
   scheduler = new _scheduler.CoreScheduler5D();
   fleetController = new _manual_scale_controller.ManualFleetScaleController();
+  peerProbes = [];
+  epochCandidates = [];
 }exports.AnstsClusterRuntime = AnstsClusterRuntime;
 
 function runCli(argv, runtime = new AnstsClusterRuntime()) {
@@ -39,6 +61,54 @@ function runCli(argv, runtime = new AnstsClusterRuntime()) {
     const ip = rest[1] ?? "10.20.1.99";
     const res = runtime.fleetController.scaleOutNode(nodeId, ip, "worker");
     return { exitCode: 0, stdout: JSON.stringify(res) };
+  }
+  if (cmd === "diagnose") {
+    const expectedProtocol = rest[0] ?? "v0.6.3";
+    const expiredLeases = runtime.peerProbes.filter((p) => p.leaseExpired).map((p) => p.nodeId);
+    const unreachablePeers = runtime.peerProbes.filter((p) => !p.reachable).map((p) => p.nodeId);
+    const protocolMismatches = runtime.peerProbes.
+    filter((p) => p.protocolVersion !== expectedProtocol).
+    map((p) => p.nodeId);
+    const totalRestoring = runtime.peerProbes.reduce((acc, p) => acc + p.restoringCount, 0);
+    const rollingUpgradeSafe =
+    expiredLeases.length === 0 &&
+    unreachablePeers.length === 0 &&
+    protocolMismatches.length === 0 &&
+    totalRestoring === 0;
+    return {
+      exitCode: rollingUpgradeSafe ? 0 : 2,
+      stdout: JSON.stringify({
+        expiredLeases,
+        unreachablePeers,
+        protocolMismatches,
+        totalRestoring,
+        rollingUpgradeSafe
+      })
+    };
+  }
+  if (cmd === "gc-audit") {
+    const graceSecs = Number(rest[0] ?? 3600);
+    const deletableEpochs = [];
+    for (const c of runtime.epochCandidates) {
+      if (c.isFacetStream) continue;
+      if (c.isPagedCell && c.hydrateMbps === 0) continue;
+      if (c.epochId >= c.ownerCurrentEpoch - 1) continue;
+      if (c.ageSeconds < graceSecs) continue;
+      if (deletableEpochs.length < 64) {
+        deletableEpochs.push(c);
+      }
+    }
+    const reclaimableBytes = deletableEpochs.reduce((acc, c) => acc + c.bytes, 0);
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        dryRun: true,
+        graceSecs,
+        deletableEpochCount: deletableEpochs.length,
+        reclaimableBytes,
+        deletableScopes: deletableEpochs.map((e) => `${e.cellScope}@epoch-${e.epochId}`)
+      })
+    };
   }
   return { exitCode: 1, stdout: JSON.stringify({ error: `Unknown command: ${cmd ?? ""}` }) };
 }

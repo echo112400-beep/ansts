@@ -161,3 +161,73 @@ export class FleetHaAndAutoscalerController {
     return { healthyNodes: healthy.length, unhealthyNodeIds, scaleAction };
   }
 }
+
+
+/**
+ * M16 TASK-76: `CELLD_DURABILITY=fleet` Peer-Replicated Log Pipeline (`CELLD_LOG_PIPELINE=4`),
+ * Adaptive Hedged Log Append (`CELLD_LOG_HEDGE_MS`), & Automatic Single-Node `bucket` Fallback.
+ */
+export class FleetReplicatedDurabilityEngine {
+  private readonly mode: "fleet" | "bucket";
+  private readonly logPipelineLimit: number;
+  private slowestRecentAppendMs = 40;
+
+  constructor(mode: "fleet" | "bucket" = "fleet", logPipelineLimit = 4) {
+    this.mode = mode;
+    this.logPipelineLimit = Math.max(1, Math.min(4, logPipelineLimit));
+  }
+
+  public computeAdaptiveHedgeThresholdMs(): number {
+    return Math.max(250, this.slowestRecentAppendMs * 4);
+  }
+
+  public commitWriteWithFleetDurability(params: {
+    livePeerNodeCount: number;
+    peerFsyncLatencyMs: number;
+    bucketPutLatencyMs: number;
+    inFlightLogRounds?: number;
+  }): {
+    effectiveDurabilityMode: "fleet" | "bucket_fallback" | "bucket";
+    acknowledgedVia: "PEER_FSYNC" | "HEDGED_PEER_COPY" | "BUCKET_PUT";
+    commitLatencyMs: number;
+    hedgedCopyTriggered: boolean;
+    pipelineRoundsUsed: number;
+  } {
+    const pipelineRoundsUsed = Math.min(this.logPipelineLimit, params.inFlightLogRounds ?? 1);
+    if (this.mode === "bucket" || params.livePeerNodeCount < 1) {
+      const effectiveDurabilityMode = this.mode === "bucket" ? "bucket" : "bucket_fallback";
+      return {
+        effectiveDurabilityMode,
+        acknowledgedVia: "BUCKET_PUT",
+        commitLatencyMs: params.bucketPutLatencyMs,
+        hedgedCopyTriggered: false,
+        pipelineRoundsUsed,
+      };
+    }
+
+    const hedgeThresholdMs = this.computeAdaptiveHedgeThresholdMs();
+    const hedgedCopyTriggered = params.peerFsyncLatencyMs >= hedgeThresholdMs;
+    const effectivePeerLatencyMs = hedgedCopyTriggered
+      ? Math.min(params.peerFsyncLatencyMs, hedgeThresholdMs + 18)
+      : params.peerFsyncLatencyMs;
+
+    this.slowestRecentAppendMs = Math.max(10, Math.min(200, effectivePeerLatencyMs));
+
+    if (effectivePeerLatencyMs <= params.bucketPutLatencyMs) {
+      return {
+        effectiveDurabilityMode: "fleet",
+        acknowledgedVia: hedgedCopyTriggered ? "HEDGED_PEER_COPY" : "PEER_FSYNC",
+        commitLatencyMs: effectivePeerLatencyMs,
+        hedgedCopyTriggered,
+        pipelineRoundsUsed,
+      };
+    }
+    return {
+      effectiveDurabilityMode: "fleet",
+      acknowledgedVia: "BUCKET_PUT",
+      commitLatencyMs: params.bucketPutLatencyMs,
+      hedgedCopyTriggered,
+      pipelineRoundsUsed,
+    };
+  }
+}

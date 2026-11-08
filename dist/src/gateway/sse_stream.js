@@ -71,6 +71,21 @@ class SseEventStreamGateway {
     return sub;
   }
 
+  /**
+   * M16 TASK-81: Seamless WebSocket/SSE Reconnect Handler for Code `1012 Service Restart`
+   * during `celld` cell rebalancing or `CELLD_DEPLOY_MAX_AGE_S` deployment rollouts.
+   */
+  handleWebSocket1012Reconnect(
+  taskId,
+  oldSubscriptionId,
+  newSubscriptionId,
+  lastReceivedEventId)
+  {
+    this.unsubscribe(taskId, oldSubscriptionId);
+    const subscription = this.subscribe(taskId, newSubscriptionId, lastReceivedEventId);
+    return { subscription, closeCodeHandled: 1012 };
+  }
+
   unsubscribe(taskId, subscriptionId) {
     const taskSubs = this.subscriptionsByTask.get(taskId);
     const sub = taskSubs?.get(subscriptionId);

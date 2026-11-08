@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ShardedQueueBrokerPool = exports.SafeEpochGarbageCollector = exports.RpoZeroDurabilityEngine = exports.FleetHaAndAutoscalerController = exports.DurableWorkflowContext = void 0;
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ShardedQueueBrokerPool = exports.SafeEpochGarbageCollector = exports.RpoZeroDurabilityEngine = exports.FleetReplicatedDurabilityEngine = exports.FleetHaAndAutoscalerController = exports.DurableWorkflowContext = void 0;
 
 
 var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
@@ -160,4 +160,74 @@ class FleetHaAndAutoscalerController {
     }
     return { healthyNodes: healthy.length, unhealthyNodeIds, scaleAction };
   }
-}exports.FleetHaAndAutoscalerController = FleetHaAndAutoscalerController;
+}
+
+
+/**
+ * M16 TASK-76: `CELLD_DURABILITY=fleet` Peer-Replicated Log Pipeline (`CELLD_LOG_PIPELINE=4`),
+ * Adaptive Hedged Log Append (`CELLD_LOG_HEDGE_MS`), & Automatic Single-Node `bucket` Fallback.
+ */exports.FleetHaAndAutoscalerController = FleetHaAndAutoscalerController;
+class FleetReplicatedDurabilityEngine {
+  mode;
+  logPipelineLimit;
+  slowestRecentAppendMs = 40;
+
+  constructor(mode = "fleet", logPipelineLimit = 4) {
+    this.mode = mode;
+    this.logPipelineLimit = Math.max(1, Math.min(4, logPipelineLimit));
+  }
+
+  computeAdaptiveHedgeThresholdMs() {
+    return Math.max(250, this.slowestRecentAppendMs * 4);
+  }
+
+  commitWriteWithFleetDurability(params)
+
+
+
+
+
+
+
+
+
+
+  {
+    const pipelineRoundsUsed = Math.min(this.logPipelineLimit, params.inFlightLogRounds ?? 1);
+    if (this.mode === "bucket" || params.livePeerNodeCount < 1) {
+      const effectiveDurabilityMode = this.mode === "bucket" ? "bucket" : "bucket_fallback";
+      return {
+        effectiveDurabilityMode,
+        acknowledgedVia: "BUCKET_PUT",
+        commitLatencyMs: params.bucketPutLatencyMs,
+        hedgedCopyTriggered: false,
+        pipelineRoundsUsed
+      };
+    }
+
+    const hedgeThresholdMs = this.computeAdaptiveHedgeThresholdMs();
+    const hedgedCopyTriggered = params.peerFsyncLatencyMs >= hedgeThresholdMs;
+    const effectivePeerLatencyMs = hedgedCopyTriggered ?
+    Math.min(params.peerFsyncLatencyMs, hedgeThresholdMs + 18) :
+    params.peerFsyncLatencyMs;
+
+    this.slowestRecentAppendMs = Math.max(10, Math.min(200, effectivePeerLatencyMs));
+
+    if (effectivePeerLatencyMs <= params.bucketPutLatencyMs) {
+      return {
+        effectiveDurabilityMode: "fleet",
+        acknowledgedVia: hedgedCopyTriggered ? "HEDGED_PEER_COPY" : "PEER_FSYNC",
+        commitLatencyMs: effectivePeerLatencyMs,
+        hedgedCopyTriggered,
+        pipelineRoundsUsed
+      };
+    }
+    return {
+      effectiveDurabilityMode: "fleet",
+      acknowledgedVia: "BUCKET_PUT",
+      commitLatencyMs: params.bucketPutLatencyMs,
+      hedgedCopyTriggered,
+      pipelineRoundsUsed
+    };
+  }
+}exports.FleetReplicatedDurabilityEngine = FleetReplicatedDurabilityEngine;

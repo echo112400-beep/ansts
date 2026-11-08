@@ -61,5 +61,14 @@
     {
       "binding": "ANSTS_DYNAMIC_WORKER_LOADER"
     }
+  ],
+  "containers": [
+    {
+      "class_name": "AgentTaskHarnessCell",
+      "image": "./deploy/Dockerfile.sandbox",
+      "instance_type": "standard-2",
+      "max_instances": 128,
+      "runtime": "kata"
+    }
   ]
 }

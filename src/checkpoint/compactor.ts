@@ -46,6 +46,71 @@ export class WalCompactorAndPagedRestorer {
     return snap;
   }
 
+  /**
+   * M16 TASK-79: `CELLD_LTX_COMPACTION=1` Additive L0->L1 Block Compaction (max 256 objects in 64 MiB buffer)
+   * and `CELLD_LTX_TRUNCATE_PAGES=128` SQLite WAL Truncation & Sparse Paged Restore (`CELLD_LTX_PAGED=1`).
+   */
+  public executeCelldLtxL1Compaction(params: {
+    cellId: string;
+    l0ObjectCount: number;
+    txidDistance: number;
+    totalL0Megabytes: number;
+    minTxidsThreshold?: number;
+    minMegabytesThreshold?: number;
+  }): {
+    compactionTriggered: boolean;
+    batchesMerged: number;
+    spilledToLocalDisk: boolean;
+    resultingL1Objects: number;
+  } {
+    const minTxids = params.minTxidsThreshold ?? 256;
+    const minMb = Math.min(64, params.minMegabytesThreshold ?? 32);
+    if (params.txidDistance < minTxids && params.totalL0Megabytes < minMb) {
+      return {
+        compactionTriggered: false,
+        batchesMerged: 0,
+        spilledToLocalDisk: false,
+        resultingL1Objects: 0,
+      };
+    }
+    const batchesMerged = Math.max(1, Math.ceil(params.l0ObjectCount / 256));
+    const spilledToLocalDisk = params.totalL0Megabytes > 64;
+    return {
+      compactionTriggered: true,
+      batchesMerged,
+      spilledToLocalDisk,
+      resultingL1Objects: batchesMerged,
+    };
+  }
+
+  public evaluateWalTruncationAndPaging(params: {
+    dbSizeMb: number;
+    walSizePages: number;
+    ltxChainSizeMb: number;
+    pagedMinMb?: number;
+    hydrateMbps?: number;
+  }): {
+    shouldTruncateWalAtCheckpoint: boolean;
+    usePagedRestore: boolean;
+    estimatedFullHydrationSeconds: number;
+  } {
+    const walSizeMb = (params.walSizePages * 4096) / (1024 * 1024);
+    const shouldTruncateWalAtCheckpoint =
+      params.dbSizeMb <= 4.0 ? params.walSizePages >= 128 : walSizeMb > params.dbSizeMb;
+    const pagedMinMb = params.pagedMinMb ?? 256;
+    const hydrateMbps = params.hydrateMbps ?? 16;
+    const usePagedRestore = params.ltxChainSizeMb >= pagedMinMb;
+    const estimatedFullHydrationSeconds =
+      usePagedRestore && hydrateMbps > 0
+        ? Number((params.ltxChainSizeMb / hydrateMbps).toFixed(2))
+        : 0;
+    return {
+      shouldTruncateWalAtCheckpoint,
+      usePagedRestore,
+      estimatedFullHydrationSeconds,
+    };
+  }
+
   public restoreViaUserfaultfd(
     taskId: string,
     workingSetRatio = 0.2
