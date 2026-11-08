@@ -2,6 +2,7 @@
  * @fileoverview M4 TASK-18: NodeDaemon Runtime Agent with Turn-Level WAL Checkpointing.
  */
 import { CheckpointRecord, NodeHeartbeat, TaskSpec, TaskState } from "./models.js";
+import { StaleFenceError } from "./lease_coordinator.js";
 import { SagaToolGateway } from "./saga_gateway.js";
 import { CoreScheduler5D } from "./scheduler.js";
 
@@ -41,8 +42,10 @@ export class NodeDaemon {
     overlayfsDiffUri: string
   ): CheckpointRecord {
     if (!scheduler.leaseCoordinator.validateFencingToken(task.task_id, task.lease_fencing_token)) {
-      throw new Error(
-        `Fencing token ${task.lease_fencing_token} rejected for task ${task.task_id} on node ${this.nodeId}`
+      throw new StaleFenceError(
+        task.task_id,
+        task.lease_fencing_token,
+        scheduler.leaseCoordinator.getLease(task.task_id)?.fencing_token ?? -1
       );
     }
     task.current_turn = turnIndex;

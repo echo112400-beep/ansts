@@ -25,6 +25,24 @@ var _models = require("../models.js"); /**
 
   }
 
+  rehydrateSchedulerFromSql() {
+    return this.rehydrateFromSql();
+  }
+
+  async submitTaskRpc(task, signal) {
+    if (signal?.aborted) {
+      throw new Error("submitTaskRpc aborted by caller AbortSignal");
+    }
+    return this.submitTask(task);
+  }
+
+  async scheduleTickRpc(signal) {
+    if (signal?.aborted) {
+      throw new Error("scheduleTickRpc aborted by caller AbortSignal");
+    }
+    return this.alarm();
+  }
+
   rehydrateFromSql() {
     const rows = this.ctx.storage.sql.
     exec("SELECT * FROM ansts_tasks").

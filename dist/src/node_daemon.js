@@ -1,7 +1,8 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.NodeDaemon = void 0;
 
 
-var _models = require("./models.js"); /**
+var _models = require("./models.js");
+var _lease_coordinator = require("./lease_coordinator.js"); /**
  * @fileoverview M4 TASK-18: NodeDaemon Runtime Agent with Turn-Level WAL Checkpointing.
  */
 
@@ -41,8 +42,10 @@ class NodeDaemon {
   overlayfsDiffUri)
   {
     if (!scheduler.leaseCoordinator.validateFencingToken(task.task_id, task.lease_fencing_token)) {
-      throw new Error(
-      `Fencing token ${task.lease_fencing_token} rejected for task ${task.task_id} on node ${this.nodeId}`);
+      throw new _lease_coordinator.StaleFenceError(
+      task.task_id,
+      task.lease_fencing_token,
+      scheduler.leaseCoordinator.getLease(task.task_id)?.fencing_token ?? -1);
 
     }
     task.current_turn = turnIndex;

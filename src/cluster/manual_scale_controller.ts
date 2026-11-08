@@ -1,6 +1,84 @@
 /**
  * @fileoverview M13 TASK-62: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller.
  */
+import * as crypto from "node:crypto";
+
+/**
+ * Consistent Hash Virtual Slot Ring Manager (`VirtualHashSlotRingManager`) for Non-K8s Bare-Metal Manual Scale-Out/In.
+ * Maps keys onto a ring of `totalVirtualSlots` (default 1024) with configurable virtual nodes per physical node.
+ */
+export class VirtualHashSlotRingManager {
+  public readonly totalVirtualSlots: number;
+  public readonly vnodesPerNode: number;
+  private readonly ring: Array<{ tokenHash: number; nodeId: string }> = [];
+  private readonly activeNodeIds: Set<string> = new Set();
+
+  constructor(totalVirtualSlots = 1024, vnodesPerNode = 16) {
+    this.totalVirtualSlots = totalVirtualSlots;
+    this.vnodesPerNode = vnodesPerNode;
+  }
+
+  private static hashString(input: string): number {
+    return crypto.createHash("sha256").update(input, "utf-8").digest().readUInt32BE(0);
+  }
+
+  public addNode(nodeId: string): void {
+    if (this.activeNodeIds.has(nodeId)) return;
+    this.activeNodeIds.add(nodeId);
+    for (let v = 0; v < this.vnodesPerNode; v++) {
+      const tokenHash = VirtualHashSlotRingManager.hashString(`${nodeId}#vnode-${v}`);
+      this.ring.push({ tokenHash, nodeId });
+    }
+    this.ring.sort((a, b) => a.tokenHash - b.tokenHash);
+  }
+
+  public removeNode(nodeId: string): void {
+    if (!this.activeNodeIds.has(nodeId)) return;
+    this.activeNodeIds.delete(nodeId);
+    for (let i = this.ring.length - 1; i >= 0; i--) {
+      if (this.ring[i].nodeId === nodeId) {
+        this.ring.splice(i, 1);
+      }
+    }
+  }
+
+  public getOwnerNodeForSlot(slotIndex: number): string | null {
+    if (this.ring.length === 0) return null;
+    const slotHash = VirtualHashSlotRingManager.hashString(`slot:${slotIndex % this.totalVirtualSlots}`);
+    let low = 0;
+    let high = this.ring.length - 1;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if (this.ring[mid].tokenHash >= slotHash) {
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+    const chosenIdx = low < this.ring.length ? low : 0;
+    return this.ring[chosenIdx].nodeId;
+  }
+
+  public getOwnerNodeForKey(key: string): { slotIndex: number; nodeId: string | null } {
+    const slotIndex = VirtualHashSlotRingManager.hashString(key) % this.totalVirtualSlots;
+    return {
+      slotIndex,
+      nodeId: this.getOwnerNodeForSlot(slotIndex),
+    };
+  }
+
+  public computeSlotDistribution(): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const n of this.activeNodeIds) counts.set(n, 0);
+    if (this.ring.length === 0) return counts;
+    for (let s = 0; s < this.totalVirtualSlots; s++) {
+      const owner = this.getOwnerNodeForSlot(s)!;
+      counts.set(owner, (counts.get(owner) ?? 0) + 1);
+    }
+    return counts;
+  }
+}
+
 export type FleetNodeState = "ACTIVE" | "CORDONED" | "DRAINING" | "OFFLINE";
 
 export interface BareMetalFleetNode {
@@ -14,6 +92,7 @@ export interface BareMetalFleetNode {
 
 export class ManualFleetScaleController {
   private readonly nodes: Map<string, BareMetalFleetNode> = new Map();
+  public readonly slotRing: VirtualHashSlotRingManager = new VirtualHashSlotRingManager(1024, 16);
 
   public registerBareMetalNode(node: Omit<BareMetalFleetNode, "state" | "runningCells"> & { runningCells?: string[] }): BareMetalFleetNode {
     const full: BareMetalFleetNode = {
@@ -22,6 +101,7 @@ export class ManualFleetScaleController {
       runningCells: node.runningCells ? [...node.runningCells] : [],
     };
     this.nodes.set(node.nodeId, full);
+    this.slotRing.addNode(node.nodeId);
     return full;
   }
 
@@ -73,6 +153,7 @@ export class ManualFleetScaleController {
       idx += 1;
     }
     source.state = "OFFLINE";
+    this.slotRing.removeNode(nodeId);
     return { drainedCells, finalState: source.state };
   }
 

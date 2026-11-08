@@ -24,9 +24,126 @@ export enum TaskState {
 
 export enum ToolCallEffectClass {
   READ_ONLY = "READ_ONLY",
+  PURE_READ = "READ_ONLY",
   IDEMPOTENT_WRITE = "IDEMPOTENT_WRITE",
   COMPENSATABLE = "COMPENSATABLE",
+  SAGA_COMPENSATABLE = "COMPENSATABLE",
+  STAGED_COMMIT = "STAGED_COMMIT",
   IRREVERSIBLE = "IRREVERSIBLE",
+}
+
+export type PreemptionPolicy = "PreemptToHibernate" | "Never" | "YieldOnPressure";
+
+/**
+ * Dual-Tuple Monotonic Fencing Token `(epoch, turnSeq, taskId)` aligned with `FenceTokenProto` in `proto/ansts_rpc.proto`.
+ */
+export class FenceToken {
+  public readonly epoch: number;
+  public readonly turnSeq: number;
+  public readonly taskId: string;
+
+  constructor(epoch: number, turnSeq: number, taskId: string) {
+    if (!Number.isInteger(epoch) || epoch < 0) {
+      throw new Error(`FenceToken epoch must be a non-negative integer, got ${epoch}`);
+    }
+    if (!Number.isInteger(turnSeq) || turnSeq < 0) {
+      throw new Error(`FenceToken turnSeq must be a non-negative integer, got ${turnSeq}`);
+    }
+    this.epoch = epoch;
+    this.turnSeq = turnSeq;
+    this.taskId = taskId;
+  }
+
+  public nextEpoch(): FenceToken {
+    return new FenceToken(this.epoch + 1, 0, this.taskId);
+  }
+
+  public nextTurn(): FenceToken {
+    return new FenceToken(this.epoch, this.turnSeq + 1, this.taskId);
+  }
+
+  public compareTo(other: FenceToken): number {
+    if (this.epoch !== other.epoch) {
+      return this.epoch > other.epoch ? 1 : -1;
+    }
+    if (this.turnSeq !== other.turnSeq) {
+      return this.turnSeq > other.turnSeq ? 1 : -1;
+    }
+    return 0;
+  }
+
+  public isStrictlyOlderThan(other: FenceToken): boolean {
+    return this.compareTo(other) < 0;
+  }
+
+  public toScalarToken(): number {
+    return this.epoch * 1_000_000 + this.turnSeq;
+  }
+
+  public toProto(): { epoch: number; turn_seq: number; task_id: string } {
+    return { epoch: this.epoch, turn_seq: this.turnSeq, task_id: this.taskId };
+  }
+}
+
+/**
+ * Turn-Level Write-Ahead Log Frame (`TurnWalFrame`) with CRC32 integrity verification and dual-tuple `FenceToken`.
+ */
+export class TurnWalFrame {
+  public readonly frameId: string;
+  public readonly taskId: string;
+  public readonly turnIndex: number;
+  public readonly fence: FenceToken;
+  public readonly changedFiles: string[];
+  public readonly sqliteWalPages: number;
+  public readonly crc32Hex: string;
+  public readonly createdAtMs: number;
+
+  constructor(params: {
+    frameId: string;
+    taskId: string;
+    turnIndex: number;
+    fence: FenceToken;
+    changedFiles: string[];
+    sqliteWalPages: number;
+    crc32Hex?: string;
+    createdAtMs?: number;
+  }) {
+    this.frameId = params.frameId;
+    this.taskId = params.taskId;
+    this.turnIndex = params.turnIndex;
+    this.fence = params.fence;
+    this.changedFiles = [...params.changedFiles];
+    this.sqliteWalPages = params.sqliteWalPages;
+    this.createdAtMs = params.createdAtMs ?? Date.now();
+    this.crc32Hex = params.crc32Hex ?? TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+  }
+
+  public static computeCrc32Hex(
+    taskId: string,
+    turnIndex: number,
+    fence: FenceToken,
+    changedFiles: string[]
+  ): string {
+    const raw = `${taskId}:${turnIndex}:${fence.epoch}:${fence.turnSeq}:${changedFiles.join(",")}`;
+    let crc = 0xffffffff;
+    for (let i = 0; i < raw.length; i++) {
+      crc ^= raw.charCodeAt(i);
+      for (let j = 0; j < 8; j++) {
+        crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+      }
+    }
+    return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, "0");
+  }
+
+  public verifyIntegrity(): boolean {
+    const expected = TurnWalFrame.computeCrc32Hex(
+      this.taskId,
+      this.turnIndex,
+      this.fence,
+      this.changedFiles
+    );
+    return this.crc32Hex === expected;
+  }
 }
 
 export interface ResourceProfile {

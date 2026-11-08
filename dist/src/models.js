@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ToolCallEffectClass = exports.TaskState = exports.TaskSpec = exports.TaskPriority = exports.NodeHeartbeat = exports.LlmEndpointMetrics = void 0; /**
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TurnWalFrame = exports.ToolCallEffectClass = exports.TaskState = exports.TaskSpec = exports.TaskPriority = exports.NodeHeartbeat = exports.LlmEndpointMetrics = exports.FenceToken = void 0; /**
  * @fileoverview Core Domain Models, TaskSpec v1beta1, 5D Resource Profiles, Monotonic Lease Fencing & LlmEndpointMetrics.
  */let
 TaskPriority;exports.TaskPriority = TaskPriority;(function (TaskPriority) {TaskPriority[TaskPriority["P0_EMERGENCY"] = 0] = "P0_EMERGENCY";TaskPriority[TaskPriority["P1_HIGH"] = 1] = "P1_HIGH";TaskPriority[TaskPriority["P2_STANDARD"] = 2] = "P2_STANDARD";TaskPriority[TaskPriority["P3_BATCH"] = 3] = "P3_BATCH";})(TaskPriority || (exports.TaskPriority = TaskPriority = {}));let
@@ -22,12 +22,129 @@ TaskState;exports.TaskState = TaskState;(function (TaskState) {TaskState["SUBMIT
 
 
 
-ToolCallEffectClass;exports.ToolCallEffectClass = ToolCallEffectClass;(function (ToolCallEffectClass) {ToolCallEffectClass["READ_ONLY"] = "READ_ONLY";ToolCallEffectClass["IDEMPOTENT_WRITE"] = "IDEMPOTENT_WRITE";ToolCallEffectClass["COMPENSATABLE"] = "COMPENSATABLE";ToolCallEffectClass["IRREVERSIBLE"] = "IRREVERSIBLE";})(ToolCallEffectClass || (exports.ToolCallEffectClass = ToolCallEffectClass = {}));
+ToolCallEffectClass;exports.ToolCallEffectClass = ToolCallEffectClass;(function (ToolCallEffectClass) {ToolCallEffectClass["READ_ONLY"] = "READ_ONLY";ToolCallEffectClass["PURE_READ"] = "READ_ONLY";ToolCallEffectClass["IDEMPOTENT_WRITE"] = "IDEMPOTENT_WRITE";ToolCallEffectClass["COMPENSATABLE"] = "COMPENSATABLE";ToolCallEffectClass["SAGA_COMPENSATABLE"] = "COMPENSATABLE";ToolCallEffectClass["STAGED_COMMIT"] = "STAGED_COMMIT";ToolCallEffectClass["IRREVERSIBLE"] = "IRREVERSIBLE";})(ToolCallEffectClass || (exports.ToolCallEffectClass = ToolCallEffectClass = {}));
 
 
 
 
 
+
+
+
+
+
+
+/**
+ * Dual-Tuple Monotonic Fencing Token `(epoch, turnSeq, taskId)` aligned with `FenceTokenProto` in `proto/ansts_rpc.proto`.
+ */
+class FenceToken {
+  epoch;
+  turnSeq;
+  taskId;
+
+  constructor(epoch, turnSeq, taskId) {
+    if (!Number.isInteger(epoch) || epoch < 0) {
+      throw new Error(`FenceToken epoch must be a non-negative integer, got ${epoch}`);
+    }
+    if (!Number.isInteger(turnSeq) || turnSeq < 0) {
+      throw new Error(`FenceToken turnSeq must be a non-negative integer, got ${turnSeq}`);
+    }
+    this.epoch = epoch;
+    this.turnSeq = turnSeq;
+    this.taskId = taskId;
+  }
+
+  nextEpoch() {
+    return new FenceToken(this.epoch + 1, 0, this.taskId);
+  }
+
+  nextTurn() {
+    return new FenceToken(this.epoch, this.turnSeq + 1, this.taskId);
+  }
+
+  compareTo(other) {
+    if (this.epoch !== other.epoch) {
+      return this.epoch > other.epoch ? 1 : -1;
+    }
+    if (this.turnSeq !== other.turnSeq) {
+      return this.turnSeq > other.turnSeq ? 1 : -1;
+    }
+    return 0;
+  }
+
+  isStrictlyOlderThan(other) {
+    return this.compareTo(other) < 0;
+  }
+
+  toScalarToken() {
+    return this.epoch * 1_000_000 + this.turnSeq;
+  }
+
+  toProto() {
+    return { epoch: this.epoch, turn_seq: this.turnSeq, task_id: this.taskId };
+  }
+}
+
+/**
+ * Turn-Level Write-Ahead Log Frame (`TurnWalFrame`) with CRC32 integrity verification and dual-tuple `FenceToken`.
+ */exports.FenceToken = FenceToken;
+class TurnWalFrame {
+  frameId;
+  taskId;
+  turnIndex;
+  fence;
+  changedFiles;
+  sqliteWalPages;
+  crc32Hex;
+  createdAtMs;
+
+  constructor(params)
+
+
+
+
+
+
+
+
+  {
+    this.frameId = params.frameId;
+    this.taskId = params.taskId;
+    this.turnIndex = params.turnIndex;
+    this.fence = params.fence;
+    this.changedFiles = [...params.changedFiles];
+    this.sqliteWalPages = params.sqliteWalPages;
+    this.createdAtMs = params.createdAtMs ?? Date.now();
+    this.crc32Hex = params.crc32Hex ?? TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+  }
+
+  static computeCrc32Hex(
+  taskId,
+  turnIndex,
+  fence,
+  changedFiles)
+  {
+    const raw = `${taskId}:${turnIndex}:${fence.epoch}:${fence.turnSeq}:${changedFiles.join(",")}`;
+    let crc = 0xffffffff;
+    for (let i = 0; i < raw.length; i++) {
+      crc ^= raw.charCodeAt(i);
+      for (let j = 0; j < 8; j++) {
+        crc = crc >>> 1 ^ (crc & 1 ? 0xedb88320 : 0);
+      }
+    }
+    return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, "0");
+  }
+
+  verifyIntegrity() {
+    const expected = TurnWalFrame.computeCrc32Hex(
+    this.taskId,
+    this.turnIndex,
+    this.fence,
+    this.changedFiles);
+
+    return this.crc32Hex === expected;
+  }
+}exports.TurnWalFrame = TurnWalFrame;
 
 
 

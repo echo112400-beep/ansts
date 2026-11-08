@@ -25,6 +25,24 @@ export class AnstsSchedulerCell {
     );
   }
 
+  public rehydrateSchedulerFromSql(): number {
+    return this.rehydrateFromSql();
+  }
+
+  public async submitTaskRpc(task: TaskSpec, signal?: AbortSignal): Promise<TaskSpec> {
+    if (signal?.aborted) {
+      throw new Error("submitTaskRpc aborted by caller AbortSignal");
+    }
+    return this.submitTask(task);
+  }
+
+  public async scheduleTickRpc(signal?: AbortSignal): Promise<{ placements: Array<[string, string, number]>; recoveredIds: string[] }> {
+    if (signal?.aborted) {
+      throw new Error("scheduleTickRpc aborted by caller AbortSignal");
+    }
+    return this.alarm();
+  }
+
   public rehydrateFromSql(): number {
     const rows = this.ctx.storage.sql
       .exec<Record<string, unknown>>("SELECT * FROM ansts_tasks")

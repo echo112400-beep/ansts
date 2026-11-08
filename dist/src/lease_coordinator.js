@@ -1,12 +1,38 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.LeaseCoordinator = void 0; /**
- * @fileoverview M2 TASK-07: Monotonic Fencing Token Lease Coordinator with Split-Brain Rejection.
- */
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.StaleFenceError = exports.LeaseCoordinator = void 0;
 
+
+var _models = require("./models.js"); /**
+ * @fileoverview M2 TASK-07: Monotonic Fencing Token & Dual-Tuple `FenceToken` Lease Coordinator with `StaleFenceError` (HTTP 409) Split-Brain Rejection.
+ */class StaleFenceError extends Error {
+  statusCode = 409;
+  taskId;
+  attemptedFence;
+  currentHighestFence;
+
+  constructor(taskId, attemptedFence, currentHighestFence) {
+    const att =
+    attemptedFence instanceof _models.FenceToken ?
+    `(${attemptedFence.epoch},${attemptedFence.turnSeq})` :
+    String(attemptedFence);
+    const cur =
+    currentHighestFence instanceof _models.FenceToken ?
+    `(${currentHighestFence.epoch},${currentHighestFence.turnSeq})` :
+    String(currentHighestFence);
+    super(
+    `StaleFenceError [409]: Fencing token ${att} rejected for task ${taskId} (highest=${cur})`);
+
+    this.name = "StaleFenceError";
+    this.taskId = taskId;
+    this.attemptedFence = att;
+    this.currentHighestFence = cur;
+  }
+}exports.StaleFenceError = StaleFenceError;
 
 class LeaseCoordinator {
   leaseTtlSeconds;
   activeLeases = new Map();
   highestTokenByTask = new Map();
+  dualTupleFencesByTask = new Map();
 
   constructor(leaseTtlSeconds = 15.0) {
     this.leaseTtlSeconds = leaseTtlSeconds;
@@ -16,6 +42,10 @@ class LeaseCoordinator {
     const prevToken = this.highestTokenByTask.get(taskId) ?? 0;
     const nextToken = prevToken + 1;
     this.highestTokenByTask.set(taskId, nextToken);
+
+    const prevDual = this.dualTupleFencesByTask.get(taskId);
+    const nextDual = prevDual ? prevDual.nextEpoch() : new _models.FenceToken(nextToken, 0, taskId);
+    this.dualTupleFencesByTask.set(taskId, nextDual);
 
     const now = Date.now() / 1000;
     const record = {
@@ -27,6 +57,37 @@ class LeaseCoordinator {
     };
     this.activeLeases.set(taskId, record);
     return record;
+  }
+
+  getDualTupleFence(taskId) {
+    return (
+      this.dualTupleFencesByTask.get(taskId) ??
+      new _models.FenceToken(this.highestTokenByTask.get(taskId) ?? 1, 0, taskId));
+
+  }
+
+  advanceTurnFence(taskId, callerFence) {
+    const current = this.getDualTupleFence(taskId);
+    if (callerFence.isStrictlyOlderThan(current)) {
+      throw new StaleFenceError(taskId, callerFence, current);
+    }
+    const next = callerFence.nextTurn();
+    this.dualTupleFencesByTask.set(taskId, next);
+    return next;
+  }
+
+  assertValidFence(taskId, fencingTokenOrDual) {
+    if (fencingTokenOrDual instanceof _models.FenceToken) {
+      const current = this.getDualTupleFence(taskId);
+      if (fencingTokenOrDual.isStrictlyOlderThan(current)) {
+        throw new StaleFenceError(taskId, fencingTokenOrDual, current);
+      }
+      return;
+    }
+    if (!this.validateFencingToken(taskId, fencingTokenOrDual)) {
+      const highest = this.highestTokenByTask.get(taskId) ?? 0;
+      throw new StaleFenceError(taskId, fencingTokenOrDual, highest);
+    }
   }
 
   renewLease(taskId, nodeId, fencingToken) {
