@@ -1,3 +1,6 @@
+/**
+ * @fileoverview Deterministic replay envelope: virtual clock and seeded randomness.
+ */
 import * as crypto from "node:crypto";
 export interface ReplayEnvelopeState {
   envelopeId: string;

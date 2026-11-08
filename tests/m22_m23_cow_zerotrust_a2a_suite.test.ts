@@ -7,6 +7,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   SandboxBranchForker,
   ZeroTrustSecurityGuard,
@@ -39,7 +42,7 @@ test("test 71: [TASK-105 & TASK-106] SandboxBranchForker forks parallel CoW sub-
 });
 
 test("test 72: [TASK-107 & TASK-108] ZeroTrustSecurityGuard secretless AF_VSOCK proxy, egress domain micro-segmentation, and cgroup.freeze=1 containment", () => {
-  const guard = new ZeroTrustSecurityGuard();
+  const guard = new ZeroTrustSecurityGuard(fs.mkdtempSync(path.join(os.tmpdir(), "ansts-cgroup-")));
   const tok = guard.issueShortLivedToken("tenant-sec", "github-git-https", 60000, 1000);
 
   // 1. Valid VSOCK credential injection

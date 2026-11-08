@@ -2,7 +2,7 @@
  * @fileoverview M8 TASK-28 ~ TASK-31: RPO=0 LTX Durability Engine, DurableWorkflowContext, Sharded Queue Broker & Safe Epoch GC.
  */
 import * as crypto from "node:crypto";
-import { R2BucketLike, SqlStorageLike } from "./env.js";
+import { InMemoryCellSqlStorage, R2BucketLike, SqlStorageLike } from "./env.js";
 
 export interface LtxSegmentMetadata {
   cellId: string;
@@ -166,9 +166,14 @@ export class DurableWorkflowContext {
   private readonly pendingEventsByType: Map<string, Array<Record<string, unknown>>> = new Map();
   private readonly eventWaitersByType: Map<string, Array<(event: Record<string, unknown>) => void>> = new Map();
 
-  constructor(sql: SqlStorageLike, workflowId: string) {
-    this.sql = sql;
-    this.workflowId = workflowId;
+  constructor(sqlOrWorkflowId: SqlStorageLike | string, workflowIdOrTimeout: string | number = "workflow") {
+    if (typeof sqlOrWorkflowId === "string") {
+      this.sql = new InMemoryCellSqlStorage();
+      this.workflowId = sqlOrWorkflowId;
+    } else {
+      this.sql = sqlOrWorkflowId;
+      this.workflowId = String(workflowIdOrTimeout);
+    }
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS workflow_steps (step_key TEXT PRIMARY KEY, workflow_id TEXT, output_json TEXT, completed_at INTEGER)"
     );

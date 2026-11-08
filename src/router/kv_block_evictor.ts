@@ -1,3 +1,6 @@
+/**
+ * @fileoverview KV-cache block eviction under a fixed memory budget.
+ */
 export interface KvCacheMemoryBlock {
   blockId: string;
   taskId: string;

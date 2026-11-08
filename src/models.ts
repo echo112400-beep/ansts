@@ -231,6 +231,8 @@ export interface AgentTaskParams {
   priority?: TaskPriority;
   fence?: FenceToken | null;
   createdAtMs?: number;
+  burstCpu?: number;
+  execMemMb?: number;
 }
 
 export class AgentTask {
@@ -240,6 +242,8 @@ export class AgentTask {
   public readonly priority: TaskPriority;
   public fence: FenceToken | null;
   public readonly createdAtMs: number;
+  public readonly burstCpu?: number;
+  public readonly execMemMb?: number;
 
   constructor(params: AgentTaskParams) {
     if (!params.taskId) {
@@ -251,6 +255,8 @@ export class AgentTask {
     this.priority = params.priority ?? TaskPriority.P2_STANDARD;
     this.fence = params.fence ?? null;
     this.createdAtMs = params.createdAtMs ?? Date.now();
+    this.burstCpu = params.burstCpu;
+    this.execMemMb = params.execMemMb;
   }
 
   public transitionTo(nextState: TaskState): void {

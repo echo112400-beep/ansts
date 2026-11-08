@@ -19,7 +19,9 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
       return out;
     };
     const srcFiles = walk(path.join(process.cwd(), "src"));
-    assert.equal(srcFiles.length, 58);
+    // The M1–M15 snapshot was 58 files. This branch also carries the later
+    // celld v2.5 modules; every file, including those, must keep a file overview.
+    assert.equal(srcFiles.length, 101);
     for (const f of srcFiles) {
       const content = fs.readFileSync(f, "utf-8");
       assert.ok(content.includes("@fileoverview"), `Missing @fileoverview in ${f}`);

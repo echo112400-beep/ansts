@@ -30,8 +30,10 @@ export class MultiRegionGeoRouter {
   public updateRegionMetrics(regionId: string, pingMs: number, healthy: boolean): void {
     const r = this.regions.get(regionId);
     if (r) {
-      r.pingEwmaMs = r.pingEwmaMs * 0.8 + pingMs * 0.2;
       r.healthy = healthy;
+      // Samples at or above the 250ms routing SLA replace the average immediately.
+      // Smaller samples stay exponentially smoothed so one quiet probe cannot hide a spike.
+      r.pingEwmaMs = pingMs >= 250 ? pingMs : r.pingEwmaMs * 0.8 + pingMs * 0.2;
     }
   }
 

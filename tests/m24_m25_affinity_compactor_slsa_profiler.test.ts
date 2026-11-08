@@ -11,12 +11,25 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import {
   PrefixCacheAffinityRouter,
   HierarchicalContextCompactor,
   SandboxProvenanceAttestor,
   ZeroTrustSecurityGuard,
   OnlineContinuousProfiler,
+  LeaseCoordinator,
+  SagaToolGateway,
+  ToolCallEffectClass as ToolEffectClass,
+  MultiNodeClusterDaemonServer,
+  TanStackConsoleBffClient,
+  FenceToken,
+  WalCompactorAndPagedRestorer,
+  CloudEventsBus,
+  CgroupPhaseController,
+  WarmSandboxPoolManager,
+  ConsoleDataTableEngine,
+  AgentTask,
 } from "../src/index";
 
 test("test 74: [TASK-113 & TASK-114] PrefixCacheAffinityRouter achieves KV-Cache hit, reduces TTFT by 65%, applies 80% FinOps discount, and spills over when overloaded", () => {

@@ -1,3 +1,6 @@
+/**
+ * @fileoverview AST-checked speculative decoding that rejects drafts failing to parse.
+ */
 import { WarmLspDaemonPool } from "../saga/mcp_streamable_hub";
 export interface SpeculativeDecodingResult {
   acceptedDraftTokensCount: number;

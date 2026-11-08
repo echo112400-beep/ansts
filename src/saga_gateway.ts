@@ -2,7 +2,9 @@
  * @fileoverview M3 TASK-11: Unified Idempotent Tool Proxy & Saga Transaction Gateway.
  */
 import * as crypto from "node:crypto";
-import { ToolCallEffectClass, ToolExecutionLog } from "./models.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { FenceToken, ToolCallEffectClass, ToolExecutionLog } from "./models.js";
 import { SagaCompensatorEngine } from "./saga/compensator.js";
 import { StagingCommitAndApprovalGate } from "./saga/staging.js";
 
@@ -14,12 +16,64 @@ export class SagaToolGateway {
   public readonly compensator: SagaCompensatorEngine;
   public readonly stagingGate: StagingCommitAndApprovalGate;
 
+  private readonly workspaceDir?: string;
+  private readonly compensations: Array<{ tool?: string; filePath: string }> = [];
+
   constructor(
-    compensator = new SagaCompensatorEngine(),
-    stagingGate = new StagingCommitAndApprovalGate()
+    compensatorOrLease?: SagaCompensatorEngine | { acquireLease?: unknown },
+    stagingGateOrWorkspace?: StagingCommitAndApprovalGate | string,
   ) {
-    this.compensator = compensator;
-    this.stagingGate = stagingGate;
+    if (
+      compensatorOrLease &&
+      typeof (compensatorOrLease as { acquireLease?: unknown }).acquireLease === "function" &&
+      typeof stagingGateOrWorkspace === "string"
+    ) {
+      this.compensator = new SagaCompensatorEngine();
+      this.stagingGate = new StagingCommitAndApprovalGate();
+      this.workspaceDir = stagingGateOrWorkspace;
+      fs.mkdirSync(this.workspaceDir, { recursive: true });
+      return;
+    }
+    this.compensator = (compensatorOrLease as SagaCompensatorEngine | undefined) ?? new SagaCompensatorEngine();
+    this.stagingGate = (stagingGateOrWorkspace as StagingCommitAndApprovalGate | undefined) ?? new StagingCommitAndApprovalGate();
+  }
+
+  /** Filesystem tools addressed by a fencing token. Compensation is LIFO. */
+  public executeTool(request: {
+    fence: FenceToken;
+    toolCallId: string;
+    toolName: string;
+    effectClass: ToolCallEffectClass | string;
+    compensationTool?: string;
+    payload: string;
+  }): { status: "OK"; result?: string } {
+    if (!this.workspaceDir) throw new Error("SagaToolGateway has no workspace directory");
+    const args = JSON.parse(request.payload) as { filePath?: string; content?: string };
+    const filePath = path.resolve(this.workspaceDir, args.filePath ?? "");
+    if (!filePath.startsWith(path.resolve(this.workspaceDir))) {
+      throw new Error("tool path escapes the workspace");
+    }
+    if (request.toolName === "fs_write_file") {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, args.content ?? "", "utf8");
+      this.compensations.push({ tool: request.compensationTool, filePath });
+      return { status: "OK" };
+    }
+    if (request.toolName === "fs_read_file") {
+      return { status: "OK", result: fs.readFileSync(filePath, "utf8") };
+    }
+    if (request.toolName === "fs_delete_file" && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    return { status: "OK" };
+  }
+
+  public rollbackAndCompensate(_fence: FenceToken, _fromIndex = 0): void {
+    for (let i = this.compensations.length - 1; i >= 0; i -= 1) {
+      const step = this.compensations[i];
+      if (step.tool === "fs_delete_file" && fs.existsSync(step.filePath)) fs.unlinkSync(step.filePath);
+    }
+    this.compensations.length = 0;
   }
 
   public registerTool(

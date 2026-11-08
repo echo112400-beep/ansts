@@ -1,6 +1,8 @@
 /**
  * @fileoverview M5 TASK-20: Async Layer Compactor & Userfaultfd On-Demand Page Restorer.
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { WalDeltaEntry } from "./wal_engine.js";
 
 export interface CompactedBaseSnapshot {
@@ -14,6 +16,25 @@ export interface CompactedBaseSnapshot {
 
 export class WalCompactorAndPagedRestorer {
   private readonly compactedByTask: Map<string, CompactedBaseSnapshot> = new Map();
+
+  constructor(private readonly snapshotDir?: string) {}
+
+  /** Writes an L1 snapshot and reads the hot prefix back with a positional pread. */
+  public pagedRestore(taskId: string, frames: unknown[]): { hotPagesReady: boolean; hotBytesRead: number } {
+    const dir = this.snapshotDir ?? path.join("/tmp", `ansts-l1-${taskId}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${taskId}.snap`);
+    fs.writeFileSync(file, JSON.stringify(frames));
+    const fd = fs.openSync(file, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const buf = Buffer.alloc(Math.min(4096, size));
+      const hotBytesRead = size === 0 ? 0 : fs.readSync(fd, buf, 0, buf.length, 0);
+      return { hotPagesReady: hotBytesRead > 0, hotBytesRead };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
 
   public compactLayers(taskId: string, entries: WalDeltaEntry[]): CompactedBaseSnapshot {
     if (entries.length === 0) {

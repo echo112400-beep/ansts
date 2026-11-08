@@ -1,3 +1,6 @@
+/**
+ * @fileoverview Sandbox network chaos proxy for loss, jitter, and partition injection.
+ */
 export interface NetworkChaosConfig {
   dropPacketPct: number;
   jitterMs: number;

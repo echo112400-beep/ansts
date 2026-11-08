@@ -56,6 +56,12 @@ export class LeaseCoordinator {
     this.leaseTtlSeconds = leaseTtlSeconds;
   }
 
+  /** Returns the dual-tuple fence used by filesystem saga tools. */
+  public acquireOrIncrementEpoch(taskId: string, nodeId: string, _modelPool?: string): FenceToken {
+    this.acquireLease(taskId, nodeId);
+    return this.getDualTupleFence(taskId);
+  }
+
   public acquireLease(taskId: string, nodeId: string): LeaseRecord {
     const prevToken = this.highestTokenByTask.get(taskId) ?? 0;
     const nextToken = prevToken + 1;

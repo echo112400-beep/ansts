@@ -1,3 +1,6 @@
+/**
+ * @fileoverview Priority load shedder that keeps P0 work when the cluster is saturated.
+ */
 export type TaskPriorityClass = "P3_BACKGROUND" | "P2_ASYNC_INDEX" | "P1_STANDARD" | "P0_CRITICAL";
 export interface LoadSheddingReport {
   ingressTotalCount: number;

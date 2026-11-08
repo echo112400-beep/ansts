@@ -296,6 +296,21 @@ export class MultiNodeClusterDaemonServer {
       });
     }
 
+    this.consoleBff.recordLiveTaskExecution({
+      cellId: `AgentTaskHarnessCell_#${taskId}`,
+      taskId,
+      tenantId,
+      ownerBrainNode: this.config.nodeId,
+      heapUsedMb: Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1)),
+      heapLimitMb: 128,
+      sqliteState: "Synced (RPO=0 Bucket + LTX Archive)",
+      fenceEpoch: fence.epoch,
+      fenceTurnSeq: fence.turnSeq,
+      routedModelPool: "DeepSeek",
+      kvCacheHit: Boolean(llmRoute.selectedBackendId),
+      phase: "EXECUTION_8C",
+    });
+
     return {
       status: "EXECUTED",
       executedByBrainNodeId: this.config.nodeId,

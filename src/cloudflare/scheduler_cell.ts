@@ -1,17 +1,25 @@
 /**
  * @fileoverview M7 TASK-26: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing).
  */
-import { DurableObjectStateLike } from "./env.js";
+import { CloudflareCelldEnv, DurableObjectStateLike } from "./env.js";
 import { CoreScheduler5D } from "../scheduler.js";
 import { NodeHeartbeat, TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { SchedulerV25Persistence } from "./scheduler_v25_persistence.js";
 
 export class AnstsSchedulerCell {
   private readonly ctx: DurableObjectStateLike;
+  private readonly env?: CloudflareCelldEnv;
+  private readonly persistence: SchedulerV25Persistence;
   public readonly scheduler: CoreScheduler5D;
+  /** v2.5 cache rebuilt from this cell's SQLite. Distinct from the legacy TaskSpec scheduler. */
+  public readonly cluster: SchedulerV25Persistence["facade"];
 
-  constructor(ctx: DurableObjectStateLike) {
+  constructor(ctx: DurableObjectStateLike, env?: CloudflareCelldEnv) {
     this.ctx = ctx;
+    this.env = env;
     this.scheduler = new CoreScheduler5D(15.0);
+    this.persistence = new SchedulerV25Persistence(ctx, env);
+    this.cluster = this.persistence.facade;
     this.initSchema();
     this.rehydrateFromSql();
   }
@@ -113,6 +121,11 @@ export class AnstsSchedulerCell {
   }
 
   public async alarm(): Promise<{ placements: Array<[string, string, number]>; recoveredIds: string[] }> {
+    // v2.5 alarm only drains the outbox. Placement stays on /scheduler/tick.
+    if (this.env) {
+      await this.persistence.flushOutbox();
+      return { placements: [], recoveredIds: [] };
+    }
     const recoveredIds = this.scheduler.reconcileOrphanedLeases();
     const placements = this.scheduler.scheduleTick();
     for (const [taskId] of placements) {
@@ -127,6 +140,10 @@ export class AnstsSchedulerCell {
 
   public async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const path = url.pathname.replace(/^\/v1beta1(?=\/)/, "");
+    if (this.persistence.handles(path, request.method)) {
+      return this.persistence.handle(request, path);
+    }
     if (request.method === "POST" && url.pathname === "/submit") {
       const body = (await request.json()) as Record<string, unknown>;
       const spec = new TaskSpec({
