@@ -1,112 +1,146 @@
 /**
- * TASK-11: Coordinator-Free CAS Leases, Dual-Tuple Fencing (epoch, turnSeq) & Heartbeat Failover.
+ * @fileoverview M2 TASK-07: Monotonic Fencing Token & Dual-Tuple `FenceToken` Lease Coordinator with `StaleFenceError` (HTTP 409) Split-Brain Rejection.
  */
-
-import { FenceToken } from "./models";
+import { FenceToken, LeaseRecord } from "./models.js";
 
 export class StaleFenceError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "StaleFenceError";
-  }
-}
+  public readonly statusCode = 409;
+  public readonly taskId: string;
+  public readonly attemptedFence: string;
+  public readonly currentHighestFence: string;
 
-export interface TaskLeaseRecord {
-  taskId: string;
-  nodeId: string;
-  modelPool: string;
-  fence: FenceToken;
+  /**
+   * Domain call sites raise the error from a fully formatted `409 <Reason>: ...` message, while the
+   * lease coordinator raises it from the `(taskId, attemptedFence, highestFence)` triple.
+   */
+  constructor(message: string);
+  constructor(taskId: string, attemptedFence: FenceToken | number, currentHighestFence: FenceToken | number);
+  constructor(
+    taskIdOrMessage: string,
+    attemptedFence?: FenceToken | number,
+    currentHighestFence?: FenceToken | number,
+  ) {
+    if (attemptedFence === undefined || currentHighestFence === undefined) {
+      super(taskIdOrMessage);
+      this.name = "StaleFenceError";
+      this.taskId = "";
+      this.attemptedFence = "";
+      this.currentHighestFence = "";
+      return;
+    }
+    const att =
+      attemptedFence instanceof FenceToken
+        ? `(${attemptedFence.epoch},${attemptedFence.turnSeq})`
+        : String(attemptedFence);
+    const cur =
+      currentHighestFence instanceof FenceToken
+        ? `(${currentHighestFence.epoch},${currentHighestFence.turnSeq})`
+        : String(currentHighestFence);
+    super(
+      `StaleFenceError [409]: Fencing token ${att} rejected for task ${taskIdOrMessage} (highest=${cur})`
+    );
+    this.name = "StaleFenceError";
+    this.taskId = taskIdOrMessage;
+    this.attemptedFence = att;
+    this.currentHighestFence = cur;
+  }
 }
 
 export class LeaseCoordinator {
-  private leases: Map<string, TaskLeaseRecord> = new Map();
-  private nodeHeartbeats: Map<string, number> = new Map();
+  private readonly leaseTtlSeconds: number;
+  private readonly activeLeases: Map<string, LeaseRecord> = new Map();
+  private readonly highestTokenByTask: Map<string, number> = new Map();
+  private readonly dualTupleFencesByTask: Map<string, FenceToken> = new Map();
 
-  constructor(public readonly heartbeatTimeoutSec: number = 12.0) {}
-
-  public recordNodeHeartbeat(nodeId: string, now: number): void {
-    this.nodeHeartbeats.set(nodeId, now);
+  constructor(leaseTtlSeconds = 15.0) {
+    this.leaseTtlSeconds = leaseTtlSeconds;
   }
 
-  public detectDeadNodes(now: number): string[] {
-    const dead: string[] = [];
-    for (const [nid, lastTs] of this.nodeHeartbeats.entries()) {
-      if (now - lastTs > this.heartbeatTimeoutSec) {
-        dead.push(nid);
+  public acquireLease(taskId: string, nodeId: string): LeaseRecord {
+    const prevToken = this.highestTokenByTask.get(taskId) ?? 0;
+    const nextToken = prevToken + 1;
+    this.highestTokenByTask.set(taskId, nextToken);
+
+    const prevDual = this.dualTupleFencesByTask.get(taskId);
+    const nextDual = prevDual ? prevDual.nextEpoch() : new FenceToken(nextToken, 0, taskId);
+    this.dualTupleFencesByTask.set(taskId, nextDual);
+
+    const now = Date.now() / 1000;
+    const record: LeaseRecord = {
+      task_id: taskId,
+      node_id: nodeId,
+      fencing_token: nextToken,
+      acquired_at: now,
+      expires_at: now + this.leaseTtlSeconds,
+    };
+    this.activeLeases.set(taskId, record);
+    return record;
+  }
+
+  public getDualTupleFence(taskId: string): FenceToken {
+    return (
+      this.dualTupleFencesByTask.get(taskId) ??
+      new FenceToken(this.highestTokenByTask.get(taskId) ?? 1, 0, taskId)
+    );
+  }
+
+  public advanceTurnFence(taskId: string, callerFence: FenceToken): FenceToken {
+    const current = this.getDualTupleFence(taskId);
+    if (callerFence.isStrictlyOlderThan(current)) {
+      throw new StaleFenceError(taskId, callerFence, current);
+    }
+    const next = callerFence.nextTurn();
+    this.dualTupleFencesByTask.set(taskId, next);
+    return next;
+  }
+
+  public assertValidFence(taskId: string, fencingTokenOrDual: number | FenceToken): void {
+    if (fencingTokenOrDual instanceof FenceToken) {
+      const current = this.getDualTupleFence(taskId);
+      if (fencingTokenOrDual.isStrictlyOlderThan(current)) {
+        throw new StaleFenceError(taskId, fencingTokenOrDual, current);
+      }
+      return;
+    }
+    if (!this.validateFencingToken(taskId, fencingTokenOrDual)) {
+      const highest = this.highestTokenByTask.get(taskId) ?? 0;
+      throw new StaleFenceError(taskId, fencingTokenOrDual, highest);
+    }
+  }
+
+  public renewLease(taskId: string, nodeId: string, fencingToken: number): boolean {
+    const lease = this.activeLeases.get(taskId);
+    if (!lease) return false;
+    if (lease.node_id !== nodeId || lease.fencing_token !== fencingToken) {
+      return false;
+    }
+    lease.expires_at = Date.now() / 1000 + this.leaseTtlSeconds;
+    return true;
+  }
+
+  public validateFencingToken(taskId: string, fencingToken: number): boolean {
+    const highest = this.highestTokenByTask.get(taskId) ?? 0;
+    const active = this.activeLeases.get(taskId);
+    if (!active) return false;
+    return fencingToken === highest && active.fencing_token === fencingToken;
+  }
+
+  public revokeLease(taskId: string): void {
+    this.activeLeases.delete(taskId);
+  }
+
+  public getLease(taskId: string): LeaseRecord | undefined {
+    return this.activeLeases.get(taskId);
+  }
+
+  public scanExpiredLeases(nowSec = Date.now() / 1000): LeaseRecord[] {
+    const expired: LeaseRecord[] = [];
+    for (const [taskId, lease] of this.activeLeases.entries()) {
+      if (nowSec >= lease.expires_at) {
+        expired.push(lease);
+        this.activeLeases.delete(taskId);
       }
     }
-    return dead;
-  }
-
-  public tryCasAcquire(
-    taskId: string,
-    nodeId: string,
-    modelPool: string,
-    expectedEpoch: number,
-  ): FenceToken | null {
-    const existing = this.leases.get(taskId);
-    const currEpoch = existing ? existing.fence.epoch : 0;
-    const currTurn = existing ? existing.fence.turnSeq : 1;
-    if (currEpoch !== expectedEpoch) {
-      return null;
-    }
-    const newFence = new FenceToken(expectedEpoch + 1, currTurn, taskId);
-    this.leases.set(taskId, { taskId, nodeId, modelPool, fence: newFence });
-    return newFence;
-  }
-
-  public acquireOrIncrementEpoch(taskId: string, nodeId: string, modelPool: string): FenceToken {
-    const existing = this.leases.get(taskId);
-    const expectedEpoch = existing ? existing.fence.epoch : 0;
-    const currTurn = existing ? existing.fence.turnSeq : 1;
-    const newFence = new FenceToken(expectedEpoch + 1, currTurn, taskId);
-    this.leases.set(taskId, { taskId, nodeId, modelPool, fence: newFence });
-    return newFence;
-  }
-
-  public verifyAndAdvanceFence(incomingFence: FenceToken): FenceToken {
-    const record = this.leases.get(incomingFence.taskId);
-    if (!record) {
-      throw new StaleFenceError(`409 StaleFenceRejected: Unknown task ${incomingFence.taskId}`);
-    }
-    if (!incomingFence.dominates(record.fence)) {
-      throw new StaleFenceError(
-        `409 StaleFenceRejected: incoming (${incomingFence.epoch}, ${incomingFence.turnSeq}) < current (${record.fence.epoch}, ${record.fence.turnSeq})`,
-      );
-    }
-    record.fence = incomingFence;
-    return record.fence;
-  }
-
-  public getLease(taskId: string): TaskLeaseRecord | undefined {
-    return this.leases.get(taskId);
-  }
-
-  /** Drops a lease (task completion / terminal state): no later fence can validate against it. */
-  public releaseLease(taskId: string): void {
-    this.leases.delete(taskId);
-  }
-
-  /** Detached copy of every live lease, used to roll back a failed scheduling transaction. */
-  public snapshotLeases(): TaskLeaseRecord[] {
-    return Array.from(this.leases.values()).map((r) => ({
-      taskId: r.taskId,
-      nodeId: r.nodeId,
-      modelPool: r.modelPool,
-      fence: new FenceToken(r.fence.epoch, r.fence.turnSeq, r.fence.taskId),
-    }));
-  }
-
-  /** Restores a lease snapshot by replacing the whole map. */
-  public restoreLeases(records: TaskLeaseRecord[]): void {
-    this.leases.clear();
-    for (const r of records) {
-      this.leases.set(r.taskId, {
-        taskId: r.taskId,
-        nodeId: r.nodeId,
-        modelPool: r.modelPool,
-        fence: new FenceToken(r.fence.epoch, r.fence.turnSeq, r.fence.taskId),
-      });
-    }
+    return expired;
   }
 }

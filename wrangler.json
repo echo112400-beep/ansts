@@ -1,5 +1,5 @@
 {
-  "name": "ansts-scheduler-v2",
+  "name": "ansts-v2-celld-scheduler",
   "main": "src/cloudflare/worker.ts",
   "compatibility_date": "2026-10-01",
   "durable_objects": {
@@ -23,24 +23,23 @@
       ]
     }
   ],
-  "d1_databases": [
-    {
-      "binding": "ANSTS_D1",
-      "database_name": "ansts-audit-ledger",
-      "database_id": "ansts-d1-prod-01",
-      "migrations_dir": "migrations"
-    }
-  ],
   "kv_namespaces": [
     {
       "binding": "ANSTS_KV",
-      "id": "ansts-idempotency-kv-01"
+      "id": "ansts_idempotency_kv"
     }
   ],
   "r2_buckets": [
     {
       "binding": "ANSTS_CHECKPOINTS_R2",
-      "bucket_name": "ansts-checkpoints"
+      "bucket_name": "ansts-checkpoints-l1"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "ANSTS_D1",
+      "database_name": "ansts_audit_d1",
+      "database_id": "ansts-d1-prod-001"
     }
   ],
   "queues": {
@@ -53,25 +52,23 @@
     "consumers": [
       {
         "queue": "ansts-cloudevents-outbox",
-        "max_batch_size": 10,
-        "max_batch_timeout": 2,
+        "max_batch_size": 50,
         "max_retries": 5
       }
     ]
   },
-  "triggers": {
-    "crons": [
-      "* * * * *"
-    ]
-  },
-  "vars": {
-    "PRIMARY_MODEL_POOL": "DeepSeek",
-    "FAST_UTILITY_POOL": "GLM-5.3",
-    "FALLBACK_MODEL_POOL": "Qwen-3.8"
-  },
   "worker_loaders": [
     {
       "binding": "ANSTS_DYNAMIC_WORKER_LOADER"
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "AgentTaskHarnessCell",
+      "image": "./deploy/Dockerfile.sandbox",
+      "instance_type": "standard-2",
+      "max_instances": 128,
+      "runtime": "kata"
     }
   ]
 }

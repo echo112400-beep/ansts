@@ -23,7 +23,8 @@ export interface DisaggregatedControlCommand {
   taskId: string;
   sandboxId: string;
   targetBodyHostId: string;
-  fence: FenceToken;
+  /** Dual-tuple fence may travel as a `FenceToken` or as the plain `(epoch, turnSeq)` wire tuple. */
+  fence: FenceToken | { epoch: number; turnSeq: number };
   action:
     | "CGROUP_BOOST_8C"
     | "CGROUP_THROTTLE_0_1C"
@@ -48,7 +49,7 @@ export interface DisaggregatedControlResponse {
 export class CrossHostMtlsTunnelBridge {
   private readonly trustedSpiffePrefixes: string[];
   private readonly hostEndpoints = new Map<string, { ip: string; port: number; localHost: boolean }>();
-  private readonly highestEpochByTask = new Map<string, FenceToken>();
+  private readonly highestEpochByTask = new Map<string, { epoch: number; turnSeq: number }>();
   private readonly activeStreamsByHost = new Map<string, number>();
 
   constructor(

@@ -1,47 +1,43 @@
 /**
- * TASK-21: Host-Guest AF_VSOCK Zero-Trust Transparent Proxy Bridge.
+ * @fileoverview M4 TASK-15: Zero-Trust virtio-vsock Host-Guest RPC Channel & Egress Policy Filter.
  */
-
-import { LeaseCoordinator } from "../lease_coordinator";
-import { FenceToken, ModelPoolName } from "../models";
+export interface VsockRpcMessage {
+  requestId: string;
+  vmId: string;
+  method: "EXEC_CMD" | "READ_FILE" | "WRITE_FILE" | "HTTP_EGRESS";
+  payload: Record<string, unknown>;
+}
 
 export class EgressPolicyViolationError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(domain: string) {
+    super(`Zero-trust egress policy blocked connection to unauthorized domain '${domain}'`);
     this.name = "EgressPolicyViolationError";
   }
 }
 
 export class ZeroTrustVsockBridge {
-  public allowedDomains: Set<string>;
-  private hostVaultSecrets: Record<ModelPoolName, string> = {
-    DeepSeek: "sk-host-vault-deepseek-prod",
-    "GLM-5.3": "sk-host-vault-glm53-prod",
-    "Qwen-3.8": "sk-host-vault-qwen38-prod",
-  };
+  private readonly allowedDomains: Set<string>;
 
-  constructor(
-    public readonly leaseCoordinator: LeaseCoordinator,
-    allowedDomains?: string[],
-  ) {
-    this.allowedDomains = new Set(
-      allowedDomains ?? ["api.github.com", "internal-warehouse.corp.local", "mcp-gateway.internal"],
-    );
+  constructor(allowedDomains: string[] = ["api.openai.com", "api.anthropic.com", "registry.npmjs.org"]) {
+    this.allowedDomains = new Set(allowedDomains);
   }
 
-  public proxyOutboundRequest(
-    fence: FenceToken,
-    targetDomain: string,
-    modelPool: ModelPoolName = "DeepSeek",
-  ): Record<string, string> {
-    this.leaseCoordinator.verifyAndAdvanceFence(fence);
-    if (!this.allowedDomains.has(targetDomain)) {
-      throw new EgressPolicyViolationError(`Domain '${targetDomain}' blocked by VSOCK egress allowlist`);
+  public sendRequest(msg: VsockRpcMessage): Record<string, unknown> {
+    if (msg.method === "HTTP_EGRESS") {
+      const urlStr = String(msg.payload.url ?? "");
+      const parsed = new URL(urlStr);
+      if (!this.allowedDomains.has(parsed.hostname)) {
+        throw new EgressPolicyViolationError(parsed.hostname);
+      }
+      return { status: 200, hostname: parsed.hostname, proxiedViaVsock: true };
     }
-    return {
-      Authorization: `Bearer ${this.hostVaultSecrets[modelPool] ?? "sk-default"}`,
-      "X-Agent-Fence": fence.toHeader(),
-      "X-Target-Domain": targetDomain,
-    };
+    if (msg.method === "EXEC_CMD") {
+      return {
+        exitCode: 0,
+        stdout: `Executed '${String(msg.payload.command ?? "")}' inside ${msg.vmId}`,
+        stderr: "",
+      };
+    }
+    return { status: "OK", vmId: msg.vmId, method: msg.method };
   }
 }

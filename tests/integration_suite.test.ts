@@ -1,220 +1,157 @@
 /**
- * End-to-End Multi-Service Integration Test Suite in TypeScript.
+ * @fileoverview M1-M6 Core End-to-End Integration Suite (7 tests).
  */
-
-import { strict as assert } from "assert";
-import * as fs from "fs";
-import * as path from "path";
-import { test } from "node:test";
-import * as yaml from "js-yaml";
-
+import { describe, it } from "node:test";
+import * as assert from "node:assert/strict";
 import {
-  AgentTask,
-  AnstsClusterRuntime,
-  FenceToken,
-  SandboxPhase,
-  StaleFenceError,
+  CoreScheduler5D,
+  NodeDaemon,
+  TaskPriority,
+  TaskSpec,
   TaskState,
-  ToolEffectClass,
-} from "../src/index";
+  CognitiveRouter,
+  LlmEndpointMetrics,
+  SagaToolGateway,
+  ToolCallEffectClass,
+} from "../src/index.js";
 
-test("01. TaskSpec v1beta1 loading, P50 Bayesian soft reservation, and 5D W-DRF scheduling", () => {
-  const cluster = new AnstsClusterRuntime();
-  const specPath = path.join(__dirname, "..", "..", "specs", "taskspec_v1beta1_example.yaml");
-  const raw = yaml.load(fs.readFileSync(specPath, "utf8")) as Record<string, any>;
+describe("M1-M6 Core Integration Suite", () => {
+  it("1. 5D Scheduler places tasks onto optimal warm-pool node and increments fencing token", () => {
+    const scheduler = new CoreScheduler5D(15.0);
+    const daemonA = new NodeDaemon("node-a", 32, 65536, 8);
+    const daemonB = new NodeDaemon("node-b", 32, 65536, 0);
+    scheduler.registerOrUpdateNode(daemonA.emitHeartbeat(0));
+    scheduler.registerOrUpdateNode(daemonB.emitHeartbeat(4));
 
-  assert.equal(raw.apiVersion, "scheduler.agent.io/v1beta1");
-  assert.equal(raw.spec.cognitive_policy.primary_model, "DeepSeek");
-  assert.equal(raw.spec.cognitive_policy.fast_utility_model, "GLM-5.3");
-  assert.ok(raw.spec.cognitive_policy.fallback_models.includes("Qwen-3.8"));
-
-  const t1 = new AgentTask({
-    taskId: "tsk_fin_01",
-    tenantId: "fin-enterprise",
-    priorityClass: "P0",
-    baseScore: 950,
-    primaryModel: "DeepSeek",
-    effort: "high",
-    maxTotalTokens: 600000,
-  });
-  const t2 = new AgentTask({
-    taskId: "tsk_code_02",
-    tenantId: "codegen-pro",
-    priorityClass: "P1",
-    baseScore: 820,
-    primaryModel: "GLM-5.3",
-    effort: "medium",
-    maxTotalTokens: 300000,
-  });
-
-  const soft1 = cluster.scheduler.submitTask(t1);
-  cluster.scheduler.submitTask(t2);
-  assert.ok(soft1 <= t1.maxTotalTokens);
-
-  const dispatched = cluster.scheduler.scheduleTick(10.0);
-  assert.equal(dispatched.length, 2);
-  assert.equal(t1.state, TaskState.RUNNING);
-  assert.equal(t1.fence.epoch, 1);
-  assert.equal(t1.fence.turnSeq, 1);
-});
-
-test("02. Bi-Modal Phase-Elastic Cgroups (0.1C <-> 8.0C) & Node Burst Semaphore", () => {
-  const cluster = new AnstsClusterRuntime();
-  const task = new AgentTask({ taskId: "tsk_phase_01", tenantId: "fin-enterprise" });
-  cluster.scheduler.submitTask(task);
-  cluster.scheduler.scheduleTick(1.0);
-
-  const cogCpu = cluster.nodeDaemon.transitionToCognitivePhase(task);
-  assert.equal(cogCpu, 0.1);
-  assert.equal(task.phase, SandboxPhase.COGNITIVE);
-
-  const burstRes = cluster.nodeDaemon.transitionToExecutionPhase(task);
-  assert.equal(burstRes.allocatedCpu, 8.0);
-  assert.equal(burstRes.microQueued, false);
-
-  cluster.nodeDaemon.activeBurstCount = 4;
-  const cappedRes = cluster.nodeDaemon.transitionToExecutionPhase(task);
-  assert.equal(cappedRes.allocatedCpu, 2.0);
-  assert.equal(cappedRes.microQueued, true);
-});
-
-test("03. Turn-level Cognitive Routing (DeepSeek / GLM-5.3 / Qwen-3.8) & 429 Failover", () => {
-  const cluster = new AnstsClusterRuntime();
-  const task = new AgentTask({
-    taskId: "tsk_route_01",
-    tenantId: "fin-enterprise",
-    primaryModel: "DeepSeek",
-    fastUtilityModel: "GLM-5.3",
-    fallbackModels: ["Qwen-3.8", "GLM-5.3"],
-    effort: "high",
-  });
-  cluster.scheduler.submitTask(task);
-  cluster.scheduler.scheduleTick(1.0);
-
-  const r1 = cluster.cogRouter.routeTurn(task, task.fence, false, 0);
-  assert.equal(r1.routedModel, "DeepSeek");
-  assert.equal(r1.effectiveEffort, "high");
-
-  const r2 = cluster.cogRouter.routeTurn(task, task.fence, true, 0);
-  assert.equal(r2.routedModel, "GLM-5.3");
-  assert.equal(r2.effectiveEffort, "minimal");
-
-  cluster.cogRouter.tripPoolBreaker("DeepSeek", 0.48);
-  const r3 = cluster.cogRouter.routeTurn(task, task.fence, false, 0);
-  assert.equal(r3.routedModel, "Qwen-3.8");
-  assert.equal(r3.effectiveEffort, "medium");
-});
-
-test("04. Multi-Agent DAG Quota Escrow Vouchers & Straggler Acceleration", () => {
-  const cluster = new AnstsClusterRuntime();
-  const parent = new AgentTask({ taskId: "tsk_parent", tenantId: "fin-enterprise", reservedTps: 180 });
-  cluster.scheduler.submitTask(parent);
-  cluster.scheduler.scheduleTick(1.0);
-
-  const children = [0, 1, 2, 3].map(
-    (i) => new AgentTask({ taskId: `tsk_child_${i}`, tenantId: "fin-enterprise" }),
-  );
-  const vouchers = cluster.queueMgr.spawnDagWithEscrow("dag_01", parent, children, false);
-  assert.equal(parent.state, TaskState.HIBERNATED_YIELD);
-  assert.equal(vouchers.length, 4);
-
-  const dispatched = cluster.scheduler.scheduleTick(2.0);
-  assert.equal(dispatched.length, 4);
-
-  children.slice(0, 3).forEach((c) => {
-    c.state = TaskState.SUCCEEDED;
-  });
-  const oldTps = children[3].reservedTps;
-  const actions = cluster.queueMgr.evaluateDagBarriers();
-  assert.ok(actions.includes(`STRAGGLER_BOOSTED:${children[3].taskId}`));
-  assert.ok(children[3].reservedTps > oldTps);
-});
-
-test("05. Progress Velocity (V_k < 0.10) Tree Backtrack & 4-Tier Saga Compensation", () => {
-  const cluster = new AnstsClusterRuntime();
-  const task = new AgentTask({ taskId: "tsk_saga_01", tenantId: "codegen-pro" });
-  cluster.scheduler.submitTask(task);
-  cluster.scheduler.scheduleTick(1.0);
-
-  const res1 = cluster.nodeDaemon.recordTurnAndAuditVelocity({
-    task,
-    routedModel: "DeepSeek",
-    effectiveEffort: "high",
-    tokensUsed: 1200,
-    workspaceMerkleHash: "hash_t1",
-    passRate: 0.5,
-    errorCount: 4,
-    diffEntropy: 0.6,
-  });
-  assert.equal(res1.action, "CONTINUE");
-
-  cluster.sagaGw.executeTool({
-    fence: task.fence,
-    toolCallId: "call_git_1",
-    toolName: "git_branch_push",
-    effectClass: ToolEffectClass.SAGA_COMPENSATABLE,
-    payload: "branch=fix-bug-1",
-    compensationTool: "git_branch_delete",
-  });
-  const stagedResp = cluster.sagaGw.executeTool({
-    fence: task.fence,
-    toolCallId: "call_ledger_1",
-    toolName: "settlement_ledger_post",
-    effectClass: ToolEffectClass.STAGED_COMMIT,
-    payload: "amount=50000",
-  });
-  assert.equal(stagedResp.staged, true);
-
-  let outcome: Record<string, any> = {};
-  for (const h of ["hash_t1", "hash_t1", "hash_t1"]) {
-    outcome = cluster.nodeDaemon.recordTurnAndAuditVelocity({
-      task,
-      routedModel: "DeepSeek",
-      effectiveEffort: "high",
-      tokensUsed: 1200,
-      workspaceMerkleHash: h,
-      passRate: 0.5,
-      errorCount: 4,
-      diffEntropy: 0.0,
+    const task = new TaskSpec({
+      task_id: "task-5d-001",
+      tenant_id: "tenant-alpha",
+      priority: TaskPriority.P1_HIGH,
+      prompt: "Analyze repository",
     });
-  }
-  assert.equal(outcome.action, "BACKTRACKED");
-  assert.ok(outcome.compensatedTools.includes("git_branch_delete(branch=fix-bug-1)"));
-  assert.equal((cluster.sagaGw.stagingBuffer.get(task.taskId) ?? []).length, 0);
-  assert.equal(task.effort, "max");
-});
-
-test("06. Host Crash Epoch+1 Takeover, TurnWAL Resume & Dual-Tuple Fencing Split-Brain Guard", () => {
-  const cluster = new AnstsClusterRuntime();
-  const task = new AgentTask({ taskId: "tsk_ha_01", tenantId: "fin-enterprise" });
-  cluster.scheduler.submitTask(task);
-  cluster.scheduler.scheduleTick(1.0);
-
-  cluster.nodeDaemon.recordTurnAndAuditVelocity({
-    task,
-    routedModel: "DeepSeek",
-    effectiveEffort: "high",
-    tokensUsed: 1500,
-    workspaceMerkleHash: "hash_ok_1",
-    passRate: 0.7,
-    errorCount: 1,
-    diffEntropy: 0.5,
+    scheduler.submitTask(task);
+    const placements = scheduler.scheduleTick();
+    assert.equal(placements.length, 1);
+    assert.equal(placements[0][0], "task-5d-001");
+    assert.equal(placements[0][1], "node-a");
+    assert.equal(task.state, TaskState.LEASED);
+    assert.ok(task.lease_fencing_token >= 1);
   });
-  const staleZombieFence = new FenceToken(1, 2, task.taskId);
 
-  const newFence = cluster.nodeDaemon.failoverTaskToNode(task, "worker-us-west-02");
-  assert.equal(newFence.epoch, 2);
-  assert.equal(task.assignedNodeId, "worker-us-west-02");
+  it("2. Monotonic Fencing Token prevents split-brain zombie NodeDaemon checkpoint write", () => {
+    const scheduler = new CoreScheduler5D(15.0);
+    const daemon1 = new NodeDaemon("node-1");
+    const daemon2 = new NodeDaemon("node-2");
+    scheduler.registerOrUpdateNode(daemon1.emitHeartbeat());
+    scheduler.registerOrUpdateNode(daemon2.emitHeartbeat());
 
-  assert.throws(
-    () =>
-      cluster.sagaGw.executeTool({
-        fence: staleZombieFence,
-        toolCallId: "zombie_call_99",
-        toolName: "settlement_ledger_post",
-        effectClass: ToolEffectClass.IDEMPOTENT_WRITE,
-        payload: "duplicate_write",
-      }),
-    StaleFenceError,
-  );
+    const task = new TaskSpec({ task_id: "task-fence-1", tenant_id: "t1", priority: TaskPriority.P1_HIGH });
+    scheduler.submitTask(task);
+    scheduler.scheduleTick();
+    const oldToken = task.lease_fencing_token;
+
+    const newLease = scheduler.leaseCoordinator.acquireLease(task.task_id, "node-2");
+    assert.ok(newLease.fencing_token > oldToken);
+
+    task.lease_fencing_token = oldToken;
+    assert.throws(() => {
+      daemon1.writeTurnCheckpoint(scheduler, task, 1, "hash-1", "s3://zombie/1");
+    }, /Fencing token .* rejected/);
+  });
+
+  it("3. DRF Multi-Tenant Fairness schedules lower-share tenant ahead of dominant hog tenant", () => {
+    const scheduler = new CoreScheduler5D(15.0);
+    const hogTask = new TaskSpec({ task_id: "hog-1", tenant_id: "tenant-hog", priority: TaskPriority.P2_STANDARD });
+    const fairTask = new TaskSpec({ task_id: "fair-1", tenant_id: "tenant-fair", priority: TaskPriority.P2_STANDARD });
+    scheduler.queueManager.tenantActiveCount.set("tenant-hog", 15);
+    scheduler.queueManager.tenantActiveCount.set("tenant-fair", 0);
+
+    scheduler.queueManager.enqueue(hogTask);
+    scheduler.queueManager.enqueue(fairTask);
+
+    const first = scheduler.queueManager.popNext();
+    assert.equal(first?.task_id, "fair-1");
+  });
+
+  it("4. Aging Starvation Prevention promotes long-waiting P3_BATCH task above newly arrived P2_STANDARD", () => {
+    const scheduler = new CoreScheduler5D(15.0);
+    const agedP3 = new TaskSpec({ task_id: "aged-p3", tenant_id: "t1", priority: TaskPriority.P3_BATCH });
+    agedP3.created_at = Date.now() / 1000 - 3600;
+    const freshP2 = new TaskSpec({ task_id: "fresh-p2", tenant_id: "t2", priority: TaskPriority.P2_STANDARD });
+    freshP2.created_at = Date.now() / 1000;
+
+    scheduler.queueManager.enqueue(agedP3);
+    scheduler.queueManager.enqueue(freshP2);
+
+    const popped = scheduler.queueManager.popNext();
+    assert.equal(popped?.task_id, "aged-p3");
+  });
+
+  it("5. DAG Dependency Resolution unlocks child task only after parent completes", () => {
+    const scheduler = new CoreScheduler5D(15.0);
+    const daemon = new NodeDaemon("node-dag");
+    scheduler.registerOrUpdateNode(daemon.emitHeartbeat());
+
+    const parent = new TaskSpec({ task_id: "parent-1", tenant_id: "t1", priority: TaskPriority.P1_HIGH });
+    const child = new TaskSpec({
+      task_id: "child-1",
+      tenant_id: "t1",
+      priority: TaskPriority.P1_HIGH,
+      dependencies: ["parent-1"],
+    });
+    scheduler.submitTask(parent);
+    scheduler.submitTask(child);
+    assert.equal(child.state, TaskState.SUBMITTED);
+
+    scheduler.scheduleTick();
+    scheduler.completeTaskExecution("parent-1", "node-dag", parent.lease_fencing_token);
+    assert.equal(child.state, TaskState.QUEUED);
+  });
+
+  it("6. Prefix-Cache Aware CognitiveRouter routes repeated prefix hash to sticky KV-warm endpoint", () => {
+    const router = new CognitiveRouter();
+    router.registerEndpoint(
+      new LlmEndpointMetrics({
+        endpoint_id: "ep-openai-1",
+        provider: "openai",
+        model_name: "gpt-4o",
+        ttft_ewma_ms: 220,
+        tpm_limit: 500_000,
+      })
+    );
+    router.registerEndpoint(
+      new LlmEndpointMetrics({
+        endpoint_id: "ep-anthropic-1",
+        provider: "anthropic",
+        model_name: "claude-3-7-sonnet",
+        ttft_ewma_ms: 210,
+        tpm_limit: 500_000,
+      })
+    );
+
+    const prefix = CognitiveRouter.computePrefixHash("sys", "tools", "ctx");
+    const [firstEp, hit1] = router.selectEndpoint(prefix, 1000, TaskPriority.P1_HIGH);
+    assert.equal(hit1, false);
+    router.releaseEndpoint(firstEp.endpoint_id);
+
+    const [secondEp, hit2] = router.selectEndpoint(prefix, 1000, TaskPriority.P1_HIGH);
+    assert.equal(secondEp.endpoint_id, firstEp.endpoint_id);
+    assert.equal(hit2, true);
+  });
+
+  it("7. SagaToolGateway deduplicates mutating tool calls on retry with identical SHA-256 idempotency key", () => {
+    const saga = new SagaToolGateway();
+    let invocations = 0;
+    saga.registerTool("charge_card", ToolCallEffectClass.COMPENSATABLE, (args) => {
+      invocations += 1;
+      return { charged: args.amount, seq: invocations };
+    });
+
+    const [res1, dedup1] = saga.invokeTool("task-1", 1, "charge_card", { amount: 99 });
+    const [res2, dedup2] = saga.invokeTool("task-1", 1, "charge_card", { amount: 99 });
+    assert.equal(dedup1, false);
+    assert.equal(dedup2, true);
+    assert.equal(invocations, 1);
+    assert.deepEqual(res1, res2);
+  });
 });

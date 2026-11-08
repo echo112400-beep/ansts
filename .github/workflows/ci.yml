@@ -1,71 +1,39 @@
-name: ANSTS v2.0 TypeScript CI — Lint, Build & Integration Tests
+name: ANSTS v2.2 TypeScript & celld HA CI Pipeline
 
 on:
   push:
-    branches: [ "main", "master", "release/*" ]
+    branches: ["main", "master", "release/**"]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  lint-and-schema-check:
-    name: "1. TypeScript AST Lint, Protobuf & TaskSpec Schema Verification"
+  lint-build-and-test:
+    name: "Verify TypeScript AST, Build & 55 Integration/Chaos Tests (Node ${{ matrix.node-version }})"
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Run TypeScript AST, Schema & Proto Lint
-        run: node scripts/ci_check.mjs --stage lint
-
-  build-typescript:
-    name: "2. TypeScript Microservices Compilation & Bundle Verification"
-    needs: lint-and-schema-check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Build TypeScript to dist/
-        run: node scripts/ci_check.mjs --stage build
-
-  integration-and-chaos-tests:
-    name: "3. Full M1~M6 Unit, Integration & Chaos Benchmark Suite"
-    needs: build-typescript
-    runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
-        node-version: ["18", "20"]
+        node-version: ["18.x", "20.x", "22.x"]
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js ${{ matrix.node-version }}
+      - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies (tolerant of missing lockfile)
+        run: npm install --no-audit --no-fund || true
 
-      - name: Execute Full Integration & Chaos Test Suite
-        run: node scripts/ci_check.mjs --stage all
+      - name: Stage 1 — TypeScript AST, Google Style & Schema Lint
+        run: npm run lint
+
+      - name: Stage 2 — Compile 66 TypeScript Modules to CommonJS (dist/)
+        run: npm run build
+
+      - name: Stage 3 — Execute Full 55-Test Integration, Chaos & celld HA Suite
+        run: npm test

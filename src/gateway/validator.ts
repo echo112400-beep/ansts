@@ -1,136 +1,75 @@
 /**
- * TASK-01: Strict TaskSpec v1beta1 Validator and Default Value Injector across 7 spec blocks.
+ * @fileoverview M1 TASK-01: TaskSpec v1beta1 Schema Validator & Semantic Sanitizer.
  */
+import { ResourceProfile, TaskPriority, TaskSpec } from "../models.js";
 
 export class TaskSpecValidationError extends Error {
-  constructor(public readonly fieldPath: string, message: string) {
-    super(`[${fieldPath}] ${message}`);
+  public readonly field: string;
+  constructor(field: string, message: string) {
+    super(`Invalid TaskSpec field '${field}': ${message}`);
     this.name = "TaskSpecValidationError";
+    this.field = field;
   }
 }
 
-const VALID_PRIORITIES = new Set([
-  "P0", "P1", "P2", "P3", "P4",
-  "critical-p0", "high-interactive", "normal-batch", "low-background", "spot-opportunistic",
-]);
-const VALID_MODELS = new Set(["DeepSeek", "GLM-5.3", "Qwen-3.8"]);
-const VALID_EFFORTS = new Set(["minimal", "low", "medium", "high", "max"]);
-const VALID_DRIVERS = new Set(["firecracker", "kata", "gvisor", "runc"]);
-const VALID_EFFECT_CLASSES = new Set(["PURE_READ", "IDEMPOTENT_WRITE", "SAGA_COMPENSATABLE", "STAGED_COMMIT"]);
-
 export class TaskSpecValidator {
-  public validateAndNormalize(rawDoc: Record<string, any>): Record<string, any> {
-    if (!rawDoc || typeof rawDoc !== "object") {
-      throw new TaskSpecValidationError("root", "TaskSpec document must be an object");
+  public static validateAndNormalize(payload: Record<string, unknown>): TaskSpec {
+    if (!payload || typeof payload !== "object") {
+      throw new TaskSpecValidationError("root", "Payload must be a JSON object");
     }
-    const doc = JSON.parse(JSON.stringify(rawDoc));
-    if (doc.apiVersion !== "scheduler.agent.io/v1beta1") {
-      throw new TaskSpecValidationError("apiVersion", "Must be 'scheduler.agent.io/v1beta1'");
+    const apiVersion = (payload.apiVersion as string) ?? "agent.scheduler.io/v1beta1";
+    if (apiVersion !== "agent.scheduler.io/v1beta1") {
+      throw new TaskSpecValidationError("apiVersion", `Unsupported apiVersion '${apiVersion}'`);
     }
-    if (doc.kind !== "AgentTask") {
-      throw new TaskSpecValidationError("kind", "Must be 'AgentTask'");
+    const taskId = String(payload.task_id ?? payload.taskId ?? "").trim();
+    if (!taskId || !/^[a-zA-Z0-9_\-:.]{3,128}$/.test(taskId)) {
+      throw new TaskSpecValidationError("task_id", "task_id must be 3-128 alphanumeric/dash characters");
     }
-
-    const meta = doc.metadata;
-    if (!meta || typeof meta !== "object") {
-      throw new TaskSpecValidationError("metadata", "Missing metadata object");
+    const tenantId = String(payload.tenant_id ?? payload.tenantId ?? "").trim();
+    if (!tenantId) {
+      throw new TaskSpecValidationError("tenant_id", "tenant_id is required");
     }
-    for (const reqField of ["task_id", "tenant_id"]) {
-      if (!meta[reqField]) {
-        throw new TaskSpecValidationError(`metadata.${reqField}`, "Field is required");
-      }
+    const priorityNum = Number(payload.priority ?? TaskPriority.P2_STANDARD);
+    if (![0, 1, 2, 3].includes(priorityNum)) {
+      throw new TaskSpecValidationError("priority", "priority must be 0, 1, 2, or 3");
     }
-    meta.idempotency_key = meta.idempotency_key ?? `idem-${meta.task_id}`;
-    meta.priority_class = meta.priority_class ?? "P1";
-    if (!VALID_PRIORITIES.has(meta.priority_class)) {
-      throw new TaskSpecValidationError("metadata.priority_class", `Invalid priority: ${meta.priority_class}`);
+    const maxTurns = Number(payload.max_turns ?? 30);
+    if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 500) {
+      throw new TaskSpecValidationError("max_turns", "max_turns must be an integer in [1, 500]");
     }
-    meta.priority_score = meta.priority_score ?? 800;
-    if (typeof meta.priority_score !== "number" || meta.priority_score < 0 || meta.priority_score > 1000) {
-      throw new TaskSpecValidationError("metadata.priority_score", "Must be in [0, 1000]");
+    const timeoutSeconds = Number(payload.timeout_seconds ?? 1800);
+    if (timeoutSeconds < 5 || timeoutSeconds > 86400) {
+      throw new TaskSpecValidationError("timeout_seconds", "timeout_seconds must be in [5, 86400]");
     }
-    meta.custom_metadata = meta.custom_metadata ?? {};
-
-    const spec = doc.spec;
-    if (!spec || typeof spec !== "object") {
-      throw new TaskSpecValidationError("spec", "Missing spec object");
-    }
-
-    spec.scheduling_policy = spec.scheduling_policy ?? {};
-    spec.cognitive_policy = spec.cognitive_policy ?? {};
-    spec.quota_and_dag_policy = spec.quota_and_dag_policy ?? {};
-    spec.execution_and_sandbox = spec.execution_and_sandbox ?? {};
-    spec.tools_and_saga_config = spec.tools_and_saga_config ?? {};
-    spec.harness_and_resilience = spec.harness_and_resilience ?? {};
-    spec.observability_and_notify = spec.observability_and_notify ?? { event_stream: { enabled: true } };
-
-    // 1. scheduling_policy
-    const sched = spec.scheduling_policy;
-    sched.queue_name = sched.queue_name ?? "default";
-    sched.max_queue_wait_sec = sched.max_queue_wait_sec ?? 300;
-    if (sched.max_queue_wait_sec <= 0) {
-      throw new TaskSpecValidationError("spec.scheduling_policy.max_queue_wait_sec", "Must be > 0");
-    }
-    sched.preemption_policy = sched.preemption_policy ?? "PreemptToHibernate";
-
-    // 2. cognitive_policy
-    const cog = spec.cognitive_policy;
-    cog.primary_model = cog.primary_model ?? "DeepSeek";
-    if (!VALID_MODELS.has(cog.primary_model)) {
-      throw new TaskSpecValidationError("spec.cognitive_policy.primary_model", `Invalid model: ${cog.primary_model}`);
-    }
-    cog.fast_utility_model = cog.fast_utility_model ?? "GLM-5.3";
-    if (!VALID_MODELS.has(cog.fast_utility_model)) {
-      throw new TaskSpecValidationError("spec.cognitive_policy.fast_utility_model", `Invalid model: ${cog.fast_utility_model}`);
-    }
-    cog.fallback_models = cog.fallback_models ?? ["Qwen-3.8", "GLM-5.3"];
-    if (!Array.isArray(cog.fallback_models) || cog.fallback_models.length === 0 || cog.fallback_models.some((m: string) => !VALID_MODELS.has(m))) {
-      throw new TaskSpecValidationError("spec.cognitive_policy.fallback_models", "Invalid fallback models");
-    }
-    cog.default_reasoning_effort = cog.default_reasoning_effort ?? "high";
-    if (!VALID_EFFORTS.has(cog.default_reasoning_effort)) {
-      throw new TaskSpecValidationError("spec.cognitive_policy.default_reasoning_effort", "Invalid reasoning effort");
-    }
-
-    // 3. quota_and_dag_policy
-    const quota = spec.quota_and_dag_policy;
-    quota.max_total_tokens = quota.max_total_tokens ?? 500000;
-    quota.reserved_tps = quota.reserved_tps ?? 120;
-    quota.max_concurrent_sessions = quota.max_concurrent_sessions ?? 4;
-    if (quota.max_total_tokens <= 0 || quota.reserved_tps <= 0 || quota.max_concurrent_sessions <= 0) {
-      throw new TaskSpecValidationError("spec.quota_and_dag_policy", "Quotas must be > 0");
-    }
-
-    // 4. execution_and_sandbox
-    const sbx = spec.execution_and_sandbox;
-    sbx.isolation_driver = sbx.isolation_driver ?? "firecracker";
-    if (!VALID_DRIVERS.has(sbx.isolation_driver)) {
-      throw new TaskSpecValidationError("spec.execution_and_sandbox.isolation_driver", "Invalid driver");
-    }
-    sbx.warm_pool_id = sbx.warm_pool_id ?? "pool-py312-ds";
-    sbx.max_turns = sbx.max_turns ?? 20;
-    sbx.phase_elastic_resources = sbx.phase_elastic_resources ?? {};
-    sbx.phase_elastic_resources.cognitive_phase = sbx.phase_elastic_resources.cognitive_phase ?? {
-      cpu_cores: 0.1,
-      memory_active_mb: 256,
+    const rawRp = (payload.resource_profile as Partial<ResourceProfile>) ?? {};
+    const resourceProfile: ResourceProfile = {
+      think_cpu_cores: Number(rawRp.think_cpu_cores ?? 0.25),
+      act_cpu_cores: Number(rawRp.act_cpu_cores ?? 4.0),
+      act_memory_mb: Number(rawRp.act_memory_mb ?? 8192),
+      disk_mb: Number(rawRp.disk_mb ?? 10240),
     };
-    sbx.phase_elastic_resources.execution_phase = sbx.phase_elastic_resources.execution_phase ?? {
-      cpu_request_cores: 2.0,
-      cpu_burst_limit_cores: 8.0,
-      memory_limit_mb: 4096,
-    };
-
-    // 5. tools_and_saga_config
-    const policies = spec.tools_and_saga_config.transactional_policies ?? [];
-    policies.forEach((pol: any, idx: number) => {
-      if (!VALID_EFFECT_CLASSES.has(pol.effect_class)) {
-        throw new TaskSpecValidationError(`spec.tools_and_saga_config.transactional_policies[${idx}]`, "Invalid effect_class");
-      }
-      if (pol.effect_class === "SAGA_COMPENSATABLE" && !pol.compensation_tool) {
-        throw new TaskSpecValidationError(`spec.tools_and_saga_config.transactional_policies[${idx}]`, "Requires compensation_tool");
-      }
+    if (resourceProfile.think_cpu_cores <= 0 || resourceProfile.act_cpu_cores < resourceProfile.think_cpu_cores) {
+      throw new TaskSpecValidationError(
+        "resource_profile.cpu",
+        "act_cpu_cores must be >= think_cpu_cores and > 0"
+      );
+    }
+    const deps = Array.isArray(payload.dependencies) ? payload.dependencies.map(String) : [];
+    if (deps.includes(taskId)) {
+      throw new TaskSpecValidationError("dependencies", "Task cannot depend on itself");
+    }
+    return new TaskSpec({
+      task_id: taskId,
+      tenant_id: tenantId,
+      priority: priorityNum as TaskPriority,
+      prompt: String(payload.prompt ?? ""),
+      max_turns: maxTurns,
+      timeout_seconds: timeoutSeconds,
+      resource_profile: resourceProfile,
+      dependencies: deps,
+      idempotency_key: payload.idempotency_key ? String(payload.idempotency_key) : undefined,
+      parent_task_id: payload.parent_task_id ? String(payload.parent_task_id) : undefined,
+      expected_SubAgent_count: Number(payload.expected_SubAgent_count ?? 0),
     });
-
-    return doc;
   }
 }

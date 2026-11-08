@@ -16,9 +16,6 @@
  *    zero-loss batch flush upon collector recovery.
  */
 
-import * as os from "node:os";
-import * as path from "node:path";
-
 import { CapacitySlaEnforcer } from "./capacity_sla_enforcer";
 import { CanaryRolloutController } from "./canary_rollout_controller";
 import { EdgeTunnelHaDynamicRouter } from "../runtime/edge_tunnel_ha_router";
@@ -33,7 +30,7 @@ import {
 import { OtelAndPrometheusExporter } from "../telemetry/otel_prometheus";
 import { CloudEventsBus } from "../telemetry/cloudevents";
 import { UnifiedComponentPersistenceStore } from "../checkpoint/unified_state_store";
-import { InMemorySqlStorage } from "../cloudflare/env";
+import { InMemoryCellSqlStorage } from "../cloudflare/env";
 
 export interface ChaosDrillReport {
   drillId: string;
@@ -47,18 +44,6 @@ export interface ChaosDrillReport {
 
 export class ProductionChaosDrillRunner {
   public readonly reports: ChaosDrillReport[] = [];
-
-  /**
-   * @param walStorageRootDir Root for the drill WAL frames. Drills must be repeatable, and WAL frames
-   * are create-once (`If-None-Match`), so the default is scoped to this runner instance.
-   */
-  constructor(
-    public readonly walStorageRootDir: string = path.join(
-      os.tmpdir(),
-      "ansts_chaos_drills",
-      `run_${process.pid}_${Date.now()}`,
-    ),
-  ) {}
 
   /**
    * Executes all 4 production chaos drills and returns an aggregated verification report.
@@ -224,7 +209,7 @@ export class ProductionChaosDrillRunner {
     rollout.advanceRolloutPhase("PHASE_2_CANARY_8_SLOTS");
 
     const sseGw = new SseEventStreamGateway();
-    const wal = new TurnWalEngine(this.walStorageRootDir);
+    const wal = new TurnWalEngine();
     const streamPub = new AgentStreamQueuePublisher(sseGw, wal);
     sseGw.registerClient("client-canary-watch", 100);
 
@@ -303,7 +288,7 @@ export class ProductionChaosDrillRunner {
   }
 
   public runCollectorOutageAndCellCrashDrill(): ChaosDrillReport {
-    const sql = new InMemorySqlStorage();
+    const sql = new InMemoryCellSqlStorage();
     const store = new UnifiedComponentPersistenceStore(sql);
     const coord1 = new FaultTolerantObservabilityCoordinator(
       new OtelAndPrometheusExporter(),

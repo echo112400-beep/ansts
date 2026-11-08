@@ -1,333 +1,441 @@
 /**
- * Core Domain Models, 5D Resource Vectors, Dual-Tuple Fencing, Dual-Clock Budgets & Turn-WAL Structures.
- * 100% aligned with TaskSpec v1beta1 and Google Engineering Design Doc v2.1.
+ * @fileoverview Core Domain Models, TaskSpec v1beta1, 5D Resource Profiles, Monotonic Lease Fencing & LlmEndpointMetrics.
  */
-
-export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "max";
-export type ModelPoolName = "DeepSeek" | "GLM-5.3" | "Qwen-3.8";
-export type IsolationDriver = "firecracker" | "kata" | "gvisor" | "runc";
-export type PreemptionPolicy = "PreemptToHibernate" | "Never" | "YieldOnPressure";
-export type HibernationReason =
-  | "NONE"
-  | "PREEMPTED"
-  | "PSI_MEMORY_PRESSURE"
-  | "HUMAN_APPROVAL_WAIT"
-  | "IDLE_TIMEOUT"
-  | "DAG_PARENT_YIELD";
-
-export const EFFORT_MULTIPLIERS: Record<ReasoningEffort, number> = {
-  minimal: 1.0,
-  low: 1.2,
-  medium: 1.8,
-  high: 3.0,
-  max: 5.0,
-};
+export enum TaskPriority {
+  P0_EMERGENCY = 0,
+  P1_HIGH = 1,
+  P2_STANDARD = 2,
+  P3_BATCH = 3,
+}
 
 export enum TaskState {
   SUBMITTED = "SUBMITTED",
   QUEUED = "QUEUED",
-  PROVISIONING = "PROVISIONING",
+  LEASED = "LEASED",
   RUNNING = "RUNNING",
-  GRACEFUL_DRAINING = "GRACEFUL_DRAINING",
+  RUNNING_THINK = "RUNNING_THINK",
+  THINKING_GEN = "THINKING_GEN",
+  RUNNING_ACT = "RUNNING_ACT",
+  TOOL_EXEC = "TOOL_EXEC",
+  WAITING_SUB_AGENT = "WAITING_SUB_AGENT",
+  SUSPENDED_APPROVAL = "SUSPENDED_APPROVAL",
+  PREEMPTING = "PREEMPTING",
   HIBERNATED = "HIBERNATED",
-  HIBERNATED_YIELD = "HIBERNATED_YIELD",
-  BACKTRACKING = "BACKTRACKING",
-  RECOVERING = "RECOVERING",
-  SUCCEEDED = "SUCCEEDED",
-  CIRCUIT_BROKEN = "CIRCUIT_BROKEN",
+  COMPLETED = "COMPLETED",
+  SUCCEEDED = "COMPLETED",
+  FAILED = "FAILED",
+  DEAD_LETTER = "DEAD_LETTER",
 }
 
-export enum SandboxPhase {
-  COGNITIVE = "COGNITIVE_0.1C",
-  EXECUTION = "EXECUTION_BURST",
-  IDLE = "IDLE_0C",
-}
+/** Inference model pools that requests can be routed to (`PrefixCacheAffinityRouter`). */
+export type ModelPoolName = "DeepSeek" | "GLM-5.3" | "Qwen-3.8";
 
-export enum ToolEffectClass {
-  PURE_READ = "PURE_READ",
+export enum ToolCallEffectClass {
+  READ_ONLY = "READ_ONLY",
+  PURE_READ = "READ_ONLY",
   IDEMPOTENT_WRITE = "IDEMPOTENT_WRITE",
-  SAGA_COMPENSATABLE = "SAGA_COMPENSATABLE",
+  COMPENSATABLE = "COMPENSATABLE",
+  SAGA_COMPENSATABLE = "COMPENSATABLE",
   STAGED_COMMIT = "STAGED_COMMIT",
+  IRREVERSIBLE = "IRREVERSIBLE",
 }
 
-export interface EphemeralHeavyExecutorSpec {
-  triggerTool: string;
-  executorPool: string;
-  maxAttachSec: number;
-}
+export type PreemptionPolicy = "PreemptToHibernate" | "Never" | "YieldOnPressure";
 
+/**
+ * Dual-Tuple Monotonic Fencing Token `(epoch, turnSeq, taskId)` aligned with `FenceTokenProto` in `proto/ansts_rpc.proto`.
+ */
 export class FenceToken {
   public readonly epoch: number;
   public readonly turnSeq: number;
   public readonly taskId: string;
 
-  constructor(epoch: number, turnSeq: number, taskId: string = "") {
+  constructor(epoch: number, turnSeq: number, taskId: string) {
+    if (!Number.isInteger(epoch) || epoch < 0) {
+      throw new Error(`FenceToken epoch must be a non-negative integer, got ${epoch}`);
+    }
+    if (!Number.isInteger(turnSeq) || turnSeq < 0) {
+      throw new Error(`FenceToken turnSeq must be a non-negative integer, got ${turnSeq}`);
+    }
     this.epoch = epoch;
     this.turnSeq = turnSeq;
     this.taskId = taskId;
   }
 
-  public dominates(other: FenceToken): boolean {
-    if (this.epoch !== other.epoch) {
-      return this.epoch > other.epoch;
-    }
-    return this.turnSeq >= other.turnSeq;
+  public nextEpoch(): FenceToken {
+    return new FenceToken(this.epoch + 1, 0, this.taskId);
   }
 
   public nextTurn(): FenceToken {
     return new FenceToken(this.epoch, this.turnSeq + 1, this.taskId);
   }
 
-  public nextEpoch(): FenceToken {
-    return new FenceToken(this.epoch + 1, this.turnSeq, this.taskId);
+  public compareTo(other: FenceToken): number {
+    if (this.epoch !== other.epoch) {
+      return this.epoch > other.epoch ? 1 : -1;
+    }
+    if (this.turnSeq !== other.turnSeq) {
+      return this.turnSeq > other.turnSeq ? 1 : -1;
+    }
+    return 0;
   }
 
-  public toHeader(): string {
-    return `${this.epoch}:${this.turnSeq}`;
+  public isStrictlyOlderThan(other: FenceToken): boolean {
+    return this.compareTo(other) < 0;
   }
-}
 
-export class ResourceVector5D {
-  constructor(
-    public readonly steadyCpu: number,
-    public readonly burstCpu: number,
-    public readonly steadyMemMb: number,
-    public readonly sessions: number,
-    public readonly effectiveTps: number,
-  ) {}
+  public toScalarToken(): number {
+    return this.epoch * 1_000_000 + this.turnSeq;
+  }
 
-  public static fromTaskParams(params: {
-    cogCpu: number;
-    execCpu: number;
-    burstCpu: number;
-    cogMemMb: number;
-    execMemMb: number;
-    sessions: number;
-    reservedTps: number;
-    effort: ReasoningEffort;
-    rhoCog?: number;
-  }): ResourceVector5D {
-    const rhoCog = params.rhoCog ?? 0.75;
-    const rhoExec = 1.0 - rhoCog;
-    const steadyCpu = Number((rhoCog * params.cogCpu + rhoExec * params.execCpu).toFixed(4));
-    const steadyMem = Number((rhoCog * params.cogMemMb + rhoExec * params.execMemMb).toFixed(2));
-    const mult = EFFORT_MULTIPLIERS[params.effort] ?? 1.0;
-    const effTps = Math.round(params.reservedTps * mult);
-    return new ResourceVector5D(steadyCpu, params.burstCpu, steadyMem, params.sessions, effTps);
+  public toProto(): { epoch: number; turn_seq: number; task_id: string } {
+    return { epoch: this.epoch, turn_seq: this.turnSeq, task_id: this.taskId };
   }
 }
 
-export interface EscrowVoucher {
-  parentTaskId: string;
-  parentFence: FenceToken;
-  childTaskId: string;
-  delegatedTps: number;
-  delegatedTokens: number;
-}
+/**
+ * Turn-Level Write-Ahead Log Frame (`TurnWalFrame`) with CRC32 integrity verification and dual-tuple `FenceToken`.
+ */
+export class TurnWalFrame {
+  public readonly frameId: string;
+  public readonly taskId: string;
+  public readonly turnIndex: number;
+  public readonly fence: FenceToken;
+  public readonly changedFiles: string[];
+  public readonly sqliteWalPages: number;
+  public readonly crc32Hex: string;
+  public readonly createdAtMs: number;
+  /** Task state at the moment the frame was written (`THINKING_GEN` / `TOOL_EXEC` / ...). */
+  public readonly state: TaskState;
+  public readonly routedModel: string;
+  public readonly tokensUsed: number;
+  /** Evaluation telemetry persisted for shadow replay / scorecards. */
+  public readonly passRate: number;
+  public readonly errorCount: number;
+  public readonly diffEntropy: number;
+  public readonly workspaceMerkleHash: string;
+  public readonly diffSnapshot: string;
+  public readonly contextMessages: string[];
 
-export interface TurnWalFrame {
-  taskId: string;
-  fence: FenceToken;
-  routedModel: string;
-  effectiveEffort: ReasoningEffort;
-  tokensUsed: number;
-  workspaceMerkleHash: string;
-  passRate: number;
-  errorCount: number;
-  diffEntropy: number;
-  contextMessages: string[];
-}
-
-export interface AgentTaskInit {
-  taskId: string;
-  tenantId: string;
-  priorityClass?: string;
-  baseScore?: number;
-  enqueueTs?: number;
-  deadlineTs?: number;
-  preemptionPolicy?: PreemptionPolicy;
-  localityRegion?: string;
-  primaryModel?: ModelPoolName;
-  fastUtilityModel?: ModelPoolName;
-  fallbackModels?: ModelPoolName[];
-  effort?: ReasoningEffort;
-  thinkingBudgetTokens?: number;
-  temperature?: number;
-  maxContextWindow?: number;
-  reservedTps?: number;
-  maxBurstTps?: number;
-  maxRpm?: number;
-  maxTotalTokens?: number;
-  maxInputTokens?: number;
-  maxOutputTokens?: number;
-  softReservedTokens?: number;
-  usedTokens?: number;
-  usedInputTokens?: number;
-  usedOutputTokens?: number;
-  maxSessions?: number;
-  maxTotalSessions?: number;
-  activeSessions?: number;
-  totalSpawnedSessions?: number;
-  cogCpu?: number;
-  execCpu?: number;
-  burstCpu?: number;
-  cogMemMb?: number;
-  execMemMb?: number;
-  maxPids?: number;
-  isolationDriver?: IsolationDriver;
-  warmPoolId?: string;
-  maxTurns?: number;
-  maxWallClockSec?: number;
-  maxActiveComputeSec?: number;
-  ephemeralHeavyExecutors?: EphemeralHeavyExecutorSpec[];
-  denyCommands?: string[];
-  state?: TaskState;
-  phase?: SandboxPhase;
-  customMetadata?: Record<string, string>;
-}
-
-export class AgentTask {
-  public taskId: string;
-  public tenantId: string;
-  public priorityClass: string;
-  public baseScore: number;
-  public enqueueTs: number;
-  public deadlineTs: number;
-  public preemptionPolicy: PreemptionPolicy;
-  public localityRegion: string;
-  public primaryModel: ModelPoolName;
-  public fastUtilityModel: ModelPoolName;
-  public fallbackModels: ModelPoolName[];
-  public effort: ReasoningEffort;
-  public thinkingBudgetTokens: number;
-  public temperature: number;
-  public maxContextWindow: number;
-  public reservedTps: number;
-  public maxBurstTps: number;
-  public maxRpm: number;
-  public maxTotalTokens: number;
-  public maxInputTokens: number;
-  public maxOutputTokens: number;
-  public softReservedTokens: number;
-  public usedTokens: number;
-  public usedInputTokens: number;
-  public usedOutputTokens: number;
-  public maxSessions: number;
-  public maxTotalSessions: number;
-  public activeSessions: number;
-  public totalSpawnedSessions: number;
-  public cogCpu: number;
-  public execCpu: number;
-  public burstCpu: number;
-  public cogMemMb: number;
-  public execMemMb: number;
-  public maxPids: number;
-  public isolationDriver: IsolationDriver;
-  public warmPoolId: string;
-  public maxTurns: number;
-  public maxWallClockSec: number;
-  public maxActiveComputeSec: number;
-  public activeComputeSec: number = 0.0;
-  public wallClockSec: number = 0.0;
-  public hibernationReason: HibernationReason = "NONE";
-  public drainSummary: string | null = null;
-  public cgroupFrozen: boolean = false;
-  public ephemeralHeavyExecutors: EphemeralHeavyExecutorSpec[];
-  public denyCommands: string[];
-  public state: TaskState;
-  public phase: SandboxPhase;
-  public fence: FenceToken;
-  public assignedNodeId: string | null = null;
-  public assignedModelPool: string | null = null;
-  public backtrackCount: number = 0;
-  public negativeMemories: string[] = [];
-  public customMetadata: Record<string, string>;
-
-  constructor(init: AgentTaskInit) {
-    this.taskId = init.taskId;
-    this.tenantId = init.tenantId;
-    this.priorityClass = init.priorityClass ?? "P1";
-    this.baseScore = init.baseScore ?? 800;
-    this.enqueueTs = init.enqueueTs ?? 0.0;
-    this.deadlineTs = init.deadlineTs ?? 300.0;
-    this.preemptionPolicy = init.preemptionPolicy ?? "PreemptToHibernate";
-    this.localityRegion = init.localityRegion ?? "us-west-2";
-    this.primaryModel = init.primaryModel ?? "DeepSeek";
-    this.fastUtilityModel = init.fastUtilityModel ?? "GLM-5.3";
-    this.fallbackModels = init.fallbackModels ?? ["Qwen-3.8", "GLM-5.3"];
-    this.effort = init.effort ?? "high";
-    this.thinkingBudgetTokens = init.thinkingBudgetTokens ?? 16384;
-    this.temperature = init.temperature ?? 0.2;
-    this.maxContextWindow = init.maxContextWindow ?? 128000;
-    this.reservedTps = init.reservedTps ?? 120;
-    this.maxBurstTps = init.maxBurstTps ?? 400;
-    this.maxRpm = init.maxRpm ?? 60;
-    this.maxTotalTokens = init.maxTotalTokens ?? 500000;
-    this.maxInputTokens = init.maxInputTokens ?? 400000;
-    this.maxOutputTokens = init.maxOutputTokens ?? 100000;
-    this.softReservedTokens = init.softReservedTokens ?? 150000;
-    this.usedTokens = init.usedTokens ?? 0;
-    this.usedInputTokens = init.usedInputTokens ?? 0;
-    this.usedOutputTokens = init.usedOutputTokens ?? 0;
-    this.maxSessions = init.maxSessions ?? 4;
-    this.maxTotalSessions = init.maxTotalSessions ?? 16;
-    this.activeSessions = init.activeSessions ?? 0;
-    this.totalSpawnedSessions = init.totalSpawnedSessions ?? 1;
-    this.cogCpu = init.cogCpu ?? 0.1;
-    this.execCpu = init.execCpu ?? 2.0;
-    this.burstCpu = init.burstCpu ?? 8.0;
-    this.cogMemMb = init.cogMemMb ?? 256.0;
-    this.execMemMb = init.execMemMb ?? 4096.0;
-    this.maxPids = init.maxPids ?? 256;
-    this.isolationDriver = init.isolationDriver ?? "firecracker";
-    this.warmPoolId = init.warmPoolId ?? "pool-py312-ds";
-    this.maxTurns = init.maxTurns ?? 15;
-    this.maxWallClockSec = init.maxWallClockSec ?? 1800;
-    this.maxActiveComputeSec = init.maxActiveComputeSec ?? 600;
-    this.ephemeralHeavyExecutors = init.ephemeralHeavyExecutors ?? [
-      {
-        triggerTool: "playwright_browser",
-        executorPool: "pool-headless-chromium-gpu",
-        maxAttachSec: 120,
-      },
-    ];
-    this.denyCommands = init.denyCommands ?? ["rm -rf /", "mkfs", "dd", "shutdown"];
-    this.state = init.state ?? TaskState.QUEUED;
-    this.phase = init.phase ?? SandboxPhase.IDLE;
-    this.fence = new FenceToken(0, 0, init.taskId);
-    this.customMetadata = init.customMetadata ?? {};
+  constructor(params: {
+    frameId: string;
+    taskId: string;
+    turnIndex: number;
+    fence: FenceToken;
+    changedFiles: string[];
+    sqliteWalPages: number;
+    crc32Hex?: string;
+    createdAtMs?: number;
+    /** Alias of `createdAtMs` used by the stream publisher's WAL frame literals. */
+    timestampMs?: number;
+    state?: TaskState;
+    routedModel?: string;
+    tokensUsed?: number;
+    passRate?: number;
+    errorCount?: number;
+    diffEntropy?: number;
+    workspaceMerkleHash?: string;
+    diffSnapshot?: string;
+    contextMessages?: string[];
+  }) {
+    this.frameId = params.frameId;
+    this.taskId = params.taskId;
+    this.turnIndex = params.turnIndex;
+    this.fence = params.fence;
+    this.changedFiles = [...params.changedFiles];
+    this.sqliteWalPages = params.sqliteWalPages;
+    this.createdAtMs = params.createdAtMs ?? params.timestampMs ?? Date.now();
+    this.state = params.state ?? TaskState.RUNNING_ACT;
+    this.routedModel = params.routedModel ?? "";
+    this.tokensUsed = params.tokensUsed ?? 0;
+    this.passRate = params.passRate ?? 1;
+    this.errorCount = params.errorCount ?? 0;
+    this.diffEntropy = params.diffEntropy ?? 0;
+    this.diffSnapshot = params.diffSnapshot ?? "";
+    this.contextMessages = params.contextMessages ? [...params.contextMessages] : [];
+    this.crc32Hex = params.crc32Hex ?? TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+    this.workspaceMerkleHash = params.workspaceMerkleHash ?? `merkle_${this.crc32Hex}`;
   }
 
-  public demandVector(rhoCog: number = 0.75): ResourceVector5D {
-    return ResourceVector5D.fromTaskParams({
-      cogCpu: this.cogCpu,
-      execCpu: this.execCpu,
-      burstCpu: this.burstCpu,
-      cogMemMb: this.cogMemMb,
-      execMemMb: this.execMemMb,
-      sessions: Math.max(1, this.activeSessions || this.maxSessions),
-      reservedTps: this.reservedTps,
-      effort: this.effort,
-      rhoCog,
+  /**
+   * Builds a frame from the sparse trajectory literals used by shadow replay / stream publishing:
+   * frame identity (`frameId`, `turnIndex`, `changedFiles`, `sqliteWalPages`) is derived from the
+   * `FenceToken` and every telemetry field falls back to the constructor default.
+   */
+  public static fromPartial(params: {
+    taskId: string;
+    fence: FenceToken;
+    frameId?: string;
+    turnIndex?: number;
+    changedFiles?: string[];
+    sqliteWalPages?: number;
+    crc32Hex?: string;
+    createdAtMs?: number;
+    timestampMs?: number;
+    state?: TaskState;
+    routedModel?: string;
+    tokensUsed?: number;
+    passRate?: number;
+    errorCount?: number;
+    diffEntropy?: number;
+    workspaceMerkleHash?: string;
+    diffSnapshot?: string;
+    contextMessages?: string[];
+  }): TurnWalFrame {
+    const turnIndex = params.turnIndex ?? params.fence.turnSeq;
+    return new TurnWalFrame({
+      ...params,
+      frameId: params.frameId ?? `frame-${params.taskId}-t${turnIndex}`,
+      turnIndex,
+      changedFiles: params.changedFiles ?? [],
+      sqliteWalPages: params.sqliteWalPages ?? 0,
     });
   }
 
-  public advanceClocks(deltaWallSec: number, deltaActiveComputeSec: number): boolean {
-    this.wallClockSec = Number((this.wallClockSec + deltaWallSec).toFixed(3));
-    if (this.state === TaskState.RUNNING) {
-      this.activeComputeSec = Number((this.activeComputeSec + deltaActiveComputeSec).toFixed(3));
+  public static computeCrc32Hex(
+    taskId: string,
+    turnIndex: number,
+    fence: FenceToken,
+    changedFiles: string[]
+  ): string {
+    const raw = `${taskId}:${turnIndex}:${fence.epoch}:${fence.turnSeq}:${changedFiles.join(",")}`;
+    let crc = 0xffffffff;
+    for (let i = 0; i < raw.length; i++) {
+      crc ^= raw.charCodeAt(i);
+      for (let j = 0; j < 8; j++) {
+        crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+      }
     }
-    if (
-      this.activeComputeSec >= this.maxActiveComputeSec ||
-      this.wallClockSec >= this.maxWallClockSec ||
-      this.usedTokens >= this.maxTotalTokens ||
-      this.usedInputTokens >= this.maxInputTokens ||
-      this.usedOutputTokens >= this.maxOutputTokens
-    ) {
-      this.state = TaskState.GRACEFUL_DRAINING;
-      this.drainSummary = `Graceful drain triggered at turn=${this.fence.turnSeq} (activeCompute=${this.activeComputeSec}s, tokens=${this.usedTokens})`;
-      return true;
-    }
-    return false;
+    return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, "0");
   }
+
+  public verifyIntegrity(): boolean {
+    const expected = TurnWalFrame.computeCrc32Hex(
+      this.taskId,
+      this.turnIndex,
+      this.fence,
+      this.changedFiles
+    );
+    return this.crc32Hex === expected;
+  }
+}
+
+/**
+ * Mutable per-task runtime record used by the console BFF / HITL approval gate.
+ * It is intentionally thin: the durable task specification lives in `TaskSpec`.
+ */
+export interface AgentTaskParams {
+  taskId: string;
+  tenantId: string;
+  state?: TaskState;
+  priority?: TaskPriority;
+  fence?: FenceToken | null;
+  createdAtMs?: number;
+}
+
+export class AgentTask {
+  public readonly taskId: string;
+  public readonly tenantId: string;
+  public state: TaskState;
+  public readonly priority: TaskPriority;
+  public fence: FenceToken | null;
+  public readonly createdAtMs: number;
+
+  constructor(params: AgentTaskParams) {
+    if (!params.taskId) {
+      throw new Error("AgentTask requires a non-empty taskId");
+    }
+    this.taskId = params.taskId;
+    this.tenantId = params.tenantId;
+    this.state = params.state ?? TaskState.SUBMITTED;
+    this.priority = params.priority ?? TaskPriority.P2_STANDARD;
+    this.fence = params.fence ?? null;
+    this.createdAtMs = params.createdAtMs ?? Date.now();
+  }
+
+  public transitionTo(nextState: TaskState): void {
+    this.state = nextState;
+  }
+}
+
+export interface ResourceProfile {
+  think_cpu_cores: number;
+  act_cpu_cores: number;
+  act_memory_mb: number;
+  disk_mb: number;
+}
+
+export interface TaskSpecInit {
+  task_id: string;
+  tenant_id: string;
+  priority?: TaskPriority;
+  prompt?: string;
+  max_turns?: number;
+  timeout_seconds?: number;
+  resource_profile?: Partial<ResourceProfile>;
+  dependencies?: string[];
+  idempotency_key?: string;
+  parent_task_id?: string;
+  expected_SubAgent_count?: number;
+  prefix_Cache_hash?: string;
+}
+
+export class TaskSpec {
+  public task_id: string;
+  public tenant_id: string;
+  public priority: TaskPriority;
+  public prompt: string;
+  public max_turns: number;
+  public current_turn = 0;
+  public timeout_seconds: number;
+  public resource_profile: ResourceProfile;
+  public dependencies: string[];
+  public idempotency_key?: string;
+  public parent_task_id?: string;
+  public expected_SubAgent_count: number;
+  public prefix_Cache_hash = "";
+  public state: TaskState = TaskState.SUBMITTED;
+  public assigned_node_id?: string;
+  public lease_fencing_token = 0;
+  public retry_count = 0;
+  public created_at: number;
+
+  constructor(init: TaskSpecInit) {
+    this.task_id = init.task_id;
+    this.tenant_id = init.tenant_id;
+    this.priority = init.priority ?? TaskPriority.P2_STANDARD;
+    this.prompt = init.prompt ?? "";
+    this.max_turns = init.max_turns ?? 30;
+    this.timeout_seconds = init.timeout_seconds ?? 1800;
+    this.resource_profile = {
+      think_cpu_cores: init.resource_profile?.think_cpu_cores ?? 0.25,
+      act_cpu_cores: init.resource_profile?.act_cpu_cores ?? 4.0,
+      act_memory_mb: init.resource_profile?.act_memory_mb ?? 4096,
+      disk_mb: init.resource_profile?.disk_mb ?? 10240,
+    };
+    this.dependencies = init.dependencies ? [...init.dependencies] : [];
+    this.idempotency_key = init.idempotency_key;
+    this.parent_task_id = init.parent_task_id;
+    this.expected_SubAgent_count = init.expected_SubAgent_count ?? 0;
+    this.prefix_Cache_hash = init.prefix_Cache_hash ?? "";
+    this.created_at = Date.now() / 1000;
+  }
+}
+
+export interface NodeHeartbeatInit {
+  node_id: string;
+  total_cpu_cores?: number;
+  free_cpu_cores?: number;
+  total_memory_mb?: number;
+  free_memory_mb?: number;
+  warm_pool_ready?: number;
+  psi_memory_some_avg10?: number;
+  running_tasks?: number;
+  healthy?: boolean;
+  cached_images?: Iterable<string>;
+}
+
+export class NodeHeartbeat {
+  public node_id: string;
+  public total_cpu_cores: number;
+  public free_cpu_cores: number;
+  public total_memory_mb: number;
+  public free_memory_mb: number;
+  public warm_pool_ready: number;
+  public psi_memory_some_avg10: number;
+  public running_tasks: number;
+  public healthy: boolean;
+  public cached_images: Set<string>;
+  public timestamp: number;
+
+  constructor(init: NodeHeartbeatInit) {
+    this.node_id = init.node_id;
+    this.total_cpu_cores = init.total_cpu_cores ?? 32.0;
+    this.free_cpu_cores = init.free_cpu_cores ?? this.total_cpu_cores;
+    this.total_memory_mb = init.total_memory_mb ?? 65536;
+    this.free_memory_mb = init.free_memory_mb ?? this.total_memory_mb;
+    this.warm_pool_ready = init.warm_pool_ready ?? 8;
+    this.psi_memory_some_avg10 = init.psi_memory_some_avg10 ?? 1.5;
+    this.running_tasks = init.running_tasks ?? 0;
+    this.healthy = init.healthy ?? true;
+    this.cached_images = new Set(init.cached_images ?? []);
+    this.timestamp = Date.now() / 1000;
+  }
+}
+
+export interface LlmEndpointMetricsInit {
+  endpoint_id: string;
+  provider: string;
+  model_name: string;
+  ttft_ewma_ms?: number;
+  tpm_limit?: number;
+  tpm_used?: number;
+  rpm_limit?: number;
+  rpm_used?: number;
+  max_concurrency?: number;
+  active_requests?: number;
+  healthy?: boolean;
+}
+
+export class LlmEndpointMetrics {
+  public endpoint_id: string;
+  public provider: string;
+  public model_name: string;
+  public ttft_ewma_ms: number;
+  public tpm_limit: number;
+  public tpm_used: number;
+  public rpm_limit: number;
+  public rpm_used: number;
+  public max_concurrency: number;
+  public active_requests: number;
+  public rate_limit_hits_last_min = 0;
+  public healthy: boolean;
+
+  constructor(init: LlmEndpointMetricsInit) {
+    this.endpoint_id = init.endpoint_id;
+    this.provider = init.provider;
+    this.model_name = init.model_name;
+    this.ttft_ewma_ms = init.ttft_ewma_ms ?? 250.0;
+    this.tpm_limit = init.tpm_limit ?? 1_000_000;
+    this.tpm_used = init.tpm_used ?? 0;
+    this.rpm_limit = init.rpm_limit ?? 2000;
+    this.rpm_used = init.rpm_used ?? 0;
+    this.max_concurrency = init.max_concurrency ?? 200;
+    this.active_requests = init.active_requests ?? 0;
+    this.healthy = init.healthy ?? true;
+  }
+
+  public get tpm_remaining(): number {
+    return Math.max(0, this.tpm_limit - this.tpm_used);
+  }
+}
+
+export interface LeaseRecord {
+  task_id: string;
+  node_id: string;
+  fencing_token: number;
+  acquired_at: number;
+  expires_at: number;
+}
+
+export interface CheckpointRecord {
+  checkpoint_id: string;
+  task_id: string;
+  turn_index: number;
+  fencing_token: number;
+  state_hash: string;
+  overlayfs_diff_uri: string;
+  created_at: number;
+}
+
+export interface ToolExecutionLog {
+  idempotency_key: string;
+  task_id: string;
+  turn_index: number;
+  tool_name: string;
+  effect_class: ToolCallEffectClass;
+  status: "SUCCESS" | "FAILED";
+  result_payload: Record<string, unknown>;
+  compensation_tool?: string;
+  executed_at: number;
 }

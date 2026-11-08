@@ -1,76 +1,68 @@
 /**
- * TASK-28: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher with DLQ Replay.
+ * @fileoverview M6 TASK-23: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher.
  */
+import * as crypto from "node:crypto";
 
-import * as crypto from "crypto";
-
-export interface OutboxRecord {
-  eventId: string;
-  tenantId: string;
-  payloadJson: string;
-  signatureSha256: string;
-  delivered: boolean;
+export interface OutboxWebhookMessage {
+  messageId: string;
+  taskId: string;
+  targetUrl: string;
+  payload: Record<string, unknown>;
   attempts: number;
+  delivered: boolean;
+  deadLettered: boolean;
+  signatureHeader?: string;
 }
 
 export class TransactionalOutboxDispatcher {
-  private secret: Buffer;
-  public outbox: OutboxRecord[] = [];
-  public deadLetterQueue: OutboxRecord[] = [];
+  private readonly outbox: Map<string, OutboxWebhookMessage> = new Map();
+  private readonly maxAttempts: number;
+  private readonly signingSecret: string;
 
-  constructor(
-    webhookSecret: string = "whsec_ansts_v2_prod",
-    public readonly maxRetries: number = 5,
-  ) {
-    this.secret = Buffer.from(webhookSecret, "utf8");
+  constructor(signingSecret = "ansts-webhook-hmac-secret", maxAttempts = 4) {
+    this.signingSecret = signingSecret;
+    this.maxAttempts = maxAttempts;
   }
 
-  public signPayload(payloadJson: string): string {
-    const digest = crypto.createHmac("sha256", this.secret).update(payloadJson, "utf8").digest("hex");
-    return `sha256=${digest}`;
-  }
-
-  public stageInTransaction(eventEnvelope: Record<string, any>): OutboxRecord {
-    const payloadJson = JSON.stringify(eventEnvelope);
-    const rec: OutboxRecord = {
-      eventId: eventEnvelope.id,
-      tenantId: eventEnvelope.data.tenant_id,
-      payloadJson,
-      signatureSha256: this.signPayload(payloadJson),
-      delivered: false,
+  public enqueueOutbox(messageId: string, taskId: string, targetUrl: string, payload: Record<string, unknown>): OutboxWebhookMessage {
+    const msg: OutboxWebhookMessage = {
+      messageId,
+      taskId,
+      targetUrl,
+      payload,
       attempts: 0,
+      delivered: false,
+      deadLettered: false,
     };
-    this.outbox.push(rec);
-    return rec;
+    this.outbox.set(messageId, msg);
+    return msg;
   }
 
-  public dispatchPending(transportFn: (rec: OutboxRecord) => number): { deliveredCount: number; dlqCount: number } {
-    let deliveredCount = 0;
-    let dlqCount = 0;
-    const remaining: OutboxRecord[] = [];
+  public signPayload(payloadJson: string, timestampSec = Math.floor(Date.now() / 1000)): string {
+    const body = `${timestampSec}.${payloadJson}`;
+    const hmac = crypto.createHmac("sha256", this.signingSecret).update(body, "utf-8").digest("hex");
+    return `t=${timestampSec},v1=${hmac}`;
+  }
 
-    for (const rec of this.outbox) {
-      if (rec.delivered) {
-        remaining.push(rec);
-        continue;
-      }
-      while (rec.attempts < this.maxRetries) {
-        rec.attempts += 1;
-        const status = transportFn(rec);
-        if (status >= 200 && status < 300) {
-          rec.delivered = true;
-          deliveredCount += 1;
-          break;
-        }
-      }
-      if (rec.delivered) {
-        remaining.push(rec);
-      } else {
-        this.deadLetterQueue.push(rec);
-        dlqCount += 1;
+  public processPending(sender: (msg: OutboxWebhookMessage) => boolean): {
+    deliveredCount: number;
+    deadLetterCount: number;
+  } {
+    let deliveredCount = 0;
+    let deadLetterCount = 0;
+    for (const msg of this.outbox.values()) {
+      if (msg.delivered || msg.deadLettered) continue;
+      msg.attempts += 1;
+      msg.signatureHeader = this.signPayload(JSON.stringify(msg.payload));
+      const ok = sender(msg);
+      if (ok) {
+        msg.delivered = true;
+        deliveredCount += 1;
+      } else if (msg.attempts >= this.maxAttempts) {
+        msg.deadLettered = true;
+        deadLetterCount += 1;
       }
     }
-    this.outbox = remaining;
-    return { deliveredCount, dlqCount };
+    return { deliveredCount, deadLetterCount };
   }
 }

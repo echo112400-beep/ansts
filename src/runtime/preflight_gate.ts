@@ -34,6 +34,26 @@ export interface PreflightCheckResult {
 }
 
 export class ProductionPreflightGate {
+  /**
+   * Instance seam over `evaluate`: reads the environment variables the production profile is configured
+   * with (`ANSTS_RUNTIME_PROFILE`, `S3_ENDPOINT`, `CELLD_BUCKET`, AWS credentials, Cgroup/PSI roots).
+   */
+  public runPreflightChecks(
+    env: Record<string, string | undefined> = {},
+  ): PreflightCheckResult {
+    return ProductionPreflightGate.evaluate({
+      profile: env.ANSTS_RUNTIME_PROFILE === "production" ? "production" : "test",
+      role: "all",
+      s3Endpoint: env.S3_ENDPOINT,
+      s3Bucket: env.CELLD_BUCKET,
+      s3AccessKeyId: env.AWS_ACCESS_KEY_ID,
+      s3SecretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+      cgroupRoot: env.ANSTS_CGROUP_ROOT,
+      procPressureRoot: env.ANSTS_PROC_PRESSURE_ROOT,
+      vsockSocketDir: env.ANSTS_VSOCK_SOCKET_DIR,
+    });
+  }
+
   public static evaluate(spec: PreflightEnvironmentSpec): PreflightCheckResult {
     const checks: Record<string, { ok: boolean; detail: string }> = {};
     const failedReasons: string[] = [];

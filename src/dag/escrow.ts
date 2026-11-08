@@ -1,57 +1,88 @@
 /**
- * TASK-08: Multi-Agent DAG State Machine, HMAC-Signed Quota Escrow Vouchers & Straggler Acceleration.
+ * @fileoverview M2 TASK-05: Deadlock-Free Parent-Child Sub-Agent Quota Escrow Coordinator.
  */
+import { TaskSpec, TaskState } from "../models.js";
 
-import * as crypto from "crypto";
-import { AgentTask, EscrowVoucher, SandboxPhase, TaskState } from "../models";
+export interface QuotaEscrowRecord {
+  parentTaskId: string;
+  tenantId: string;
+  escrowedSlots: number;
+  usedSlots: number;
+  childTaskIds: Set<string>;
+}
 
 export class DagEscrowCoordinator {
-  private secret: Buffer;
-  private signatures: Map<string, string> = new Map();
-  /** childTaskId -> issued voucher. The single source of truth for delegated quota. */
-  public issuedVouchers: Map<string, EscrowVoucher> = new Map();
+  private readonly escrows: Map<string, QuotaEscrowRecord> = new Map();
+  private readonly dependencyGraph: Map<string, Set<string>> = new Map();
 
-  constructor(clusterSecret: string = "ansts-escrow-hmac-secret-v2") {
-    this.secret = Buffer.from(clusterSecret, "utf8");
-  }
-
-  public signVoucher(voucher: EscrowVoucher): string {
-    const msg = `${voucher.parentTaskId}:${voucher.parentFence.epoch}:${voucher.parentFence.turnSeq}:${voucher.childTaskId}:${voucher.delegatedTps}:${voucher.delegatedTokens}`;
-    const sig = crypto.createHmac("sha256", this.secret).update(msg, "utf8").digest("hex");
-    this.signatures.set(voucher.childTaskId, sig);
-    return sig;
-  }
-
-  public verifyVoucher(voucher: EscrowVoucher, signature: string): boolean {
-    const expected = this.signVoucher(voucher);
-    return crypto.timingSafeEqual(Buffer.from(expected, "utf8"), Buffer.from(signature, "utf8"));
-  }
-
-  public yieldParentAndIssueVouchers(parent: AgentTask, children: AgentTask[]): EscrowVoucher[] {
-    parent.state = TaskState.HIBERNATED_YIELD;
-    parent.phase = SandboxPhase.IDLE;
-    parent.activeSessions = 0;
-
-    const m = Math.max(1, children.length);
-    const perTps = Math.max(15, Math.floor(parent.reservedTps / m));
-    const remTok = Math.max(10000, parent.maxTotalTokens - parent.usedTokens);
-    const perTok = Math.floor(remTok / m);
-
-    const vouchers: EscrowVoucher[] = [];
-    for (const child of children) {
-      child.reservedTps = perTps;
-      child.maxTotalTokens = perTok;
-      const v: EscrowVoucher = {
-        parentTaskId: parent.taskId,
-        parentFence: parent.fence,
-        childTaskId: child.taskId,
-        delegatedTps: perTps,
-        delegatedTokens: perTok,
-      };
-      this.signVoucher(v);
-      this.issuedVouchers.set(child.taskId, v);
-      vouchers.push(v);
+  public reserveParentEscrow(parent: TaskSpec, maxTenantQuota: number, currentTenantUsed: number): QuotaEscrowRecord {
+    const requestedEscrow = Math.max(0, parent.expected_SubAgent_count);
+    if (currentTenantUsed + 1 + requestedEscrow > maxTenantQuota) {
+      throw new Error(
+        `Insufficient tenant quota to escrow ${requestedEscrow} SubAgent slots for parent ${parent.task_id}`
+      );
     }
-    return vouchers;
+    const record: QuotaEscrowRecord = {
+      parentTaskId: parent.task_id,
+      tenantId: parent.tenant_id,
+      escrowedSlots: requestedEscrow,
+      usedSlots: 0,
+      childTaskIds: new Set(),
+    };
+    this.escrows.set(parent.task_id, record);
+    return record;
+  }
+
+  public registerChildSubAgent(parent: TaskSpec, child: TaskSpec): { usedEscrowSlot: boolean } {
+    this.assertNoCycle(child.task_id, new Set([parent.task_id, ...child.dependencies]));
+    this.dependencyGraph.set(child.task_id, new Set([parent.task_id, ...child.dependencies]));
+
+    parent.state = TaskState.WAITING_SUB_AGENT;
+    const escrow = this.escrows.get(parent.task_id);
+    if (escrow && escrow.usedSlots < escrow.escrowedSlots) {
+      escrow.usedSlots += 1;
+      escrow.childTaskIds.add(child.task_id);
+      return { usedEscrowSlot: true };
+    }
+    if (escrow) {
+      escrow.childTaskIds.add(child.task_id);
+    }
+    return { usedEscrowSlot: false };
+  }
+
+  public completeChildSubAgent(parent: TaskSpec, childTaskId: string): boolean {
+    const escrow = this.escrows.get(parent.task_id);
+    if (!escrow) {
+      parent.state = TaskState.RUNNING_THINK;
+      return true;
+    }
+    escrow.childTaskIds.delete(childTaskId);
+    if (escrow.usedSlots > 0) {
+      escrow.usedSlots -= 1;
+    }
+    if (escrow.childTaskIds.size === 0) {
+      parent.state = TaskState.RUNNING_THINK;
+      return true;
+    }
+    return false;
+  }
+
+  private assertNoCycle(sourceTaskId: string, targets: Set<string>): void {
+    const visited = new Set<string>();
+    const stack = [...targets];
+    while (stack.length > 0) {
+      const curr = stack.pop()!;
+      if (curr === sourceTaskId) {
+        throw new Error(`DAG cycle detected involving task '${sourceTaskId}'`);
+      }
+      if (visited.has(curr)) continue;
+      visited.add(curr);
+      const nextDeps = this.dependencyGraph.get(curr);
+      if (nextDeps) {
+        for (const dep of nextDeps) {
+          stack.push(dep);
+        }
+      }
+    }
   }
 }

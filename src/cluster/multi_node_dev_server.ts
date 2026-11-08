@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 /**
  * @fileoverview M28 (TASK-131): Multi-Instance `celld` Distributed Dev Cluster Node Server
  * (`MultiNodeClusterDaemonServer`).
@@ -98,7 +100,6 @@ export class MultiNodeClusterDaemonServer {
     this.sseGateway = new SseEventStreamGateway();
     this.walEngine = new TurnWalEngine(`${config.storageDir}/turnwal`);
     this.streamPublisher = new AgentStreamQueuePublisher(this.sseGateway, this.walEngine);
-    this.consoleBff = new ConsoleBffController(this.tunnelRouter, this.geoRouter, this.streamPublisher);
     this.branchForker = new SandboxBranchForker(`${config.storageDir}/sandboxes_cow`);
     this.securityGuard = new ZeroTrustSecurityGuard(`${config.storageDir}/cgroup_v2`);
     this.affinityRouter = new PrefixCacheAffinityRouter();
@@ -111,6 +112,7 @@ export class MultiNodeClusterDaemonServer {
       healthy: true,
     });
     this.canaryController = new CanaryRolloutController("v2.5.0", "v2.5.1-canary");
+    this.consoleBff = new ConsoleBffController(this.tunnelRouter, this.geoRouter, this.streamPublisher, this.mesh, this.canaryController);
   }
 
   public async start(): Promise<number> {
@@ -191,14 +193,19 @@ export class MultiNodeClusterDaemonServer {
   }
 
   public async executeScheduledTaskOnBrain(params: {
-    requestId: string;
-    tenantId: string;
-    taskId: string;
+    requestId?: string;
+    tenantId?: string;
+    taskId?: string;
     repoId?: string;
     promptText?: string;
     targetBodyHostId?: string;
-    envelope: any;
+    envelope?: any;
   }): Promise<Record<string, any>> {
+    // Internal HTTP RPC peers post a bare JSON body, so identity fields are re-defaulted here.
+    const taskId = params.taskId ?? `task_${Date.now()}`;
+    const tenantId = params.tenantId ?? "tenant-dev-01";
+    const envelope = params.envelope ?? {};
+
     // 1. Joint Compute-LLM Prefix-Cache Affinity Routing
     const llmRoute = this.affinityRouter.routeWithJointPrefixAffinity({
       repoId: params.repoId ?? "repo-default",
@@ -208,16 +215,16 @@ export class MultiNodeClusterDaemonServer {
     });
 
     // 2. Persist TurnWAL Frame with OS O_EXCL atomic lock + fsync
-    const fence = new FenceToken(params.envelope.slotEpoch ?? 1, 1, params.taskId);
+    const fence = new FenceToken(envelope.slotEpoch ?? 1, 1, taskId);
     const pubRes = this.streamPublisher.publishTaskStreamEvent({
-      clientId: `client-${params.tenantId}`,
-      taskId: params.taskId,
+      clientId: `client-${tenantId}`,
+      taskId,
       eventType: "TOOL_EXEC_PULSE",
       state: TaskState.TOOL_EXEC,
       fence,
       payload: {
-        shardId: params.envelope.targetShardId,
-        slotIndex: params.envelope.slotIndex,
+        shardId: envelope.targetShardId,
+        slotIndex: envelope.slotIndex,
         llmBackendId: llmRoute.selectedBackendId,
       },
     });
@@ -229,15 +236,15 @@ export class MultiNodeClusterDaemonServer {
 
     if (remoteBodyUrl) {
       bodyExecResult = await this.httpPostJson(`${remoteBodyUrl}/internal/v1beta1/body/exec-sandbox-burst`, {
-        taskId: params.taskId,
-        sandboxId: `sbx-${params.taskId}`,
+        taskId,
+        sandboxId: `sbx-${taskId}`,
         fence: { epoch: fence.epoch, turnSeq: fence.turnSeq },
         cpuBurstCores: 8.0,
       });
     } else {
       bodyExecResult = this.executeSandboxBurstOnBody({
-        taskId: params.taskId,
-        sandboxId: `sbx-${params.taskId}`,
+        taskId,
+        sandboxId: `sbx-${taskId}`,
         fence: { epoch: fence.epoch, turnSeq: fence.turnSeq },
         cpuBurstCores: 8.0,
       });
@@ -246,7 +253,7 @@ export class MultiNodeClusterDaemonServer {
     return {
       status: "EXECUTED",
       executedByBrainNodeId: this.config.nodeId,
-      schedulerEnvelope: params.envelope,
+      schedulerEnvelope: envelope,
       llmAffinityRoute: llmRoute,
       walObjectKey: pubRes.walObjectKey,
       bodyExecution: bodyExecResult,
@@ -254,25 +261,28 @@ export class MultiNodeClusterDaemonServer {
   }
 
   public executeSandboxBurstOnBody(params: {
-    taskId: string;
-    sandboxId: string;
-    fence: { epoch: number; turnSeq: number };
-    cpuBurstCores: number;
+    taskId?: string;
+    sandboxId?: string;
+    fence?: { epoch: number; turnSeq: number };
+    cpuBurstCores?: number;
   }): Record<string, any> {
-    const chk = this.branchForker.createCheckpoint(params.sandboxId, "workspace", {
-      "main.ts": `// Task ${params.taskId}`,
+    const taskId = params.taskId ?? `task_${Date.now()}`;
+    const sandboxId = params.sandboxId ?? `sbx-${taskId}`;
+    const cpuBurstCores = params.cpuBurstCores ?? 8.0;
+    const chk = this.branchForker.createCheckpoint(sandboxId, "workspace", {
+      "main.ts": `// Task ${taskId}`,
     });
-    const branch = this.branchForker.forkBranch(params.sandboxId, chk.checkpointId);
+    const branch = this.branchForker.forkBranch(sandboxId, chk.checkpointId);
     this.branchForker.recordBranchFileMutation(
       branch.branchId,
       "output.log",
-      `Executed on ${this.config.nodeId} at ${params.cpuBurstCores}C`,
+      `Executed on ${this.config.nodeId} at ${cpuBurstCores}C`,
     );
     const mergeRes = this.branchForker.mergeWinningBranchAndPruneSiblings(branch.branchId);
 
     return {
       bodyNodeId: this.config.nodeId,
-      sandboxId: params.sandboxId,
+      sandboxId,
       checkpointId: chk.checkpointId,
       branchId: branch.branchId,
       forkLatencyMs: branch.forkLatencyMs,
@@ -406,7 +416,7 @@ export class MultiNodeClusterDaemonServer {
         hostBrainNodeId: s.hostBrainNodeId,
         assignedSlots: `${idx * 85}..${Math.min(255, (idx + 1) * 85 - 1)}`,
         inFlightRequests: s.queuedTaskIds.size,
-        ewmaLatencyMs: 1.15,
+        ewmaLatencyMs: Number((this.mesh.p2cRouter.shards.get(s.shardId)?.ewmaLatencyMs ?? 0.42).toFixed(2)),
         status: s.healthy ? "STEADY" : "DRAINING",
         epoch: this.mesh.slotRing.generation,
       }));
@@ -453,6 +463,215 @@ export class MultiNodeClusterDaemonServer {
       const adv = this.canaryController.advanceRolloutPhase(nextPhase);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(adv));
+      return;
+    }
+
+
+    // 11. Serve TanStack Console HTML UI directly on GET / or GET /console
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/console" || url.pathname === "/ansts_console_prototype.html")) {
+      const candidatePath = path.resolve(process.cwd(), "docs/ansts_console_prototype.html");
+      if (fs.existsSync(candidatePath)) {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(fs.readFileSync(candidatePath, "utf8"));
+        return;
+      }
+    }
+
+    // 12. TanStack Console Body Fleet Tab BFF API (/v1beta1/console/fleet)
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/fleet") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.consoleBff.getFleetStatus()));
+      return;
+    }
+
+    // 13. TanStack Console Agent Harness (Brain) & Shards Tab BFF API (/v1beta1/console/harness)
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/harness") {
+      const heapMb = Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.consoleBff.getHarnessAndShardsStatus(heapMb)));
+      return;
+    }
+
+    // 14. TanStack Console mTLS & Dual-Homed Tunnels Tab BFF API (/v1beta1/console/tunnels)
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/tunnels") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.consoleBff.getTunnelsStatus()));
+      return;
+    }
+
+    // 15. TanStack Console TurnWAL Incremental Catch-up & Replay BFF API (/v1beta1/console/wal/catchup)
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/wal/catchup") {
+      const body = await this.readJsonBody(req);
+      const replayRes = this.consoleBff.replayMissedWalFrames(
+        body.clientId ?? "console-operator-client",
+        body.taskId ?? "task-prod-101",
+        Number(body.lastReceivedTurnSeq ?? 14),
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(replayRes));
+      return;
+    }
+
+
+    // 16. TanStack Console Shadow Eval Lab Tab BFF API (GET /v1beta1/console/shadow-lab & POST /v1beta1/console/shadow-lab/run)
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/shadow-lab") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.consoleBff.getShadowLabScorecards()));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/shadow-lab/run") {
+      const body = await this.readJsonBody(req);
+      const scorecard = this.consoleBff.triggerShadowReplayEval({
+        sourceTaskId: body.sourceTaskId ?? "task-prod-101",
+        baselinePool: body.baselinePool ?? "DeepSeek",
+        candidatePool: body.candidatePool ?? "GLM-5.3",
+        shadowTrafficSamplePct: Number(body.shadowTrafficSamplePct ?? 5.0),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(scorecard));
+      return;
+    }
+
+
+    // 17. M35 16x16 (256-Slot) Virtual Hash Slot Matrix Heatmap & Online Migration
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/slots-heatmap") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.consoleBff.getSlotsHeatmapAndSovereignty()));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/slots/migrate") {
+      const body = await this.readJsonBody(req);
+      const mig = this.consoleBff.migrateVirtualSlotOnline(
+        Number(body.slotIndex ?? 0),
+        String(body.targetShardId ?? "scheduler-shard-01"),
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(mig));
+      return;
+    }
+
+    // 18. M35 Live V8 Inspector CPU/Heap Flame Graph Capture
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/profiler/capture") {
+      const body = await this.readJsonBody(req);
+      const profile = this.consoleBff.captureLiveV8FlameGraph(String(body.isolateId ?? "celld-brain-01"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(profile));
+      return;
+    }
+
+    // 19. M35 Interactive Production Chaos Engineering Drill Runner
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/chaos/run") {
+      const summary = this.consoleBff.runChaosEngineeringDrills();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(summary));
+      return;
+    }
+
+    // 20. M35 Spot Host Termination 2-Minute Warning Live Evacuation
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/spot/evacuate") {
+      const body = await this.readJsonBody(req);
+      const evac = this.consoleBff.triggerSpotHostEvacuation(String(body.spotHostId ?? "body-host-edge-02"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(evac));
+      return;
+    }
+
+    // 21. M35 HITL STAGED_COMMIT Approval Gate & Zero-Token Time-Travel Replay Forking
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/hitl-timetravel") {
+      const taskId = url.searchParams.get("taskId") ?? "task-prod-101";
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.consoleBff.getHitlAndTimeTravelState(taskId)));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/hitl/decide") {
+      const body = await this.readJsonBody(req);
+      const resDec = this.consoleBff.decideHitlStagedCommit({
+        taskId: String(body.taskId ?? "task-prod-101"),
+        decision: body.decision ?? "approve",
+        toolName: body.toolName,
+        payload: body.payload,
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(resDec));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/timetravel/fork") {
+      const body = await this.readJsonBody(req);
+      const forkRes = this.consoleBff.forkFromHistoricalTurn(
+        String(body.taskId ?? "task-prod-101"),
+        Number(body.targetTurnSeq ?? 15),
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(forkRes));
+      return;
+    }
+
+    // 22. M35 Multi-Agent CoW Branch Tree, SLSA v1.0 Attestation & Git AST 3-Way Merger
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/cow-ast") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.consoleBff.getCowBranchesAndAstMergerStatus()));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/cow/fork-attest") {
+      const body = await this.readJsonBody(req);
+      const rec = this.consoleBff.forkAndAttestSubAgentBranch(body);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(rec));
+      return;
+    }
+
+    // 23. M35 5D W-DRF Quota Radar, FinOps Burn-Rate & KV-Cache Savings
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/finops-wdrf") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.consoleBff.getFinOpsAndWdrfRadar()));
+      return;
+    }
+
+
+    // 24. M36 TASK-150: Full-Duplex Console SSE Real-Time Delta Push Stream
+    if (req.method === "GET" && url.pathname === "/v1beta1/console/events/stream") {
+      this.consoleBff.ssePushGateway.attachSseSubscriber(res);
+      return;
+    }
+
+    // 25. M36 TASK-151: Control-Plane OIDC/JWT RBAC Token Issuance & Verification
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/rbac/token") {
+      const body = await this.readJsonBody(req);
+      const out = this.consoleBff.issueOperatorRbacJwt(
+        String(body.operatorId ?? "sre-lead-01"),
+        body.role ?? "SRE_ADMIN",
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(out));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/rbac/verify") {
+      const body = await this.readJsonBody(req);
+      try {
+        const verified = this.consoleBff.authorizeRbacOperation(
+          String(body.token ?? ""),
+          body.permission ?? "console:read",
+        );
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ authorized: true, ...verified }));
+      } catch (err: any) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ authorized: false, error: err?.message ?? "Forbidden" }));
+      }
+      return;
+    }
+
+    // 26. M36 & M37 (TASK-148 ~ TASK-155): Unified Deep-Tech Runtime & Autonomous GC/Deadlock Probe
+    if (req.method === "POST" && url.pathname === "/v1beta1/console/v27/deep-tech-probe") {
+      const probeRes = this.consoleBff.runV27DeepTechSuiteProbe();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(probeRes));
       return;
     }
 

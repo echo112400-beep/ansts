@@ -11,24 +11,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
 import {
   PrefixCacheAffinityRouter,
   HierarchicalContextCompactor,
   SandboxProvenanceAttestor,
   ZeroTrustSecurityGuard,
   OnlineContinuousProfiler,
-  AgentTask,
-  CgroupPhaseController,
-  CloudEventsBus,
-  ConsoleDataTableEngine,
-  FenceToken,
-  LeaseCoordinator,
-  MultiNodeClusterDaemonServer,
-  SagaToolGateway,
-  ToolEffectClass,
-  WalCompactorAndPagedRestorer,
-  WarmSandboxPoolManager,
 } from "../src/index";
 
 test("test 74: [TASK-113 & TASK-114] PrefixCacheAffinityRouter achieves KV-Cache hit, reduces TTFT by 65%, applies 80% FinOps discount, and spills over when overloaded", () => {
@@ -411,6 +399,62 @@ test("test 81: [M29/M30 TanStack Control Plane & Live Cluster BFF/Metrics HTTP V
     const metricsText = await metricsRes.text();
     assert.ok(metricsText.includes("ansts_celld_isolate_heap_used_megabytes"));
     assert.ok(metricsText.includes("ansts_scheduler_shard_inflight_requests"));
+  } finally {
+    await gateway.stop();
+  }
+});
+
+test("test 82: [M31 Full TanStack Console Prototype BFF Integration] TanStackConsoleBffClient verifies all 5 Prototype tabs (Overview, Fleet, Harness, Tunnels, TurnWAL Catch-up) and live mutations over HTTP", async () => {
+  const baseDir = `/tmp/ansts_m31_bff_${Date.now()}`;
+  const gateway = new MultiNodeClusterDaemonServer({
+    nodeId: "celld-gw-01",
+    role: "gateway",
+    listenPort: 0,
+    peerBrainUrls: {},
+    peerBodyUrls: {},
+    storageDir: `${baseDir}/gw-01`,
+  });
+  const port = await gateway.start();
+  const client = new TanStackConsoleBffClient(`http://127.0.0.1:${port}`);
+
+  try {
+    // 1. Tab 1: Overview (KPIs + Dual-Homed Body Hosts Table)
+    const overview = await client.fetchOverview("us-west-2");
+    assert.equal(overview.clusterHealthy, true);
+    assert.equal(overview.rpoZeroGuaranteed, true);
+    assert.ok(Array.isArray(overview.bodyHostRows));
+    assert.ok(overview.bodyHostRows.length >= 2);
+    assert.equal(overview.bodyHostRows[0].hostId, "body-host-edge-01");
+
+    // 2. Tab 2: Body Fleet (Cgroups v2 8.0C allocator + Preflight Gate checks)
+    const fleet = await client.fetchFleet();
+    assert.ok(fleet.hostAllocator.cpuMaxBurstUs.includes("800,000"));
+    assert.equal(fleet.preflightChecks.length, 4);
+    assert.equal(fleet.preflightChecks.every((c: any) => c.passed), true);
+
+    // 3. Tab 3: Agent Harness & 256-Slot Shards
+    const harness = await client.fetchHarnessAndShards();
+    assert.equal(harness.totalVirtualSlots, 256);
+    assert.equal(harness.shards.length, 3);
+    assert.ok(harness.activeHarnessCells.length >= 2);
+
+    // 4. Tab 4: mTLS Dual-Homed Tunnels & Make-Before-Break Drain on `body-host-edge-01`
+    const tunnelsBefore = await client.fetchTunnels();
+    assert.ok(tunnelsBefore.gateways.length >= 3);
+
+    const drainRes = await client.mutateDrainGatewayOrHost("body-host-edge-01", 15000);
+    assert.equal(drainRes.drainingGatewayId, "celld-gw-01");
+    assert.ok(drainRes.s3CasGeneration.startsWith("v1-gen-"));
+
+    // 5. Tab 5: Real Disk-Backed TurnWAL Catch-up Replay (`turnSeq > 14` -> returns frames #15, #16, #17)
+    const walReplay = await client.mutateWalCatchupReplay({
+      clientId: "console-operator-client",
+      taskId: "task-prod-101",
+      lastReceivedTurnSeq: 14,
+    });
+    assert.equal(walReplay.replayedWalFrames.length, 3);
+    assert.equal(walReplay.replayedWalFrames[0].fence.turnSeq, 15);
+    assert.equal(walReplay.replayedWalFrames[2].fence.turnSeq, 17);
   } finally {
     await gateway.stop();
   }

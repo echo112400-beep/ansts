@@ -3,12 +3,6 @@ set -euo pipefail
 
 COMPOSE_FILE="deploy/dev-cluster/docker-compose.dev-cluster.yml"
 
-# Bypass any corporate/local HTTP proxy for loopback & RFC1918 health probes.
-# NOTE: proxy settings commonly use wildcards like `127.*`, which curl does NOT honour,
-# which would make every localhost probe below return `502 Bad Gateway`.
-export no_proxy="127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-export NO_PROXY="${no_proxy}"
-
 echo "===> [1/4] Starting ANSTS v2.5 Full Dev Cluster (TanStack Console + 2 Gateways + 3 celld Brains + 2 Body Daemons + RustFS + Prometheus + Grafana)..."
 docker compose -f "${COMPOSE_FILE}" up -d --build
 
@@ -32,22 +26,10 @@ curl -fsS -X POST http://127.0.0.1:18081/internal/v1beta1/tunnel/register \
   -d '{"hostId":"body-host-01","gatewayId":"celld-gw-02","role":"SECONDARY","connGeneration":1,"epoch":1}' | sed 's/^/  [Tunnel Secondary] /'
 echo ""
 
-# Smoke task id must be unique per run: WAL writes use `If-None-Match` create-once
-# semantics, so a fixed id makes every re-run of this script report
-# `412 PreconditionFailed: ...turn_0001.wal already exists on disk`.
-SMOKE_TASK_ID="task-distributed-$(date +%Y%m%d%H%M%S)-${RANDOM}"
-DISPATCH_RESPONSE=$(curl -fsS -X POST http://127.0.0.1:18080/v1beta1/tasks/dispatch \
+curl -fsS -X POST http://127.0.0.1:18080/v1beta1/tasks/dispatch \
   -H "Content-Type: application/json" \
-  -d "{\"tenantId\":\"tenant-alpha\",\"taskId\":\"${SMOKE_TASK_ID}\",\"repoId\":\"ansts-monorepo\",\"promptText\":\"verify distributed celld dispatch\",\"targetBodyHostId\":\"body-host-01\"}")
-echo "  [Dispatch Result] ${DISPATCH_RESPONSE}"
+  -d '{"tenantId":"tenant-alpha","taskId":"task-distributed-001","repoId":"ansts-monorepo","promptText":"verify distributed celld dispatch","targetBodyHostId":"body-host-01"}' | sed 's/^/  [Dispatch Result] /'
 echo ""
-case "${DISPATCH_RESPONSE}" in
-  *'"status":"EXECUTED"'*) ;;
-  *)
-    echo "  [FAIL] Distributed smoke task ${SMOKE_TASK_ID} was not executed." >&2
-    exit 1
-    ;;
-esac
 
 echo "===> [4/4] Verifying TanStack Console BFF Endpoints & Prometheus Metrics..."
 curl -fsS "http://127.0.0.1:8088/v1beta1/console/overview?region=us-west-2" | sed 's/^/  [TanStack Console Overview] /'

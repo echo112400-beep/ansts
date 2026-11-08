@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ANSTS Live Console — 真实 BFF 数据</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, Arial, sans-serif; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .slot-strip { display: flex; gap: 2px; height: 26px; }
+  .slot-strip > div { border-radius: 2px; transition: opacity .2s; }
+  .slot-strip > div:hover { opacity: .75; }
+  .spin { animation: sp .9s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  details > summary { cursor: pointer; }
+  .fade-in { animation: fi .18s ease-out; }
+  @keyframes fi { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; } }
+</style>
+</head>
+<body class="bg-slate-950 text-slate-200 min-h-screen antialiased">
+
+<!-- ============================ Header ============================ -->
+<header class="sticky top-0 z-20 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
+  <div class="mx-auto max-w-7xl px-5 py-3 flex flex-wrap items-center gap-3">
+    <div class="flex items-center gap-3">
+      <div class="h-8 w-8 rounded-lg bg-cyan-500/15 border border-cyan-500/30 grid place-items-center">
+        <span class="text-cyan-400 text-sm font-bold">A</span>
+      </div>
+      <div>
+        <h1 class="text-sm font-semibold tracking-wide">ANSTS Live Console</h1>
+        <p class="text-[11px] text-slate-500">实时数据来自 <span class="mono text-slate-400">/v1beta1/console/*</span> BFF，无桩数据</p>
+      </div>
+    </div>
+
+    <div class="ml-auto flex flex-wrap items-center gap-2">
+      <span id="conn" class="inline-flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-900 px-2.5 py-1 text-[11px] text-slate-400">
+        <span id="conn-dot" class="h-1.5 w-1.5 rounded-full bg-slate-500"></span>
+        <span id="conn-text">未连接</span>
+      </span>
+
+      <label class="flex items-center gap-1.5 text-[11px] text-slate-400">
+        <input id="auto" type="checkbox" checked class="accent-cyan-500" />
+        自动刷新 3s
+      </label>
+
+      <select id="region" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] text-slate-200 focus:outline-none focus:border-cyan-500">
+        <option value="us-west-2">us-west-2</option>
+        <option value="eu-central-1">eu-central-1</option>
+      </select>
+
+      <button id="refresh" class="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-[11px] font-medium text-cyan-400 hover:bg-cyan-500/20 transition">
+        <svg id="refresh-icon" class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
+        刷新
+      </button>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <nav class="mx-auto max-w-7xl px-5 flex gap-1 overflow-x-auto text-[12px]">
+    <button data-tab="overview" class="tab-btn">集群概览</button>
+    <button data-tab="shards" class="tab-btn">分片矩阵</button>
+    <button data-tab="dispatch" class="tab-btn">任务派发</button>
+    <button data-tab="tunnels" class="tab-btn">隧道与排空</button>
+    <button data-tab="rollout" class="tab-btn">灰度发布</button>
+    <button data-tab="wal" class="tab-btn">WAL 续传</button>
+  </nav>
+</header>
+
+<!-- ============================ Error bar ============================ -->
+<div id="errbar" class="hidden mx-auto max-w-7xl px-5 pt-3">
+  <div class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[12px] text-rose-300">
+    <span class="font-semibold">请求失败</span>
+    <span id="errmsg" class="mono ml-2 break-all"></span>
+  </div>
+</div>
+
+<main class="mx-auto max-w-7xl px-5 py-5 space-y-5">
+
+  <!-- ======================= Overview ======================= -->
+  <section id="tab-overview" class="space-y-5">
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+      <div class="card">
+        <p class="card-label">集群健康</p>
+        <p id="ov-health" class="card-value">—</p>
+        <p id="ov-health-sub" class="card-sub">—</p>
+      </div>
+      <div class="card">
+        <p class="card-label">RPO = 0</p>
+        <p id="ov-rpo" class="card-value">—</p>
+        <p id="ov-rpo-sub" class="card-sub">—</p>
+      </div>
+      <div class="card">
+        <p class="card-label">命中区域</p>
+        <p id="ov-region" class="card-value">—</p>
+        <p id="ov-region-sub" class="card-sub">—</p>
+      </div>
+      <div class="card">
+        <p class="card-label">活跃沙箱</p>
+        <p id="ov-sbx" class="card-value">—</p>
+        <p id="ov-sbx-sub" class="card-sub">—</p>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+      <div class="panel">
+        <h2 class="panel-title">Brain Isolate 准入（<span class="mono">CapacitySlaEnforcer</span>）</h2>
+        <dl id="ov-brain" class="kv"><dd class="text-slate-500 text-[12px]">加载中…</dd></dl>
+      </div>
+      <div class="panel">
+        <h2 class="panel-title">RustFS EC:4 存储可靠性</h2>
+        <dl id="ov-ec4" class="kv"><dd class="text-slate-500 text-[12px]">加载中…</dd></dl>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 class="panel-title">双活隧道路由表 <span class="panel-note">来自 <span class="mono">EdgeTunnelHaDynamicRouter.routeTable</span></span></h2>
+      <div class="overflow-x-auto">
+        <table class="tbl">
+          <thead><tr>
+            <th>hostId</th><th>连接代数</th><th>epoch</th>
+            <th>主网关</th><th>中继地址</th><th class="text-right">更新于</th>
+          </tr></thead>
+          <tbody id="ov-routes"><tr><td colspan="6" class="text-slate-500">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= Shards ======================= -->
+  <section id="tab-shards" class="space-y-4 hidden">
+    <div class="panel">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="panel-title">虚拟槽位分配 <span class="panel-note"><span id="sh-total">—</span> slots · ring generation <span id="sh-gen">—</span></span></h2>
+        <span class="rounded border border-slate-700 bg-slate-900 px-2 py-0.5 text-[11px] text-slate-400">rollout phase: <span id="sh-phase" class="mono text-cyan-400">—</span></span>
+      </div>
+      <div id="sh-strip" class="slot-strip mt-3"></div>
+      <div id="sh-legend" class="mt-2 flex flex-wrap gap-3 text-[11px] text-slate-500"></div>
+    </div>
+
+    <div class="panel">
+      <h2 class="panel-title">Shard 明细</h2>
+      <div class="overflow-x-auto">
+        <table class="tbl">
+          <thead><tr>
+            <th>shardId</th><th>宿主 Brain</th><th>槽位区间</th>
+            <th class="text-right">在途请求</th><th class="text-right">EWMA 延迟</th>
+            <th>状态</th><th class="text-right">epoch</th>
+          </tr></thead>
+          <tbody id="sh-rows"><tr><td colspan="7" class="text-slate-500">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= Dispatch ======================= -->
+  <section id="tab-dispatch" class="space-y-4 hidden">
+    <div class="panel">
+      <h2 class="panel-title">派发一个真实任务 <span class="panel-note">POST <span class="mono">/v1beta1/tasks/dispatch</span> → 调度分片 → Brain 执行 → Body 沙箱</span></h2>
+      <form id="dispatch-form" class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+        <label class="field">
+          <span class="field-label">tenantId</span>
+          <input name="tenantId" value="tenant-dev-01" class="input" />
+        </label>
+        <label class="field">
+          <span class="field-label">repoId（可选）</span>
+          <input name="repoId" placeholder="repo-ansts-core" class="input" />
+        </label>
+        <label class="field md:col-span-2">
+          <span class="field-label">promptText</span>
+          <textarea name="promptText" rows="2" class="input" placeholder="实现一个带重试的 HTTP 客户端">给调度器写一个健康检查脚本</textarea>
+        </label>
+        <label class="field">
+          <span class="field-label">targetBodyHostId（可选）</span>
+          <input name="targetBodyHostId" placeholder="body-host-01" class="input" />
+        </label>
+        <div class="flex items-end">
+          <button type="submit" class="btn-primary">派发任务</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="dispatch-result" class="hidden space-y-4 fade-in">
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <div class="panel">
+          <h3 class="panel-title">① 调度分片（Scheduler Envelope）</h3>
+          <dl id="ds-sched" class="kv"></dl>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">② LLM 前缀缓存亲和路由</h3>
+          <dl id="ds-llm" class="kv"></dl>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">③ TurnWAL 落盘</h3>
+          <dl id="ds-wal" class="kv"></dl>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">④ Body 沙箱执行</h3>
+          <dl id="ds-body" class="kv"></dl>
+        </div>
+      </div>
+      <div class="panel">
+        <h3 class="panel-title">原始响应</h3>
+        <pre id="ds-raw" class="raw"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= Tunnels ======================= -->
+  <section id="tab-tunnels" class="space-y-4 hidden">
+    <div class="panel">
+      <h2 class="panel-title">Make-Before-Break 排空 <span class="panel-note">POST <span class="mono">/v1beta1/console/tunnels/drain</span>，通知双跳宿主切换到备用网关</span></h2>
+      <div class="overflow-x-auto mt-3">
+        <table class="tbl">
+          <thead><tr><th>hostId</th><th>主网关</th><th>连接代数</th><th>epoch</th><th class="text-right">操作</th></tr></thead>
+          <tbody id="tn-rows"><tr><td colspan="5" class="text-slate-500">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <p class="mt-2 text-[11px] text-slate-500">排空不注入故障：真实调用 tunnelRouter 生成切换通知，返回 <span class="mono">notices</span>。</p>
+    </div>
+    <div id="drain-result" class="panel hidden">
+      <h3 class="panel-title">排空结果</h3>
+      <pre id="drain-raw" class="raw"></pre>
+    </div>
+  </section>
+
+  <!-- ======================= Rollout ======================= -->
+  <section id="tab-rollout" class="space-y-4 hidden">
+    <div class="panel">
+      <h2 class="panel-title">灰度拓扑状态 <span class="panel-note">来自 <span class="mono">/v1beta1/console/shards</span> · 变更走 <span class="mono">/v1beta1/console/canary/action</span></span></h2>
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-3">
+        <div class="card"><p class="card-label">当前阶段</p><p id="ro-phase" class="card-value">—</p></div>
+        <div class="card"><p class="card-label">Ring Generation</p><p id="ro-gen" class="card-value">—</p></div>
+        <div class="card"><p class="card-label">Topology Epoch</p><p id="ro-epoch" class="card-value">—</p></div>
+      </div>
+      <div class="mt-4 flex flex-wrap gap-2">
+        <button class="btn-ghost" data-phase="PHASE_1_SHADOW_1_SLOT">推进 · SHADOW 1 slot</button>
+        <button class="btn-ghost" data-phase="PHASE_2_CANARY_8_SLOTS">推进 · CANARY 8 slots</button>
+        <button class="btn-ghost" data-phase="PHASE_3_PARTIAL_64_SLOTS">推进 · PARTIAL 64 slots</button>
+        <button class="btn-ghost" data-phase="PHASE_4_FULL_256_SLOTS">推进 · FULL 256 slots</button>
+        <button class="btn-danger" data-action="rollback">一键回滚到 stable</button>
+      </div>
+      <p class="mt-2 text-[11px] text-slate-500">推进/回滚会真实改写 256 个虚拟槽位的 <span class="mono">ownerVersion</span>、<span class="mono">migrationStage</span> 与 <span class="mono">topologyEpoch</span>。</p>
+    </div>
+    <div id="rollout-result" class="panel hidden">
+      <h3 class="panel-title">操作返回</h3>
+      <pre id="rollout-raw" class="raw"></pre>
+    </div>
+  </section>
+
+  <!-- ======================= WAL ======================= -->
+  <section id="tab-wal" class="space-y-4 hidden">
+    <div class="panel">
+      <h2 class="panel-title">TurnWAL 增量续传 <span class="panel-note">POST <span class="mono">&lt;node&gt;/v1beta1/console/wal/catchup</span> — 按 Last-Event-ID 重放缺失帧</span></h2>
+      <form id="wal-form" class="mt-3 grid grid-cols-1 md:grid-cols-4 gap-3">
+        <label class="field"><span class="field-label">clientId</span><input name="clientId" value="console-live-client" class="input" /></label>
+        <label class="field md:col-span-2"><span class="field-label">taskId</span><input name="taskId" id="wal-taskid" placeholder="先在上面派发一个任务" class="input mono" /></label>
+        <label class="field"><span class="field-label">lastReceivedTurnSeq</span><input name="lastReceivedTurnSeq" type="number" value="0" min="0" class="input mono" /></label>
+        <div class="md:col-span-4 flex flex-wrap items-center gap-2">
+          <button type="submit" class="btn-primary">执行续传</button>
+          <button type="button" id="wal-use-last" class="btn-ghost">用最近派发的 taskId</button>
+          <span class="text-[11px] text-slate-500">目标节点：<span id="wal-node" class="mono text-slate-300">gateway-01（默认）</span></span>
+        </div>
+      </form>
+      <p class="mt-2 text-[11px] text-slate-500">TurnWAL 写在<b>实际执行任务的节点</b>（Brain）本地磁盘，而不是转发该任务的上游网关，因此页面按派发响应里的 <span class="mono">executedByBrainNodeId</span> 自动选择节点代理。</p>
+    </div>
+
+    <div id="wal-result" class="hidden space-y-4 fade-in">
+      <div class="grid grid-cols-1 sm:grid-cols-4 gap-3">
+        <div class="card"><p class="card-label">重放帧数</p><p id="wl-count" class="card-value">—</p></div>
+        <div class="card"><p class="card-label">当前 turnSeq</p><p id="wl-turn" class="card-value">—</p></div>
+        <div class="card"><p class="card-label">当前 epoch</p><p id="wl-epoch" class="card-value">—</p></div>
+        <div class="card"><p class="card-label">实时流已恢复</p><p id="wl-live" class="card-value">—</p></div>
+      </div>
+      <div class="panel">
+        <h3 class="panel-title">重放的 TurnWAL 帧 <span class="panel-note">从 <span id="wl-src" class="mono"></span> 读取</span></h3>
+        <div class="overflow-x-auto">
+          <table class="tbl">
+            <thead><tr><th class="text-right">turnSeq</th><th class="text-right">epoch</th><th>eventType</th><th class="text-right">写入时间</th><th>payload</th></tr></thead>
+            <tbody id="wl-rows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel"><h3 class="panel-title">原始响应</h3><pre id="wl-raw" class="raw"></pre></div>
+    </div>
+  </section>
+
+  <footer class="pt-2 pb-8 text-[11px] text-slate-600">
+    数据来源：<span class="mono">GET /v1beta1/console/overview</span> · <span class="mono">GET /v1beta1/console/shards</span> ·
+    <span class="mono">POST /v1beta1/tasks/dispatch</span> · <span class="mono">POST /v1beta1/console/tunnels/drain</span> ·
+    <span class="mono">POST /v1beta1/console/canary/action</span> · <span class="mono">POST /node/&lt;node&gt;/v1beta1/console/wal/catchup</span>
+  </footer>
+</main>
+
+<script>
+/* ============================== 样式类定义（Tailwind 已在 <head> 声明） ============================== */
+const sheet = document.createElement("style");
+sheet.textContent = `
+  .card { border-radius:.6rem; border:1px solid rgb(30 41 59); background:rgb(15 23 42); padding:.85rem 1rem; }
+  .card-label { font-size:11px; color:rgb(100 116 139); letter-spacing:.02em; }
+  .card-value { margin-top:.3rem; font-size:1.35rem; font-weight:600; color:rgb(226 232 240); font-variant-numeric:tabular-nums; }
+  .card-sub { margin-top:.15rem; font-size:11px; color:rgb(100 116 139); }
+  .panel { border-radius:.6rem; border:1px solid rgb(30 41 59); background:rgb(15 23 42); padding:1rem; }
+  .panel-title { font-size:12px; font-weight:600; color:rgb(203 213 225); letter-spacing:.02em; }
+  .panel-note { font-weight:400; color:rgb(100 116 139); font-size:11px; }
+  .kv { margin-top:.6rem; display:grid; grid-template-columns:minmax(9rem,auto) 1fr; gap:.35rem .9rem; font-size:12px; }
+  .kv dt { color:rgb(100 116 139); }
+  .kv dd { color:rgb(226 232 240); font-family:ui-monospace,Menlo,Consolas,monospace; word-break:break-all; }
+  .tbl { width:100%; font-size:12px; border-collapse:collapse; }
+  .tbl thead th { text-align:left; padding:.5rem .75rem; color:rgb(100 116 139); font-weight:500; border-bottom:1px solid rgb(30 41 59); white-space:nowrap; }
+  .tbl tbody td { padding:.5rem .75rem; border-bottom:1px solid rgb(30 41 59); color:rgb(203 213 225); vertical-align:top; }
+  .tbl tbody tr:last-child td { border-bottom:none; }
+  .tbl tbody tr:hover td { background:rgb(2 6 23); }
+  .input { width:100%; border-radius:.45rem; border:1px solid rgb(51 65 85); background:rgb(2 6 23); padding:.4rem .6rem; font-size:12px; color:rgb(226 232 240); }
+  .input:focus { outline:none; border-color:rgb(6 182 212); }
+  .field-label { display:block; margin-bottom:.25rem; font-size:11px; color:rgb(100 116 139); }
+  .btn-primary { border-radius:.45rem; border:1px solid rgba(6,182,212,.35); background:rgba(6,182,212,.12); padding:.45rem 1rem; font-size:12px; font-weight:500; color:rgb(34 211 238); }
+  .btn-primary:hover { background:rgba(6,182,212,.22); }
+  .btn-primary:disabled { opacity:.5; cursor:not-allowed; }
+  .btn-ghost { border-radius:.45rem; border:1px solid rgb(51 65 85); background:rgb(15 23 42); padding:.4rem .8rem; font-size:11.5px; color:rgb(148 163 184); }
+  .btn-ghost:hover { background:rgb(30 41 59); color:rgb(226 232 240); }
+  .btn-danger { border-radius:.45rem; border:1px solid rgba(244,63,94,.35); background:rgba(244,63,94,.1); padding:.4rem .8rem; font-size:11.5px; color:rgb(251 113 133); }
+  .btn-danger:hover { background:rgba(244,63,94,.2); }
+  .btn-xs { border-radius:.35rem; border:1px solid rgb(51 65 85); background:rgb(30 41 59); padding:.15rem .5rem; font-size:11px; color:rgb(34 211 238); }
+  .btn-xs:hover { background:rgb(51 65 85); }
+  .raw { margin-top:.5rem; max-height:22rem; overflow:auto; border-radius:.45rem; border:1px solid rgb(30 41 59); background:rgb(2 6 23); padding:.6rem .75rem;
+         font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11px; line-height:1.5; color:rgb(148 163 184); white-space:pre-wrap; word-break:break-all; }
+  .tab-btn { padding:.55rem .9rem; border-bottom:2px solid transparent; color:rgb(100 116 139); white-space:nowrap; }
+  .tab-btn:hover { color:rgb(226 232 240); }
+  .tab-btn.active { border-bottom-color:rgb(6 182 212); color:rgb(34 211 238); }
+  .pill-ok { color:rgb(52 211 153); }
+  .pill-bad { color:rgb(251 113 133); }
+  .pill-warn { color:rgb(251 191 36); }
+  .mono-sm { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11px; color:rgb(100 116 139); }
+`;
+document.head.appendChild(sheet);
+
+/* ============================== 工具函数 ============================== */
+const $ = (id) => document.getElementById(id);
+const state = { region: "us-west-2", auto: true, activeTab: "overview", lastTaskId: null, lastNode: null, timer: null, inflight: 0 };
+
+/** Maps a cluster node identity to the nginx per-node proxy prefix (/node/<short-name>). */
+function nodePath(nodeId) {
+  const brain = /^brain-node-(\d\d)$/.exec(nodeId ?? "");
+  if (brain) return `/node/brain-${brain[1]}`;
+  const gw = /^celld-gw-(\d\d)$/.exec(nodeId ?? "");
+  if (gw && gw[1] === "01") return "/node/gateway-01";
+  return "";
+}
+
+function esc(v) {
+  return String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function ago(ms) {
+  if (!ms) return "—";
+  const d = Math.max(0, Date.now() - Number(ms));
+  if (d < 1000) return `${d}ms 前`;
+  if (d < 60000) return `${Math.round(d / 1000)}s 前`;
+  return `${Math.round(d / 60000)}m 前`;
+}
+function kv(obj) {
+  return Object.entries(obj)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`)
+    .join("");
+}
+function bool(v, yes = "是", no = "否") {
+  return v ? `<span class="pill-ok">${yes}</span>` : `<span class="pill-bad">${no}</span>`;
+}
+
+function showError(msg) {
+  $("errbar").classList.remove("hidden");
+  $("errmsg").textContent = msg;
+  $("conn-dot").className = "h-1.5 w-1.5 rounded-full bg-rose-500";
+  $("conn-text").textContent = "不可达";
+}
+function clearError() {
+  $("errbar").classList.add("hidden");
+  $("conn-dot").className = "h-1.5 w-1.5 rounded-full bg-emerald-500";
+  $("conn-text").textContent = "已连接";
+}
+
+async function call(path, opts = {}) {
+  const res = await fetch(path, { headers: { "content-type": "application/json" }, ...opts });
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!res.ok) {
+    throw new Error(`${res.status} ${res.statusText} → ${JSON.stringify(data).slice(0, 240)}`);
+  }
+  return data;
+}
+
+async function guard(fn) {
+  state.inflight += 1;
+  $("refresh-icon").classList.add("spin");
+  try {
+    await fn();
+    clearError();
+  } catch (e) {
+    showError(e.message || String(e));
+  } finally {
+    state.inflight -= 1;
+    if (state.inflight === 0) $("refresh-icon").classList.remove("spin");
+  }
+}
+
+/* ============================== 概览 ============================== */
+async function loadOverview() {
+  const d = await call(`/v1beta1/console/overview?region=${encodeURIComponent(state.region)}`);
+
+  $("ov-health").innerHTML = bool(d.clusterHealthy, "HEALTHY", "DEGRADED");
+  $("ov-health-sub").textContent = `version ${d.version}`;
+
+  $("ov-rpo").innerHTML = bool(d.rpoZeroGuaranteed, "GUARANTEED", "AT RISK");
+  $("ov-rpo-sub").textContent = `EC:4 容错剩余 ${d.storageEc4?.remainingFaultToleranceDrives ?? "—"} 盘`;
+
+  $("ov-region").textContent = d.selectedRegion ?? "—";
+  $("ov-region-sub").textContent = d.geoFailoverActive ? "异地故障转移已激活" : "主区域命中，无故障转移";
+
+  const sbx = d.sandboxes || {};
+  $("ov-sbx").textContent = `${sbx.active ?? "—"} / ${sbx.limit ?? "—"}`;
+  const pct = sbx.limit ? Math.round((sbx.active / sbx.limit) * 100) : 0;
+  $("ov-sbx-sub").textContent = `占用 ${pct}%`;
+
+  const b = d.brainIsolate || {};
+  const violations = (b.slaViolations || []);
+  $("ov-brain").innerHTML = kv({
+    allowed: bool(b.allowed, "允许准入", "拒绝准入"),
+    estimatedCellRamMb: b.estimatedCellRamMb ?? "—",
+    gcTriggered: bool(b.gcTriggered, "已触发 GC", "未触发"),
+    circuitBreakerTripped: bool(b.circuitBreakerTripped, "**已熔断**", "正常"),
+    slaViolations: violations.length
+      ? violations.map((v) => `<span class="pill-warn">${esc(v)}</span>`).join("<br>")
+      : `<span class="pill-ok">无</span>`,
+  });
+
+  const s = d.storageEc4 || {};
+  $("ov-ec4").innerHTML = kv({
+    quorumIntact: bool(s.quorumIntact, "法定票数完整", "**失去法定票数**"),
+    rpoZeroGuaranteed: bool(s.rpoZeroGuaranteed, "RPO=0 保证", "RPO=0 不保证"),
+    remainingFaultToleranceDrives: s.remainingFaultToleranceDrives ?? "—",
+    slaViolations: (s.slaViolations || []).length ? s.slaViolations.join("<br>") : `<span class="pill-ok">无</span>`,
+  });
+
+  renderRoutes(d.activeTunnelRoutes || []);
+  return d;
+}
+
+function renderRoutes(routes) {
+  const rows = routes.length
+    ? routes.map((r) => `
+        <tr>
+          <td class="font-semibold text-slate-200">${esc(r.hostId)}</td>
+          <td class="mono">Gen #${esc(r.connGeneration)}</td>
+          <td class="mono">${esc(r.epoch)}</td>
+          <td class="text-cyan-400">${esc(r.primaryGatewayId)}</td>
+          <td class="mono text-slate-500">${esc(r.primaryRelayUrl)}</td>
+          <td class="text-right text-slate-500">${esc(ago(r.updatedAtMs))}</td>
+        </tr>`).join("")
+    : `<tr><td colspan="6" class="text-slate-500">当前网关没有注册的隧道宿主。注意：本集群的宿主隧道注册由 <span class="mono">deploy/dev-cluster/dev-cluster-up.sh</span> 的 bootstrap curl 完成，网关进程重启后需要重新执行。（宿主可能注册在另一个网关上）</td></tr>`;
+
+  $("ov-routes").innerHTML = rows;
+  $("tn-rows").innerHTML = routes.length
+    ? routes.map((r) => `
+        <tr>
+          <td class="font-semibold text-slate-200">${esc(r.hostId)}</td>
+          <td class="text-cyan-400">${esc(r.primaryGatewayId)}</td>
+          <td class="mono">Gen #${esc(r.connGeneration)}</td>
+          <td class="mono">${esc(r.epoch)}</td>
+          <td class="text-right">
+            <button class="btn-xs" onclick="drainGateway('${esc(r.primaryGatewayId)}')">排空 ${esc(r.primaryGatewayId)}</button>
+          </td>
+        </tr>`).join("")
+    : `<tr><td colspan="5" class="text-slate-500">无可用路由</td></tr>`;
+}
+
+/* ============================== 分片矩阵 ============================== */
+function parseRange(str) {
+  const m = /^(\d+)\.\.(\d+)$/.exec(String(str ?? ""));
+  if (!m) return null;
+  return { from: Number(m[1]), to: Number(m[2]) };
+}
+
+async function loadShards() {
+  const d = await call("/v1beta1/console/shards");
+  const total = d.totalVirtualSlots || 256;
+  const shards = d.shards || [];
+
+  $("sh-total").textContent = total;
+  $("sh-gen").textContent = d.ringGeneration ?? "—";
+  $("sh-phase").textContent = d.rolloutPhase ?? "—";
+  $("ro-phase").textContent = d.rolloutPhase ?? "—";
+  $("ro-gen").textContent = d.ringGeneration ?? "—";
+
+  const colors = ["bg-cyan-500/70", "bg-violet-500/70", "bg-emerald-500/70", "bg-amber-500/70", "bg-sky-500/70"];
+  $("sh-strip").innerHTML = shards.map((s, i) => {
+    const r = parseRange(s.assignedSlots);
+    const span = r ? r.to - r.from + 1 : Math.round(total / Math.max(1, shards.length));
+    const width = (span / total) * 100;
+    const cls = s.status === "STEADY" ? colors[i % colors.length] : "bg-amber-600/80";
+    return `<div class="${cls}" style="width:${width}%" title="${esc(s.shardId)} · ${esc(s.assignedSlots)} · ${esc(s.status)} · 在途 ${esc(s.inFlightRequests)}"></div>`;
+  }).join("") || `<div class="bg-slate-800 w-full"></div>`;
+
+  $("sh-legend").innerHTML = shards.map((s, i) => {
+    const cls = s.status === "STEADY" ? colors[i % colors.length] : "bg-amber-600/80";
+    return `<span class="inline-flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-sm ${cls}"></span>${esc(s.shardId)} · ${esc(s.assignedSlots)}</span>`;
+  }).join("");
+
+  $("sh-rows").innerHTML = shards.length
+    ? shards.map((s) => `
+        <tr>
+          <td class="font-semibold text-slate-200">${esc(s.shardId)}</td>
+          <td class="mono">${esc(s.hostBrainNodeId)}</td>
+          <td class="mono text-slate-400">${esc(s.assignedSlots)}</td>
+          <td class="text-right mono ${s.inFlightRequests > 0 ? "text-amber-400" : "text-slate-500"}">${esc(s.inFlightRequests)}</td>
+          <td class="text-right mono">${esc(s.ewmaLatencyMs)} ms</td>
+          <td>${s.status === "STEADY"
+            ? `<span class="pill-ok">STEADY</span>`
+            : `<span class="pill-warn">${esc(s.status)}</span>`}</td>
+          <td class="text-right mono text-slate-500">${esc(s.epoch)}</td>
+        </tr>`).join("")
+    : `<tr><td colspan="7" class="text-slate-500">无分片</td></tr>`;
+
+  return d;
+}
+
+/* ============================== 任务派发 ============================== */
+$("dispatch-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  guard(async () => {
+    const fd = new FormData(e.target);
+    const payload = { tenantId: fd.get("tenantId") || "tenant-dev-01" };
+    for (const k of ["repoId", "promptText", "targetBodyHostId"]) {
+      const v = String(fd.get(k) ?? "").trim();
+      if (v) payload[k] = v;
+    }
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true;
+    btn.textContent = "派发中…";
+    try {
+      const d = await call("/v1beta1/tasks/dispatch", { method: "POST", body: JSON.stringify(payload) });
+      renderDispatch(d);
+      await loadShards();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "派发任务";
+    }
+  });
+});
+
+function renderDispatch(d) {
+  $("dispatch-result").classList.remove("hidden");
+  const env = d.schedulerEnvelope || {};
+  const llm = d.llmAffinityRoute || {};
+  const body = d.bodyExecution || {};
+
+  $("ds-sched").innerHTML = kv({
+    status: d.status ? `<span class="pill-ok">${esc(d.status)}</span>` : "—",
+    taskId: esc(env.taskId ?? "—"),
+    slotIndex: esc(env.slotIndex ?? "—"),
+    slotEpoch: esc(env.slotEpoch ?? "—"),
+    targetShardId: esc(env.targetShardId ?? "—"),
+    cellObjectId: esc(env.cellObjectId ?? "—"),
+    hopMode: esc(env.hopMode ?? "—"),
+    selfHealedFromStaleCache: bool(env.selfHealedFromStaleCache, "是", "否"),
+    bufferedDuringDrain: bool(env.bufferedDuringDrain, "是", "否"),
+  });
+
+  $("ds-llm").innerHTML = kv({
+    modelPool: esc(llm.modelPool ?? "—"),
+    selectedBackendId: esc(llm.selectedBackendId ?? "—"),
+    prefixFingerprint: esc(llm.prefixFingerprint ?? "—"),
+    kvCacheHit: bool(llm.kvCacheHit, "命中", "未命中"),
+    estimatedTtftMs: esc(llm.estimatedTtftMs ?? "—"),
+    finopsDiscountRatio: esc(llm.finopsDiscountRatio ?? "—"),
+    jointScore: esc(llm.jointScore ?? "—"),
+    fallbackDueToOverload: bool(llm.fallbackDueToOverload, "是", "否"),
+  });
+
+  $("ds-wal").innerHTML = kv({ walObjectKey: esc(d.walObjectKey ?? "—") });
+
+  $("ds-body").innerHTML = kv({
+    bodyNodeId: esc(body.bodyNodeId ?? "—"),
+    sandboxId: esc(body.sandboxId ?? "—"),
+    checkpointId: esc(body.checkpointId ?? "—"),
+    branchId: esc(body.branchId ?? "—"),
+    forkLatencyMs: esc(body.forkLatencyMs ?? "—"),
+    mergedFilesCount: esc(body.mergedFilesCount ?? "—"),
+    routedByNodeId: esc(d.routedByNodeId ?? "—"),
+    executedByBrainNodeId: esc(d.executedByBrainNodeId ?? "—"),
+    hopMode: esc(d.hopMode ?? "—"),
+  });
+
+  $("ds-raw").textContent = JSON.stringify(d, null, 2);
+
+  if (env.taskId) {
+    state.lastTaskId = env.taskId;
+    $("wal-taskid").value = env.taskId;
+  }
+  state.lastNode = d.executedByBrainNodeId ?? d.routedByNodeId ?? null;
+  $("wal-node").textContent = state.lastNode
+    ? `${state.lastNode} → ${nodePath(state.lastNode) || "默认（gateway-01）"}`
+    : "gateway-01（默认）";
+}
+
+/* ============================== 隧道排空 ============================== */
+async function drainGateway(gatewayId) {
+  if (!confirm(`对网关 ${gatewayId} 执行 Make-Before-Break 排空？\n\n会真实通知其绑定的双跳宿主切换到备用网关。`)) return;
+  await guard(async () => {
+    const d = await call("/v1beta1/console/tunnels/drain", {
+      method: "POST",
+      body: JSON.stringify({ gatewayId, gracePeriodMs: 15000 }),
+    });
+    $("drain-result").classList.remove("hidden");
+    $("drain-raw").textContent = JSON.stringify(d, null, 2);
+    await loadOverview();
+  });
+}
+
+/* ============================== 灰度发布 ============================== */
+document.querySelectorAll("[data-phase],[data-action]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const action = btn.dataset.action;
+    const phase = btn.dataset.phase;
+    if (action === "rollback" && !confirm("一键回滚全部 256 个槽位到 stable 版本？")) return;
+    guard(async () => {
+      const payload = action === "rollback" ? { action: "rollback" } : { targetPhase: phase };
+      const d = await call("/v1beta1/console/canary/action", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      $("rollout-result").classList.remove("hidden");
+      $("rollout-raw").textContent = JSON.stringify(d, null, 2);
+      const phaseVal = d.phase ?? d.currentPhase;
+      if (phaseVal) $("ro-phase").textContent = phaseVal;
+      if (d.topologyEpoch) $("ro-epoch").textContent = d.topologyEpoch;
+      await loadShards();
+    });
+  });
+});
+
+/* ============================== WAL 续传 ============================== */
+$("wal-use-last").addEventListener("click", () => {
+  if (!state.lastTaskId) {
+    showError("还没有派发过任务，先到「任务派发」执行一次");
+    return;
+  }
+  $("wal-taskid").value = state.lastTaskId;
+});
+
+$("wal-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  guard(async () => {
+    const fd = new FormData(e.target);
+    const taskId = String(fd.get("taskId") ?? "").trim();
+    if (!taskId) throw new Error("taskId 不能为空");
+    const prefix = nodePath(state.lastNode);
+    const d = await call(`${prefix}/v1beta1/console/wal/catchup`, {
+      method: "POST",
+      body: JSON.stringify({
+        clientId: fd.get("clientId") || "console-live-client",
+        taskId,
+        lastReceivedTurnSeq: Number(fd.get("lastReceivedTurnSeq") || 0),
+      }),
+    });
+    const frames = d.replayedWalFrames || [];
+    $("wal-result").classList.remove("hidden");
+    $("wl-count").textContent = frames.length;
+    $("wl-turn").textContent = d.currentTurnSeq ?? "—";
+    $("wl-epoch").textContent = d.currentEpoch ?? "—";
+    $("wl-live").innerHTML = bool(d.liveStreamResumed, "是", "否");
+    $("wl-src").textContent = `${prefix || "gateway-01"}（${state.lastNode ?? "未派发过任务"}）`;
+    $("wl-rows").innerHTML = frames.length
+      ? frames.map((f) => {
+          let eventType = "WAL_REPLAY_FRAME";
+          try {
+            const parsed = JSON.parse(f.diffSnapshot ?? "{}");
+            if (parsed && typeof parsed.eventType === "string") eventType = parsed.eventType;
+          } catch { /* diffSnapshot may be raw text */ }
+          return `
+          <tr>
+            <td class="text-right mono">${esc(f.fence?.turnSeq ?? "—")}</td>
+            <td class="text-right mono">${esc(f.fence?.epoch ?? "—")}</td>
+            <td class="mono text-cyan-400">${esc(eventType)}</td>
+            <td class="text-right text-slate-500">${esc(f.timestampMs ? new Date(Number(f.timestampMs)).toLocaleTimeString() : "—")}</td>
+            <td class="mono text-slate-400 break-all">${esc(f.diffSnapshot ?? "—")}</td>
+          </tr>`;
+        }).join("")
+      : `<tr><td colspan="5" class="text-slate-500">节点 ${esc(state.lastNode ?? "gateway-01")} 上没有 taskId 下 turnSeq &gt; ${esc(d.lastReceivedTurnSeq ?? 0)} 的 WAL 帧</td></tr>`;
+    $("wl-raw").textContent = JSON.stringify(d, null, 2);
+  });
+});
+
+/* ============================== Tab 切换 / 自动刷新 ============================== */
+function switchTab(tab) {
+  state.activeTab = tab;
+  document.querySelectorAll(".tab-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.tab === tab);
+  });
+  for (const id of ["overview", "shards", "dispatch", "tunnels", "rollout", "wal"]) {
+    $(`tab-${id}`).classList.toggle("hidden", id !== tab);
+  }
+  if (tab === "overview") guard(loadOverview);
+  if (tab === "shards" || tab === "rollout") guard(loadShards);
+  if (tab === "tunnels") guard(loadOverview);
+}
+
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+});
+
+$("region").addEventListener("change", (e) => {
+  state.region = e.target.value;
+  guard(loadOverview);
+});
+$("refresh").addEventListener("click", () => {
+  guard(async () => {
+    await loadOverview();
+    await loadShards();
+  });
+});
+$("auto").addEventListener("change", (e) => {
+  state.auto = e.target.checked;
+});
+
+setInterval(() => {
+  if (!state.auto) return;
+  if (state.inflight > 0) return;
+  if (state.activeTab === "overview" || state.activeTab === "tunnels") guard(loadOverview);
+  else if (state.activeTab === "shards" || state.activeTab === "rollout") guard(loadShards);
+}, 3000);
+
+/* ============================== 启动 ============================== */
+switchTab("overview");
+</script>
+</body>
+</html>

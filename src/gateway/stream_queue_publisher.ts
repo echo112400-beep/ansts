@@ -55,13 +55,13 @@ export class AgentStreamQueuePublisher {
       ...params.payload,
     });
 
-    const walFrame: TurnWalFrame = {
+    const walFrame: TurnWalFrame = TurnWalFrame.fromPartial({
       taskId: params.taskId,
       fence: new FenceToken(params.fence.epoch, params.fence.turnSeq, params.taskId),
       state: params.state,
       diffSnapshot: serializedPayload,
       timestampMs: Date.now(),
-    };
+    });
 
     // 1. Persist to TurnWAL with Epoch fencing before emitting to stream
     const walObjectKey = this.walEngine.writeWalFrameIfNoneMatch(walFrame);

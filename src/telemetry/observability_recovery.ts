@@ -204,7 +204,8 @@ export class W3cTraceContinuityPropagator {
       lastSpanId: newSpanId,
     });
 
-    const nowNs = BigInt(Date.now()) * BigInt(1_000_000);
+    const nowMs = Date.now();
+    const nowNs = BigInt(nowMs) * BigInt(1_000_000);
     const startNs = nowNs - BigInt(Math.round(params.durationMs * 1_000_000));
     const traceparent = W3cTraceContinuityPropagator.formatW3cTraceparent(traceId, newSpanId, true);
 
@@ -213,6 +214,8 @@ export class W3cTraceContinuityPropagator {
       spanId: newSpanId,
       parentSpanId,
       name: params.name,
+      startTimeMs: nowMs - params.durationMs,
+      endTimeMs: nowMs,
       startTimeUnixNano: startNs.toString(),
       endTimeUnixNano: nowNs.toString(),
       traceparent,

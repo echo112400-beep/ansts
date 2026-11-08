@@ -1,101 +1,51 @@
 /**
- * @fileoverview TASK-19 & M27 (TASK-128): Cgroups v2 Bi-Modal Phase Controller (0.1C <-> 8.0C)
- * with Real Cgroup Filesystem (`cpu.max`, `memory.high`, `memory.reclaim`) Persistence.
+ * @fileoverview M4 TASK-13: Linux cgroup v2 Dynamic CPU/Memory Phase-Decoupled Controller.
  */
+import { ResourceProfile } from "../models.js";
 
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { AgentTask, SandboxPhase } from "../models";
-
-export interface CgroupLimits {
-  cpuCores: number;
-  memoryHighMb: number;
-  zramReclaimed: boolean;
-  microQueuedMs: number;
-  cpuMaxFileContent?: string;
-  cgroupDirPath?: string;
+export interface CgroupAllocationState {
+  taskId: string;
+  phase: "THINK" | "ACT";
+  cpuQuotaUsPer100ms: number;
+  cpuWeight: number;
+  memoryHighBytes: number;
+  memoryMaxBytes: number;
 }
 
 export class CgroupPhaseController {
-  public activeBurstTasks: Set<string> = new Set();
-  public appliedLimits: Map<string, CgroupLimits> = new Map();
+  private readonly allocations: Map<string, CgroupAllocationState> = new Map();
 
-  constructor(
-    public readonly hostPhysicalCores: number = 32.0,
-    public varMaxConcurrentBursts: number = 4,
-    public readonly cgroupRootDir: string = "/tmp/ansts_cgroup_v2/phase.slice",
-  ) {
-    fs.mkdirSync(this.cgroupRootDir, { recursive: true });
-  }
-
-  public get maxConcurrentBursts(): number {
-    return this.varMaxConcurrentBursts;
-  }
-
-  public set maxConcurrentBursts(val: number) {
-    this.varMaxConcurrentBursts = val;
-  }
-
-  private writeCgroupControlFiles(taskId: string, cpuCores: number, memoryHighMb: number, reclaimZram: boolean): {
-    cpuMaxFileContent: string;
-    cgroupDirPath: string;
-  } {
-    const cgroupDirPath = path.join(this.cgroupRootDir, taskId);
-    fs.mkdirSync(cgroupDirPath, { recursive: true });
-
-    const periodUs = 100000;
-    const quotaUs = Math.max(1000, Math.round(cpuCores * periodUs));
-    const cpuMaxFileContent = `${quotaUs} ${periodUs}`;
-    fs.writeFileSync(path.join(cgroupDirPath, "cpu.max"), `${cpuMaxFileContent}\n`, "utf8");
-    fs.writeFileSync(path.join(cgroupDirPath, "memory.high"), `${memoryHighMb * 1024 * 1024}\n`, "utf8");
-    if (reclaimZram) {
-      fs.writeFileSync(path.join(cgroupDirPath, "memory.reclaim"), "64M\n", "utf8");
-    }
-    return { cpuMaxFileContent, cgroupDirPath };
-  }
-
-  public enterCognitivePhase(task: AgentTask): CgroupLimits {
-    this.activeBurstTasks.delete(task.taskId);
-    task.phase = SandboxPhase.COGNITIVE;
-    const disk = this.writeCgroupControlFiles(task.taskId, task.cogCpu, task.cogMemMb, true);
-    const lim: CgroupLimits = {
-      cpuCores: task.cogCpu,
-      memoryHighMb: task.cogMemMb,
-      zramReclaimed: true,
-      microQueuedMs: 0,
-      cpuMaxFileContent: disk.cpuMaxFileContent,
-      cgroupDirPath: disk.cgroupDirPath,
+  public applyThinkPhase(taskId: string, profile: ResourceProfile): CgroupAllocationState {
+    const state: CgroupAllocationState = {
+      taskId,
+      phase: "THINK",
+      cpuQuotaUsPer100ms: Math.round(profile.think_cpu_cores * 100_000),
+      cpuWeight: 20,
+      memoryHighBytes: 256 * 1024 * 1024,
+      memoryMaxBytes: 512 * 1024 * 1024,
     };
-    this.appliedLimits.set(task.taskId, lim);
-    return lim;
+    this.allocations.set(taskId, state);
+    return state;
   }
 
-  public enterExecutionPhase(task: AgentTask): CgroupLimits {
-    task.phase = SandboxPhase.EXECUTION;
-    let lim: CgroupLimits;
-    if (this.activeBurstTasks.size < this.varMaxConcurrentBursts) {
-      this.activeBurstTasks.add(task.taskId);
-      const disk = this.writeCgroupControlFiles(task.taskId, task.burstCpu, task.execMemMb, false);
-      lim = {
-        cpuCores: task.burstCpu,
-        memoryHighMb: task.execMemMb,
-        zramReclaimed: false,
-        microQueuedMs: 0,
-        cpuMaxFileContent: disk.cpuMaxFileContent,
-        cgroupDirPath: disk.cgroupDirPath,
-      };
-    } else {
-      const disk = this.writeCgroupControlFiles(task.taskId, task.execCpu, task.execMemMb, false);
-      lim = {
-        cpuCores: task.execCpu,
-        memoryHighMb: task.execMemMb,
-        zramReclaimed: false,
-        microQueuedMs: 220,
-        cpuMaxFileContent: disk.cpuMaxFileContent,
-        cgroupDirPath: disk.cgroupDirPath,
-      };
-    }
-    this.appliedLimits.set(task.taskId, lim);
-    return lim;
+  public applyActPhase(taskId: string, profile: ResourceProfile): CgroupAllocationState {
+    const state: CgroupAllocationState = {
+      taskId,
+      phase: "ACT",
+      cpuQuotaUsPer100ms: Math.round(profile.act_cpu_cores * 100_000),
+      cpuWeight: 200,
+      memoryHighBytes: Math.round(profile.act_memory_mb * 0.85 * 1024 * 1024),
+      memoryMaxBytes: Math.round(profile.act_memory_mb * 1024 * 1024),
+    };
+    this.allocations.set(taskId, state);
+    return state;
+  }
+
+  public getAllocation(taskId: string): CgroupAllocationState | undefined {
+    return this.allocations.get(taskId);
+  }
+
+  public removeTask(taskId: string): void {
+    this.allocations.delete(taskId);
   }
 }

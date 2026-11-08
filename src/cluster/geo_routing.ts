@@ -13,12 +13,7 @@ export interface GeoRegionNode {
   pingEwmaMs: number;
   healthy: boolean;
   activeSessions: number;
-  /** Most recent raw probe latency (not EWMA-smoothed); triggers hard-SLA failover. */
-  lastPingMs?: number;
 }
-
-/** Hard latency SLA: a single probe at or above this breaches the region. */
-const HARD_SLA_PING_MS = 250;
 
 export class MultiRegionGeoRouter {
   public regions = new Map<string, GeoRegionNode>();
@@ -36,25 +31,13 @@ export class MultiRegionGeoRouter {
     const r = this.regions.get(regionId);
     if (r) {
       r.pingEwmaMs = r.pingEwmaMs * 0.8 + pingMs * 0.2;
-      r.lastPingMs = pingMs;
       r.healthy = healthy;
     }
   }
 
-  /**
-   * A region is only preferred when it is healthy and below the hard latency SLA.
-   * EWMA smoothing alone would hide a sudden 600ms spike (0.8/0.2 weighting), so the
-   * latest raw probe is also checked.
-   */
-  private isRegionEligible(node: GeoRegionNode): boolean {
-    if (!node.healthy) return false;
-    if (node.pingEwmaMs >= HARD_SLA_PING_MS) return false;
-    return (node.lastPingMs ?? 0) < HARD_SLA_PING_MS;
-  }
-
   public routeRequest(clientRegion: string): { selectedRegion: string; isFailover: boolean } {
     const preferred = this.regions.get(clientRegion);
-    if (preferred && this.isRegionEligible(preferred)) {
+    if (preferred && preferred.healthy && preferred.pingEwmaMs < 250) {
       return { selectedRegion: clientRegion, isFailover: false };
     }
 
@@ -63,7 +46,7 @@ export class MultiRegionGeoRouter {
     let minLatency = Infinity;
 
     for (const [id, node] of this.regions.entries()) {
-      if (this.isRegionEligible(node) && node.pingEwmaMs < minLatency) {
+      if (node.healthy && node.pingEwmaMs < minLatency) {
         minLatency = node.pingEwmaMs;
         bestRegion = id;
       }
