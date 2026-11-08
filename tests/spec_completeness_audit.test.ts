@@ -1,134 +1,135 @@
 /**
- * 100% Spec-to-Code Completeness Verification Suite.
- * Verifies every granular feature in the Google Design Doc & TaskSpec v1beta1.
+ * @fileoverview M1-M6 Spec Completeness Verification Suite (6 tests).
  */
-
-import { strict as assert } from "assert";
-import { test } from "node:test";
-
+import { describe, it } from "node:test";
+import * as assert from "node:assert/strict";
 import {
-  AgentHarnessRunner,
-  AgentTask,
-  AnstsClusterRuntime,
-  SyntacticAndVelocityBreaker,
-  TaskState,
-} from "../src/index";
+  SseEventStreamGateway,
+  SagaCompensatorEngine,
+  StagingCommitAndApprovalGate,
+  CgroupPhaseController,
+  ZeroTrustVsockBridge,
+  TurnWalEngine,
+  WalCompactorAndPagedRestorer,
+  DeterministicTimeTravelReplayer,
+  CloudEventsBus,
+  TransactionalOutboxDispatcher,
+  BidirectionalBackpressureController,
+  TaskSpec,
+} from "../src/index.js";
 
-test("Spec Completeness #1: A -> B -> A -> B Cyclic Tool Oscillation & Consecutive Tool Error (>=5) Breakers", () => {
-  const breaker = new SyntacticAndVelocityBreaker(3, 5);
-  const task = new AgentTask({ taskId: "tsk_osc_01", tenantId: "codegen-pro", state: TaskState.RUNNING });
-
-  // A -> B -> A -> B cyclic oscillation triggers REFLEXION_INTERVENTION on 1st cycle, CIRCUIT_BROKEN on 2nd
-  assert.equal(breaker.recordAndCheckToolCall(task.taskId, "read_file", "path=a.ts"), "OK");
-  assert.equal(breaker.recordAndCheckToolCall(task.taskId, "edit_file", "path=a.ts"), "OK");
-  assert.equal(breaker.recordAndCheckToolCall(task.taskId, "read_file", "path=a.ts"), "OK");
-  assert.equal(
-    breaker.recordAndCheckToolCall(task.taskId, "edit_file", "path=a.ts"),
-    "REFLEXION_INTERVENTION",
-  );
-  assert.equal(breaker.recordAndCheckToolCall(task.taskId, "read_file", "path=a.ts"), "CIRCUIT_BROKEN");
-
-  // Consecutive tool error breaker (>=5 non-zero exits)
-  for (let i = 0; i < 4; i++) {
-    assert.equal(breaker.recordToolExitStatus(task, 1), "OK");
-  }
-  assert.equal(breaker.recordToolExitStatus(task, 127), "CIRCUIT_BROKEN");
-  assert.equal(task.state, TaskState.CIRCUIT_BROKEN);
-});
-
-test("Spec Completeness #2: Token Burn-Rate Spike (>35%) & Degenerate Repetition Breaker", () => {
-  const breaker = new SyntacticAndVelocityBreaker();
-  const task = new AgentTask({
-    taskId: "tsk_spike_01",
-    tenantId: "fin-enterprise",
-    maxTotalTokens: 100000,
-    temperature: 0.4,
-    fallbackModels: ["Qwen-3.8", "GLM-5.3"],
+describe("M1-M6 Spec Completeness Verification Suite", () => {
+  it("1. SSE Event Stream Gateway supports Last-Event-ID history replay", () => {
+    const sse = new SseEventStreamGateway();
+    sse.publish({ id: "evt-1", event: "turn", taskId: "t1", turnIndex: 1, timestampMs: 1, data: { step: 1 } });
+    sse.publish({ id: "evt-2", event: "turn", taskId: "t1", turnIndex: 2, timestampMs: 2, data: { step: 2 } });
+    const sub = sse.subscribe("t1", "sub-1", "evt-1");
+    const chunk = String(sub.stream.read() ?? "");
+    assert.ok(chunk.includes("evt-2"));
+    sub.close();
   });
 
-  // Single turn burns 40,000 tokens (40% > 35% threshold) -> halves temperature & switches to Qwen-3.8
-  const spikeRes = breaker.evaluateBurnRateSpikeAndRepetition(task, 40000, "normal output");
-  assert.equal(spikeRes.tripped, true);
-  assert.equal(spikeRes.newModel, "Qwen-3.8");
-  assert.equal(task.temperature, 0.2);
+  it("2. SagaCompensatorEngine and StagingCommitAndApprovalGate rollback and gate high-risk actions", () => {
+    const comp = new SagaCompensatorEngine();
+    comp.recordForwardStep({
+      stepId: "s1",
+      taskId: "t1",
+      turnIndex: 1,
+      toolName: "create_branch",
+      forwardPayload: { branch: "feat-x" },
+      compensateHandler: (p) => ({ deleted: p.branch }),
+    });
+    const rolled = comp.rollbackTask("t1");
+    assert.equal(rolled.length, 1);
 
-  // Degenerate character repetition detection
-  const repRes = breaker.evaluateBurnRateSpikeAndRepetition(
-    task,
-    1000,
-    "REPEATED_TOKEN_BLOCK_".repeat(8),
-  );
-  assert.equal(repRes.tripped, true);
-});
-
-test("Spec Completeness #3: Sandbox Abuse Breaker (deny_commands & max_pids -> Cgroup Freeze)", () => {
-  const breaker = new SyntacticAndVelocityBreaker();
-  const task = new AgentTask({
-    taskId: "tsk_abuse_01",
-    tenantId: "codegen-pro",
-    maxPids: 256,
-    denyCommands: ["rm -rf /", "mkfs", "dd", "shutdown"],
+    const gate = new StagingCommitAndApprovalGate();
+    const task = new TaskSpec({ task_id: "t-app", tenant_id: "t1" });
+    const ticket = gate.requestHumanApproval(task, "drop_prod_table", { table: "users" });
+    const resolved = gate.resolveApproval(ticket.ticketId, true, "sec-ops", task);
+    assert.equal(resolved.status, "APPROVED");
   });
 
-  const cmdCheck = breaker.enforceSandboxAbuseAndCommandGuard(task, "sudo rm -rf / --no-preserve-root", 12);
-  assert.equal(cmdCheck.allowed, false);
-  assert.equal(cmdCheck.cgroupFrozen, true);
-  assert.equal(task.cgroupFrozen, true);
-  assert.equal(task.state, TaskState.CIRCUIT_BROKEN);
-
-  const task2 = new AgentTask({ taskId: "tsk_forkbomb", tenantId: "codegen-pro", maxPids: 256 });
-  const pidCheck = breaker.enforceSandboxAbuseAndCommandGuard(task2, "python3 worker.py", 300);
-  assert.equal(pidCheck.allowed, false);
-  assert.equal(pidCheck.cgroupFrozen, true);
-});
-
-test("Spec Completeness #4: Ephemeral Heavy Executor Offloading & Live Turn Migration (<50ms)", () => {
-  const cluster = new AnstsClusterRuntime();
-  const task = new AgentTask({ taskId: "tsk_heavy_01", tenantId: "research-lab" });
-  cluster.scheduler.submitTask(task);
-  cluster.scheduler.scheduleTick(1.0);
-
-  // Attach ephemeral heavy executor when playwright_browser tool is invoked
-  const handle = cluster.nodeDaemon.attachEphemeralHeavyExecutorIfNeeded(task, "playwright_browser");
-  assert.ok(handle !== null);
-  assert.equal(handle!.executorPool, "pool-headless-chromium-gpu");
-  assert.equal(handle!.attached, true);
-  assert.equal(cluster.nodeDaemon.detachEphemeralHeavyExecutor(task.taskId), true);
-
-  // Section 6.2 Guardrail 3: Live Turn Migration after 3 consecutive saturated turns
-  assert.equal(
-    cluster.nodeDaemon.checkAndLiveMigrateAtTurnBoundary(task, true, "worker-us-west-02").migrated,
-    false,
-  );
-  assert.equal(
-    cluster.nodeDaemon.checkAndLiveMigrateAtTurnBoundary(task, true, "worker-us-west-02").migrated,
-    false,
-  );
-  const mig = cluster.nodeDaemon.checkAndLiveMigrateAtTurnBoundary(task, true, "worker-us-west-02");
-  assert.equal(mig.migrated, true);
-  assert.ok((mig.migrationLatencyMs ?? 100) < 50);
-  assert.equal(task.assignedNodeId, "worker-us-west-02");
-});
-
-test("Spec Completeness #5: Cumulative maxTotalSessions Enforcement in AgentHarnessRunner", () => {
-  const runner = new AgentHarnessRunner();
-  const task = new AgentTask({
-    taskId: "tsk_sess_cap",
-    tenantId: "fin-enterprise",
-    maxSessions: 2,
-    maxTotalSessions: 3,
-    activeSessions: 1,
-    totalSpawnedSessions: 1,
+  it("3. CgroupPhaseController decouples THINK (0.25 core) and ACT (4.0 cores) limits", () => {
+    const ctrl = new CgroupPhaseController();
+    const think = ctrl.applyThinkPhase("t1", {
+      think_cpu_cores: 0.25,
+      act_cpu_cores: 4.0,
+      act_memory_mb: 8192,
+      disk_mb: 10240,
+    });
+    const act = ctrl.applyActPhase("t1", {
+      think_cpu_cores: 0.25,
+      act_cpu_cores: 4.0,
+      act_memory_mb: 8192,
+      disk_mb: 10240,
+    });
+    assert.ok(act.cpuQuotaUsPer100ms > think.cpuQuotaUsPer100ms * 10);
   });
 
-  // Spawn 2nd session -> allowed (active=2, total=2)
-  assert.equal(runner.tryAcquireSubSession(task), true);
-  // 3rd concurrent session -> blocked by maxSessions=2
-  assert.equal(runner.tryAcquireSubSession(task), false);
-  // Release one session -> active=1, spawn 3rd cumulative session -> allowed (active=2, total=3)
-  runner.releaseSubSession(task);
-  assert.equal(runner.tryAcquireSubSession(task), true);
-  // Release one session -> active=1, try to spawn 4th cumulative session -> blocked by maxTotalSessions=3!
-  runner.releaseSubSession(task);
-  assert.equal(runner.tryAcquireSubSession(task), false);
+  it("4. ZeroTrustVsockBridge blocks unauthorized external domains", () => {
+    const bridge = new ZeroTrustVsockBridge(["api.openai.com"]);
+    assert.throws(() => {
+      bridge.sendRequest({
+        requestId: "r1",
+        vmId: "vm-1",
+        method: "HTTP_EGRESS",
+        payload: { url: "https://evil-exfil.example.com/steal" },
+      });
+    }, /blocked connection/);
+  });
+
+  it("5. TurnWalEngine, WalCompactor, and DeterministicTimeTravelReplayer fork task at historical turn", () => {
+    const wal = new TurnWalEngine();
+    const e1 = wal.appendTurnDelta({
+      taskId: "t-wal",
+      turnIndex: 1,
+      fencingToken: 1,
+      changedFiles: ["a.ts"],
+      sqliteWalPages: 10,
+      highestSubmittedFencingToken: 1,
+    });
+    const e2 = wal.appendTurnDelta({
+      taskId: "t-wal",
+      turnIndex: 2,
+      fencingToken: 1,
+      changedFiles: ["a.ts", "b.ts"],
+      sqliteWalPages: 12,
+      highestSubmittedFencingToken: 1,
+    });
+    const compactor = new WalCompactorAndPagedRestorer();
+    const snap = compactor.compactLayers("t-wal", [e1, e2]);
+    assert.equal(snap.mergedFileSet.length, 2);
+
+    const replayer = new DeterministicTimeTravelReplayer();
+    const orig = new TaskSpec({ task_id: "t-wal", tenant_id: "t1", prompt: "old" });
+    const branch = replayer.forkTaskAtTurn(orig, [e1, e2], 1, "t-wal-fork", "new prompt");
+    assert.equal(branch.restoredTurnIndex, 1);
+    assert.deepEqual(branch.inheritedFiles, ["a.ts"]);
+  });
+
+  it("6. CloudEventsBus, OutboxWebhook & BidirectionalBackpressureController close telemetry loop", () => {
+    const bus = new CloudEventsBus();
+    bus.emitEvent({
+      type: "io.scheduler.agent.turn.completed",
+      subject: "task-1",
+      tenantId: "tenant-1",
+      llmCostUsd: 0.05,
+      sandboxCpuCoreSeconds: 12,
+    });
+    assert.ok((bus.getTenantReport("tenant-1")?.grandTotalUsd ?? 0) > 0.05);
+
+    const outbox = new TransactionalOutboxDispatcher();
+    outbox.enqueueOutbox("m1", "task-1", "https://example.com/hook", { ok: true });
+    const res = outbox.processPending(() => true);
+    assert.equal(res.deliveredCount, 1);
+
+    const loop = new BidirectionalBackpressureController();
+    const state = loop.computeClusterHealthState({
+      maxNodePsiSomePct: 80,
+      globalRateLimitedEndpoints: 3,
+      totalEndpoints: 4,
+      globalQueueDepth: 2000,
+    });
+    assert.equal(state.mode, "RED_SHEDDING");
+  });
 });

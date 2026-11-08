@@ -1,276 +1,220 @@
 /**
- * TASK-09 & TASK-10: 5D Phase & Effort-Aware W-DRF Scheduler, Graceful PreemptToHibernate,
- * and Automatic Wake-on-Headroom for Preempted / PSI-Hibernated Sandboxes.
+ * @fileoverview M2 TASK-08: 5D Weighted Scoring Engine, Preemption & DAG Orchestration Core Scheduler.
  */
-
-import { CognitiveRouter } from "./cognitive_router";
-import { LeaseCoordinator } from "./lease_coordinator";
-import { AgentTask, FenceToken, IsolationDriver, ModelPoolName, ResourceVector5D, SandboxPhase, TaskState } from "./models";
-import { BayesianTaskProfiler } from "./profiler";
-import { MultiTenantQueueManager } from "./queue_manager";
-
-export interface TenantQuotaConfig {
-  tenantId: string;
-  weight: number;
-  dominantShare: number;
-}
-
-export interface WorkerNodeState {
-  nodeId: string;
-  driver: IsolationDriver;
-  warmPools: string[];
-  cpuCap: number;
-  burstSemCap: number;
-  memCapMb: number;
-  alive: boolean;
-}
+import { LeaseCoordinator } from "./lease_coordinator.js";
+import { NodeHeartbeat, TaskPriority, TaskSpec, TaskState } from "./models.js";
+import { TaskResourceProfiler } from "./profiler.js";
+import { HierarchicalQueueManager } from "./queue_manager.js";
 
 export class CoreScheduler5D {
-  public tenants: Map<string, TenantQuotaConfig> = new Map();
-  public nodes: Map<string, WorkerNodeState> = new Map();
-  public tasks: Map<string, AgentTask> = new Map();
-  public hibernatedResumeQueue: AgentTask[] = [];
-  public clusterCapacity: ResourceVector5D = new ResourceVector5D(64.0, 64.0, 131072.0, 64, 4800);
+  public readonly queueManager: HierarchicalQueueManager;
+  public readonly leaseCoordinator: LeaseCoordinator;
+  public readonly profiler: TaskResourceProfiler;
+  public readonly nodes: Map<string, NodeHeartbeat> = new Map();
+  public readonly allTasks: Map<string, TaskSpec> = new Map();
+  public readonly idempotencyIndex: Map<string, string> = new Map();
+  public readonly completedIds: Set<string> = new Set();
 
-  constructor(
-    public readonly queueManager: MultiTenantQueueManager,
-    public readonly profiler: BayesianTaskProfiler,
-    public readonly leaseCoordinator: LeaseCoordinator,
-    public readonly cognitiveRouter: CognitiveRouter,
-  ) {}
-
-  public registerTenant(tenantId: string, weight: number): void {
-    this.tenants.set(tenantId, { tenantId, weight, dominantShare: 0.0 });
+  constructor(leaseTtlSeconds = 15.0) {
+    this.queueManager = new HierarchicalQueueManager();
+    this.leaseCoordinator = new LeaseCoordinator(leaseTtlSeconds);
+    this.profiler = new TaskResourceProfiler();
   }
 
-  public registerNode(node: Partial<WorkerNodeState> & { nodeId: string }): void {
-    this.nodes.set(node.nodeId, {
-      nodeId: node.nodeId,
-      driver: node.driver ?? "firecracker",
-      warmPools: node.warmPools ?? ["pool-py312-ds", "pool-rust-toolchains"],
-      cpuCap: node.cpuCap ?? 16.0,
-      burstSemCap: node.burstSemCap ?? 4,
-      memCapMb: node.memCapMb ?? 32768.0,
-      alive: node.alive ?? true,
-    });
+  public registerOrUpdateNode(heartbeat: NodeHeartbeat): void {
+    this.nodes.set(heartbeat.node_id, heartbeat);
   }
 
-  public submitTask(task: AgentTask): number {
-    const softTokens = this.profiler.assignInitialP50Reservation(task);
-    this.tasks.set(task.taskId, task);
-    this.queueManager.enqueue(task);
-    return softTokens;
-  }
-
-  public getTenantUsageVector(tenantId: string): ResourceVector5D {
-    const running = Array.from(this.tasks.values()).filter(
-      (t) => t.tenantId === tenantId && t.state === TaskState.RUNNING,
-    );
-    let sCpu = 0;
-    let bCpu = 0;
-    let sMem = 0;
-    let sess = 0;
-    let tps = 0;
-    for (const t of running) {
-      const dv = t.demandVector();
-      sCpu += dv.steadyCpu;
-      bCpu += dv.burstCpu;
-      sMem += dv.steadyMemMb;
-      sess += dv.sessions;
-      tps += dv.effectiveTps;
-    }
-    return new ResourceVector5D(sCpu, bCpu, sMem, sess, tps);
-  }
-
-  public compute5dDominantShares(): Record<string, number> {
-    const shares: Record<string, number> = {};
-    for (const [tid, tcfg] of this.tenants.entries()) {
-      const u = this.getTenantUsageVector(tid);
-      const norm = [
-        u.steadyCpu / this.clusterCapacity.steadyCpu,
-        u.burstCpu / this.clusterCapacity.burstCpu,
-        u.steadyMemMb / this.clusterCapacity.steadyMemMb,
-        u.sessions / this.clusterCapacity.sessions,
-        u.effectiveTps / this.clusterCapacity.effectiveTps,
-      ];
-      tcfg.dominantShare = Number((Math.max(...norm) / tcfg.weight).toFixed(4));
-      shares[tid] = tcfg.dominantShare;
-    }
-    return shares;
-  }
-
-  public nodeUsedCpu(nodeId: string): number {
-    return Array.from(this.tasks.values())
-      .filter((t) => t.assignedNodeId === nodeId && t.state === TaskState.RUNNING)
-      .reduce((acc, t) => acc + t.execCpu, 0.0);
-  }
-
-  public scoreNodeAndModelPool(task: AgentTask, node: WorkerNodeState): { score: number; poolName: ModelPoolName } {
-    const warmScore = node.warmPools.includes(task.warmPoolId) ? 1.0 : 0.3;
-    const usedCpu = this.nodeUsedCpu(node.nodeId);
-    const headroomScore = Math.max(0.0, (node.cpuCap - usedCpu) / node.cpuCap);
-
-    const primaryPool = this.cognitiveRouter.pools[task.primaryModel];
-    let chosenPool: ModelPoolName;
-    let poolScore: number;
-    if (primaryPool.breakerState === "CLOSED") {
-      chosenPool = task.primaryModel;
-      poolScore = primaryPool.quotaHeadroomRatio - 0.2 * primaryPool.ttftSec;
-    } else {
-      chosenPool = task.fallbackModels[0];
-      const fbPool = this.cognitiveRouter.pools[chosenPool];
-      poolScore = fbPool.quotaHeadroomRatio - 0.2 * fbPool.ttftSec;
-    }
-    const score = Number((0.45 * warmScore + 0.25 * headroomScore + 0.30 * poolScore).toFixed(4));
-    return { score, poolName: chosenPool };
-  }
-
-  public tryPreemptToHibernate(highPrioTask: AgentTask): AgentTask | null {
-    if (!["P0", "P1", "critical-p0", "high-interactive"].includes(highPrioTask.priorityClass)) {
-      return null;
-    }
-    const victims = Array.from(this.tasks.values()).filter(
-      (t) =>
-        t.state === TaskState.RUNNING &&
-        ["P3", "P4", "low-background", "spot-opportunistic"].includes(t.priorityClass),
-    );
-    if (victims.length === 0) return null;
-    victims.sort((a, b) => a.baseScore - b.baseScore);
-    const victim = victims[0];
-    victim.state = TaskState.HIBERNATED;
-    victim.hibernationReason = "PREEMPTED";
-    victim.phase = SandboxPhase.IDLE;
-    victim.activeSessions = 0;
-    if (!this.hibernatedResumeQueue.some((x) => x.taskId === victim.taskId)) {
-      this.hibernatedResumeQueue.push(victim);
-    }
-    return victim;
-  }
-
-  public scheduleTick(now: number): AgentTask[] {
-    const dispatched: AgentTask[] = [];
-    this.queueManager.sweepExpiredTasks(now);
-
-    // 1. Drain deadlock-free Escrow Fast Queue first
-    while (this.queueManager.escrowFastQueue.length > 0) {
-      const item = this.queueManager.escrowFastQueue.shift()!;
-      const child = item.child;
-      this.tasks.set(child.taskId, child);
-      const aliveNodes = Array.from(this.nodes.values()).filter((n) => n.alive);
-      if (aliveNodes.length > 0) {
-        aliveNodes.sort(
-          (a, b) => this.scoreNodeAndModelPool(child, b).score - this.scoreNodeAndModelPool(child, a).score,
-        );
-        const bestNode = aliveNodes[0];
-        const { poolName } = this.scoreNodeAndModelPool(child, bestNode);
-        const fence = this.leaseCoordinator.acquireOrIncrementEpoch(child.taskId, bestNode.nodeId, poolName);
-        child.fence = fence;
-        child.assignedNodeId = bestNode.nodeId;
-        child.assignedModelPool = poolName;
-        child.state = TaskState.RUNNING;
-        child.phase = SandboxPhase.COGNITIVE;
-        child.activeSessions = 1;
-        dispatched.append ? dispatched.push(child) : dispatched.push(child);
+  public submitTask(task: TaskSpec): TaskSpec {
+    if (task.idempotency_key) {
+      const existingId = this.idempotencyIndex.get(task.idempotency_key);
+      if (existingId !== undefined) {
+        return this.allTasks.get(existingId)!;
       }
     }
 
-    // 2. 5D W-DRF Multi-Tenant Scheduling Loop for Queued Tasks
-    const blockedTenants = new Set<string>();
-    while (true) {
-      this.compute5dDominantShares();
-      const eligibleTenants = Array.from(this.tenants.values()).filter(
-        (tcfg) =>
-          (this.queueManager.tenantQueues.get(tcfg.tenantId)?.length ?? 0) > 0 &&
-          !blockedTenants.has(tcfg.tenantId),
+    task.resource_profile = this.profiler.recommendProfile(task);
+    this.allTasks.set(task.task_id, task);
+    if (task.idempotency_key) {
+      this.idempotencyIndex.set(task.idempotency_key, task.task_id);
+    }
+
+    if (this.dependenciesSatisfied(task)) {
+      task.state = TaskState.QUEUED;
+      this.queueManager.enqueue(task);
+    } else {
+      task.state = TaskState.SUBMITTED;
+    }
+    return task;
+  }
+
+  private dependenciesSatisfied(task: TaskSpec): boolean {
+    return task.dependencies.every((depId) => this.completedIds.has(depId));
+  }
+
+  public static scoreNodeForTask(task: TaskSpec, node: NodeHeartbeat): number {
+    if (!node.healthy || node.psi_memory_some_avg10 > 60.0) {
+      return -1.0;
+    }
+    const reqCpu = task.resource_profile.think_cpu_cores;
+    const reqMem = task.resource_profile.act_memory_mb;
+    if (node.free_cpu_cores < reqCpu || node.free_memory_mb < reqMem) {
+      return -1.0;
+    }
+
+    const cpuBalance = Math.min(1.0, node.free_cpu_cores / Math.max(1.0, node.total_cpu_cores));
+    const memBalance = Math.min(1.0, node.free_memory_mb / Math.max(1.0, node.total_memory_mb));
+    const sResource = (cpuBalance + memBalance) * 15.0;
+    const sWarmPool = node.warm_pool_ready > 0 ? 25.0 : 5.0;
+    const sCacheLocality =
+      task.prefix_Cache_hash && node.cached_images.has(task.prefix_Cache_hash) ? 20.0 : 0.0;
+    const sPsiHealth = Math.max(0.0, 20.0 * (1.0 - node.psi_memory_some_avg10 / 60.0));
+    const sQueuePenalty = Math.max(0.0, 10.0 - node.running_tasks * 0.5);
+
+    return sResource + sWarmPool + sCacheLocality + sPsiHealth + sQueuePenalty;
+  }
+
+  public scheduleTick(): Array<[string, string, number]> {
+    const placements: Array<[string, string, number]> = [];
+    const maxAttempts = this.queueManager.totalQueued();
+    let attempts = 0;
+
+    while (attempts < maxAttempts) {
+      attempts += 1;
+      const task = this.queueManager.popNext();
+      if (!task) break;
+
+      let bestNode: NodeHeartbeat | null = null;
+      let bestScore = -1.0;
+      for (const node of this.nodes.values()) {
+        const s = CoreScheduler5D.scoreNodeForTask(task, node);
+        if (s > bestScore) {
+          bestScore = s;
+          bestNode = node;
+        }
+      }
+
+      if (bestNode !== null) {
+        const lease = this.leaseCoordinator.acquireLease(task.task_id, bestNode.node_id);
+        task.state = TaskState.LEASED;
+        task.assigned_node_id = bestNode.node_id;
+        task.lease_fencing_token = lease.fencing_token;
+
+        bestNode.free_cpu_cores -= task.resource_profile.think_cpu_cores;
+        bestNode.free_memory_mb -= Math.floor(task.resource_profile.act_memory_mb * 0.25);
+        bestNode.running_tasks += 1;
+        if (bestNode.warm_pool_ready > 0) {
+          bestNode.warm_pool_ready -= 1;
+        }
+        placements.push([task.task_id, bestNode.node_id, lease.fencing_token]);
+      } else {
+        if (task.priority <= TaskPriority.P1_HIGH && this.tryPreemptBatchTask(task)) {
+          this.queueManager.enqueue(task);
+          this.queueManager.completeTask(task);
+        } else {
+          this.queueManager.completeTask(task);
+          this.queueManager.enqueue(task);
+        }
+      }
+    }
+    return placements;
+  }
+
+  private tryPreemptBatchTask(urgentTask: TaskSpec): boolean {
+    const batchVictims = Array.from(this.allTasks.values()).filter(
+      (t) =>
+        t.priority === TaskPriority.P3_BATCH &&
+        (t.state === TaskState.LEASED ||
+          t.state === TaskState.RUNNING_THINK ||
+          t.state === TaskState.RUNNING_ACT)
+    );
+    if (batchVictims.length === 0) return false;
+
+    const victim = batchVictims[0];
+    const nodeId = victim.assigned_node_id;
+    victim.state = TaskState.PREEMPTING;
+
+    if (nodeId && this.nodes.has(nodeId)) {
+      const node = this.nodes.get(nodeId)!;
+      node.free_cpu_cores = Math.min(
+        node.total_cpu_cores,
+        node.free_cpu_cores + Math.max(urgentTask.resource_profile.think_cpu_cores, 1.0)
       );
-      if (eligibleTenants.length === 0) break;
+      node.free_memory_mb = Math.min(
+        node.total_memory_mb,
+        node.free_memory_mb + urgentTask.resource_profile.act_memory_mb
+      );
+      node.running_tasks = Math.max(0, node.running_tasks - 1);
+    }
 
-      eligibleTenants.sort((a, b) => a.dominantShare - b.dominantShare);
-      const chosenTenant = eligibleTenants[0];
-      const q = this.queueManager.tenantQueues.get(chosenTenant.tenantId)!;
-      q.sort((a, b) => this.queueManager.computeDynamicUrgency(b, now) - this.queueManager.computeDynamicUrgency(a, now));
-      const candidate = q[0];
+    this.leaseCoordinator.revokeLease(victim.task_id);
+    this.queueManager.completeTask(victim);
+    victim.state = TaskState.QUEUED;
+    victim.assigned_node_id = undefined;
+    this.queueManager.enqueue(victim);
+    return true;
+  }
 
-      const uVec = this.getTenantUsageVector(chosenTenant.tenantId);
-      if (this.queueManager.exceedsBurstCeiling(chosenTenant.tenantId, uVec, candidate)) {
-        blockedTenants.add(chosenTenant.tenantId);
+  public completeTaskExecution(
+    taskId: string,
+    nodeId: string,
+    fencingToken: number,
+    observedPeakCpu = 1.0,
+    observedPeakMemoryMb = 1024
+  ): boolean {
+    if (!this.leaseCoordinator.validateFencingToken(taskId, fencingToken)) {
+      return false;
+    }
+    const task = this.allTasks.get(taskId);
+    if (!task) return false;
+
+    task.state = TaskState.COMPLETED;
+    this.completedIds.add(taskId);
+    this.leaseCoordinator.revokeLease(taskId);
+    this.queueManager.completeTask(task);
+    this.profiler.recordExecutionMetrics(task, observedPeakCpu, observedPeakMemoryMb);
+
+    const node = this.nodes.get(nodeId);
+    if (node) {
+      node.free_cpu_cores = Math.min(
+        node.total_cpu_cores,
+        node.free_cpu_cores + task.resource_profile.think_cpu_cores
+      );
+      node.free_memory_mb = Math.min(
+        node.total_memory_mb,
+        node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25)
+      );
+      node.running_tasks = Math.max(0, node.running_tasks - 1);
+    }
+
+    for (const candidate of this.allTasks.values()) {
+      if (candidate.state === TaskState.SUBMITTED && this.dependenciesSatisfied(candidate)) {
+        candidate.state = TaskState.QUEUED;
+        this.queueManager.enqueue(candidate);
+      }
+    }
+    return true;
+  }
+
+  public reconcileOrphanedLeases(): string[] {
+    const expired = this.leaseCoordinator.scanExpiredLeases();
+    const recoveredIds: string[] = [];
+    for (const lease of expired) {
+      const task = this.allTasks.get(lease.task_id);
+      if (!task || task.state === TaskState.COMPLETED || task.state === TaskState.DEAD_LETTER) {
         continue;
       }
-
-      let feasibleNodes = Array.from(this.nodes.values()).filter(
-        (n) => n.alive && this.nodeUsedCpu(n.nodeId) + candidate.execCpu <= n.cpuCap,
-      );
-      if (feasibleNodes.length === 0) {
-        const victim = this.tryPreemptToHibernate(candidate);
-        if (victim) {
-          feasibleNodes = Array.from(this.nodes.values()).filter(
-            (n) => n.alive && this.nodeUsedCpu(n.nodeId) + candidate.execCpu <= n.cpuCap,
-          );
-        }
-        if (feasibleNodes.length === 0) {
-          blockedTenants.add(chosenTenant.tenantId);
-          continue;
-        }
+      this.queueManager.completeTask(task);
+      task.retry_count += 1;
+      if (task.retry_count > 3) {
+        task.state = TaskState.DEAD_LETTER;
+      } else {
+        task.state = TaskState.QUEUED;
+        task.assigned_node_id = undefined;
+        this.queueManager.enqueue(task);
+        recoveredIds.push(task.task_id);
       }
-
-      q.shift();
-      feasibleNodes.sort(
-        (a, b) => this.scoreNodeAndModelPool(candidate, b).score - this.scoreNodeAndModelPool(candidate, a).score,
-      );
-      const bestNode = feasibleNodes[0];
-      const { poolName } = this.scoreNodeAndModelPool(candidate, bestNode);
-      const fence = this.leaseCoordinator.acquireOrIncrementEpoch(candidate.taskId, bestNode.nodeId, poolName);
-      candidate.fence = fence;
-      candidate.assignedNodeId = bestNode.nodeId;
-      candidate.assignedModelPool = poolName;
-      candidate.state = TaskState.RUNNING;
-      candidate.hibernationReason = "NONE";
-      candidate.phase = SandboxPhase.COGNITIVE;
-      candidate.activeSessions = Math.min(2, candidate.maxSessions);
-      dispatched.push(candidate);
     }
-
-    // 3. Auto-Resume Preempted / PSI-Hibernated Sandboxes when Node Headroom Returns
-    if (this.hibernatedResumeQueue.length > 0) {
-      this.hibernatedResumeQueue.sort(
-        (a, b) => this.queueManager.computeDynamicUrgency(b, now) - this.queueManager.computeDynamicUrgency(a, now),
-      );
-      const stillHibernated: AgentTask[] = [];
-      for (const hTask of this.hibernatedResumeQueue) {
-        if (hTask.state !== TaskState.HIBERNATED || hTask.hibernationReason === "HUMAN_APPROVAL_WAIT") {
-          continue;
-        }
-        const feasibleNodes = Array.from(this.nodes.values()).filter(
-          (n) => n.alive && this.nodeUsedCpu(n.nodeId) + hTask.execCpu <= n.cpuCap,
-        );
-        if (feasibleNodes.length > 0) {
-          feasibleNodes.sort(
-            (a, b) => this.scoreNodeAndModelPool(hTask, b).score - this.scoreNodeAndModelPool(hTask, a).score,
-          );
-          const bestNode = feasibleNodes[0];
-          const { poolName } = this.scoreNodeAndModelPool(hTask, bestNode);
-          const prevTurn = Math.max(1, hTask.fence.turnSeq);
-          const newEpochFence = this.leaseCoordinator.acquireOrIncrementEpoch(
-            hTask.taskId,
-            bestNode.nodeId,
-            poolName,
-          );
-          hTask.fence = new FenceToken(newEpochFence.epoch, prevTurn, hTask.taskId);
-          this.leaseCoordinator.verifyAndAdvanceFence(hTask.fence);
-          hTask.assignedNodeId = bestNode.nodeId;
-          hTask.assignedModelPool = poolName;
-          hTask.state = TaskState.RUNNING;
-          hTask.hibernationReason = "NONE";
-          hTask.phase = SandboxPhase.COGNITIVE;
-          hTask.activeSessions = Math.min(2, hTask.maxSessions);
-          dispatched.push(hTask);
-        } else {
-          stillHibernated.push(hTask);
-        }
-      }
-      this.hibernatedResumeQueue = stillHibernated;
-    }
-
-    return dispatched;
+    return recoveredIds;
   }
 }

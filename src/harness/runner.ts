@@ -1,88 +1,85 @@
 /**
- * @fileoverview TASK-22 & M27 (TASK-127): AgentHarnessRunner with Sub-Session Semaphore
- * and Real Sliding-Window Message Array Compaction.
+ * @fileoverview M4 TASK-17: In-Sandbox Agent Harness ReAct Loop Runner.
  */
+import { TaskSpec, TaskState } from "../models.js";
+import { CognitiveRouter } from "../cognitive_router.js";
+import { SagaToolGateway } from "../saga_gateway.js";
+import { SyntacticAndVelocityBreaker } from "./velocity_breaker.js";
 
-import { AgentTask } from "../models";
-
-export interface CompactionEvent {
+export interface TurnExecutionSummary {
   taskId: string;
-  tokensBefore: number;
-  tokensAfter: number;
-  preservedTurns: number;
-  summarizedTurnsCount: number;
-  episodicDigest?: string;
+  turnIndex: number;
+  endpointId: string;
+  cacheHit: boolean;
+  toolOutput: Record<string, unknown>;
+  deduplicatedTool: boolean;
 }
 
 export class AgentHarnessRunner {
-  public compactionHistory: CompactionEvent[] = [];
+  private readonly router: CognitiveRouter;
+  private readonly sagaGateway: SagaToolGateway;
+  private readonly breaker: SyntacticAndVelocityBreaker;
 
   constructor(
-    public readonly compactionRatio: number = 0.80,
-    public readonly preserveLastNTurns: number = 6,
-  ) {}
-
-  public tryAcquireSubSession(task: AgentTask): boolean {
-    if (task.activeSessions >= task.maxSessions) {
-      return false;
-    }
-    if (task.totalSpawnedSessions >= task.maxTotalSessions) {
-      return false;
-    }
-    task.activeSessions += 1;
-    task.totalSpawnedSessions += 1;
-    return true;
+    router: CognitiveRouter,
+    sagaGateway: SagaToolGateway,
+    breaker = new SyntacticAndVelocityBreaker()
+  ) {
+    this.router = router;
+    this.sagaGateway = sagaGateway;
+    this.breaker = breaker;
   }
 
-  public releaseSubSession(task: AgentTask): void {
-    if (task.activeSessions > 0) {
-      task.activeSessions -= 1;
+  public executeSingleTurn(
+    task: TaskSpec,
+    toolName: string,
+    toolArgs: Record<string, unknown>,
+    estimatedTokens = 1500
+  ): TurnExecutionSummary {
+    if (task.current_turn >= task.max_turns) {
+      task.state = TaskState.DEAD_LETTER;
+      throw new Error(`Task '${task.task_id}' exceeded max_turns (${task.max_turns})`);
     }
-  }
+    task.state = TaskState.RUNNING_THINK;
+    const prefixHash =
+      task.prefix_Cache_hash ||
+      CognitiveRouter.computePrefixHash("system:agent-v2", "tools:default", task.prompt);
+    task.prefix_Cache_hash = prefixHash;
 
-  /**
-   * Compacts the context window when `contextWindowTokens >= compactionRatio * windowCap`.
-   * If `turnMessages` are supplied, slices out older turns, condenses them into an episodic
-   * summary header, and retains the last `preserveLastNTurns` verbatim.
-   */
-  public checkAndCompactContext(
-    task: AgentTask,
-    contextWindowTokens: number,
-    maxWindowTokens?: number,
-    turnMessages?: string[],
-  ): number {
-    const windowCap = maxWindowTokens ?? task.maxContextWindow;
-    if (contextWindowTokens < Math.floor(this.compactionRatio * windowCap)) {
-      return contextWindowTokens;
+    const [endpoint, cacheHit] = this.router.selectEndpoint(prefixHash, estimatedTokens, task.priority);
+    try {
+      const nextTurn = task.current_turn + 1;
+      const argsHash = SagaToolGateway.generateIdempotencyKey(task.task_id, nextTurn, toolName, toolArgs);
+      const check = this.breaker.recordAndCheckTurn(task.task_id, {
+        turnIndex: nextTurn,
+        toolName,
+        argsHash,
+        tokensConsumed: estimatedTokens,
+        timestampMs: Date.now(),
+      });
+      if (check.tripped) {
+        task.state = TaskState.SUSPENDED_APPROVAL;
+        throw new Error(`Velocity breaker tripped for task '${task.task_id}': ${check.reason}`);
+      }
+
+      task.state = TaskState.RUNNING_ACT;
+      const [toolOutput, deduplicated] = this.sagaGateway.invokeTool(
+        task.task_id,
+        nextTurn,
+        toolName,
+        toolArgs
+      );
+      task.current_turn = nextTurn;
+      return {
+        taskId: task.task_id,
+        turnIndex: nextTurn,
+        endpointId: endpoint.endpoint_id,
+        cacheHit,
+        toolOutput,
+        deduplicatedTool: deduplicated,
+      };
+    } finally {
+      this.router.releaseEndpoint(endpoint.endpoint_id);
     }
-
-    let summarizedTurnsCount = Math.max(1, task.fence.turnSeq - this.preserveLastNTurns);
-    let episodicDigest = `[Episodic Summary of early turns for ${task.taskId}]`;
-
-    if (Array.isArray(turnMessages) && turnMessages.length > this.preserveLastNTurns) {
-      const older = turnMessages.slice(0, turnMessages.length - this.preserveLastNTurns);
-      const recent = turnMessages.slice(-this.preserveLastNTurns);
-      summarizedTurnsCount = older.length;
-      episodicDigest = `[Compacted ${older.length} turns]: ` + older.map((m) => m.slice(0, 32)).join(" | ");
-      turnMessages.length = 0;
-      turnMessages.push(episodicDigest, ...recent);
-    }
-
-    // Calculate post-compaction token footprint from retained ratio + episodic summary overhead
-    const retainedTurnRatio = Math.min(
-      0.42,
-      this.preserveLastNTurns / Math.max(this.preserveLastNTurns + summarizedTurnsCount, 14),
-    );
-    const compacted = Math.floor(contextWindowTokens * retainedTurnRatio);
-
-    this.compactionHistory.push({
-      taskId: task.taskId,
-      tokensBefore: contextWindowTokens,
-      tokensAfter: compacted,
-      preservedTurns: this.preserveLastNTurns,
-      summarizedTurnsCount,
-      episodicDigest,
-    });
-    return compacted;
   }
 }

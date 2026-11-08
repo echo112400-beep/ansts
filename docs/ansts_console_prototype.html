@@ -3,14 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ANSTS v2.3 Enterprise Console (TanStack Architecture)</title>
+    <title>ANSTS v2.7 Ultimate Enterprise Console (TanStack BFF + 256-Slot Heatmap + V8 Flame Graph + HITL)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@300;400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
         code, pre, .mono { font-family: 'JetBrains Mono', monospace; }
-        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(51, 65, 85, 0.5); }
+        .glass-panel { background: rgba(30, 41, 59, 0.72); backdrop-filter: blur(12px); border: 1px solid rgba(51, 65, 85, 0.55); }
+        .slot-cell { transition: transform 0.12s ease, border-color 0.12s ease; }
+        .slot-cell:hover { transform: scale(1.28); z-index: 10; }
     </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
@@ -20,29 +22,31 @@
         <div class="flex items-center space-x-4">
             <div class="flex items-center space-x-2">
                 <div class="w-8 h-8 rounded-lg bg-cyan-500/20 border border-cyan-500/40 flex items-center justify-center text-cyan-400 font-bold">A</div>
-                <span class="font-bold text-lg tracking-tight bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">ANSTS v2.3</span>
+                <span class="font-bold text-lg tracking-tight bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">ANSTS v2.7</span>
             </div>
-            <span class="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-400 border border-slate-700">TanStack Console</span>
+            <span class="text-xs px-2.5 py-1 rounded-full bg-slate-800 text-slate-300 border border-slate-700">Ultimate TanStack Console (M35)</span>
+            <span id="syncIndicator" class="text-[11px] font-mono text-slate-500">CAS Delta Polling: 3s</span>
         </div>
 
-        <div class="flex items-center space-x-6">
+        <div class="flex items-center space-x-5">
             <div class="flex items-center space-x-2 bg-slate-800/60 px-3 py-1.5 rounded-lg border border-slate-700/60 text-xs">
-                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                <span class="text-slate-300">Cluster: <strong class="text-emerald-400">Healthy (RPO=0)</strong></span>
+                <span id="clusterHealthDot" class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span class="text-slate-300">Cluster: <strong id="clusterHealthLabel" class="text-emerald-400">Healthy (RPO=0)</strong></span>
             </div>
             <div class="flex items-center space-x-2 bg-slate-800/60 px-3 py-1.5 rounded-lg border border-slate-700/60 text-xs">
                 <span class="text-slate-400">Region:</span>
-                <select id="regionSelect" class="bg-transparent text-cyan-400 font-medium focus:outline-none cursor-pointer">
+                <select id="regionSelect" onchange="onRegionChange(this.value)" class="bg-transparent text-cyan-400 font-medium focus:outline-none cursor-pointer">
                     <option value="us-west-2" class="bg-slate-900">US-West (Primary)</option>
-                    <option value="eu-central-1" class="bg-slate-900">EU-Central (Failover)</option>
-                    <option value="ap-northeast-1" class="bg-slate-900">AP-Northeast</option>
+                    <option value="eu-central-1" class="bg-slate-900">EU-Central (GDPR Pinned)</option>
+                    <option value="ap-northeast-1" class="bg-slate-900">AP-Northeast (PDPA Pinned)</option>
                 </select>
             </div>
-            <div class="flex items-center space-x-3 border-l border-slate-800 pl-6">
-                <button class="p-2 text-slate-400 hover:text-slate-200 transition relative">
-                    <i data-lucide="bell" class="w-5 h-5"></i>
-                    <span class="absolute top-1.5 right-1.5 w-2 h-2 bg-cyan-500 rounded-full"></span>
+            <div class="flex items-center space-x-3 border-l border-slate-800 pl-5">
+                <button onclick="switchTab('wal')" title="Pending STAGED_COMMIT Human Approvals" class="px-2.5 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 hover:bg-amber-500/20 transition flex items-center space-x-1.5 text-xs font-mono">
+                    <span>HITL Gate:</span>
+                    <strong id="navHitlBadge">1</strong>
                 </button>
+                <a href="/ansts_v25_test_verification_report.html" target="_blank" class="px-2.5 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-xs font-mono hover:bg-emerald-500/20 transition">Verification Report</a>
                 <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-cyan-600 to-blue-600 flex items-center justify-center font-bold text-xs">AD</div>
             </div>
         </div>
@@ -55,100 +59,130 @@
             <nav class="space-y-1">
                 <button onclick="switchTab('overview')" id="nav-overview" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
                     <i data-lucide="layout-dashboard" class="w-4 h-4"></i>
-                    <span>Overview 概览</span>
+                    <span>Overview &amp; 5D FinOps</span>
                 </button>
                 <button onclick="switchTab('fleet')" id="nav-fleet" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
                     <i data-lucide="server" class="w-4 h-4"></i>
-                    <span>Body Fleet 裸金属躯体</span>
+                    <span>Body Fleet, CoW &amp; Spot</span>
                 </button>
                 <button onclick="switchTab('harness')" id="nav-harness" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
                     <i data-lucide="cpu" class="w-4 h-4"></i>
-                    <span>Agent Harness (Brain)</span>
+                    <span>256-Slot Map, V8 &amp; Chaos</span>
                 </button>
                 <button onclick="switchTab('tunnels')" id="nav-tunnels" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
                     <i data-lucide="git-merge" class="w-4 h-4"></i>
-                    <span>mTLS & Dual-Homed Tunnels</span>
+                    <span>mTLS Dual-Homed Tunnels</span>
                 </button>
                 <button onclick="switchTab('wal')" id="nav-wal" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
                     <i data-lucide="database" class="w-4 h-4"></i>
-                    <span>TurnWAL & Persistence</span>
+                    <span>TurnWAL, HITL &amp; Time-Travel</span>
+                </button>
+                <button onclick="switchTab('shadow')" id="nav-shadow" class="tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50">
+                    <i data-lucide="flask-conical" class="w-4 h-4"></i>
+                    <span>Shadow Eval Lab 评测室</span>
                 </button>
             </nav>
 
             <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-3 text-xs text-slate-400 space-y-2">
                 <div class="flex justify-between font-mono">
                     <span>S3 CAS Gen:</span>
-                    <span class="text-cyan-400">v1-gen-418</span>
+                    <span id="sidebarCasGen" class="text-cyan-400">v1-gen-1</span>
                 </div>
                 <div class="flex justify-between font-mono">
                     <span>Active Sessions:</span>
-                    <span class="text-emerald-400">1,248</span>
+                    <span id="sidebarActiveSessions" class="text-emerald-400">1</span>
+                </div>
+                <div class="flex justify-between font-mono">
+                    <span>Routed Region:</span>
+                    <span id="sidebarRoutedRegion" class="text-sky-400">us-west-2</span>
                 </div>
                 <div class="pt-2 border-t border-slate-800 flex items-center justify-between text-[10px] text-slate-500">
                     <span>ANSTS Enterprise</span>
-                    <span>v2.3.0-stable</span>
+                    <span id="sidebarVersion">v2.6.0</span>
                 </div>
             </div>
         </aside>
 
-        <!-- Main Content Area (TanStack-like reactive view container) -->
+        <!-- Main Content Area -->
         <main class="flex-1 overflow-y-auto p-8 bg-slate-950" id="main-content">
             
-            <!-- OVERVIEW TAB -->
+            <!-- Notification Banner -->
+            <div id="toastBanner" class="hidden mb-4 px-4 py-3 rounded-xl border border-cyan-500/40 bg-cyan-950/60 text-cyan-200 text-xs font-mono flex items-center justify-between">
+                <span id="toastMessage"></span>
+                <button onclick="document.getElementById('toastBanner').classList.add('hidden')" class="text-slate-400 hover:text-white">✕</button>
+            </div>
+
+            <!-- 1. OVERVIEW & 5D FINOPS TAB -->
             <div id="tab-overview" class="space-y-6">
                 <div class="flex items-center justify-between">
                     <div>
-                        <h1 class="text-2xl font-bold tracking-tight text-white">集群全景监控 (Cluster Overview)</h1>
-                        <p class="text-sm text-slate-400 mt-1">控制面大脑与端侧裸金属沙箱躯体的实时运行状态与高可用指标。</p>
+                        <h1 class="text-2xl font-bold tracking-tight text-white">集群全景监控与 5D W-DRF / FinOps 雷达 (Cluster &amp; FinOps Overview)</h1>
+                        <p class="text-sm text-slate-400 mt-1">实时监控大脑与躯体运行指标、五维主导份额、跨分片配额借贷及 KV-Cache 80% 缓存折扣细账。</p>
                     </div>
-                    <button onclick="refreshData()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs font-medium flex items-center space-x-2 transition">
-                        <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
-                        <span>Sync State</span>
-                    </button>
+                    <div class="flex items-center space-x-3">
+                        <button onclick="triggerV27DeepTechProbe()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-xs font-semibold text-white transition">Run v2.7 Deep-Tech Suite (UFFD / eBPF / GC)</button>
+                        <button onclick="dispatchLiveDemoTask()" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg text-xs font-semibold text-white transition">
+                            + Dispatch Distributed Task
+                        </button>
+                        <button onclick="refreshData(true, true)" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-xs font-medium flex items-center space-x-2 transition">
+                            <span>Sync State</span>
+                        </button>
+                    </div>
                 </div>
 
                 <!-- Metrics Grid -->
                 <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                     <div class="glass-panel p-5 rounded-xl border-l-4 border-l-cyan-500">
                         <div class="text-slate-400 text-xs font-medium">Active Sandboxes</div>
-                        <div class="text-3xl font-bold font-mono mt-2 text-white">32 / 32</div>
-                        <div class="text-[11px] text-emerald-400 mt-1 flex items-center">
-                            <i data-lucide="trending-up" class="w-3 h-3 mr-1"></i> 100% Cgroups v2 Enforced
-                        </div>
+                        <div id="kpiActiveSandboxes" class="text-3xl font-bold font-mono mt-2 text-white">16 / 32</div>
+                        <div class="text-[11px] text-emerald-400 mt-1">100% Cgroups v2 Enforced</div>
                     </div>
                     <div class="glass-panel p-5 rounded-xl border-l-4 border-l-emerald-500">
-                        <div class="text-slate-400 text-xs font-medium">Global Uptime</div>
-                        <div class="text-3xl font-bold font-mono mt-2 text-white">99.98%</div>
-                        <div class="text-[11px] text-slate-400 mt-1">Zero Brain-Split Incidents</div>
+                        <div class="text-slate-400 text-xs font-medium">Global Uptime &amp; RPO</div>
+                        <div id="kpiGlobalUptime" class="text-3xl font-bold font-mono mt-2 text-white">100%</div>
+                        <div id="kpiEc4Drives" class="text-[11px] text-slate-400 mt-1">RustFS EC:4 (12/12 Drives OK)</div>
                     </div>
                     <div class="glass-panel p-5 rounded-xl border-l-4 border-l-blue-500">
-                        <div class="text-slate-400 text-xs font-medium">Average mTLS RTT</div>
-                        <div class="text-3xl font-bold font-mono mt-2 text-white">0.95ms</div>
+                        <div class="text-slate-400 text-xs font-medium">Live mTLS Tunnel RTT</div>
+                        <div id="kpiMtlsRtt" class="text-3xl font-bold font-mono mt-2 text-white">0.12ms</div>
                         <div class="text-[11px] text-cyan-400 mt-1">TLS 1.3 + SPIFFE Verified</div>
                     </div>
                     <div class="glass-panel p-5 rounded-xl border-l-4 border-l-amber-500">
-                        <div class="text-slate-400 text-xs font-medium">TurnWAL Checkpoints</div>
-                        <div class="text-3xl font-bold font-mono mt-2 text-white">14.2k</div>
-                        <div class="text-[11px] text-amber-400 mt-1">If-Match ETag CAS Sync</div>
+                        <div class="text-slate-400 text-xs font-medium">Disk TurnWAL Files</div>
+                        <div id="kpiWalCheckpoints" class="text-3xl font-bold font-mono mt-2 text-white">0</div>
+                        <div class="text-[11px] text-amber-400 mt-1">O_EXCL Atomic + fsyncSync</div>
                     </div>
                 </div>
 
-                <!-- Interactive Table Section -->
-                <div class="glass-panel rounded-xl overflow-hidden mt-6">
-                    <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
-                        <h2 class="font-semibold text-sm text-slate-200 flex items-center">
-                            <i data-lucide="hard-drive" class="w-4 h-4 mr-2 text-cyan-400"></i>
-                            Edge Body Hosts & Dual-Homed Tunnel Routing (TanStack Table View)
-                        </h2>
-                        <div class="flex space-x-2">
-                            <input type="text" placeholder="Filter hostId..." class="bg-slate-900 border border-slate-700 px-3 py-1 text-xs rounded-lg text-slate-200 focus:outline-none focus:border-cyan-500">
+                <!-- 5D W-DRF Radar & FinOps Burn-Rate Ledger -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="glass-panel p-5 rounded-xl space-y-3">
+                        <div class="flex items-center justify-between">
+                            <h3 class="font-semibold text-sm text-slate-200">5D W-DRF Dominant Resource Share &amp; Bayesian P50 Reserve</h3>
+                            <span class="text-[11px] font-mono text-cyan-400">Work-Stealing Active</span>
                         </div>
+                        <div id="overviewWdrfBars" class="space-y-2.5 text-xs font-mono"></div>
+                    </div>
+                    <div class="glass-panel p-5 rounded-xl space-y-3">
+                        <div class="flex items-center justify-between">
+                            <h3 class="font-semibold text-sm text-slate-200">Multi-Tenant FinOps Ledger &amp; KV-Cache 80% Discount</h3>
+                            <span id="overviewKvSavingsBadge" class="text-[11px] font-mono text-emerald-400">TTFT -65% | Discount 80%</span>
+                        </div>
+                        <div id="overviewFinopsRows" class="space-y-2 text-xs font-mono"></div>
+                    </div>
+                </div>
+
+                <!-- Edge Body Hosts Table -->
+                <div class="glass-panel rounded-xl overflow-hidden">
+                    <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
+                        <h2 class="font-semibold text-sm text-slate-200">Edge Body Hosts &amp; Dual-Homed Tunnel Routing (TanStack Table View)</h2>
+                        <input id="hostFilterInput" oninput="renderBodyHostsTable()" type="text" placeholder="Filter hostId, tier, or gateway..." class="bg-slate-900 border border-slate-700 px-3 py-1 text-xs rounded-lg text-slate-200 focus:outline-none focus:border-cyan-500">
                     </div>
                     <div class="overflow-x-auto">
                         <table class="w-full text-left border-collapse text-xs">
                             <thead>
                                 <tr class="bg-slate-900/60 text-slate-400 border-b border-slate-800 font-medium">
-                                    <th class="py-3 px-6">Host ID / IP</th>
+                                    <th class="py-3 px-6">Host ID / IP / Tier</th>
                                     <th class="py-3 px-6">Primary Gateway</th>
                                     <th class="py-3 px-6">Secondary Standby</th>
                                     <th class="py-3 px-6">Conn Generation</th>
@@ -156,124 +190,200 @@
                                     <th class="py-3 px-6 text-right">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody class="divide-y divide-slate-800/60 font-mono">
-                                <tr class="hover:bg-slate-800/30 transition">
-                                    <td class="py-4 px-6 font-semibold text-slate-200">body-host-edge-01<div class="text-[10px] text-slate-500">10.240.32.13:9443</div></td>
-                                    <td class="py-4 px-6 text-cyan-400">celld-gw-01 (Active)</td>
-                                    <td class="py-4 px-6 text-slate-400">celld-gw-02 (Hot-Standby)</td>
-                                    <td class="py-4 px-6">Gen #412</td>
-                                    <td class="py-4 px-6"><span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px]">CONNECTED (Epoch 3)</span></td>
-                                    <td class="py-4 px-6 text-right">
-                                        <button onclick="triggerDrain('body-host-edge-01')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-cyan-400 rounded border border-slate-700 text-[11px] transition">Drain & Migrate</button>
-                                    </td>
-                                </tr>
-                                <tr class="hover:bg-slate-800/30 transition">
-                                    <td class="py-4 px-6 font-semibold text-slate-200">body-host-edge-02<div class="text-[10px] text-slate-500">10.240.32.14:9443</div></td>
-                                    <td class="py-4 px-6 text-cyan-400">celld-gw-02 (Active)</td>
-                                    <td class="py-4 px-6 text-slate-400">celld-gw-03 (Hot-Standby)</td>
-                                    <td class="py-4 px-6">Gen #398</td>
-                                    <td class="py-4 px-6"><span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px]">CONNECTED (Epoch 3)</span></td>
-                                    <td class="py-4 px-6 text-right">
-                                        <button onclick="triggerDrain('body-host-edge-02')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-cyan-400 rounded border border-slate-700 text-[11px] transition">Drain & Migrate</button>
-                                    </td>
-                                </tr>
-                            </tbody>
+                            <tbody id="overviewBodyHostsTbody" class="divide-y divide-slate-800/60 font-mono"></tbody>
                         </table>
                     </div>
                 </div>
             </div>
 
-            <!-- FLEET TAB -->
+            <!-- 2. FLEET, COW BRANCHES & SPOT EVACUATION TAB -->
             <div id="tab-fleet" class="space-y-6 hidden">
-                <h1 class="text-2xl font-bold tracking-tight text-white">裸金属沙箱躯体拓扑 (Body Fleet Management)</h1>
-                <p class="text-sm text-slate-400">管理端侧宿主机 Cgroups v2 统一层级资源分配与 OverlayFS 差异包快照。</p>
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h1 class="text-2xl font-bold tracking-tight text-white">裸金属沙箱躯体、CoW 分支证明与 Spot 竞价撤离 (Body Fleet, CoW &amp; Spot)</h1>
+                        <p class="text-sm text-slate-400">管理 Cgroups v2 8.0C 脉冲、Spot 竞价实例 `<50ms` 无损撤离、零信任守卫、CoW 分支树及 SLSA v1.0 供应链证明。</p>
+                    </div>
+                    <div class="flex space-x-3">
+                        <button onclick="triggerForkAndAttestBranch()" class="px-3.5 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-semibold transition">
+                            + Fork &amp; SLSA-Attest Sub-Agent Branch
+                        </button>
+                        <button onclick="triggerSpotEvacuation('body-host-edge-02')" class="px-3.5 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold transition">
+                            Evacuate Spot Host (body-host-edge-02)
+                        </button>
+                    </div>
+                </div>
+
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <div class="glass-panel p-6 rounded-xl space-y-4">
-                        <h3 class="font-semibold text-slate-200 text-sm flex items-center"><i data-lucide="cpu" class="w-4 h-4 mr-2 text-red-400"></i> Host Resource Allocator</h3>
-                        <div class="space-y-3 text-xs">
-                            <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
-                                <span class="text-slate-400">CPU Max Burst (8.0C Pulse):</span>
-                                <span class="font-mono text-emerald-400">800,000 / 100,000 us</span>
-                            </div>
-                            <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
-                                <span class="text-slate-400">Kernel PSI Pressure:</span>
-                                <span class="font-mono text-cyan-400">some avg10=0.02</span>
-                            </div>
-                            <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
-                                <span class="text-slate-400">AF_VSOCK Fastpath:</span>
-                                <span class="font-mono text-emerald-400">Active (/var/run/ansts/vsock.sock)</span>
-                            </div>
-                        </div>
+                        <h3 class="font-semibold text-slate-200 text-sm">Host Resource Allocator &amp; Spot Evacuation Status</h3>
+                        <div id="fleetAllocatorBox" class="space-y-2.5 text-xs"></div>
+                        <div id="spotEvacReportBox" class="p-3 bg-slate-900/90 rounded-lg border border-amber-500/30 text-xs font-mono text-amber-300 hidden"></div>
                     </div>
                     <div class="glass-panel p-6 rounded-xl space-y-4">
-                        <h3 class="font-semibold text-slate-200 text-sm flex items-center"><i data-lucide="shield-alert" class="w-4 h-4 mr-2 text-amber-400"></i> Preflight Gate Status</h3>
-                        <div class="bg-slate-900/80 p-4 rounded-xl border border-slate-800 font-mono text-[11px] text-slate-300 space-y-1">
-                            <div class="text-emerald-400">[PASS] ANSTS_RUNTIME_PROFILE=production</div>
-                            <div class="text-emerald-400">[PASS] Cgroups v2 unified hierarchy mounted</div>
-                            <div class="text-emerald-400">[PASS] RustFS S3 EC:4 connectivity verified</div>
-                            <div class="text-emerald-400">[PASS] TLS 1.3 SPIFFE cert bundle loaded</div>
+                        <h3 class="font-semibold text-slate-200 text-sm">Preflight Gate &amp; Zero-Trust Security Guard</h3>
+                        <div id="fleetPreflightBox" class="bg-slate-900/80 p-4 rounded-xl border border-slate-800 font-mono text-[11px] text-slate-300 space-y-1.5"></div>
+                    </div>
+                </div>
+
+                <!-- CoW Sub-Agent Branches, SLSA v1.0 Attestation & Git AST 3-Way Merger -->
+                <div class="glass-panel p-6 rounded-xl space-y-4">
+                    <div class="flex items-center justify-between">
+                        <h3 class="font-semibold text-sm text-slate-200">CoW Sub-Agent Branch Tree, Resident LSP (&lt;15ms) &amp; SLSA v1.0 Provenance</h3>
+                        <span id="astMergerBadge" class="text-xs font-mono text-emerald-400">Git 3-Way AST Symbol Merger: Clean</span>
+                    </div>
+                    <div id="cowBranchesGrid" class="grid grid-cols-1 md:grid-cols-2 gap-4 font-mono text-xs"></div>
+                </div>
+            </div>
+
+            <!-- 3. HARNESS, 256-SLOT HEATMAP, V8 FLAME GRAPH & CHAOS DRILLS TAB -->
+            <div id="tab-harness" class="space-y-6 hidden">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h1 class="text-2xl font-bold tracking-tight text-white">256 虚拟槽交互式热力图、V8 火焰图与混沌演练台 (Brain, Slots, Profiler &amp; Chaos)</h1>
+                        <p class="text-sm text-slate-400">点击任意虚拟哈希槽触发三阶段在线迁移；一键抓取 `node:inspector` 真实 V8 火焰图或执行四大混沌演练。</p>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <button onclick="triggerV8FlameGraphCapture()" class="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold transition">Capture V8 Flame Graph</button>
+                        <button onclick="triggerChaosDrillsRun()" class="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-semibold transition">Run All 4 Chaos Drills</button>
+                        <button onclick="triggerCanaryAction('advance', 'PHASE_2_CANARY_8_SLOTS')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition">Canary 8 Slots</button>
+                        <button onclick="triggerCanaryAction('rollback')" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-semibold transition">Instant Rollback (&lt;50ms)</button>
+                    </div>
+                </div>
+
+                <!-- Canary Rollout Banner -->
+                <div class="glass-panel p-4 rounded-xl flex items-center justify-between text-xs font-mono">
+                    <div>Rollout Phase: <strong id="harnessRolloutPhase" class="text-cyan-400">IDLE_STABLE</strong></div>
+                    <div>Stable / Canary: <span id="harnessVersionPair" class="text-emerald-400">v2.6.0 / v2.6.1-canary</span></div>
+                    <div>Topology Epoch: <span id="harnessTopoEpoch" class="text-amber-400">Epoch #1</span></div>
+                </div>
+
+                <!-- 16x16 (256-Slot) Interactive Virtual Hash Slot Matrix Heatmap -->
+                <div class="glass-panel p-5 rounded-xl space-y-3">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <h3 class="font-semibold text-sm text-slate-200">16×16 (256 Virtual Hash Slots) Sovereignty &amp; Shard Heatmap</h3>
+                            <p class="text-[11px] text-slate-400">点击任意槽位立即执行 `DRAINING -> SNAPSHOT_TRANSFERRED -> CUTOVER` 三阶段在线迁移。</p>
+                        </div>
+                        <div class="flex items-center space-x-4 text-[11px] font-mono">
+                            <span class="flex items-center"><span class="w-2.5 h-2.5 rounded-sm bg-cyan-500/70 inline-block mr-1.5"></span>0..127 GLOBAL</span>
+                            <span class="flex items-center"><span class="w-2.5 h-2.5 rounded-sm bg-indigo-500/70 inline-block mr-1.5"></span>128..191 APAC_PDPA</span>
+                            <span class="flex items-center"><span class="w-2.5 h-2.5 rounded-sm bg-emerald-500/70 inline-block mr-1.5"></span>192..255 EU_GDPR</span>
+                        </div>
+                    </div>
+                    <div id="slotsHeatmapGrid" class="grid grid-cols-16 gap-1 font-mono text-[9px]" style="grid-template-columns: repeat(16, minmax(0, 1fr));"></div>
+                </div>
+
+                <!-- Live V8 Flame Graph Visualizer & Chaos Drill Results -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="glass-panel p-5 rounded-xl space-y-3">
+                        <div class="flex items-center justify-between">
+                            <h3 class="font-semibold text-sm text-slate-200">Live V8 Inspector CPU Flame Graph (.collapsed)</h3>
+                            <span id="flameGraphMetaBadge" class="text-[11px] font-mono text-amber-400">Overhead &lt; 1%</span>
+                        </div>
+                        <div id="flameGraphBarsContainer" class="space-y-1.5 font-mono text-[11px] text-slate-200">
+                            <div class="text-slate-500">Click "Capture V8 Flame Graph" to sample live V8 Isolate call frames via node:inspector.</div>
+                        </div>
+                    </div>
+                    <div class="glass-panel p-5 rounded-xl space-y-3">
+                        <div class="flex items-center justify-between">
+                            <h3 class="font-semibold text-sm text-slate-200">Production Chaos Engineering Drills (4 Fault Domains)</h3>
+                            <span id="chaosSummaryBadge" class="text-[11px] font-mono text-purple-400">Ready</span>
+                        </div>
+                        <div id="chaosDrillsContainer" class="space-y-2 font-mono text-[11px]">
+                            <div class="text-slate-500">Click "Run All 4 Chaos Drills" to verify Gateway Blackhole, RustFS EC:4, Canary Rollback &amp; Collector Outage recovery.</div>
                         </div>
                     </div>
                 </div>
-            </div>
 
-            <!-- HARNESS TAB -->
-            <div id="tab-harness" class="space-y-6 hidden">
-                <h1 class="text-2xl font-bold tracking-tight text-white">大模型会话调度中心 (Agent Harness Cells)</h1>
-                <p class="text-sm text-slate-400">Celld Durable Object 单元、DurableObjectFacetSupervisor 与时间旅行重播器控制面板。</p>
-                <div class="glass-panel p-6 rounded-xl">
-                    <div class="text-xs font-mono text-slate-400 mb-4">Active Cell State: <span class="text-cyan-400">AgentTaskHarnessCell_#task-prod-101</span></div>
-                    <div class="p-4 bg-slate-900 rounded-xl border border-slate-800 text-xs font-mono space-y-2">
-                        <div class="flex justify-between"><span>Heap Usage:</span> <span class="text-emerald-400">42.8 MB / 128 MB (Safe)</span></div>
-                        <div class="flex justify-between"><span>SQLite State:</span> <span class="text-cyan-400">Synced (RPO=0 Bucket Archive)</span></div>
-                        <div class="flex justify-between"><span>Active Fence:</span> <span class="text-amber-400">Epoch 3, TurnSeq 14</span></div>
+                <!-- 256-Slot Scheduler Shard Matrix Table -->
+                <div class="glass-panel rounded-xl overflow-hidden">
+                    <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
+                        <span class="font-semibold text-sm text-slate-200">SchedulerShard Summary Matrix</span>
+                        <input id="shardFilterInput" oninput="renderShardsTable()" type="text" placeholder="Filter shardId..." class="bg-slate-900 border border-slate-700 px-3 py-1 text-xs rounded-lg text-slate-200">
                     </div>
+                    <table class="w-full text-left border-collapse text-xs font-mono">
+                        <thead>
+                            <tr class="bg-slate-900/60 text-slate-400 border-b border-slate-800">
+                                <th class="py-3 px-6">Shard ID</th>
+                                <th class="py-3 px-6">Host Brain Node</th>
+                                <th class="py-3 px-6">Assigned Virtual Slots</th>
+                                <th class="py-3 px-6">Queued / In-Flight</th>
+                                <th class="py-3 px-6">EWMA Latency</th>
+                                <th class="py-3 px-6">Status / Epoch</th>
+                            </tr>
+                        </thead>
+                        <tbody id="harnessShardsTbody" class="divide-y divide-slate-800/60"></tbody>
+                    </table>
                 </div>
+
+                <!-- Active AgentTaskHarnessCell Instances -->
+                <div id="harnessCellsContainer" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
             </div>
 
-            <!-- TUNNELS TAB -->
+            <!-- 4. TUNNELS TAB -->
             <div id="tab-tunnels" class="space-y-6 hidden">
                 <h1 class="text-2xl font-bold tracking-tight text-white">mTLS 双归属隧道与动态路由 (Edge Tunnel HA)</h1>
-                <p class="text-sm text-slate-400">管理反向代理集群与边缘 NodeDaemon 之间的 HTTP/2 多路复用隧道和自动故障转移。</p>
+                <p class="text-sm text-slate-400">管理反向代理集群与边缘 NodeDaemon 之间的 HTTP/2 多路复用隧道和 Make-Before-Break 平滑排水。</p>
                 <div class="glass-panel p-6 rounded-xl space-y-4">
                     <div class="flex items-center justify-between">
                         <span class="text-xs font-semibold text-slate-300 uppercase tracking-wider">Gateway Instances</span>
-                        <span class="text-xs text-emerald-400">3 / 3 Healthy</span>
+                        <span id="tunnelsHealthySummary" class="text-xs text-emerald-400 font-mono">3 / 3 Healthy</span>
                     </div>
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 font-mono text-xs">
-                        <div class="p-4 bg-slate-900 rounded-xl border border-cyan-500/30">
-                            <div class="font-bold text-cyan-400 mb-1">celld-gw-01</div>
-                            <div class="text-[11px] text-slate-400">10.240.16.11:9444</div>
-                            <div class="mt-3 pt-3 border-t border-slate-800 text-emerald-400 text-[10px]">Status: Active Primary</div>
-                        </div>
-                        <div class="p-4 bg-slate-900 rounded-xl border border-slate-700">
-                            <div class="font-bold text-slate-200 mb-1">celld-gw-02</div>
-                            <div class="text-[11px] text-slate-400">10.240.16.12:9444</div>
-                            <div class="mt-3 pt-3 border-t border-slate-800 text-cyan-400 text-[10px]">Status: Hot Standby</div>
-                        </div>
-                        <div class="p-4 bg-slate-900 rounded-xl border border-slate-700">
-                            <div class="font-bold text-slate-200 mb-1">celld-gw-03</div>
-                            <div class="text-[11px] text-slate-400">10.240.16.13:9444</div>
-                            <div class="mt-3 pt-3 border-t border-slate-800 text-cyan-400 text-[10px]">Status: Hot Standby</div>
-                        </div>
-                    </div>
+                    <div id="tunnelsGatewayGrid" class="grid grid-cols-1 md:grid-cols-3 gap-4 font-mono text-xs"></div>
                 </div>
             </div>
 
-            <!-- WAL TAB -->
+            <!-- 5. WAL, HITL APPROVAL GATE & TIME-TRAVEL DEBUGGER TAB -->
             <div id="tab-wal" class="space-y-6 hidden">
-                <h1 class="text-2xl font-bold tracking-tight text-white">回合预写日志与断线增量恢复 (TurnWAL & Catch-up)</h1>
-                <p class="text-sm text-slate-400">通过 Last-Event-ID / turn_seq 游标在 Stream 中断后无缝重放丢失的 Message 事件。</p>
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h1 class="text-2xl font-bold tracking-tight text-white">TurnWAL 预写日志、`STAGED_COMMIT` 人工审批门禁与时间旅行分叉 (WAL, HITL &amp; Time-Travel)</h1>
+                        <p class="text-sm text-slate-400">审批高危工具副作用请求（`StagingCommitAndApprovalGate`），或从任意历史 Turn 零 Token 重放并派生新 CoW 分支。</p>
+                    </div>
+                    <button onclick="triggerHitlDecision('stage_new')" class="px-3.5 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold transition">
+                        + Stage High-Risk Tool Call
+                    </button>
+                </div>
+
+                <!-- STAGED_COMMIT HITL Approval Gate Panel -->
                 <div class="glass-panel p-6 rounded-xl space-y-4">
-                    <div class="text-xs font-mono text-slate-300">Simulate Reconnection & Incremental Catch-up:</div>
-                    <div class="flex space-x-3">
-                        <input type="number" id="lastSeenSeq" value="14" class="bg-slate-900 border border-slate-700 px-3 py-2 text-xs rounded-lg text-slate-200 w-36 font-mono">
+                    <div class="flex items-center justify-between">
+                        <h3 class="font-semibold text-sm text-amber-300">Human-in-the-Loop (HITL) STAGED_COMMIT Approval Queue</h3>
+                        <span id="hitlCommittedBadge" class="text-xs font-mono text-emerald-400">Committed Production Ledger: 0</span>
+                    </div>
+                    <div id="hitlPendingContainer" class="space-y-3 font-mono text-xs"></div>
+                </div>
+
+                <!-- TurnWAL Timeline & Zero-Token Time-Travel Branch Forker -->
+                <div class="glass-panel p-6 rounded-xl space-y-4">
+                    <h3 class="font-semibold text-sm text-slate-200">TurnWAL Timeline &amp; Deterministic Time-Travel Branch Forker (0 Tokens Billed)</h3>
+                    <div id="timeTravelTimelineContainer" class="space-y-2 font-mono text-xs"></div>
+                </div>
+
+                <!-- Incremental Catch-up Simulator -->
+                <div class="glass-panel p-6 rounded-xl space-y-4">
+                    <div class="text-xs font-mono text-slate-300">Execute Real Disk-Backed TurnWAL Incremental Catch-up (`O_CREAT|O_EXCL`):</div>
+                    <div class="flex flex-wrap items-center gap-3">
+                        <input type="text" id="walTaskIdInput" value="task-prod-101" placeholder="Task ID" class="bg-slate-900 border border-slate-700 px-3 py-2 text-xs rounded-lg text-slate-200 w-48 font-mono">
+                        <input type="number" id="lastSeenSeq" value="14" class="bg-slate-900 border border-slate-700 px-3 py-2 text-xs rounded-lg text-slate-200 w-32 font-mono">
                         <button onclick="simulateReplay()" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-semibold transition">Fetch Missed TurnWAL Frames</button>
                     </div>
-                    <div id="replayResult" class="p-4 bg-slate-900 rounded-xl border border-slate-800 text-xs font-mono text-slate-400 hidden">
-                        <!-- Dynamic output -->
-                    </div>
+                    <div id="replayResult" class="p-4 bg-slate-900 rounded-xl border border-slate-800 text-xs font-mono text-slate-300 hidden whitespace-pre-wrap"></div>
                 </div>
+            </div>
+
+            <!-- 6. SHADOW EVAL LAB TAB -->
+            <div id="tab-shadow" class="space-y-6 hidden">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <h1 class="text-2xl font-bold tracking-tight text-white">无副作用影子回放与模型评测实验室 (Shadow Traffic Replay Lab)</h1>
+                        <p class="text-sm text-slate-400">通过真实 `PrefixCacheAffinityRouter` 与 `SyntacticAndVelocityBreaker` 在只读沙箱中对比候选模型与基线模型。</p>
+                    </div>
+                    <button onclick="triggerShadowEvalRun()" class="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-semibold transition">
+                        + Run Shadow Replay Eval
+                    </button>
+                </div>
+                <div id="shadowScorecardsContainer" class="space-y-4"></div>
             </div>
 
         </main>
@@ -282,7 +392,41 @@
     <script>
         lucide.createIcons();
 
+        const urlParams = new URLSearchParams(window.location.search);
+        const consoleStore = {
+            currentRegion: urlParams.get('region') || 'us-west-2',
+            activeTab: urlParams.get('tab') || 'overview',
+            lastRenderedCasGen: '',
+            overviewData: null,
+            finopsData: null,
+            fleetData: null,
+            cowAstData: null,
+            harnessData: null,
+            slotsHeatmapData: null,
+            tunnelsData: null,
+            hitlTimeTravelData: null,
+            shadowData: null,
+        };
+
+        document.getElementById('regionSelect').value = consoleStore.currentRegion;
+
+        function syncUrlSearchParams() {
+            const url = new URL(window.location.href);
+            url.searchParams.set('tab', consoleStore.activeTab);
+            url.searchParams.set('region', consoleStore.currentRegion);
+            window.history.replaceState({}, '', url.toString());
+        }
+
+        function showToast(msg) {
+            const banner = document.getElementById('toastBanner');
+            const text = document.getElementById('toastMessage');
+            text.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            banner.classList.remove('hidden');
+        }
+
         function switchTab(tabId) {
+            consoleStore.activeTab = tabId;
+            syncUrlSearchParams();
             document.querySelectorAll('.tab-btn').forEach(btn => {
                 btn.className = "tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition text-slate-400 hover:text-slate-200 hover:bg-slate-800/50";
             });
@@ -291,35 +435,567 @@
                 activeBtn.className = "tab-btn w-full flex items-center space-x-3 px-3 py-2.5 rounded-lg text-sm font-medium transition bg-cyan-500/10 text-cyan-400 border border-cyan-500/20";
             }
 
-            ['overview', 'fleet', 'harness', 'tunnels', 'wal'].forEach(id => {
+            ['overview', 'fleet', 'harness', 'tunnels', 'wal', 'shadow'].forEach(id => {
                 const el = document.getElementById('tab-' + id);
                 if (el) el.classList.add('hidden');
             });
             const target = document.getElementById('tab-' + tabId);
             if (target) target.classList.remove('hidden');
+
+            refreshData(false, true);
         }
 
-        function refreshData() {
-            alert("ANSTS v2.3 cluster state synchronized successfully via S3 CAS topology.");
+        function onRegionChange(newRegion) {
+            consoleStore.currentRegion = newRegion;
+            syncUrlSearchParams();
+            refreshData(true, true);
         }
 
-        function triggerDrain(hostId) {
-            if(confirm(`Initiate Make-Before-Break graceful drain & migrate for ${hostId}?`)) {
-                alert(`Make-Before-Break drain notice dispatched successfully for ${hostId}. Zero packet loss ensured.`);
+        async function refreshData(showNotification = false, forceRender = false) {
+            try {
+                const ovRes = await fetch(`/v1beta1/console/overview?region=${encodeURIComponent(consoleStore.currentRegion)}`);
+                if (ovRes.ok) {
+                    consoleStore.overviewData = await ovRes.json();
+                }
+                const casGen = consoleStore.overviewData?.s3CasGeneration || '';
+                const casChanged = casGen !== consoleStore.lastRenderedCasGen;
+
+                if (forceRender || casChanged) {
+                    consoleStore.lastRenderedCasGen = casGen;
+                    renderOverviewHeaderAndKpis();
+
+                    if (consoleStore.activeTab === 'overview') {
+                        const foRes = await fetch('/v1beta1/console/finops-wdrf');
+                        if (foRes.ok) consoleStore.finopsData = await foRes.json();
+                        renderOverviewTab();
+                    } else if (consoleStore.activeTab === 'fleet') {
+                        const [flRes, caRes] = await Promise.all([
+                            fetch('/v1beta1/console/fleet'),
+                            fetch('/v1beta1/console/cow-ast'),
+                        ]);
+                        if (flRes.ok) consoleStore.fleetData = await flRes.json();
+                        if (caRes.ok) consoleStore.cowAstData = await caRes.json();
+                        renderFleetTab();
+                    } else if (consoleStore.activeTab === 'harness') {
+                        const [haRes, hmRes] = await Promise.all([
+                            fetch('/v1beta1/console/harness'),
+                            fetch('/v1beta1/console/slots-heatmap'),
+                        ]);
+                        if (haRes.ok) consoleStore.harnessData = await haRes.json();
+                        if (hmRes.ok) consoleStore.slotsHeatmapData = await hmRes.json();
+                        renderHarnessTab();
+                    } else if (consoleStore.activeTab === 'tunnels') {
+                        const tuRes = await fetch('/v1beta1/console/tunnels');
+                        if (tuRes.ok) consoleStore.tunnelsData = await tuRes.json();
+                        renderTunnelsTab();
+                    } else if (consoleStore.activeTab === 'wal') {
+                        const htRes = await fetch('/v1beta1/console/hitl-timetravel');
+                        if (htRes.ok) consoleStore.hitlTimeTravelData = await htRes.json();
+                        renderWalAndHitlTab();
+                    } else if (consoleStore.activeTab === 'shadow') {
+                        const shRes = await fetch('/v1beta1/console/shadow-lab');
+                        if (shRes.ok) consoleStore.shadowData = await shRes.json();
+                        renderShadowTab();
+                    }
+                }
+
+                document.getElementById('syncIndicator').textContent = `Synced: ${new Date().toLocaleTimeString()} (${casGen})`;
+                if (showNotification) {
+                    showToast(`Synchronized state (Region: ${consoleStore.overviewData?.selectedRegion}, CAS: ${casGen}).`);
+                }
+            } catch (err) {
+                document.getElementById('syncIndicator').textContent = 'Sync Offline (Retrying...)';
             }
         }
 
-        function simulateReplay() {
-            const seq = document.getElementById('lastSeenSeq').value;
+        function renderOverviewHeaderAndKpis() {
+            const ov = consoleStore.overviewData;
+            if (!ov) return;
+            document.getElementById('clusterHealthLabel').textContent = ov.clusterHealthy ? 'Healthy (RPO=0)' : 'Degraded';
+            document.getElementById('sidebarCasGen').textContent = ov.s3CasGeneration;
+            document.getElementById('sidebarActiveSessions').textContent = (ov.activeSessionsCount || 1).toLocaleString();
+            document.getElementById('sidebarRoutedRegion').textContent = ov.selectedRegion;
+            document.getElementById('sidebarVersion').textContent = ov.version;
+            document.getElementById('navHitlBadge').textContent = String(ov.pendingHitlApprovalsCount ?? 0);
+
+            document.getElementById('kpiActiveSandboxes').textContent = `${ov.sandboxes.active} / ${ov.sandboxes.limit}`;
+            document.getElementById('kpiGlobalUptime').textContent = `${ov.globalUptimePct}%`;
+            document.getElementById('kpiEc4Drives').textContent = `RustFS EC:4 (${ov.storageEc4?.healthyDrives ?? 12}/${ov.storageEc4?.totalDrives ?? 12} Drives OK)`;
+            document.getElementById('kpiMtlsRtt').textContent = `${ov.averageMtlsRttMs}ms`;
+            document.getElementById('kpiWalCheckpoints').textContent = (ov.turnWalCheckpointsCount ?? 0).toLocaleString();
+        }
+
+        function renderOverviewTab() {
+            renderBodyHostsTable();
+            const fo = consoleStore.finopsData;
+            if (!fo) return;
+
+            document.getElementById('overviewWdrfBars').innerHTML = (fo.wdrfDimensions || []).map(d => `
+                <div>
+                    <div class="flex justify-between text-[11px] mb-1">
+                        <span class="text-slate-300">${d.dimension}</span>
+                        <span class="text-cyan-400">Dominant: ${d.dominantSharePct}% (P50 Soft: ${d.p50SoftReservePct}%)</span>
+                    </div>
+                    <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                        <div class="h-full bg-gradient-to-r from-cyan-500 to-blue-500" style="width: ${d.dominantSharePct}%"></div>
+                    </div>
+                </div>
+            `).join('');
+
+            document.getElementById('overviewFinopsRows').innerHTML = (fo.tenantBudgets || []).map(b => `
+                <div class="p-3 bg-slate-900/70 rounded-lg border border-slate-800 flex items-center justify-between">
+                    <div>
+                        <div class="font-semibold text-slate-200">${b.tenantId}</div>
+                        <div class="text-[10px] text-slate-400">Model: $${b.spentModelUsd} | Sandbox: $${b.spentSandboxUsd}</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-emerald-400 font-bold">$${b.totalSpentUsd} / $${b.dailyHardCapUsd} (${b.utilizationPct}%)</div>
+                        <div class="text-[10px] text-slate-500">${b.hardCapTripped ? 'HARD_CAP_DRAINING' : 'ADMISSION_OK'}</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderBodyHostsTable() {
+            const ov = consoleStore.overviewData;
+            if (!ov || !Array.isArray(ov.bodyHostRows)) return;
+            const filterText = (document.getElementById('hostFilterInput')?.value || '').trim().toLowerCase();
+            const rows = ov.bodyHostRows.filter(r =>
+                !filterText ||
+                r.hostId.toLowerCase().includes(filterText) ||
+                r.primaryGateway.toLowerCase().includes(filterText) ||
+                (r.pricingTier || '').toLowerCase().includes(filterText)
+            );
+
+            document.getElementById('overviewBodyHostsTbody').innerHTML = rows.map(r => `
+                <tr class="hover:bg-slate-800/30 transition">
+                    <td class="py-4 px-6 font-semibold text-slate-200">
+                        ${r.hostId}
+                        <span class="ml-2 px-1.5 py-0.5 rounded text-[9px] ${r.pricingTier === 'SPOT_PREEMPTIBLE' ? 'bg-amber-500/20 text-amber-300' : 'bg-sky-500/20 text-sky-300'}">${r.pricingTier} ($${r.hourlyCostUsd}/h)</span>
+                        <div class="text-[10px] text-slate-500">${r.ipAddress}</div>
+                    </td>
+                    <td class="py-4 px-6 text-cyan-400">${r.primaryGateway} (Primary)</td>
+                    <td class="py-4 px-6 text-slate-400">${r.secondaryGateway} (Standby)</td>
+                    <td class="py-4 px-6">Gen #${r.connGeneration}</td>
+                    <td class="py-4 px-6"><span class="px-2 py-0.5 rounded ${r.status === 'CORDONED' ? 'bg-rose-500/15 text-rose-300 border-rose-500/30' : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'} border text-[10px]">${r.status} (Ep ${r.epoch})</span></td>
+                    <td class="py-4 px-6 text-right space-x-1">
+                        <button onclick="triggerDrain('${r.hostId}')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-cyan-400 rounded border border-slate-700 text-[11px] transition">Drain &amp; Migrate</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function renderFleetTab() {
+            const fl = consoleStore.fleetData;
+            if (!fl) return;
+            const alloc = fl.hostAllocator;
+            document.getElementById('fleetAllocatorBox').innerHTML = `
+                <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+                    <span class="text-slate-400">CPU Max Burst (8.0C Pulse):</span>
+                    <span class="font-mono text-emerald-400">${alloc.cpuMaxBurstUs}</span>
+                </div>
+                <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+                    <span class="text-slate-400">AF_VSOCK Ephemeral Credential Proxy:</span>
+                    <span class="font-mono text-emerald-400">${alloc.afVsockFastpath}</span>
+                </div>
+                <div class="flex justify-between bg-slate-900/60 p-3 rounded-lg border border-slate-800">
+                    <span class="text-slate-400">Live Measured CoW Branch Fork Latency:</span>
+                    <span class="font-mono text-amber-400">${alloc.cowForkSlaMs} ms (&lt; 80ms SLA)</span>
+                </div>
+            `;
+
+            if (fl.lastSpotEvacuationReport) {
+                const rep = fl.lastSpotEvacuationReport;
+                const box = document.getElementById('spotEvacReportBox');
+                box.classList.remove('hidden');
+                box.innerHTML = `[SPOT EVACUATED] Host ${rep.evictedSpotHostId} -> ${rep.targetOnDemandHostIds.join(', ')} | Migrated ${rep.migratedSandboxesCount} sandboxes in ${rep.totalEvacuationLatencyMs}ms (Fence Epoch +1)`;
+            }
+
+            document.getElementById('fleetPreflightBox').innerHTML = (fl.preflightChecks || []).map(c =>
+                `<div class="${c.passed ? 'text-emerald-400' : 'text-rose-400'}">[${c.passed ? 'PASS' : 'FAIL'}] ${c.check}</div>`
+            ).join('') + `<div class="pt-2 border-t border-slate-800 text-cyan-300">Zero-Trust Frozen Sandboxes: ${(fl.zeroTrustStatus?.frozenSandboxes || []).length} | Active VSOCK Tokens: ${fl.zeroTrustStatus?.issuedEphemeralTokensCount ?? 0}</div>`;
+
+            const ca = consoleStore.cowAstData;
+            if (ca) {
+                document.getElementById('astMergerBadge').textContent = ca.astMergePreview?.mergedCleanly
+                    ? `Git 3-Way AST Merger: Auto-Merged (${(ca.astMergePreview.autoResolvedSymbolConflicts || []).join(', ')})`
+                    : 'Git AST Conflict Detected';
+                document.getElementById('cowBranchesGrid').innerHTML = (ca.attestedBranches || []).map(b => `
+                    <div class="p-4 bg-slate-900 rounded-xl border border-slate-800 space-y-1.5">
+                        <div class="flex justify-between">
+                            <span class="font-bold text-cyan-400">${b.branchId}</span>
+                            <span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 text-[10px]">SLSA v1.0 Verified: ${b.slsaVerified}</span>
+                        </div>
+                        <div class="text-slate-400 text-[11px]">Fork: ${b.forkLatencyMs}ms | Resident LSP Check: ${b.lspLookupLatencyMs}ms (Errors: ${b.lspDiagnosticsCount})</div>
+                        <div class="text-slate-500 text-[10px] truncate">SPIFFE Sig: ${b.attestation?.signature}</div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        function renderHarnessTab() {
+            const ha = consoleStore.harnessData;
+            if (!ha) return;
+            document.getElementById('harnessRolloutPhase').textContent = ha.rolloutPhase;
+            document.getElementById('harnessVersionPair').textContent = `${ha.stableVersion} / ${ha.canaryVersion}`;
+            document.getElementById('harnessTopoEpoch').textContent = `Epoch #${ha.topologyEpoch}`;
+
+            renderSlotsHeatmap();
+            renderShardsTable();
+            renderFlameGraphBox(ha.latestFlameGraph);
+            renderChaosReportsBox(ha.latestChaosReports);
+
+            document.getElementById('harnessCellsContainer').innerHTML = (ha.activeHarnessCells || []).map(c => `
+                <div class="glass-panel p-5 rounded-xl space-y-2">
+                    <div class="text-xs font-mono text-slate-400">Cell: <span class="text-cyan-400 font-semibold">${c.cellId}</span> (${c.ownerBrainNode})</div>
+                    <div class="p-3 bg-slate-900 rounded-lg border border-slate-800 text-xs font-mono space-y-1.5">
+                        <div class="flex justify-between"><span>Heap Usage:</span> <span class="text-emerald-400">${c.heapUsedMb} MB / ${c.heapLimitMb} MB</span></div>
+                        <div class="flex justify-between"><span>SQLite State:</span> <span class="text-cyan-400">${c.sqliteState}</span></div>
+                        <div class="flex justify-between"><span>Active Fence:</span> <span class="text-amber-400">Epoch ${c.fenceEpoch}, TurnSeq ${c.fenceTurnSeq}</span></div>
+                        <div class="flex justify-between"><span>Model &amp; KV-Cache:</span> <span class="text-indigo-400">${c.routedModelPool} (Hit: ${c.kvCacheHit})</span></div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderSlotsHeatmap() {
+            const hm = consoleStore.slotsHeatmapData;
+            if (!hm || !Array.isArray(hm.cells)) return;
+            const grid = document.getElementById('slotsHeatmapGrid');
+            grid.innerHTML = hm.cells.map(c => {
+                const bg = c.complianceRegime === 'EU_GDPR_STRICT'
+                    ? 'bg-emerald-500/30 border-emerald-500/50 text-emerald-200'
+                    : c.complianceRegime === 'APAC_PDPA_STRICT'
+                        ? 'bg-indigo-500/30 border-indigo-500/50 text-indigo-200'
+                        : 'bg-cyan-500/25 border-cyan-500/40 text-cyan-200';
+                const nextShard = c.ownerShardId === 'scheduler-shard-00' ? 'scheduler-shard-01' : 'scheduler-shard-00';
+                return `<button onclick="triggerSlotMigrate(${c.slotIndex}, '${nextShard}')" title="Slot #${c.slotIndex} | Owner: ${c.ownerShardId} | Ep: ${c.epoch} | Regime: ${c.complianceRegime} (${c.pinnedRegion})" class="slot-cell py-1 rounded border text-center ${bg}">${c.slotIndex}</button>`;
+            }).join('');
+        }
+
+        function renderFlameGraphBox(prof) {
+            if (!prof || !Array.isArray(prof.hotspots)) return;
+            document.getElementById('flameGraphMetaBadge').textContent = `${prof.profileId} | Overhead: ${prof.samplingOverheadPct}% (${prof.captureWallTimeMs}ms)`;
+            document.getElementById('flameGraphBarsContainer').innerHTML = prof.hotspots.slice(0, 6).map(h => `
+                <div class="space-y-0.5">
+                    <div class="flex justify-between text-[10px]">
+                        <span class="truncate max-w-md text-amber-200">${h.stack}</span>
+                        <span class="text-amber-400">${h.sampleCount} hits (${h.sharePct}%)</span>
+                    </div>
+                    <div class="w-full bg-slate-900 h-3 rounded overflow-hidden">
+                        <div class="bg-gradient-to-r from-amber-500 to-rose-500 h-full" style="width: ${Math.max(8, h.sharePct)}%"></div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderChaosReportsBox(reports) {
+            if (!Array.isArray(reports) || reports.length === 0) return;
+            document.getElementById('chaosSummaryBadge').textContent = `${reports.filter(r => r.passed).length}/${reports.length} Drills Passed`;
+            document.getElementById('chaosDrillsContainer').innerHTML = reports.map(r => `
+                <div class="p-2.5 bg-slate-900 rounded-lg border border-slate-800 flex items-center justify-between">
+                    <div>
+                        <div class="text-slate-200 font-semibold">${r.drillId}</div>
+                        <div class="text-[10px] text-slate-400">RTO: ${r.recoveryLatencyMs}ms | RPO=0: ${r.rpoZeroVerified} | W3C Trace: ${r.traceContinuityVerified}</div>
+                    </div>
+                    <span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px]">${r.passed ? 'PASS' : 'FAIL'}</span>
+                </div>
+            `).join('');
+        }
+
+        function renderShardsTable() {
+            const ha = consoleStore.harnessData;
+            if (!ha || !Array.isArray(ha.shards)) return;
+            const q = (document.getElementById('shardFilterInput')?.value || '').trim().toLowerCase();
+            const filtered = ha.shards.filter(s => !q || s.shardId.toLowerCase().includes(q) || s.hostBrainNodeId.toLowerCase().includes(q));
+            document.getElementById('harnessShardsTbody').innerHTML = filtered.map(s => `
+                <tr class="hover:bg-slate-800/30 transition">
+                    <td class="py-3 px-6 text-cyan-400 font-semibold">${s.shardId}</td>
+                    <td class="py-3 px-6 text-slate-200">${s.hostBrainNodeId}</td>
+                    <td class="py-3 px-6 text-slate-400">Slots ${s.assignedSlots}</td>
+                    <td class="py-3 px-6 text-emerald-400">${s.inFlightRequests} active</td>
+                    <td class="py-3 px-6">${s.ewmaLatencyMs} ms</td>
+                    <td class="py-3 px-6"><span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px]">${s.status} (Ep ${s.epoch})</span></td>
+                </tr>
+            `).join('');
+        }
+
+        function renderTunnelsTab() {
+            const tu = consoleStore.tunnelsData;
+            if (!tu) return;
+            document.getElementById('tunnelsHealthySummary').textContent = `${tu.healthyCount} / ${tu.totalCount} Healthy`;
+            document.getElementById('tunnelsGatewayGrid').innerHTML = (tu.gateways || []).map(gw => `
+                <div class="p-4 bg-slate-900 rounded-xl border ${gw.draining ? 'border-amber-500/50' : 'border-cyan-500/30'} space-y-2">
+                    <div class="flex items-center justify-between">
+                        <span class="font-bold text-cyan-400">${gw.gatewayId}</span>
+                        <span class="text-[10px] px-2 py-0.5 rounded ${gw.draining ? 'bg-amber-500/20 text-amber-300' : 'bg-emerald-500/20 text-emerald-300'}">${gw.roleLabel}</span>
+                    </div>
+                    <div class="text-[11px] text-slate-400 truncate">${gw.internalRelayUrl}</div>
+                    <div class="text-[11px] text-slate-300">Active Daemon Streams: <strong>${gw.activeStreamsCount}</strong></div>
+                    <div class="pt-2 border-t border-slate-800 flex justify-end">
+                        <button onclick="triggerDrain('${gw.gatewayId}')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-cyan-400 rounded border border-slate-700 text-[10px]">Make-Before-Break Drain</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderWalAndHitlTab() {
+            const ht = consoleStore.hitlTimeTravelData;
+            if (!ht) return;
+            document.getElementById('hitlCommittedBadge').textContent = `Committed Production Ledger: ${ht.committedLedgerCount}`;
+
+            const pending = ht.pendingStagedItems || [];
+            document.getElementById('hitlPendingContainer').innerHTML = pending.length === 0
+                ? '<div class="text-slate-500">No pending STAGED_COMMIT tool calls waiting for human approval.</div>'
+                : pending.map(p => `
+                    <div class="p-4 bg-slate-900 rounded-xl border border-amber-500/40 flex items-center justify-between">
+                        <div>
+                            <div class="text-amber-300 font-bold">Task: ${p.taskId} | Tool: ${p.toolName} (Fence Ep ${p.epoch}, Turn #${p.turnSeq})</div>
+                            <div class="text-slate-400 text-[11px] mt-1">Payload: ${p.payload}</div>
+                        </div>
+                        <div class="flex space-x-2">
+                            <button onclick="triggerHitlDecision('approve', '${p.taskId}')" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold">Approve &amp; Commit</button>
+                            <button onclick="triggerHitlDecision('reject', '${p.taskId}')" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-semibold">Reject &amp; Rollback</button>
+                        </div>
+                    </div>
+                `).join('');
+
+            document.getElementById('timeTravelTimelineContainer').innerHTML = (ht.walTimeline || []).map(f => `
+                <div class="p-3 bg-slate-900 rounded-lg border border-slate-800 flex items-center justify-between">
+                    <div>
+                        <span class="text-cyan-400 font-bold">Turn #${f.turnSeq}</span>
+                        <span class="text-slate-400 ml-2">(Epoch ${f.epoch} | State: ${f.state} | Merkle: ${f.workspaceMerkleHash?.slice(0, 12)})</span>
+                        <div class="text-[11px] text-slate-300 mt-0.5">${f.diffSnapshot}</div>
+                    </div>
+                    <button onclick="triggerTimeTravelFork('${ht.taskId}', ${f.turnSeq})" class="px-3 py-1 bg-indigo-600/80 hover:bg-indigo-500 text-white rounded text-[11px]">Fork From Turn #${f.turnSeq}</button>
+                </div>
+            `).join('');
+        }
+
+        function renderShadowTab() {
+            const sh = consoleStore.shadowData;
+            if (!sh || !Array.isArray(sh.scorecards)) return;
+            const box = document.getElementById('shadowScorecardsContainer');
+            box.innerHTML = sh.scorecards.map(sc => `
+                <div class="glass-panel p-5 rounded-xl space-y-3 font-mono text-xs">
+                    <div class="flex items-center justify-between border-b border-slate-800 pb-2">
+                        <div>Run ID: <strong class="text-cyan-400">${sc.evalRunId}</strong> | Task: <span class="text-white">${sc.sourceTaskId}</span> (${sc.replayedTurnsCount} Turns, Sample: ${sc.shadowTrafficSamplePct}%)</div>
+                        <span class="px-2.5 py-0.5 rounded text-[11px] ${sc.verdict === 'PROMOTE_CANDIDATE' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}">${sc.verdict}</span>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="p-3 bg-slate-900 rounded-lg border border-slate-800">
+                            <div class="text-slate-400 mb-1">Baseline Pool: <strong class="text-white">${sc.baseline.modelPool}</strong></div>
+                            <div>TTFT: ${sc.baseline.avgTtftMs}ms | Pass@1: ${sc.baseline.passAt1Rate} | Velocity V_k: ${sc.baseline.avgProgressVelocityVk} | Cost: $${sc.baseline.estimatedCostUsd}</div>
+                        </div>
+                        <div class="p-3 bg-slate-900 rounded-lg border border-cyan-500/30">
+                            <div class="text-slate-400 mb-1">Candidate Pool: <strong class="text-cyan-400">${sc.candidate.modelPool}</strong></div>
+                            <div>TTFT: ${sc.candidate.avgTtftMs}ms (${sc.deltas.ttftDeltaPct}%) | Pass@1: ${sc.candidate.passAt1Rate} | Velocity V_k: ${sc.candidate.avgProgressVelocityVk} | Cost: $${sc.candidate.estimatedCostUsd}</div>
+                        </div>
+                    </div>
+                    <div class="text-slate-300 text-[11px]">Verdict Reason: ${sc.verdictReason}</div>
+                </div>
+            `).join('');
+        }
+
+        async function triggerSlotMigrate(slotIndex, targetShardId) {
+            const res = await fetch('/v1beta1/console/slots/migrate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ slotIndex, targetShardId }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                showToast(`Migrated Virtual Slot #${slotIndex} -> ${data.targetShardId} (Epoch #${data.newEpoch}, CAS: ${data.s3CasGeneration}).`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function triggerV8FlameGraphCapture() {
+            const res = await fetch('/v1beta1/console/profiler/capture', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ isolateId: 'celld-brain-01' }),
+            });
+            if (res.ok) {
+                const prof = await res.json();
+                showToast(`Captured live V8 CPU Flame Graph ${prof.profileId} (Overhead: ${prof.samplingOverheadPct}%, Wall: ${prof.captureWallTimeMs}ms).`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function triggerChaosDrillsRun() {
+            const res = await fetch('/v1beta1/console/chaos/run', { method: 'POST' });
+            if (res.ok) {
+                const data = await res.json();
+                showToast(`Executed ${data.totalDrills} Production Chaos Drills -> All Passed: ${data.allPassed}.`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function triggerSpotEvacuation(spotHostId) {
+            const res = await fetch('/v1beta1/console/spot/evacuate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ spotHostId }),
+            });
+            if (res.ok) {
+                const rep = await res.json();
+                showToast(`Evacuated Spot Host ${rep.evictedSpotHostId} (${rep.migratedSandboxesCount} sandboxes) in ${rep.totalEvacuationLatencyMs}ms!`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function triggerForkAndAttestBranch() {
+            const res = await fetch('/v1beta1/console/cow/fork-attest', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            if (res.ok) {
+                const b = await res.json();
+                showToast(`Forked CoW branch ${b.branchId} (${b.forkLatencyMs}ms) + Resident LSP (${b.lspLookupLatencyMs}ms) + SLSA v1.0 Verified: ${b.slsaVerified}`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function triggerHitlDecision(decision, taskId = 'task-prod-101') {
+            const res = await fetch('/v1beta1/console/hitl/decide', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ taskId, decision }),
+            });
+            if (res.ok) {
+                const d = await res.json();
+                showToast(`HITL Gate action '${d.action}' executed for ${taskId} (Task State: ${d.taskState}).`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function triggerTimeTravelFork(taskId, targetTurnSeq) {
+            const res = await fetch('/v1beta1/console/timetravel/fork', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ taskId, targetTurnSeq }),
+            });
+            if (res.ok) {
+                const fk = await res.json();
+                showToast(`Time-Travel Forked ${fk.forkedTaskId} from Turn #${fk.replayedUpToTurn} (0 Tokens Billed, CoW Branch ${fk.forkedBranchId} in ${fk.forkLatencyMs}ms).`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function triggerDrain(targetId) {
+            const res = await fetch('/v1beta1/console/tunnels/drain', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ gatewayId: targetId, gracePeriodMs: 15000 }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                showToast(`Make-Before-Break drain executed on ${data.drainingGatewayId} (CAS: ${data.s3CasGeneration}).`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function triggerCanaryAction(action, targetPhase) {
+            const res = await fetch('/v1beta1/console/canary/action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action, targetPhase }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                showToast(`Canary Controller action '${action}' -> Phase: ${data.phase || data.currentPhase} (Epoch #${data.topologyEpoch}).`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function dispatchLiveDemoTask() {
+            const taskId = `task-ui-${Math.floor(1000 + Math.random() * 9000)}`;
+            const res = await fetch('/v1beta1/tasks/dispatch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    tenantId: 'fin-enterprise',
+                    taskId,
+                    repoId: 'repo-ansts-v26',
+                    promptText: 'Dispatched from Ultimate TanStack Console UI',
+                    targetBodyHostId: 'body-host-01',
+                }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                showToast(`Dispatched ${taskId} -> Shard ${data.schedulerEnvelope?.targetShardId} (Slot #${data.schedulerEnvelope?.slotIndex})`);
+                await refreshData(false, true);
+            }
+        }
+
+        async function simulateReplay() {
+            const taskId = document.getElementById('walTaskIdInput').value || 'task-prod-101';
+            const seq = Number(document.getElementById('lastSeenSeq').value || 14);
             const resBox = document.getElementById('replayResult');
             resBox.classList.remove('hidden');
-            resBox.innerHTML = `<span class="text-cyan-400">[REPLAY SUCCESS]</span> Fetched 3 missed TurnWAL frames for client (turnSeq > ${seq}):\n` +
-                `- Frame #15: { action: "REASONING_CHUNK", tokens: 128 }
-` +
-                `- Frame #16: { action: "TOOL_EXEC_PULSE", sandbox: "sbx-01" }
-` +
-                `- Frame #17: { action: "FINAL_ANSWER", status: "RESUMED" }`;
+
+            const res = await fetch('/v1beta1/console/wal/catchup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    clientId: 'console-operator-client',
+                    taskId,
+                    lastReceivedTurnSeq: seq,
+                }),
+            });
+            if (res.ok) {
+                const data = await res.json();
+                const frames = data.replayedWalFrames || [];
+                const lines = frames.map(f => `- Frame #${f.fence.turnSeq} (Epoch ${f.fence.epoch}, State ${f.state}): ${f.diffSnapshot}`);
+                resBox.innerHTML = `<span class="text-cyan-400">[REAL DISK WAL REPLAY SUCCESS]</span> Replayed ${frames.length} missed TurnWAL frames for task <strong>${taskId}</strong> (turnSeq &gt; ${seq}):\n` +
+                    (lines.length > 0 ? lines.join('\n') : 'No missed frames.');
+                await refreshData(false, true);
+            }
         }
+
+        async function triggerShadowEvalRun() {
+            const res = await fetch('/v1beta1/console/shadow-lab/run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    sourceTaskId: 'task-prod-101',
+                    baselinePool: 'DeepSeek',
+                    candidatePool: 'Qwen-3.8',
+                    shadowTrafficSamplePct: 5.0,
+                }),
+            });
+            if (res.ok) {
+                const sc = await res.json();
+                showToast(`Shadow Replay ${sc.evalRunId} -> Verdict: ${sc.verdict}`);
+                await refreshData(false, true);
+            }
+        }
+
+
+        async function triggerV27DeepTechProbe() {
+            const res = await fetch('/v1beta1/console/v27/deep-tech-probe', { method: 'POST' });
+            if (res.ok) {
+                const d = await res.json();
+                showToast(`v2.7 Probe OK -> UFFD Restore: ${d.uffd.hotPrefetchLatencyMs}ms | eBPF Freeze: ${d.ebpfLsm.processingLatencyMs}ms | Speculative Hit: 0ms | AST Saved: ${d.astRepairCache.tokensSaved} tok | Deadlock Broken: ${d.deadlockDetector.preemptedVictimTaskIds.join(',')} | GC Reclaimed: ${d.gcSweeper.reclaimedBytes}B`);
+                await refreshData(false, true);
+            }
+        }
+
+        // Connect full-duplex SSE push stream (<10ms real-time delta push)
+        try {
+            const sse = new EventSource('/v1beta1/console/events/stream');
+            sse.addEventListener('console_delta', (evt) => {
+                const data = JSON.parse(evt.data);
+                document.getElementById('syncIndicator').textContent = `SSE Push #${data.eventId}: ${data.eventType} (${data.s3CasGeneration})`;
+                refreshData(false, true);
+            });
+        } catch (_) {}
+
+        // Boot on URL-selected tab & start CAS delta-aware 3s polling
+        switchTab(consoleStore.activeTab);
+        setInterval(() => refreshData(false, false), 3000);
     </script>
 </body>
 </html>

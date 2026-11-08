@@ -126,6 +126,14 @@ export class SandboxBranchForker {
   }
 
   /**
+   * Writes a file into a forked branch (alias of `recordBranchFileMutation`, kept for the CoW branch
+   * BFF endpoint that patches a branch before computing incremental LSP diagnostics).
+   */
+  public writeFileInBranch(branchId: string, relativeFilePath: string, fileContent: string): string {
+    return this.recordBranchFileMutation(branchId, relativeFilePath, fileContent);
+  }
+
+  /**
    * Atomically copies all modified files from the winning branch's `upperDir` into the parent's
    * merged target directory and removes all sibling branch directories from disk.
    */

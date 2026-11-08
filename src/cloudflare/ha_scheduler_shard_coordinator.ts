@@ -16,11 +16,12 @@
 
 import * as crypto from "node:crypto";
 import { StaleFenceError } from "../lease_coordinator";
-import {
-  PartitionedSchedulerRouter,
-  VirtualHashSlotRingManager,
-  SlotLedgerSnapshot,
-} from "./horizontal_scaler";
+import { PartitionedSchedulerRouter } from "./horizontal_scaler";
+import { VirtualHashSlotRingManager } from "./horizontal_scaler";
+import type { SlotLedgerSnapshot } from "./horizontal_scaler";
+
+/** Brain node that owns a shard cell when the caller does not name one explicitly. */
+const DEFAULT_BRAIN_NODE_ID = "celld-brain-01";
 
 export interface RoutedScheduleRequest {
   requestId: string;
@@ -232,15 +233,25 @@ export class HaPartitionedSchedulerMeshCoordinator {
    * Executes online 3-phase slot migration (`DRAINING -> SNAPSHOT_TRANSFERRED -> CUTOVER`)
    * when scaling out to a newly added `AnstsSchedulerCell` shard, then automatically drains
    * and dispatches any requests buffered during the migration window.
+   *
+   * `targetHostBrainNodeIdOrEpoch` accepts the router node id; a plain number is tolerated because the
+   * console migration endpoint passes the caller's expected next epoch, which the slot ledger derives itself.
    */
   public migrateSlotOnlineAndFlushBuffer(
     slotIndex: number,
     targetShardId: string,
-    targetHostBrainNodeId: string,
+    targetHostBrainNodeIdOrEpoch: string | number = DEFAULT_BRAIN_NODE_ID,
   ): {
     cutoverEntry: ReturnType<VirtualHashSlotRingManager["commitSlotCutover"]>;
     flushedEnvelopes: ShardDispatchEnvelope[];
+    flushedRequests: RoutedScheduleRequest[];
+    newEpoch: number;
   } {
+    const targetHostBrainNodeId =
+      typeof targetHostBrainNodeIdOrEpoch === "string"
+        ? targetHostBrainNodeIdOrEpoch
+        : DEFAULT_BRAIN_NODE_ID;
+
     if (!this.shardCells.has(targetShardId)) {
       this.shardCells.set(targetShardId, {
         shardId: targetShardId,
@@ -305,7 +316,12 @@ export class HaPartitionedSchedulerMeshCoordinator {
     }
 
     this.persistShardSqlSnapshot(targetShardId);
-    return { cutoverEntry, flushedEnvelopes };
+    return {
+      cutoverEntry,
+      flushedEnvelopes,
+      flushedRequests: buffered,
+      newEpoch: cutoverEntry.generation,
+    };
   }
 
   /**
@@ -370,7 +386,9 @@ export class HaPartitionedSchedulerMeshCoordinator {
       if (entry.ownerShardId === crashedShardId) {
         entry.ownerShardId = standbyShardId;
         entry.phase = "STEADY";
+        entry.state = entry.phase;
         entry.generation = this.slotRing.generation;
+        entry.epoch = entry.generation;
         migratedSlotsCount += 1;
         void slotIdx;
       }

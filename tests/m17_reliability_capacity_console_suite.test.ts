@@ -8,9 +8,6 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import {
   CapacitySlaEnforcer,
   AgentStreamQueuePublisher,
@@ -99,8 +96,7 @@ test("test 61: [TASK-84] CapacitySlaEnforcer enforces Brain 128MB watermarks, Bo
 
 test("test 62: [TASK-85 & TASK-86] AgentStreamQueuePublisher persists TurnWAL frames and replays missed events on Last-Event-ID reconnect", () => {
   const sseGw = new SseEventStreamGateway();
-  // Isolated per-run WAL root: frames are create-once, so a shared root 412s on re-runs.
-  const walEngine = new TurnWalEngine(fs.mkdtempSync(path.join(os.tmpdir(), "ansts-m17-wal-")));
+  const walEngine = new TurnWalEngine();
   const publisher = new AgentStreamQueuePublisher(sseGw, walEngine);
 
   sseGw.registerClient("client-ui-01", 100);
@@ -208,10 +204,7 @@ test("test 63: [TASK-87 & TASK-88] TunnelGatewayCell heartbeat eviction, failove
     healthy: true,
     activeSessions: 410,
   });
-  const publisher = new AgentStreamQueuePublisher(
-    new SseEventStreamGateway(),
-    new TurnWalEngine(fs.mkdtempSync(path.join(os.tmpdir(), "ansts-m17-bff-wal-"))),
-  );
+  const publisher = new AgentStreamQueuePublisher(new SseEventStreamGateway(), new TurnWalEngine());
   const bff = new ConsoleBffController(haRouter, geoRouter, publisher);
 
   const overview = bff.getClusterOverview({

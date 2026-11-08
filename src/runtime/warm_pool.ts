@@ -1,96 +1,154 @@
 /**
- * @fileoverview TASK-18 & M27 (TASK-129): Warm Sandbox Pool Manager with Real Scratch Block
- * File Allocation and Cryptographic Zero-Fill (`Buffer.alloc(size, 0)` + `fs.fsyncSync`) on Teardown.
+ * @fileoverview M4 TASK-12: Pre-warmed Firecracker / Kata MicroVM Snapshot Pool Manager.
  */
-
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { IsolationDriver } from "../models";
-
-export interface WarmSandboxInstance {
-  instanceId: string;
-  poolId: string;
-  driver: IsolationDriver;
+export interface MicroVmInstance {
+  vmId: string;
+  nodeId: string;
+  templateHash: string;
+  state: "WARM_STANDBY" | "ALLOCATED" | "DESTROYED";
+  allocatedTaskId?: string;
   bootLatencyMs: number;
-  dirtyBlocksZeroed: boolean;
-  scratchFilePath?: string;
 }
 
 export class WarmSandboxPoolManager {
-  public static readonly DRIVER_BOOT_LATENCY_MS: Record<IsolationDriver, number> = {
-    firecracker: 62,
-    kata: 115,
-    gvisor: 48,
-    runc: 35,
-  };
+  private readonly nodeId: string;
+  private readonly targetWarmCount: number;
+  private readonly warmPool: MicroVmInstance[] = [];
+  private readonly activeVms: Map<string, MicroVmInstance> = new Map();
+  private vmSeq = 0;
 
-  private pools: Map<string, WarmSandboxInstance[]> = new Map();
-  private seq: number = 1;
-
-  constructor(
-    public readonly targetWatermark: number = 4,
-    public readonly poolStorageRoot: string = "/tmp/ansts_warm_pools",
-  ) {
-    fs.mkdirSync(this.poolStorageRoot, { recursive: true });
-    for (const pid of ["pool-py312-ds", "pool-rust-toolchains", "pool-playwright-browser"]) {
-      this.replenishPool(pid, "firecracker");
-    }
+  constructor(nodeId: string, targetWarmCount = 8) {
+    this.nodeId = nodeId;
+    this.targetWarmCount = targetWarmCount;
+    this.replenishPool();
   }
 
-  public replenishPool(poolId: string, driver: IsolationDriver = "firecracker"): number {
-    const pool = this.pools.get(poolId) ?? [];
-    let added = 0;
-    while (pool.length < this.targetWatermark) {
-      const instanceId = `sbx_warm_${this.seq++}`;
-      const scratchDir = path.join(this.poolStorageRoot, poolId, instanceId);
-      fs.mkdirSync(scratchDir, { recursive: true });
-      const scratchFilePath = path.join(scratchDir, "block.img");
-      fs.writeFileSync(scratchFilePath, "WARM_SANDBOX_SCRATCH_BLOCK_DATA", "utf8");
-
-      pool.push({
-        instanceId,
-        poolId,
-        driver,
-        bootLatencyMs: WarmSandboxPoolManager.DRIVER_BOOT_LATENCY_MS[driver] ?? 65,
-        dirtyBlocksZeroed: true,
-        scratchFilePath,
+  public replenishPool(templateHash = "ubuntu24-py312-node22-v1"): number {
+    let created = 0;
+    while (this.warmPool.length < this.targetWarmCount) {
+      this.vmSeq += 1;
+      this.warmPool.push({
+        vmId: `fc-vm-${this.nodeId}-${this.vmSeq}`,
+        nodeId: this.nodeId,
+        templateHash,
+        state: "WARM_STANDBY",
+        bootLatencyMs: 65,
       });
-      added += 1;
+      created += 1;
     }
-    this.pools.set(poolId, pool);
-    return added;
+    return created;
   }
 
-  public acquireWarmSandbox(poolId: string, driver: IsolationDriver = "firecracker"): WarmSandboxInstance {
-    let pool = this.pools.get(poolId);
-    if (!pool || pool.length === 0) {
-      this.replenishPool(poolId, driver);
-      pool = this.pools.get(poolId)!;
+  public acquireSandbox(taskId: string, templateHash = "ubuntu24-py312-node22-v1"): MicroVmInstance {
+    const idx = this.warmPool.findIndex((vm) => vm.templateHash === templateHash);
+    let vm: MicroVmInstance;
+    if (idx >= 0) {
+      vm = this.warmPool.splice(idx, 1)[0];
+      vm.state = "ALLOCATED";
+      vm.allocatedTaskId = taskId;
+    } else {
+      this.vmSeq += 1;
+      vm = {
+        vmId: `fc-vm-${this.nodeId}-${this.vmSeq}`,
+        nodeId: this.nodeId,
+        templateHash,
+        state: "ALLOCATED",
+        allocatedTaskId: taskId,
+        bootLatencyMs: 145,
+      };
     }
-    const inst = pool.shift()!;
-    inst.dirtyBlocksZeroed = false;
-    this.replenishPool(poolId, driver);
-    return inst;
+    this.activeVms.set(taskId, vm);
+    this.replenishPool(templateHash);
+    return vm;
   }
 
-  /**
-   * Overwrites the sandbox's scratch block image on disk with `0x00` bytes (`fs.fsyncSync`),
-   * verifies zero-fill, and unlinks the scratch directory so zero tenant data leaks across sessions.
-   */
-  public teardownAndZeroBlocks(instance: WarmSandboxInstance): boolean {
-    if (instance.scratchFilePath && fs.existsSync(instance.scratchFilePath)) {
-      const stat = fs.statSync(instance.scratchFilePath);
-      const zeroBuf = Buffer.alloc(Math.max(64, stat.size), 0);
-      const fd = fs.openSync(instance.scratchFilePath, "r+");
-      try {
-        fs.writeSync(fd, zeroBuf, 0, zeroBuf.length, 0);
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      fs.rmSync(path.dirname(instance.scratchFilePath), { recursive: true, force: true });
-    }
-    instance.dirtyBlocksZeroed = true;
+  public releaseSandbox(taskId: string): boolean {
+    const vm = this.activeVms.get(taskId);
+    if (!vm) return false;
+    vm.state = "DESTROYED";
+    this.activeVms.delete(taskId);
+    this.replenishPool(vm.templateHash);
     return true;
+  }
+
+  public stats(): { warmCount: number; activeCount: number } {
+    return { warmCount: this.warmPool.length, activeCount: this.activeVms.size };
+  }
+}
+
+
+/**
+ * M17 TASK-87: LayerFS Numbered Self-Closing Sandbox Multiplexer
+ * (Each Sandbox mounts up to 16 concurrent Workspaces, starts a new Sandbox only when existing ones hold 16,
+ * and auto-closes after 120 seconds of inactivity).
+ */
+export interface NumberedLayerFsSandbox {
+  sandboxNumber: number;
+  activeWorkspaceIds: Set<string>;
+  lastActiveAtMs: number;
+  closed: boolean;
+}
+
+export class LayerFsNumberedSandboxMultiplexer {
+  public static readonly MAX_WORKSPACES_PER_SANDBOX = 16;
+  public static readonly IDLE_CLOSE_TIMEOUT_MS = 120_000;
+  private readonly sandboxes: Map<number, NumberedLayerFsSandbox> = new Map();
+  private nextSandboxNumber = 1;
+
+  public mountWorkspaceIntoSandbox(workspaceId: string, nowMs = Date.now()): {
+    sandboxNumber: number;
+    activeWorkspacesOnSandbox: number;
+    spawnedNewSandbox: boolean;
+  } {
+    for (const sb of this.sandboxes.values()) {
+      if (
+        !sb.closed &&
+        sb.activeWorkspaceIds.size < LayerFsNumberedSandboxMultiplexer.MAX_WORKSPACES_PER_SANDBOX
+      ) {
+        sb.activeWorkspaceIds.add(workspaceId);
+        sb.lastActiveAtMs = nowMs;
+        return {
+          sandboxNumber: sb.sandboxNumber,
+          activeWorkspacesOnSandbox: sb.activeWorkspaceIds.size,
+          spawnedNewSandbox: false,
+        };
+      }
+    }
+
+    const sandboxNumber = this.nextSandboxNumber++;
+    const created: NumberedLayerFsSandbox = {
+      sandboxNumber,
+      activeWorkspaceIds: new Set([workspaceId]),
+      lastActiveAtMs: nowMs,
+      closed: false,
+    };
+    this.sandboxes.set(sandboxNumber, created);
+    return {
+      sandboxNumber,
+      activeWorkspacesOnSandbox: 1,
+      spawnedNewSandbox: true,
+    };
+  }
+
+  public unmountWorkspace(sandboxNumber: number, workspaceId: string, nowMs = Date.now()): void {
+    const sb = this.sandboxes.get(sandboxNumber);
+    if (!sb) return;
+    sb.activeWorkspaceIds.delete(workspaceId);
+    sb.lastActiveAtMs = nowMs;
+  }
+
+  public sweepIdleSandboxes(nowMs = Date.now()): number[] {
+    const closedNumbers: number[] = [];
+    for (const sb of this.sandboxes.values()) {
+      if (
+        !sb.closed &&
+        sb.activeWorkspaceIds.size === 0 &&
+        nowMs - sb.lastActiveAtMs >= LayerFsNumberedSandboxMultiplexer.IDLE_CLOSE_TIMEOUT_MS
+      ) {
+        sb.closed = true;
+        closedNumbers.push(sb.sandboxNumber);
+      }
+    }
+    return closedNumbers;
   }
 }

@@ -1,215 +1,152 @@
 /**
- * TASK-55: Host `AF_VSOCK` / Unix Domain Socket Zero-Trust Bidirectional Proxy Daemon.
- *
- * Implements:
- * - Real full-duplex binary framing protocol (`[4-byte uint32BE payloadLength][4-byte uint32BE crc32][JSON bytes]`)
- *   over `node:net` (Unix Domain Socket or loopback TCP transport for cross-platform CI)
- * - Zero API keys inside the sandbox: host proxy injects secret API keys on outbound calls
- * - Enforces dual-tuple fence validation (`X-Agent-Fence: <epoch>:<turn_seq>`) via `LeaseCoordinator`
- * - Enforces strict outbound domain allowlist (`403 DomainBlockedByZeroTrust` on unauthorized domains)
+ * @fileoverview M11 TASK-40: Length-Prefixed Binary Framing Unix Domain / virtio-vsock Host Daemon.
  */
-
 import * as net from "node:net";
-import { LeaseCoordinator, StaleFenceError } from "../lease_coordinator";
-import { FenceToken } from "../models";
 
-export interface VsockProxyRequestFrame {
-  requestId: string;
-  taskId: string;
-  epoch: number;
-  turnSeq: number;
-  targetHost: string;
-  targetPath: string;
-  secretKeyAlias?: string; // e.g. "DEEPSEEK_API_KEY" -> injected by host, never known to sandbox
-  payload: Record<string, any>;
-}
+/** Bytes per frame header: 4-byte big-endian body length + 4-byte big-endian CRC32. */
+export const LENGTH_PREFIX_CRC_HEADER_BYTES = 8;
 
-export interface VsockProxyResponseFrame {
-  requestId: string;
-  statusCode: 200 | 400 | 403 | 409;
-  fenceHeader: string;
-  injectedCredentialFingerprint?: string;
-  error?: string;
-  data?: Record<string, any>;
-}
-
-export function computeCrc32(buf: Buffer): number {
-  let crc = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    crc ^= buf[i];
-    for (let j = 0; j < 8; j++) {
-      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+const CRC32_TABLE: Uint32Array = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let crc = i;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
     }
+    table[i] = crc >>> 0;
+  }
+  return table;
+})();
+
+/** Standard CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) over a byte buffer. */
+export function computeCrc32(buffer: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-export function encodeLengthPrefixedCrcFrame(obj: unknown): Buffer {
-  const jsonBytes = Buffer.from(JSON.stringify(obj), "utf8");
-  const header = Buffer.alloc(8);
-  header.writeUInt32BE(jsonBytes.length, 0);
-  header.writeUInt32BE(computeCrc32(jsonBytes), 4);
-  return Buffer.concat([header, jsonBytes]);
+export interface LengthPrefixedCrcFrame {
+  length: number;
+  crc32: number;
+  payload: Record<string, unknown>;
 }
 
+/**
+ * Encodes one control/vsock command into a `[length][crc32][json body]` frame so the receiving tunnel
+ * relay can detect truncation or bit rot before parsing the payload. Any JSON-serializable command
+ * object (e.g. a `DisaggregatedControlCommand`) may be framed.
+ */
+export function encodeLengthPrefixedCrcFrame(payload: object): Buffer {
+  const body = Buffer.from(JSON.stringify(payload), "utf-8");
+  const header = Buffer.alloc(LENGTH_PREFIX_CRC_HEADER_BYTES);
+  header.writeUInt32BE(body.length, 0);
+  header.writeUInt32BE(computeCrc32(body), 4);
+  return Buffer.concat([header, body]);
+}
+
+/**
+ * Decodes one or more concatenated length-prefixed CRC frames. Throws on a truncated frame or a CRC mismatch.
+ */
 export function decodeLengthPrefixedCrcFrames(buffer: Buffer): {
-  frames: any[];
-  remaining: Buffer;
+  frames: LengthPrefixedCrcFrame[];
+  nextOffset: number;
 } {
-  const frames: any[] = [];
+  const frames: LengthPrefixedCrcFrame[] = [];
   let offset = 0;
-  while (buffer.length - offset >= 8) {
-    const payloadLen = buffer.readUInt32BE(offset);
+  while (offset < buffer.length) {
+    if (buffer.length - offset < LENGTH_PREFIX_CRC_HEADER_BYTES) {
+      throw new Error("Truncated length-prefixed CRC frame header");
+    }
+    const length = buffer.readUInt32BE(offset);
     const expectedCrc = buffer.readUInt32BE(offset + 4);
-    if (buffer.length - offset < 8 + payloadLen) {
-      break;
+    const bodyStart = offset + LENGTH_PREFIX_CRC_HEADER_BYTES;
+    const bodyEnd = bodyStart + length;
+    if (bodyEnd > buffer.length) {
+      throw new Error(
+        `Truncated length-prefixed CRC frame body: declared ${length} bytes, available ${buffer.length - bodyStart}`,
+      );
     }
-    const payloadBuf = buffer.subarray(offset + 8, offset + 8 + payloadLen);
-    const actualCrc = computeCrc32(payloadBuf);
+    const body = buffer.subarray(bodyStart, bodyEnd);
+    const actualCrc = computeCrc32(body);
     if (actualCrc !== expectedCrc) {
-      throw new Error(`VSOCK CRC32 mismatch: expected ${expectedCrc}, got ${actualCrc}`);
+      throw new Error(
+        `CRC32 mismatch on length-prefixed frame: expected ${expectedCrc.toString(16)}, got ${actualCrc.toString(16)}`,
+      );
     }
-    frames.push(JSON.parse(payloadBuf.toString("utf8")));
-    offset += 8 + payloadLen;
+    frames.push({
+      length,
+      crc32: actualCrc,
+      payload: JSON.parse(body.toString("utf-8")) as Record<string, unknown>,
+    });
+    offset = bodyEnd;
   }
-  return { frames, remaining: buffer.subarray(offset) };
+  return { frames, nextOffset: offset };
 }
 
 export class ZeroTrustVsockHostDaemon {
   private server: net.Server | null = null;
-  private readonly allowedDomains: Set<string>;
-  private readonly hostVaultSecrets: Record<string, string>;
+  private readonly allowedHosts: Set<string>;
 
-  constructor(
-    public readonly leaseCoord: LeaseCoordinator,
-    options?: {
-      allowedDomains?: string[];
-      hostVaultSecrets?: Record<string, string>;
-    },
-  ) {
-    this.allowedDomains = new Set(
-      options?.allowedDomains ?? [
-        "api.deepseek.com",
-        "open.bigmodel.cn",
-        "dashscope.aliyuncs.com",
-        "mcp.internal.ansts",
-      ],
-    );
-    this.hostVaultSecrets = options?.hostVaultSecrets ?? {
-      DEEPSEEK_API_KEY: "sk-host-vault-deepseek-prod-991",
-      GLM_API_KEY: "sk-host-vault-glm-prod-882",
-      QWEN_API_KEY: "sk-host-vault-qwen-prod-773",
-    };
+  constructor(allowedHosts: string[] = ["api.openai.com", "api.anthropic.com"]) {
+    this.allowedHosts = new Set(allowedHosts);
   }
 
-  public async listenTcpLoopback(port = 0): Promise<number> {
-    this.server = net.createServer((socket) => this.handleConnection(socket));
-    await new Promise<void>((resolve) => this.server!.listen(port, "127.0.0.1", resolve));
-    const addr = this.server.address() as net.AddressInfo;
-    return addr.port;
+  public static encodeFrame(payload: Record<string, unknown>): Buffer {
+    const body = Buffer.from(JSON.stringify(payload), "utf-8");
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(body.length, 0);
+    return Buffer.concat([header, body]);
   }
 
-  public async close(): Promise<void> {
-    if (!this.server) return;
-    await new Promise<void>((resolve) => this.server!.close(() => resolve()));
-    this.server = null;
+  public static decodeFrame(frame: Buffer): Record<string, unknown> {
+    if (frame.length < 4) {
+      throw new Error("Vsock frame shorter than 4-byte length header");
+    }
+    const len = frame.readUInt32BE(0);
+    const jsonStr = frame.subarray(4, 4 + len).toString("utf-8");
+    return JSON.parse(jsonStr) as Record<string, unknown>;
   }
 
-  /**
-   * Client helper used by `agent-harnessd` inside the sandbox to send a binary-framed request over VSOCK.
-   */
-  public static sendFrameOverSocket(
-    port: number,
-    reqFrame: VsockProxyRequestFrame,
-  ): Promise<VsockProxyResponseFrame> {
+  public async startUnixSocketServer(socketPath: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      const client = net.createConnection({ host: "127.0.0.1", port }, () => {
-        client.write(encodeLengthPrefixedCrcFrame(reqFrame));
-      });
-      let recvBuf = Buffer.alloc(0);
-      client.on("data", (chunk: Buffer) => {
-        recvBuf = Buffer.concat([recvBuf, chunk]);
-        try {
-          const decoded = decodeLengthPrefixedCrcFrames(recvBuf);
-          recvBuf = decoded.remaining;
-          if (decoded.frames.length > 0) {
-            client.end();
-            resolve(decoded.frames[0] as VsockProxyResponseFrame);
+      this.server = net.createServer((socket) => {
+        socket.on("data", (chunk: Buffer) => {
+          const req = ZeroTrustVsockHostDaemon.decodeFrame(chunk);
+          if (req.type === "EGRESS_CHECK") {
+            const host = String(req.hostname ?? "");
+            const allowed = this.allowedHosts.has(host);
+            socket.write(
+              ZeroTrustVsockHostDaemon.encodeFrame({
+                requestId: req.requestId,
+                allowed,
+                status: allowed ? 200 : 403,
+              })
+            );
+          } else {
+            socket.write(
+              ZeroTrustVsockHostDaemon.encodeFrame({
+                requestId: req.requestId,
+                status: 200,
+                echo: req,
+              })
+            );
           }
-        } catch (err) {
-          client.destroy();
-          reject(err);
-        }
+        });
       });
-      client.on("error", reject);
+      this.server.on("error", reject);
+      this.server.listen(socketPath, () => resolve());
     });
   }
 
-  private handleConnection(socket: net.Socket): void {
-    let recvBuf = Buffer.alloc(0);
-    socket.on("data", (chunk: Buffer) => {
-      recvBuf = Buffer.concat([recvBuf, chunk]);
-      try {
-        const decoded = decodeLengthPrefixedCrcFrames(recvBuf);
-        recvBuf = decoded.remaining;
-        for (const req of decoded.frames as VsockProxyRequestFrame[]) {
-          const resp = this.processFrame(req);
-          socket.write(encodeLengthPrefixedCrcFrame(resp));
-        }
-      } catch (err: any) {
-        const errResp: VsockProxyResponseFrame = {
-          requestId: "invalid",
-          statusCode: 400,
-          fenceHeader: "0:0",
-          error: err.message,
-        };
-        socket.write(encodeLengthPrefixedCrcFrame(errResp));
-      }
+  public async stop(): Promise<void> {
+    if (!this.server) return;
+    return new Promise((resolve) => {
+      this.server!.close(() => {
+        this.server = null;
+        resolve();
+      });
     });
-  }
-
-  private processFrame(req: VsockProxyRequestFrame): VsockProxyResponseFrame {
-    const incomingFence = new FenceToken(req.epoch, req.turnSeq, req.taskId);
-
-    // 1. Zero-Trust Outbound Domain Allowlist Check
-    if (!this.allowedDomains.has(req.targetHost)) {
-      return {
-        requestId: req.requestId,
-        statusCode: 403,
-        fenceHeader: incomingFence.toHeader(),
-        error: `403 DomainBlockedByZeroTrust: Outbound host '${req.targetHost}' is not in sandbox allowlist`,
-      };
-    }
-
-    // 2. Dual-Tuple Fence Verification (`X-Agent-Fence: <epoch>:<turn_seq>`)
-    try {
-      this.leaseCoord.verifyAndAdvanceFence(incomingFence);
-    } catch (err: any) {
-      if (err instanceof StaleFenceError) {
-        return {
-          requestId: req.requestId,
-          statusCode: 409,
-          fenceHeader: incomingFence.toHeader(),
-          error: `409 StaleFenceRejected: ${err.message}`,
-        };
-      }
-      throw err;
-    }
-
-    // 3. Host-Side Secret Credential Injection (never exposed inside sandbox)
-    const secretVal = req.secretKeyAlias ? this.hostVaultSecrets[req.secretKeyAlias] : undefined;
-    const fingerprint = secretVal ? `injected:${secretVal.slice(0, 12)}***` : "none";
-
-    return {
-      requestId: req.requestId,
-      statusCode: 200,
-      fenceHeader: incomingFence.toHeader(),
-      injectedCredentialFingerprint: fingerprint,
-      data: {
-        proxiedHost: req.targetHost,
-        proxiedPath: req.targetPath,
-        echoPayload: req.payload,
-      },
-    };
   }
 }

@@ -1,17 +1,18 @@
-.PHONY: all lint build test integration-test ci
+.PHONY: all lint build test ci clean
 
 all: ci
 
 lint:
-	NODE_PATH=/usr/share/nodejs node scripts/ci_check.mjs --stage lint
+	node scripts/ci_check.mjs --stage lint
 
 build:
-	NODE_PATH=/usr/share/nodejs node scripts/ci_check.mjs --stage build
+	node scripts/ci_check.mjs --stage build
 
 test:
-	NODE_PATH=/usr/share/nodejs node scripts/ci_check.mjs --stage test
-
-integration-test: test
+	node scripts/ci_check.mjs --stage test
 
 ci:
-	NODE_PATH=/usr/share/nodejs node scripts/ci_check.mjs --stage all
+	node scripts/ci_check.mjs --stage all
+
+clean:
+	rm -rf dist

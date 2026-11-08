@@ -1,108 +1,111 @@
 /**
- * TASK-02: API Gateway Server with 24h SHA-256 Idempotency Deduplication and Task Lifecycle Endpoints.
+ * @fileoverview M1 TASK-04: Stateless HTTP/REST & SSE Gateway Server.
  */
-
-import * as crypto from "crypto";
-import { AgentTask, TaskState } from "../models";
-import { CoreScheduler5D } from "../scheduler";
-import { IngressBackpressureController } from "./backpressure";
-import { TaskSpecValidator } from "./validator";
+import * as http from "node:http";
+import { TaskSpecValidator, TaskSpecValidationError } from "./validator.js";
+import { IngressBackpressureController } from "./backpressure.js";
+import { SseEventStreamGateway } from "./sse_stream.js";
+import { CoreScheduler5D } from "../scheduler.js";
 
 export class ApiGatewayServer {
-  public readonly validator: TaskSpecValidator;
-  public readonly bpController: IngressBackpressureController;
-  private idempotencyTable: Map<string, string> = new Map();
+  private readonly scheduler: CoreScheduler5D;
+  private readonly backpressure: IngressBackpressureController;
+  public readonly sseGateway: SseEventStreamGateway;
+  private server: http.Server | null = null;
 
   constructor(
-    public readonly scheduler: CoreScheduler5D,
-    validator?: TaskSpecValidator,
-    bpController?: IngressBackpressureController,
+    scheduler: CoreScheduler5D,
+    backpressure = new IngressBackpressureController(),
+    sseGateway = new SseEventStreamGateway()
   ) {
-    this.validator = validator ?? new TaskSpecValidator();
-    this.bpController = bpController ?? new IngressBackpressureController();
+    this.scheduler = scheduler;
+    this.backpressure = backpressure;
+    this.sseGateway = sseGateway;
   }
 
-  public submitTaskSpec(
-    rawDoc: Record<string, any>,
-    now: number = 0.0,
-  ): { statusCode: number; body: Record<string, any>; headers: Record<string, string> } {
-    const norm = this.validator.validateAndNormalize(rawDoc);
-    const meta = norm.metadata;
-    const spec = norm.spec;
-    const tenantId: string = meta.tenant_id;
-    const idemKey: string = meta.idempotency_key;
-    const dedupHash = crypto.createHash("sha256").update(`${tenantId}:${idemKey}`, "utf8").digest("hex");
-
-    const existingId = this.idempotencyTable.get(dedupHash);
-    if (existingId && this.scheduler.tasks.has(existingId)) {
-      const existingTask = this.scheduler.tasks.get(existingId)!;
+  public handleSubmitRequest(
+    payload: Record<string, unknown>,
+    clusterPsiPressurePct = 0
+  ): { statusCode: number; headers: Record<string, string>; body: Record<string, unknown> } {
+    try {
+      const spec = TaskSpecValidator.validateAndNormalize(payload);
+      const decision = this.backpressure.evaluateAdmission({
+        priority: spec.priority,
+        globalQueueDepth: this.scheduler.queueManager.totalQueued(),
+        tenantActiveTasks: this.scheduler.queueManager.getTenantActiveCount(spec.tenant_id),
+        clusterPsiPressurePct,
+      });
+      if (!decision.allowed) {
+        return {
+          statusCode: decision.statusCode,
+          headers: { "Retry-After": String(decision.retryAfterSeconds ?? 15) },
+          body: { error: "TOO_MANY_REQUESTS", reason: decision.reason },
+        };
+      }
+      const submitted = this.scheduler.submitTask(spec);
       return {
-        statusCode: 200,
+        statusCode: 202,
+        headers: {},
         body: {
-          task_id: existingId,
-          deduplicated: true,
-          state: existingTask.state,
-          soft_reserved_tokens: existingTask.softReservedTokens,
+          task_id: submitted.task_id,
+          state: submitted.state,
+          lease_fencing_token: submitted.lease_fencing_token,
         },
-        headers: { "X-Idempotent-Replay": "true" },
       };
+    } catch (err) {
+      if (err instanceof TaskSpecValidationError) {
+        return {
+          statusCode: 400,
+          headers: {},
+          body: { error: "VALIDATION_ERROR", field: err.field, message: err.message },
+        };
+      }
+      throw err;
     }
+  }
 
-    const qDepth = (this.scheduler.queueManager.tenantQueues.get(tenantId) ?? []).length;
-    const decision = this.bpController.evaluateAdmission(tenantId, qDepth);
-    if (!decision.allowed) {
-      return {
-        statusCode: decision.statusCode,
-        body: { error: "TooManyRequests", reason: decision.reason },
-        headers: decision.headers,
-      };
-    }
-
-    const cog = spec.cognitive_policy;
-    const quota = spec.quota_and_dag_policy;
-    const sbx = spec.execution_and_sandbox;
-    const pe = sbx.phase_elastic_resources;
-
-    const task = new AgentTask({
-      taskId: meta.task_id,
-      tenantId,
-      priorityClass: meta.priority_class,
-      baseScore: meta.priority_score,
-      enqueueTs: now,
-      deadlineTs: now + Number(spec.scheduling_policy.sla_deadline_sec ?? 600),
-      primaryModel: cog.primary_model,
-      fastUtilityModel: cog.fast_utility_model,
-      fallbackModels: cog.fallback_models,
-      effort: cog.default_reasoning_effort,
-      reservedTps: quota.reserved_tps,
-      maxTotalTokens: quota.max_total_tokens,
-      maxSessions: quota.max_concurrent_sessions,
-      cogCpu: Number(pe.cognitive_phase.cpu_cores),
-      execCpu: Number(pe.execution_phase.cpu_request_cores),
-      burstCpu: Number(pe.execution_phase.cpu_burst_limit_cores),
-      cogMemMb: Number(pe.cognitive_phase.memory_active_mb),
-      execMemMb: Number(pe.execution_phase.memory_limit_mb),
-      isolationDriver: sbx.isolation_driver,
-      warmPoolId: sbx.warm_pool_id,
-      maxTurns: sbx.max_turns,
-      customMetadata: meta.custom_metadata ?? {},
+  public async listen(port = 0): Promise<number> {
+    return new Promise((resolve, reject) => {
+      this.server = http.createServer((req, res) => {
+        if (req.method === "GET" && req.url === "/healthz") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ status: "ok", queued: this.scheduler.queueManager.totalQueued() }));
+          return;
+        }
+        if (req.method === "POST" && req.url === "/v1/tasks") {
+          const chunks: Buffer[] = [];
+          req.on("data", (c: Buffer) => chunks.push(c));
+          req.on("end", () => {
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as Record<string, unknown>;
+              const resp = this.handleSubmitRequest(body);
+              res.writeHead(resp.statusCode, { "content-type": "application/json", ...resp.headers });
+              res.end(JSON.stringify(resp.body));
+            } catch (e) {
+              res.writeHead(400, { "content-type": "application/json" });
+              res.end(JSON.stringify({ error: (e as Error).message }));
+            }
+          });
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      this.server.on("error", reject);
+      this.server.listen(port, "127.0.0.1", () => {
+        const addr = this.server!.address();
+        resolve(typeof addr === "object" && addr ? addr.port : port);
+      });
     });
+  }
 
-    if (!this.scheduler.tenants.has(tenantId)) {
-      this.scheduler.registerTenant(tenantId, 1.0);
-    }
-
-    const softTokens = this.scheduler.submitTask(task);
-    this.idempotencyTable.set(dedupHash, task.taskId);
-    return {
-      statusCode: 202,
-      body: {
-        task_id: task.taskId,
-        deduplicated: false,
-        state: task.state,
-        soft_reserved_tokens: softTokens,
-      },
-      headers: decision.headers,
-    };
+  public async close(): Promise<void> {
+    if (!this.server) return;
+    return new Promise((resolve) => {
+      this.server!.close(() => {
+        this.server = null;
+        resolve();
+      });
+    });
   }
 }

@@ -76,7 +76,7 @@ export class EdgeTunnelHaDynamicRouter {
   // L1 Dynamic Route Table (synchronized across Brain & Gateway nodes via Gossip + S3 CAS)
   public readonly routeTable = new Map<string, DynamicEdgeRouteEntry>();
   // Monotonic fence tracking per task at the edge
-  private readonly highestTaskFence = new Map<string, FenceToken>();
+  private readonly highestTaskFence = new Map<string, { epoch: number; turnSeq: number; taskId: string }>();
   private readonly gossipSubscribers: Array<(route: DynamicEdgeRouteEntry) => void> = [];
 
   constructor(public readonly localNodeGatewayId: string) {}
@@ -196,6 +196,27 @@ export class EdgeTunnelHaDynamicRouter {
    * - If `primaryGatewayId` is down or its stream broke, automatically fails over to `secondaryGatewayId`
    *   within the same call and promotes `secondaryGatewayId` to primary in the route table.
    */
+  /**
+   * Dispatch path for disaggregated control commands (`CGROUP_BOOST_8C`, `OVERLAY_*_SNAPSHOT`, ...):
+   * the caller may pass the fence either as a `FenceToken` or as the plain `(epoch, turnSeq)` tuple
+   * carried over the tunnel wire format.
+   */
+  public dispatchCommandToDaemon(params: {
+    commandId: string;
+    taskId: string;
+    sandboxId: string;
+    targetBodyHostId: string;
+    fence: FenceToken | { epoch: number; turnSeq: number };
+    action: DisaggregatedControlCommand["action"];
+    payload: Record<string, unknown>;
+  }): RelayExecutionResult {
+    const fence =
+      params.fence instanceof FenceToken
+        ? params.fence
+        : new FenceToken(params.fence.epoch, params.fence.turnSeq, params.taskId);
+    return this.routeAndForwardCommand({ ...params, fence });
+  }
+
   public routeAndForwardCommand(cmd: DisaggregatedControlCommand): RelayExecutionResult {
     const startHr = process.hrtime.bigint();
     const route = this.routeTable.get(cmd.targetBodyHostId);
@@ -214,7 +235,11 @@ export class EdgeTunnelHaDynamicRouter {
         `409 StaleFenceRejected at Tunnel Relay: (${cmd.fence.epoch},${cmd.fence.turnSeq}) < (${prevFence.epoch},${prevFence.turnSeq})`,
       );
     }
-    this.highestTaskFence.set(cmd.taskId, { ...cmd.fence });
+    this.highestTaskFence.set(cmd.taskId, {
+      epoch: cmd.fence.epoch,
+      turnSeq: cmd.fence.turnSeq,
+      taskId: cmd.taskId,
+    });
 
     const binaryFrame = encodeLengthPrefixedCrcFrame(cmd);
     const decoded = decodeLengthPrefixedCrcFrames(binaryFrame);

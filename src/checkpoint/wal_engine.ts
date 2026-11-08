@@ -1,114 +1,148 @@
 /**
- * @fileoverview TASK-24 & M26 (TASK-122): Real Disk-Backed Binary/JSON TurnWAL Engine
- * with OS-Level Atomic `O_CREAT | O_EXCL` (`flag: "wx"`) Conditional Write & `fsyncSync` Durability.
- *
- * Replaces the purely in-memory Map store with real filesystem persistence under `storageDir`
- * while maintaining the exact `If-None-Match` (`412 PreconditionFailed`) and monotonic Epoch
- * (`409 StaleFenceRejected`) semantics.
+ * @fileoverview M5 TASK-19: Turn-Level Incremental OverlayFS Snapshot & SQLite WAL Writer (`TurnWalEngine` & `TurnWalFrame`).
  */
-
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { StaleFenceError } from "../lease_coordinator";
-import { FenceToken, TurnWalFrame } from "../models";
+import { CheckpointRecord, FenceToken, TurnWalFrame } from "../models.js";
+import { StaleFenceError } from "../lease_coordinator.js";
+
+export interface WalDeltaEntry {
+  walSeq: number;
+  taskId: string;
+  turnIndex: number;
+  fencingToken: number;
+  changedFiles: string[];
+  sqliteWalPages: number;
+  checksumSha256: string;
+  checkpoint: CheckpointRecord;
+  frame: TurnWalFrame;
+}
 
 export class TurnWalEngine {
-  private highestEpochByTask: Map<string, number> = new Map();
+  private readonly logsByTask: Map<string, WalDeltaEntry[]> = new Map();
+  /** Every frame persisted for a task, in append order (`appendTurnDelta` + `writeWalFrameIfNoneMatch`). */
+  private readonly framesByTask: Map<string, TurnWalFrame[]> = new Map();
+  /** `objectKey -> etag` of every frame persisted through `writeWalFrameIfNoneMatch`. */
+  private readonly etagByObjectKey: Map<string, string> = new Map();
+  /** Object keys whose conditional write was skipped because the object already existed (`If-None-Match: *`). */
+  public readonly idempotentSkipObjectKeys: string[] = [];
+  private globalSeq = 0;
 
-  constructor(public readonly storageRootDir: string = "/tmp/ansts_turnwal_store") {
-    fs.mkdirSync(this.storageRootDir, { recursive: true });
+  constructor(public readonly walDir: string = "/tmp/ansts_turnwal") {
+    fs.mkdirSync(this.walDir, { recursive: true });
   }
 
-  public objectKey(fence: FenceToken): string {
-    const ep = String(fence.epoch).padStart(2, "0");
-    const tr = String(fence.turnSeq).padStart(4, "0");
-    return `checkpoints/${fence.taskId}/ep_${ep}/turn_${tr}.wal`;
+  public appendTurnDelta(params: {
+    taskId: string;
+    turnIndex: number;
+    fencingToken: number;
+    changedFiles: string[];
+    sqliteWalPages: number;
+    highestSubmittedFencingToken: number;
+  }): WalDeltaEntry {
+    if (params.fencingToken < params.highestSubmittedFencingToken) {
+      throw new StaleFenceError(
+        params.taskId,
+        params.fencingToken,
+        params.highestSubmittedFencingToken
+      );
+    }
+    this.globalSeq += 1;
+    const raw = `${params.taskId}:${params.turnIndex}:${params.fencingToken}:${params.changedFiles.join(",")}`;
+    const checksumSha256 = crypto.createHash("sha256").update(raw, "utf-8").digest("hex");
+
+    const frame = new TurnWalFrame({
+      frameId: `frame-${params.taskId}-t${params.turnIndex}-s${this.globalSeq}`,
+      taskId: params.taskId,
+      turnIndex: params.turnIndex,
+      fence: new FenceToken(params.fencingToken, params.turnIndex, params.taskId),
+      changedFiles: params.changedFiles,
+      sqliteWalPages: params.sqliteWalPages,
+    });
+
+    const checkpoint: CheckpointRecord = {
+      checkpoint_id: `wal-${params.taskId}-t${params.turnIndex}-s${this.globalSeq}`,
+      task_id: params.taskId,
+      turn_index: params.turnIndex,
+      fencing_token: params.fencingToken,
+      state_hash: checksumSha256.slice(0, 16),
+      overlayfs_diff_uri: `s3://ansts-wal/${params.taskId}/turn-${params.turnIndex}.zst`,
+      created_at: Date.now() / 1000,
+    };
+    const entry: WalDeltaEntry = {
+      walSeq: this.globalSeq,
+      taskId: params.taskId,
+      turnIndex: params.turnIndex,
+      fencingToken: params.fencingToken,
+      changedFiles: [...params.changedFiles],
+      sqliteWalPages: params.sqliteWalPages,
+      checksumSha256,
+      checkpoint,
+      frame,
+    };
+    const list = this.logsByTask.get(params.taskId) ?? [];
+    list.push(entry);
+    this.logsByTask.set(params.taskId, list);
+    this.recordFrame(frame);
+    return entry;
   }
 
-  public resolveFilePath(objectKey: string): string {
-    return path.join(this.storageRootDir, objectKey);
+  public getTaskWalEntries(taskId: string): WalDeltaEntry[] {
+    return [...(this.logsByTask.get(taskId) ?? [])];
+  }
+
+  public getTaskWalFrames(taskId: string): TurnWalFrame[] {
+    return [...(this.framesByTask.get(taskId) ?? [])];
+  }
+
+  private recordFrame(frame: TurnWalFrame): void {
+    const frames = this.framesByTask.get(frame.taskId) ?? [];
+    frames.push(frame);
+    this.framesByTask.set(frame.taskId, frames);
+  }
+
+  /** Alias of `getTaskWalFrames` used by the TurnWAL timeline / catch-up BFF endpoints. */
+  public listTaskFrames(taskId: string): TurnWalFrame[] {
+    return this.getTaskWalFrames(taskId);
   }
 
   /**
-   * Atomically writes a TurnWAL frame to disk using OS-level `O_CREAT | O_EXCL` (`flag: "wx"`)
-   * and flushes to disk with `fs.fsyncSync(fd)`.
+   * Appends a `TurnWalFrame` under an `If-None-Match: *` guard (S3/RustFS CAS semantics): the frame is
+   * written to `<walDir>/<taskId>_turn<turnSeq>_ep<epoch>.wal` only when the object key is still absent
+   * or `ifNoneMatchEtag` differs from the persisted ETag. An already-present frame is never rewritten;
+   * its object key is recorded in `idempotentSkipObjectKeys` and returned.
    */
-  public writeWalFrameIfNoneMatch(frame: TurnWalFrame): string {
-    const highestEp = this.highestEpochByTask.get(frame.taskId) ?? this.scanHighestEpochOnDisk(frame.taskId);
-    if (frame.fence.epoch < highestEp) {
-      throw new StaleFenceError(
-        `409 StaleFenceRejected on storage write: epoch ${frame.fence.epoch} < ${highestEp}`,
-      );
-    }
-    this.highestEpochByTask.set(frame.taskId, frame.fence.epoch);
-
-    const key = this.objectKey(frame.fence);
-    const fullPath = this.resolveFilePath(key);
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-
-    const serialized = JSON.stringify(frame);
-    let fd: number;
-    try {
-      // OS kernel atomic If-None-Match via O_CREAT | O_EXCL ("wx")
-      fd = fs.openSync(fullPath, "wx", 0o644);
-    } catch (err: any) {
-      if (err && err.code === "EEXIST") {
-        throw new StaleFenceError(`412 PreconditionFailed (If-None-Match): ${key} already exists on disk`);
-      }
-      throw err;
-    }
-
-    try {
-      fs.writeFileSync(fd, serialized, "utf8");
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-
-    return key;
-  }
-
-  public listTaskFrames(taskId: string): TurnWalFrame[] {
-    const taskDir = path.join(this.storageRootDir, "checkpoints", taskId);
-    if (!fs.existsSync(taskDir)) {
-      return [];
-    }
-
-    const walFiles: string[] = [];
-    for (const epEntry of fs.readdirSync(taskDir, { withFileTypes: true })) {
-      if (epEntry.isDirectory() && epEntry.name.startsWith("ep_")) {
-        const epDir = path.join(taskDir, epEntry.name);
-        for (const fEntry of fs.readdirSync(epDir, { withFileTypes: true })) {
-          if (fEntry.isFile() && fEntry.name.endsWith(".wal")) {
-            walFiles.push(path.join(epDir, fEntry.name));
-          }
-        }
-      }
-    }
-
-    walFiles.sort();
-    return walFiles.map((filePath) => {
-      const raw = fs.readFileSync(filePath, "utf8");
-      const parsed = JSON.parse(raw);
-      return {
-        ...parsed,
-        fence: new FenceToken(parsed.fence.epoch, parsed.fence.turnSeq, parsed.fence.taskId),
-      } as TurnWalFrame;
+  public writeWalFrameIfNoneMatch(frame: TurnWalFrame, ifNoneMatchEtag?: string): string {
+    const objectKey = `${frame.taskId}_turn${frame.fence.turnSeq}_ep${frame.fence.epoch}.wal`;
+    const filePath = path.join(this.walDir, objectKey);
+    const serialized = JSON.stringify({
+      frameId: frame.frameId,
+      taskId: frame.taskId,
+      turnIndex: frame.turnIndex,
+      fence: frame.fence.toProto(),
+      changedFiles: frame.changedFiles,
+      sqliteWalPages: frame.sqliteWalPages,
+      crc32Hex: frame.crc32Hex,
+      state: frame.state,
+      routedModel: frame.routedModel,
+      tokensUsed: frame.tokensUsed,
+      workspaceMerkleHash: frame.workspaceMerkleHash,
+      diffSnapshot: frame.diffSnapshot,
+      createdAtMs: frame.createdAtMs,
     });
-  }
+    const etag = crypto.createHash("sha256").update(serialized, "utf-8").digest("hex");
 
-  private scanHighestEpochOnDisk(taskId: string): number {
-    const taskDir = path.join(this.storageRootDir, "checkpoints", taskId);
-    if (!fs.existsSync(taskDir)) return 0;
-    let maxEp = 0;
-    for (const entry of fs.readdirSync(taskDir, { withFileTypes: true })) {
-      if (entry.isDirectory() && entry.name.startsWith("ep_")) {
-        const epNum = parseInt(entry.name.slice(3), 10);
-        if (!Number.isNaN(epNum) && epNum > maxEp) {
-          maxEp = epNum;
-        }
-      }
+    const existingEtag = this.etagByObjectKey.get(objectKey);
+    const alreadyPresent = fs.existsSync(filePath) || existingEtag !== undefined;
+    if (alreadyPresent && (ifNoneMatchEtag === undefined || ifNoneMatchEtag === existingEtag)) {
+      this.idempotentSkipObjectKeys.push(objectKey);
+      return objectKey;
     }
-    return maxEp;
+
+    fs.writeFileSync(filePath, serialized, "utf8");
+    this.etagByObjectKey.set(objectKey, etag);
+    this.recordFrame(frame);
+    return objectKey;
   }
 }

@@ -1,66 +1,44 @@
 /**
- * TASK-16: Persistent Saga Transaction Journal and LIFO Reverse Compensation Executor.
+ * @fileoverview M3 TASK-09: Reverse-Order Saga Compensation Rollback Engine.
  */
-
-import { FenceToken } from "../models";
-
-export interface CompensatableActionRecord {
+export interface SagaStepRecord {
+  stepId: string;
   taskId: string;
-  fence: FenceToken;
-  forwardTool: string;
-  compensationTool: string;
-  payload: string;
+  turnIndex: number;
+  toolName: string;
+  forwardPayload: Record<string, unknown>;
+  compensateHandler?: (payload: Record<string, unknown>) => Record<string, unknown>;
   compensated: boolean;
-  attempts: number;
+  compensationResult?: Record<string, unknown>;
 }
 
 export class SagaCompensatorEngine {
-  private records: Map<string, CompensatableActionRecord[]> = new Map();
+  private readonly stepsByTask: Map<string, SagaStepRecord[]> = new Map();
 
-  constructor(public readonly maxRetries: number = 3) {}
-
-  public registerForwardAction(
-    taskId: string,
-    fence: FenceToken,
-    forwardTool: string,
-    compensationTool: string,
-    payload: string,
-  ): CompensatableActionRecord {
-    const rec: CompensatableActionRecord = {
-      taskId,
-      fence,
-      forwardTool,
-      compensationTool,
-      payload,
-      compensated: false,
-      attempts: 0,
-    };
-    const list = this.records.get(taskId) ?? [];
-    list.push(rec);
-    this.records.set(taskId, list);
-    return rec;
+  public recordForwardStep(step: Omit<SagaStepRecord, "compensated">): void {
+    let list = this.stepsByTask.get(step.taskId);
+    if (!list) {
+      list = [];
+      this.stepsByTask.set(step.taskId, list);
+    }
+    list.push({ ...step, compensated: false });
   }
 
-  public compensateLifo(
-    taskId: string,
-    afterTurnExclusive: number,
-    customExecutor?: (compTool: string, payload: string) => boolean,
-  ): string[] {
-    const list = this.records.get(taskId) ?? [];
-    const candidates = list.filter((r) => r.fence.turnSeq > afterTurnExclusive && !r.compensated);
-    const executed: string[] = [];
-    for (let i = candidates.length - 1; i >= 0; i--) {
-      const rec = candidates[i];
-      for (let attempt = 0; attempt < this.maxRetries; attempt++) {
-        rec.attempts += 1;
-        const ok = customExecutor ? customExecutor(rec.compensationTool, rec.payload) : true;
-        if (ok) {
-          rec.compensated = true;
-          executed.push(`${rec.compensationTool}(${rec.payload})`);
-          break;
-        }
+  public rollbackTask(taskId: string, upToTurnInclusive = 0): SagaStepRecord[] {
+    const list = this.stepsByTask.get(taskId) ?? [];
+    const rolledBack: SagaStepRecord[] = [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const step = list[i];
+      if (!step.compensated && step.turnIndex >= upToTurnInclusive && step.compensateHandler) {
+        step.compensationResult = step.compensateHandler(step.forwardPayload);
+        step.compensated = true;
+        rolledBack.push(step);
       }
     }
-    return executed;
+    return rolledBack;
+  }
+
+  public getTaskSteps(taskId: string): SagaStepRecord[] {
+    return [...(this.stepsByTask.get(taskId) ?? [])];
   }
 }

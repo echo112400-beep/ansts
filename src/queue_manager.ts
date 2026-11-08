@@ -1,223 +1,141 @@
 /**
- * TASK-06, TASK-07, TASK-08: 3-Tier H-WFQ Queue Tree, Aging+EDF Priority Queue, and DAG Escrow.
+ * @fileoverview M2 TASK-06 & M16 TASK-80: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging Tournament Queue Manager.
  */
+import { TaskPriority, TaskSpec } from "./models.js";
 
-import { DagEscrowCoordinator } from "./dag/escrow";
-import { AgentTask, EscrowVoucher, FenceToken, ResourceVector5D, SandboxPhase, TaskState } from "./models";
-
-export interface TenantQueueQuota {
-  tenantId: string;
-  tierGroup?: string;
-  weight?: number;
-  guaranteedCpu?: number;
-  burstCeilingCpu?: number;
-  burstCeilingTps?: number;
-  maxQueueWaitSec?: number;
+interface TenantHeapNode {
+  task: TaskSpec;
+  intraTenantStaticKey: number;
 }
 
-export class SubAgentDagGroup {
-  public stragglerTriggerRatio: number = 0.75;
-  public boostTpsMultiplier: number = 2.0;
+export class HierarchicalQueueManager {
+  private readonly queuedTasks: Map<string, TaskSpec> = new Map();
+  private readonly tenantHeaps: Map<string, TenantHeapNode[]> = new Map();
+  public readonly tenantActiveCount: Map<string, number> = new Map();
+  private readonly agingBoostPerSec: number;
 
-  constructor(
-    public readonly dagId: string,
-    public readonly parentTask: AgentTask,
-    public readonly children: AgentTask[],
-    public readonly speculativeRaceMode: boolean = false,
-  ) {}
-
-  public completionRatio(): number {
-    if (this.children.length === 0) return 0.0;
-    const done = this.children.filter((c) => c.state === TaskState.SUCCEEDED).length;
-    return done / this.children.length;
-  }
-}
-
-export class MultiTenantQueueManager {
-  public tenantQuotas: Map<string, Required<TenantQueueQuota>> = new Map();
-  public tenantQueues: Map<string, AgentTask[]> = new Map();
-  public expiredTasks: AgentTask[] = [];
-  public escrowCoordinator: DagEscrowCoordinator = new DagEscrowCoordinator();
-  public escrowFastQueue: Array<{ child: AgentTask; voucher: EscrowVoucher }> = [];
-  public activeDags: Map<string, SubAgentDagGroup> = new Map();
-
-  constructor(
-    public readonly agingBeta: number = 65.0,
-    public readonly agingT: number = 10.0,
-    public readonly edfGamma: number = 180.0,
-  ) {}
-
-  public configureTenantQuota(q: TenantQueueQuota): void {
-    this.tenantQuotas.set(q.tenantId, {
-      tenantId: q.tenantId,
-      tierGroup: q.tierGroup ?? "Enterprise-Dedicated",
-      weight: q.weight ?? 1.0,
-      guaranteedCpu: q.guaranteedCpu ?? 4.0,
-      burstCeilingCpu: q.burstCeilingCpu ?? 32.0,
-      burstCeilingTps: q.burstCeilingTps ?? 2400,
-      maxQueueWaitSec: q.maxQueueWaitSec ?? 300.0,
-    });
+  constructor(agingBoostPerSec = 0.05) {
+    this.agingBoostPerSec = agingBoostPerSec;
   }
 
-  public enqueue(task: AgentTask): void {
-    task.state = TaskState.QUEUED;
-    const q = this.tenantQueues.get(task.tenantId) ?? [];
-    // Rehydration and dead-lease recovery may re-admit an already-queued task; queue identity is 1:1.
-    if (!q.includes(task)) {
-      q.push(task);
-    }
-    this.tenantQueues.set(task.tenantId, q);
-  }
-
-  public sweepExpiredTasks(now: number): AgentTask[] {
-    const newlyExpired: AgentTask[] = [];
-    for (const [tid, q] of this.tenantQueues.entries()) {
-      const maxWait = this.tenantQuotas.get(tid)?.maxQueueWaitSec ?? 300.0;
-      const kept: AgentTask[] = [];
-      for (const t of q) {
-        if (now - t.enqueueTs > maxWait) {
-          t.state = TaskState.CIRCUIT_BROKEN;
-          this.expiredTasks.push(t);
-          newlyExpired.push(t);
-        } else {
-          kept.push(t);
-        }
-      }
-      this.tenantQueues.set(tid, kept);
-    }
-    return newlyExpired;
-  }
-
-  public exceedsBurstCeiling(tenantId: string, currentUsage: ResourceVector5D, candidate: AgentTask): boolean {
-    const quota = this.tenantQuotas.get(tenantId);
-    if (!quota) return false;
-    const candVec = candidate.demandVector();
-    if (currentUsage.steadyCpu + candVec.steadyCpu > quota.burstCeilingCpu) return true;
-    if (currentUsage.effectiveTps + candVec.effectiveTps > quota.burstCeilingTps) return true;
-    return false;
-  }
-
-  public computeDynamicUrgency(task: AgentTask, now: number): number {
-    const waitSec = Math.max(0.0, now - task.enqueueTs);
-    const agingBonus = this.agingBeta * Math.log(1.0 + waitSec / this.agingT);
-    const remDeadline = Math.max(1.0, task.deadlineTs - now);
-    const edfBonus = this.edfGamma * (60.0 / remDeadline);
-    return Number((task.baseScore + agingBonus + edfBonus).toFixed(2));
-  }
-
-  public popBestForTenant(tenantId: string, now: number): AgentTask | undefined {
-    const q = this.tenantQueues.get(tenantId);
-    if (!q || q.length === 0) return undefined;
-    q.sort((a, b) => this.computeDynamicUrgency(b, now) - this.computeDynamicUrgency(a, now));
-    return q.shift();
-  }
-
-  public spawnDagWithEscrow(
-    dagId: string,
-    parent: AgentTask,
-    children: AgentTask[],
-    raceMode: boolean = false,
-  ): EscrowVoucher[] {
-    const vouchers = this.escrowCoordinator.yieldParentAndIssueVouchers(parent, children);
-    children.forEach((child, i) => {
-      this.escrowFastQueue.push({ child, voucher: vouchers[i] });
-    });
-    this.activeDags.set(dagId, new SubAgentDagGroup(dagId, parent, children, raceMode));
-    return vouchers;
-  }
-
-  public evaluateDagBarriers(): string[] {    const actions: string[] = [];
-    for (const dag of this.activeDags.values()) {
-      if (dag.speculativeRaceMode) {
-        const winners = dag.children.filter((c) => c.state === TaskState.SUCCEEDED);
-        if (winners.length > 0) {
-          for (const c of dag.children) {
-            if (c.taskId !== winners[0].taskId && c.state === TaskState.RUNNING) {
-              c.state = TaskState.CIRCUIT_BROKEN;
-              c.activeSessions = 0;
-              actions.push(`RACE_PRUNED:${c.taskId}`);
-            }
-          }
-          dag.parentTask.state = TaskState.RUNNING;
-          dag.parentTask.phase = SandboxPhase.COGNITIVE;
-          actions.push(`PARENT_RESUMED:${dag.parentTask.taskId}`);
-        }
-      } else {
-        const ratio = dag.completionRatio();
-        if (ratio >= 1.0) {
-          dag.parentTask.state = TaskState.RUNNING;
-          dag.parentTask.phase = SandboxPhase.COGNITIVE;
-          actions.push(`JOIN_COMPLETED:${dag.parentTask.taskId}`);
-        } else if (ratio >= dag.stragglerTriggerRatio) {
-          const unusedTps = dag.children
-            .filter((c) => c.state === TaskState.SUCCEEDED)
-            .reduce((acc, c) => acc + c.reservedTps, 0);
-          const running = dag.children.filter((c) => c.state === TaskState.RUNNING);
-          for (const straggler of running) {
-            straggler.reservedTps = Math.floor(
-              Math.min(
-                straggler.reservedTps * dag.boostTpsMultiplier,
-                straggler.reservedTps + Math.floor(unusedTps / Math.max(1, running.length)),
-              ),
-            );
-            straggler.baseScore += 150;
-            actions.push(`STRAGGLER_BOOSTED:${straggler.taskId}`);
-          }
-        }
-      }
-    }
-    return actions;
-  }
-
-  /** Delegated-quota vouchers, keyed by child task id (owned by the escrow coordinator). */
-  public get issuedVouchers(): Map<string, EscrowVoucher> {
-    return this.escrowCoordinator.issuedVouchers;
-  }
-
-  /**
-   * Rebuilds an active DAG after a restart. `children` must be the already-rehydrated task instances so
-   * that `dag.children[i]` stays reference-identical to `scheduler.tasks.get(childId)`.
-   */
-  public restoreDagGroup(
-    dagId: string,
-    parent: AgentTask,
-    children: AgentTask[],
-    raceMode: boolean = false,
-  ): void {
-    this.activeDags.set(dagId, new SubAgentDagGroup(dagId, parent, children, raceMode));
-  }
-
-  /** Removes a task from its tenant queue (it belongs to a DAG fast queue instead). */
-  public removeFromTenantQueue(taskId: string): void {
-    for (const q of this.tenantQueues.values()) {
-      const idx = q.findIndex((t) => t.taskId === taskId);
-      if (idx >= 0) q.splice(idx, 1);
-    }
-  }
-
-  /** Re-queues a DAG child on the fast path (idempotent by child id). */
-  public enqueueEscrowChild(child: AgentTask): void {
-    if (!this.escrowCoordinator.issuedVouchers.has(child.taskId)) return;
-    if (this.escrowFastQueue.some((item) => item.child.taskId === child.taskId)) return;
-    this.escrowFastQueue.push({ child, voucher: this.escrowCoordinator.issuedVouchers.get(child.taskId)! });
-  }
-
-  /** Re-registers a persisted escrow voucher so delegated quota survives a cold start. */
-  public restoreEscrowVoucher(init: {
-    parentTaskId: string;
-    childTaskId: string;
-    delegatedTps: number;
-    delegatedTokens: number;
-    dagId?: string;
-  }): void {
-    const parent = this.activeDags.get(init.dagId ?? "")?.parentTask;
-    const voucher: EscrowVoucher = {
-      parentTaskId: init.parentTaskId,
-      parentFence: parent ? parent.fence : new FenceToken(0, 0, init.parentTaskId),
-      childTaskId: init.childTaskId,
-      delegatedTps: init.delegatedTps,
-      delegatedTokens: init.delegatedTokens,
+  private getBasePriorityScore(priority: TaskPriority): number {
+    const basePriorityScore: Record<TaskPriority, number> = {
+      [TaskPriority.P0_EMERGENCY]: 1000,
+      [TaskPriority.P1_HIGH]: 300,
+      [TaskPriority.P2_STANDARD]: 150,
+      [TaskPriority.P3_BATCH]: 50,
     };
-    this.escrowCoordinator.issuedVouchers.set(init.childTaskId, voucher);
+    return basePriorityScore[priority] ?? 100;
+  }
+
+  public enqueue(task: TaskSpec): void {
+    this.queuedTasks.set(task.task_id, task);
+    let heap = this.tenantHeaps.get(task.tenant_id);
+    if (!heap) {
+      heap = [];
+      this.tenantHeaps.set(task.tenant_id, heap);
+    }
+    const intraTenantStaticKey =
+      this.getBasePriorityScore(task.priority) - task.created_at * this.agingBoostPerSec;
+    this.heapPush(heap, { task, intraTenantStaticKey });
+  }
+
+  public getTenantActiveCount(tenantId: string): number {
+    return this.tenantActiveCount.get(tenantId) ?? 0;
+  }
+
+  public totalQueued(): number {
+    return this.queuedTasks.size;
+  }
+
+  public computeEffectiveScore(task: TaskSpec, nowSec: number): number {
+    const base = this.getBasePriorityScore(task.priority);
+    const waitSeconds = Math.max(0, nowSec - task.created_at);
+    const agingBonus = waitSeconds * this.agingBoostPerSec;
+    const activeForTenant = this.getTenantActiveCount(task.tenant_id);
+    const drfPenalty = activeForTenant * 25.0;
+    return base + agingBonus - drfPenalty;
+  }
+
+  public popNext(): TaskSpec | null {
+    if (this.queuedTasks.size === 0) return null;
+    const nowSec = Date.now() / 1000;
+
+    let winningTenantId: string | null = null;
+    let winningScore = -Infinity;
+
+    for (const [tenantId, heap] of this.tenantHeaps.entries()) {
+      while (heap.length > 0 && !this.queuedTasks.has(heap[0].task.task_id)) {
+        this.heapPop(heap);
+      }
+      if (heap.length === 0) continue;
+      const topTask = heap[0].task;
+      const dynamicScore = this.computeEffectiveScore(topTask, nowSec);
+      if (dynamicScore > winningScore) {
+        winningScore = dynamicScore;
+        winningTenantId = tenantId;
+      }
+    }
+
+    if (!winningTenantId) return null;
+    const winningHeap = this.tenantHeaps.get(winningTenantId)!;
+    const poppedNode = this.heapPop(winningHeap)!;
+    const bestTask = poppedNode.task;
+
+    this.queuedTasks.delete(bestTask.task_id);
+    this.tenantActiveCount.set(
+      bestTask.tenant_id,
+      this.getTenantActiveCount(bestTask.tenant_id) + 1
+    );
+    return bestTask;
+  }
+
+  public completeTask(task: TaskSpec): void {
+    this.queuedTasks.delete(task.task_id);
+    const curr = this.getTenantActiveCount(task.tenant_id);
+    if (curr > 0) {
+      this.tenantActiveCount.set(task.tenant_id, curr - 1);
+    }
+  }
+
+  private heapPush(heap: TenantHeapNode[], node: TenantHeapNode): void {
+    heap.push(node);
+    let idx = heap.length - 1;
+    while (idx > 0) {
+      const parentIdx = (idx - 1) >> 1;
+      if (heap[parentIdx].intraTenantStaticKey >= heap[idx].intraTenantStaticKey) break;
+      const tmp = heap[parentIdx];
+      heap[parentIdx] = heap[idx];
+      heap[idx] = tmp;
+      idx = parentIdx;
+    }
+  }
+
+  private heapPop(heap: TenantHeapNode[]): TenantHeapNode | undefined {
+    if (heap.length === 0) return undefined;
+    const top = heap[0];
+    const last = heap.pop()!;
+    if (heap.length > 0) {
+      heap[0] = last;
+      let idx = 0;
+      const len = heap.length;
+      while (true) {
+        const left = (idx << 1) + 1;
+        const right = left + 1;
+        let largest = idx;
+        if (left < len && heap[left].intraTenantStaticKey > heap[largest].intraTenantStaticKey) {
+          largest = left;
+        }
+        if (right < len && heap[right].intraTenantStaticKey > heap[largest].intraTenantStaticKey) {
+          largest = right;
+        }
+        if (largest === idx) break;
+        const tmp = heap[idx];
+        heap[idx] = heap[largest];
+        heap[largest] = tmp;
+        idx = largest;
+      }
+    }
+    return top;
   }
 }

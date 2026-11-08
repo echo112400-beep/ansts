@@ -1,152 +1,42 @@
 /**
- * TASK-05: Online Conjugate Bayesian Task Profiler with V8-Portable JSON Serialization & Lazy Node FS.
+ * @fileoverview M2 TASK-05B: Bayesian EWMA Task Resource Profiler for Think/Act Right-Sizing.
  */
+import { ResourceProfile, TaskSpec } from "./models.js";
 
-import * as crypto from "crypto";
-import { AgentTask } from "./models";
+export class TaskResourceProfiler {
+  private readonly historyByTenant: Map<string, { peakCpuEwma: number; peakMemMbEwma: number; samples: number }> =
+    new Map();
+  private readonly alpha: number;
 
-export interface FingerprintStatsData {
-  sampleCount: number;
-  muLogTokens: number;
-  sigmaLogTokens: number;
-  alphaCog: number;
-  betaExec: number;
-}
-
-export class FingerprintStats implements FingerprintStatsData {
-  public sampleCount: number;
-  public muLogTokens: number;
-  public sigmaLogTokens: number;
-  public alphaCog: number;
-  public betaExec: number;
-
-  constructor(init?: Partial<FingerprintStatsData>) {
-    this.sampleCount = init?.sampleCount ?? 0;
-    this.muLogTokens = init?.muLogTokens ?? Math.log(140000.0);
-    this.sigmaLogTokens = init?.sigmaLogTokens ?? 0.45;
-    this.alphaCog = init?.alphaCog ?? 15.0;
-    this.betaExec = init?.betaExec ?? 5.0;
+  constructor(alpha = 0.35) {
+    this.alpha = alpha;
   }
 
-  public get p50Tokens(): number {
-    return Math.round(Math.exp(this.muLogTokens));
-  }
-
-  public get p85Tokens(): number {
-    return Math.round(Math.exp(this.muLogTokens + 1.0364 * this.sigmaLogTokens));
-  }
-
-  public get rhoCog(): number {
-    return Number((this.alphaCog / Math.max(1e-6, this.alphaCog + this.betaExec)).toFixed(4));
-  }
-}
-
-export class BayesianTaskProfiler {
-  private profiles: Map<string, FingerprintStats> = new Map();
-
-  constructor(public readonly coldStartMinSamples: number = 5) {}
-
-  public fingerprint(task: AgentTask): string {
-    const raw = `${task.tenantId}:${task.primaryModel}:${task.isolationDriver}:${task.warmPoolId}`;
-    return crypto.createHash("sha256").update(raw, "utf8").digest("hex").slice(0, 16);
-  }
-
-  public assignInitialP50Reservation(task: AgentTask): number {
-    const fp = this.fingerprint(task);
-    let stats = this.profiles.get(fp);
-    if (!stats) {
-      stats = new FingerprintStats();
-      this.profiles.set(fp, stats);
+  public recommendProfile(task: TaskSpec): ResourceProfile {
+    const hist = this.historyByTenant.get(task.tenant_id);
+    if (!hist || hist.samples < 3) {
+      return { ...task.resource_profile };
     }
-    const softTokens =
-      stats.sampleCount < this.coldStartMinSamples
-        ? Math.min(task.maxTotalTokens, Math.max(stats.p50Tokens, Math.floor(task.maxTotalTokens / 2)))
-        : Math.min(task.maxTotalTokens, stats.p50Tokens);
-    task.softReservedTokens = softTokens;
-    return softTokens;
+    return {
+      think_cpu_cores: task.resource_profile.think_cpu_cores,
+      act_cpu_cores: Math.max(task.resource_profile.think_cpu_cores, Number((hist.peakCpuEwma * 1.2).toFixed(2))),
+      act_memory_mb: Math.max(512, Math.ceil(hist.peakMemMbEwma * 1.25)),
+      disk_mb: task.resource_profile.disk_mb,
+    };
   }
 
-  public checkAndRenewLease(task: AgentTask): boolean {
-    if (task.usedTokens >= Math.floor(0.85 * task.softReservedTokens)) {
-      if (task.softReservedTokens < task.maxTotalTokens) {
-        const fp = this.fingerprint(task);
-        const stats = this.profiles.get(fp) ?? new FingerprintStats();
-        const increment = Math.max(50000, stats.p85Tokens - stats.p50Tokens);
-        task.softReservedTokens = Math.min(task.maxTotalTokens, task.softReservedTokens + increment);
-        return true;
-      }
+  public recordExecutionMetrics(task: TaskSpec, observedPeakCpu: number, observedPeakMemoryMb: number): void {
+    const existing = this.historyByTenant.get(task.tenant_id);
+    if (!existing) {
+      this.historyByTenant.set(task.tenant_id, {
+        peakCpuEwma: observedPeakCpu,
+        peakMemMbEwma: observedPeakMemoryMb,
+        samples: 1,
+      });
+      return;
     }
-    return false;
-  }
-
-  public recordCompletion(task: AgentTask, observedRhoCog: number = 0.75): FingerprintStats {
-    const fp = this.fingerprint(task);
-    let stats = this.profiles.get(fp);
-    if (!stats) {
-      stats = new FingerprintStats();
-      this.profiles.set(fp, stats);
-    }
-    const obsTokens = Math.max(1000, task.usedTokens);
-    const logX = Math.log(obsTokens);
-
-    const priorWeight = Math.max(1, stats.sampleCount);
-    const newMu = (stats.muLogTokens * priorWeight + logX) / (priorWeight + 1);
-    const varPrev = stats.sigmaLogTokens ** 2;
-    const newVar = (priorWeight * varPrev + (logX - newMu) * (logX - stats.muLogTokens)) / (priorWeight + 1);
-    stats.muLogTokens = newMu;
-    stats.sigmaLogTokens = Math.max(0.1, Math.sqrt(Math.max(0.01, newVar)));
-
-    const clampedRho = Math.min(0.98, Math.max(0.02, observedRhoCog));
-    stats.alphaCog += clampedRho * 4.0;
-    stats.betaExec += (1.0 - clampedRho) * 4.0;
-    stats.sampleCount += 1;
-    return stats;
-  }
-
-  /**
-   * Detached view of the conjugate priors, used by durable checkpoints and cluster health endpoints.
-   * Cold-start reservations must survive a restart, so the snapshot is what gets persisted.
-   */
-  public snapshot(): FingerprintStatsData[] {
-    return Array.from(this.profiles.values()).map((v) => ({
-      sampleCount: v.sampleCount,
-      muLogTokens: v.muLogTokens,
-      sigmaLogTokens: v.sigmaLogTokens,
-      alphaCog: v.alphaCog,
-      betaExec: v.betaExec,
-    }));
-  }
-
-  public toJSONString(): string {
-    const obj: Record<string, FingerprintStatsData> = {};
-    for (const [k, v] of this.profiles.entries()) {
-      obj[k] = {
-        sampleCount: v.sampleCount,
-        muLogTokens: v.muLogTokens,
-        sigmaLogTokens: v.sigmaLogTokens,
-        alphaCog: v.alphaCog,
-        betaExec: v.betaExec,
-      };
-    }
-    return JSON.stringify(obj, null, 2);
-  }
-
-  public loadFromJSONString(jsonStr: string): void {
-    const raw = JSON.parse(jsonStr) as Record<string, FingerprintStatsData>;
-    this.profiles.clear();
-    for (const [k, v] of Object.entries(raw)) {
-      this.profiles.set(k, new FingerprintStats(v));
-    }
-  }
-
-  public saveToFile(filePath: string): void {
-    // Lazy require of node:fs so V8 Isolate bundles never fail at module import time
-    const fs = require("fs");
-    fs.writeFileSync(filePath, this.toJSONString(), "utf8");
-  }
-
-  public loadFromFile(filePath: string): void {
-    const fs = require("fs");
-    this.loadFromJSONString(fs.readFileSync(filePath, "utf8"));
+    existing.peakCpuEwma = this.alpha * observedPeakCpu + (1 - this.alpha) * existing.peakCpuEwma;
+    existing.peakMemMbEwma = this.alpha * observedPeakMemoryMb + (1 - this.alpha) * existing.peakMemMbEwma;
+    existing.samples += 1;
   }
 }

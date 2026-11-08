@@ -1,122 +1,83 @@
 /**
- * TASK-23 & Design Doc Section 7.3 Tier-1 Complete Suite:
- * 1. AST Identical Call Breaker (3x) AND A -> B -> A -> B Cyclic Oscillation Detector
- * 2. Consecutive Tool Error Breaker (>= 5 consecutive non-zero exits)
- * 3. Token Burn-Rate Spike (> 35% of maxTotalTokens in 1 turn) & Degenerate Repetition Breaker
- * 4. Sandbox Abuse & Command Deny Breaker (deny_commands, max_pids -> cgroup.freeze = 1)
+ * @fileoverview M4 TASK-16: Semantic Loop Detector, Token Velocity Breaker & JSON AST Validator.
  */
-
-import * as crypto from "crypto";
-import { AgentTask, TaskState } from "../models";
+export interface TurnDiagnostic {
+  turnIndex: number;
+  toolName: string;
+  argsHash: string;
+  tokensConsumed: number;
+  timestampMs: number;
+}
 
 export class SyntacticAndVelocityBreaker {
-  private callSignatures: Map<string, string[]> = new Map();
-  private interventionsCount: Map<string, number> = new Map();
-  private consecutiveToolErrors: Map<string, number> = new Map();
+  private readonly historyByTask: Map<string, TurnDiagnostic[]> = new Map();
+  private readonly maxIdenticalConsecutiveCalls: number;
+  private readonly maxTokensPerMinutePerTask: number;
 
-  constructor(
-    public readonly astCallLimit: number = 3,
-    public readonly maxConsecutiveErrors: number = 5,
-    public readonly singleTurnBurnSpikeRatio: number = 0.35,
-  ) {}
-
-  public normalizeCallSignature(toolName: string, rawExpr: string): string {
-    const canonical = rawExpr.replace(/\s+/g, "");
-    return crypto.createHash("sha256").update(`${toolName}:${canonical}`, "utf8").digest("hex").slice(0, 16);
+  constructor(maxIdenticalConsecutiveCalls = 3, maxTokensPerMinutePerTask = 120_000) {
+    this.maxIdenticalConsecutiveCalls = maxIdenticalConsecutiveCalls;
+    this.maxTokensPerMinutePerTask = maxTokensPerMinutePerTask;
   }
 
-  public recordAndCheckToolCall(
+  public static validateJsonToolCall(rawJson: string): { valid: boolean; parsed?: Record<string, unknown>; error?: string } {
+    try {
+      const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { valid: false, error: "Tool call AST root must be a JSON object" };
+      }
+      return { valid: true, parsed };
+    } catch (err) {
+      return { valid: false, error: (err as Error).message };
+    }
+  }
+
+  /**
+   * Computes the Progress Velocity `V_k` of a turn from its pass rate, the share of errors it eliminated
+   * relative to the previous turn, and the entropy of its diff. Deterministic blend in `[0, 1]`:
+   * a value below `0.15` means the turn made no measurable progress (the shadow replay lab counts it as a
+   * velocity-breaker backtrack).
+   */
+  public computeProgressVelocity(
+    passRate: number,
+    errorReductionRatio: number,
+    diffEntropy: number
+  ): number {
+    const clamp01 = (v: number): number => (Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0);
+    const passComponent = clamp01(passRate) * 0.5;
+    const errorComponent = clamp01(errorReductionRatio) * 0.3;
+    const focusComponent = (1 - clamp01(diffEntropy)) * 0.2;
+    return Number(clamp01(passComponent + errorComponent + focusComponent).toFixed(4));
+  }
+
+  public recordAndCheckTurn(
     taskId: string,
-    toolName: string,
-    expr: string,
-  ): "OK" | "REFLEXION_INTERVENTION" | "CIRCUIT_BROKEN" {
-    const sig = this.normalizeCallSignature(toolName, expr);
-    const hist = this.callSignatures.get(taskId) ?? [];
-    hist.push(sig);
-    this.callSignatures.set(taskId, hist);
-
-    // Check 1A: N consecutive identical normalized AST calls
-    const isIdenticalStreak =
-      hist.length >= this.astCallLimit &&
-      new Set(hist.slice(-this.astCallLimit)).size === 1;
-
-    // Check 1B: A -> B -> A -> B periodic 2-step oscillation
-    const isCyclicOscillation =
-      hist.length >= 4 &&
-      hist[hist.length - 4] === hist[hist.length - 2] &&
-      hist[hist.length - 3] === hist[hist.length - 1] &&
-      hist[hist.length - 2] !== hist[hist.length - 1];
-
-    if (isIdenticalStreak || isCyclicOscillation) {
-      const count = (this.interventionsCount.get(taskId) ?? 0) + 1;
-      this.interventionsCount.set(taskId, count);
-      return count === 1 ? "REFLEXION_INTERVENTION" : "CIRCUIT_BROKEN";
+    diag: TurnDiagnostic
+  ): { tripped: boolean; reason?: "SEMANTIC_DEAD_LOOP" | "TOKEN_VELOCITY_EXCEEDED" } {
+    let list = this.historyByTask.get(taskId);
+    if (!list) {
+      list = [];
+      this.historyByTask.set(taskId, list);
     }
-    return "OK";
-  }
+    list.push(diag);
 
-  public recordToolExitStatus(task: AgentTask, exitCode: number): "OK" | "CIRCUIT_BROKEN" {
-    if (exitCode === 0) {
-      this.consecutiveToolErrors.set(task.taskId, 0);
-      return "OK";
-    }
-    const streak = (this.consecutiveToolErrors.get(task.taskId) ?? 0) + 1;
-    this.consecutiveToolErrors.set(task.taskId, streak);
-    if (streak >= this.maxConsecutiveErrors) {
-      task.state = TaskState.CIRCUIT_BROKEN;
-      return "CIRCUIT_BROKEN";
-    }
-    return "OK";
-  }
-
-  public evaluateBurnRateSpikeAndRepetition(
-    task: AgentTask,
-    turnTokensUsed: number,
-    outputSample: string = "",
-  ): { tripped: boolean; action: string; newModel?: string; newTemperature?: number } {
-    const spikeRatio = turnTokensUsed / Math.max(1, task.maxTotalTokens);
-    // Detect degenerate repetition (e.g., same 12-char substring repeated >= 6 times)
-    const hasDegenerateRepeat = /(.{10,})\1{5,}/.test(outputSample);
-
-    if (spikeRatio > this.singleTurnBurnSpikeRatio || hasDegenerateRepeat) {
-      task.temperature = Math.max(0.0, Number((task.temperature * 0.5).toFixed(2)));
-      const fallback = task.fallbackModels[0] ?? "Qwen-3.8";
-      task.assignedModelPool = fallback;
-      return {
-        tripped: true,
-        action: "ROLLBACK_TURN_AND_SWITCH_FALLBACK",
-        newModel: fallback,
-        newTemperature: task.temperature,
-      };
-    }
-    return { tripped: false, action: "OK" };
-  }
-
-  public enforceSandboxAbuseAndCommandGuard(
-    task: AgentTask,
-    commandStr: string,
-    activePids: number = 10,
-  ): { allowed: boolean; cgroupFrozen: boolean; reason: string } {
-    for (const denied of task.denyCommands) {
-      if (commandStr.includes(denied)) {
-        task.cgroupFrozen = true;
-        task.state = TaskState.CIRCUIT_BROKEN;
-        return {
-          allowed: false,
-          cgroupFrozen: true,
-          reason: `Denied command '${denied}' triggered Cgroup freeze`,
-        };
+    if (list.length >= this.maxIdenticalConsecutiveCalls) {
+      const recent = list.slice(-this.maxIdenticalConsecutiveCalls);
+      const allSame = recent.every(
+        (d) => d.toolName === diag.toolName && d.argsHash === diag.argsHash
+      );
+      if (allSame) {
+        return { tripped: true, reason: "SEMANTIC_DEAD_LOOP" };
       }
     }
-    if (activePids >= task.maxPids) {
-      task.cgroupFrozen = true;
-      task.state = TaskState.CIRCUIT_BROKEN;
-      return {
-        allowed: false,
-        cgroupFrozen: true,
-        reason: `PID count ${activePids} >= max_pids ${task.maxPids} triggered Cgroup freeze`,
-      };
+
+    const windowStart = diag.timestampMs - 60_000;
+    const tokensInLastMin = list
+      .filter((d) => d.timestampMs >= windowStart)
+      .reduce((acc, d) => acc + d.tokensConsumed, 0);
+    if (tokensInLastMin > this.maxTokensPerMinutePerTask) {
+      return { tripped: true, reason: "TOKEN_VELOCITY_EXCEEDED" };
     }
-    return { allowed: true, cgroupFrozen: false, reason: "OK" };
+
+    return { tripped: false };
   }
 }

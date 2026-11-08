@@ -1,268 +1,389 @@
 /**
- * Cloudflare Workers & denoland/celld Runtime Bindings, Durable Object Base Interfaces,
- * and In-Process Simulator Mocks for Local CI Verification.
+ * @fileoverview M7 TASK-25: Cloudflare Workers & denoland/celld Unified Runtime Bindings & SQL/KV/R2 Mock Layer.
  */
+export interface DurableObjectIdLike {
+  toString(): string;
+  name?: string;
+}
 
-export interface SqlStorageCursor<T = Record<string, any>> {
+export interface DurableObjectStubLike {
+  id: DurableObjectIdLike;
+  fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+}
+
+export interface DurableObjectNamespaceLike {
+  idFromName(name: string): DurableObjectIdLike;
+  get(id: DurableObjectIdLike): DurableObjectStubLike;
+}
+
+export interface SqlCursorLike<T = Record<string, unknown>> {
   toArray(): T[];
   one(): T | null;
 }
 
-export interface SqlStorage {
-  exec<T = Record<string, any>>(query: string, ...bindings: any[]): SqlStorageCursor<T>;
+export interface SqlStorageLike {
+  exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): SqlCursorLike<T>;
 }
 
-export interface CompanionContainer {
-  running: boolean;
-  allocatedCpuCores: number;
-  start(): Promise<void>;
-  stop(): Promise<void>;
-  fetch(req: RequestInfo, init?: RequestInit): Promise<Response>;
-}
-
-export interface DurableObjectStorage {
-  sql: SqlStorage;
-  get<T = any>(key: string): Promise<T | undefined>;
-  put<T = any>(key: string, value: T): Promise<void>;
+export interface DurableObjectStorageLike {
+  sql: SqlStorageLike;
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put<T = unknown>(key: string, value: T): Promise<void>;
   delete(key: string): Promise<boolean>;
   setAlarm(scheduledTime: number | Date): Promise<void>;
   getAlarm(): Promise<number | null>;
-  /**
-   * Optional SQLite transaction wrapper. When present, all state mutations inside `callback` are
-   * atomic: a throw rolls the whole unit back (RPO=0 durability contract).
-   */
-  transactionSync?<T>(callback: () => T): T;
-  /**
-   * Optional write-ahead-log flush. Implementations without real WAL semantics may override this
-   * to reject when durability cannot be confirmed, in which case callers must fail closed.
-   */
-  sync?(): Promise<void>;
 }
 
-export interface DurableObjectState {
-  id: { toString(): string; name?: string };
-  storage: DurableObjectStorage;
-  container?: CompanionContainer;
-  acceptWebSocket(ws: WebSocketLike, tags?: string[]): void;
-  getWebSockets(tag?: string): WebSocketLike[];
-  waitUntil(promise: Promise<any>): void;
+export interface DurableObjectFacetsLike {
+  get<T = DurableObjectStubLike>(
+    facetName: string,
+    initOrFactory?: () => { class: unknown; id?: string }
+  ): T;
+  abort(facetName: string, error?: Error): void;
+  delete(facetName: string): Promise<void>;
 }
 
-export interface WebSocketLike {
-  send(data: string): void;
-  close(code?: number, reason?: string): void;
-  serializeAttachment?(attachment: any): void;
-  deserializeAttachment?(): any;
+export interface DurableObjectStateLike {
+  id: DurableObjectIdLike;
+  storage: DurableObjectStorageLike;
+  facets?: DurableObjectFacetsLike;
+  blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
 }
 
-export interface DurableObjectStub {
-  fetch(input: RequestInfo, init?: RequestInit): Promise<Response>;
-}
-
-export interface DurableObjectNamespace {
-  idFromName(name: string): { toString(): string; name: string };
-  get(id: { toString(): string; name?: string }): DurableObjectStub;
-}
-
-export interface KVNamespaceBinding {
-  get(key: string, type?: "text" | "json"): Promise<any>;
-  put(key: string, value: string, options?: { expirationTtl?: number; metadata?: any }): Promise<void>;
+export interface KvNamespaceLike {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
   delete(key: string): Promise<void>;
 }
 
-export interface R2ObjectBody {
+export interface R2ObjectBodyLike {
   key: string;
-  body: string;
-  customMetadata?: Record<string, string>;
+  etag: string;
+  size: number;
+  customMetadata: Record<string, string>;
+  arrayBuffer(): Promise<ArrayBuffer>;
   text(): Promise<string>;
 }
 
-export interface R2BucketBinding {
+export interface R2BucketLike {
   put(
     key: string,
-    value: string,
-    options?: { onlyIf?: { etagDoesNotMatch?: string }; customMetadata?: Record<string, string> },
-  ): Promise<{ key: string } | null>;
-  get(key: string): Promise<R2ObjectBody | null>;
-  list(options?: { prefix?: string }): Promise<{ objects: Array<{ key: string }> }>;
+    value: Uint8Array | ArrayBuffer | string,
+    options?: { customMetadata?: Record<string, string>; onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }
+  ): Promise<{ key: string; etag: string; size: number } | null>;
+  get(key: string): Promise<R2ObjectBodyLike | null>;
+  delete(key: string): Promise<void>;
+  list(options?: { prefix?: string }): Promise<{ objects: Array<{ key: string; etag: string; size: number }> }>;
 }
 
-export interface D1PreparedStatement {
-  bind(...values: any[]): D1PreparedStatement;
-  run(): Promise<{ success: boolean }>;
-  all<T = Record<string, any>>(): Promise<{ results: T[] }>;
-}
-
-export interface D1DatabaseBinding {
-  prepare(query: string): D1PreparedStatement;
-}
-
-export interface QueueMessage<T = any> {
+export interface QueueMessageLike<T = unknown> {
   id: string;
   timestamp: Date;
   body: T;
+  attempts: number;
   ack(): void;
-  retry(): void;
+  retry(options?: { delaySeconds?: number }): void;
 }
 
-export interface MessageBatch<T = any> {
+export interface QueueBatchLike<T = unknown> {
   queue: string;
-  messages: Array<QueueMessage<T>>;
+  messages: Array<QueueMessageLike<T>>;
 }
 
-export interface QueueBinding {
-  send(message: any): Promise<void>;
+export interface QueueProducerLike<T = unknown> {
+  send(body: T, options?: { contentType?: string; delaySeconds?: number }): Promise<void>;
+}
+
+export interface DynamicWorkerLoaderModuleSpec {
+  compatibilityDate: string;
+  mainModule: string;
+  modules: Record<string, string | { js?: string; cjs?: string; text?: string; json?: unknown }>;
+  env?: Record<string, unknown>;
+  globalOutbound?: unknown | null;
+}
+
+export interface DynamicWorkerEntrypointLike {
+  fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+}
+
+export interface DynamicWorkerStubLike {
+  getEntrypoint(name?: string): DynamicWorkerEntrypointLike;
+}
+
+export interface DynamicWorkerLoaderBindingLike {
+  get(
+    id: string,
+    loaderCallback: () => Promise<DynamicWorkerLoaderModuleSpec>
+  ): DynamicWorkerStubLike;
 }
 
 export interface CloudflareCelldEnv {
-  SCHEDULER_CELL: DurableObjectNamespace;
-  AGENT_HARNESS_CELL: DurableObjectNamespace;
-  ANSTS_D1: D1DatabaseBinding;
-  ANSTS_KV: KVNamespaceBinding;
-  ANSTS_CHECKPOINTS_R2: R2BucketBinding;
-  ANSTS_EVENTS_QUEUE: QueueBinding;
-  /**
-   * Stable scheduler cluster identity. Every scheduler RPC must resolve to this single logical cell;
-   * falling back to per-shard ids silently splits one cluster into several schedulers.
-   */
-  SCHEDULER_CLUSTER_ID?: string;
-  PRIMARY_MODEL_POOL?: string;
-  FAST_UTILITY_POOL?: string;
-  FALLBACK_MODEL_POOL?: string;
-  WEBHOOK_HMAC_SECRET?: string;
+  ANSTS_SCHEDULER_CELL: DurableObjectNamespaceLike;
+  ANSTS_HARNESS_CELL: DurableObjectNamespaceLike;
+  ANSTS_IDEMPOTENCY_KV: KvNamespaceLike;
+  ANSTS_CHECKPOINT_BUCKET: R2BucketLike;
+  ANSTS_TASK_DISPATCH_QUEUE: QueueProducerLike;
+  ANSTS_WEBHOOK_OUTBOX_QUEUE: QueueProducerLike;
+  ANSTS_SANDBOX_LOADER?: DynamicWorkerLoaderBindingLike;
+  CELLD_REGION?: string;
 }
 
-/**
- * Lightweight SQLite/KV/R2/Container simulator for testing Durable Objects & Workers
- * in Node.js CI while remaining 100% API-compatible with `celld` and Cloudflare Workers.
- */
-export class InMemoryCellSqlStorage implements SqlStorage {
-  public tables: Map<string, Array<Record<string, any>>> = new Map();
+export class InMemoryCellSqlStorage implements SqlStorageLike {
+  private tables: Map<string, Map<string, Record<string, unknown>>> = new Map();
+  private txSnapshot: Map<string, Map<string, Record<string, unknown>>> | null = null;
 
-  public exec<T = Record<string, any>>(query: string, ...bindings: any[]): SqlStorageCursor<T> {
-    const q = query.trim();
+  public exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): SqlCursorLike<T> {
+    const q = query.trim().replace(/\s+/g, " ");
     const upper = q.toUpperCase();
 
-    if (upper.startsWith("CREATE TABLE")) {
-      const match = q.match(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)/i);
-      if (match) {
-        const tableName = match[1];
-        if (!this.tables.has(tableName)) {
-          this.tables.set(tableName, []);
+    if (upper === "BEGIN" || upper === "BEGIN TRANSACTION") {
+      this.txSnapshot = new Map();
+      for (const [tName, rows] of this.tables.entries()) {
+        const clonedRows = new Map<string, Record<string, unknown>>();
+        for (const [pk, r] of rows.entries()) {
+          clonedRows.set(pk, { ...r });
+        }
+        this.txSnapshot.set(tName, clonedRows);
+      }
+      return { toArray: () => [], one: () => null };
+    }
+
+    if (upper === "COMMIT" || upper === "COMMIT TRANSACTION") {
+      this.txSnapshot = null;
+      return { toArray: () => [], one: () => null };
+    }
+
+    if (upper === "ROLLBACK" || upper === "ROLLBACK TRANSACTION") {
+      if (this.txSnapshot) {
+        this.tables = this.txSnapshot;
+        this.txSnapshot = null;
+      }
+      return { toArray: () => [], one: () => null };
+    }
+
+    if (upper.startsWith("CREATE TABLE") || upper.startsWith("CREATE INDEX") || upper.startsWith("PRAGMA")) {
+      const m = q.match(/CREATE TABLE(?: IF NOT EXISTS)?\s+([a-zA-Z0-9_]+)/i);
+      if (m) {
+        const tbl = m[1];
+        if (!this.tables.has(tbl)) {
+          this.tables.set(tbl, new Map());
         }
       }
       return { toArray: () => [], one: () => null };
     }
 
-    if (upper.startsWith("INSERT INTO")) {
-      const match = q.match(/INSERT\s+INTO\s+([a-zA-Z0-9_]+)\s*\(([^)]+)\)/i);
-      if (match) {
-        const tableName = match[1];
-        const cols = match[2].split(",").map((c) => c.trim());
-        const row: Record<string, any> = {};
-        cols.forEach((col, idx) => {
-          row[col] = bindings[idx];
+    if (upper.startsWith("INSERT") || upper.startsWith("REPLACE")) {
+      const m = q.match(/(?:INSERT(?: OR REPLACE)?|REPLACE)\s+INTO\s+([a-zA-Z0-9_]+)\s*\(([^)]+)\)/i);
+      if (m) {
+        const tblName = m[1];
+        const cols = m[2].split(",").map((c) => c.trim());
+        let tbl = this.tables.get(tblName);
+        if (!tbl) {
+          tbl = new Map();
+          this.tables.set(tblName, tbl);
+        }
+        const row: Record<string, unknown> = {};
+        cols.forEach((col, i) => {
+          row[col] = bindings[i];
         });
-        const rows = this.tables.get(tableName) ?? [];
-        rows.push(row);
-        this.tables.set(tableName, rows);
+        const pk = String(bindings[0] ?? `${tbl.size + 1}`);
+        tbl.set(pk, row);
+      }
+      return { toArray: () => [], one: () => null };
+    }
+
+    if (upper.startsWith("UPDATE ")) {
+      const m = q.match(/UPDATE\s+([a-zA-Z0-9_]+)\s+SET\s+(.+?)\s+WHERE\s+([a-zA-Z0-9_]+)\s*=\s*\?/i);
+      if (m) {
+        const tbl = this.tables.get(m[1]);
+        const setClause = m[2];
+        const pkValue = String(bindings[bindings.length - 1]);
+        if (tbl && tbl.has(pkValue)) {
+          const existing = tbl.get(pkValue)!;
+          const setCols = setClause.split(",").map((part) => part.split("=")[0].trim());
+          setCols.forEach((c, idx) => {
+            if (idx < bindings.length - 1) {
+              existing[c] = bindings[idx];
+            }
+          });
+        }
       }
       return { toArray: () => [], one: () => null };
     }
 
     if (upper.startsWith("DELETE FROM")) {
-      const match = q.match(/DELETE\s+FROM\s+([a-zA-Z0-9_]+)(?:\s+WHERE\s+([a-zA-Z0-9_]+)\s*([>=])\s*\?)?/i);
-      if (match) {
-        const tableName = match[1];
-        const col = match[2];
-        const operator = match[3] ?? "=";
-        const rows = this.tables.get(tableName) ?? [];
-        if (col && bindings.length > 0) {
-          this.tables.set(
-            tableName,
-            rows.filter((r) => (operator === ">" ? r[col] > bindings[0] : r[col] !== bindings[0])),
-          );
-        } else {
-          this.tables.set(tableName, []);
+      const m = q.match(/DELETE FROM\s+([a-zA-Z0-9_]+)(?:\s+WHERE\s+(.+))?/i);
+      if (m) {
+        const tbl = this.tables.get(m[1]);
+        if (tbl) {
+          if (m[2] && bindings.length > 0) {
+            const condCols = m[2].split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
+            for (const [pk, row] of tbl.entries()) {
+              const matchAll = condCols.every((col, idx) => String(row[col]) === String(bindings[idx]));
+              if (matchAll) tbl.delete(pk);
+            }
+          } else {
+            tbl.clear();
+          }
         }
       }
       return { toArray: () => [], one: () => null };
     }
 
-    if (upper.startsWith("SELECT")) {
-      const match = q.match(/FROM\s+([a-zA-Z0-9_]+)/i);
-      const tableName = match ? match[1] : "";
-      const rows = (this.tables.get(tableName) ?? []) as T[];
-      return {
-        toArray: () => [...rows],
-        one: () => (rows.length > 0 ? rows[rows.length - 1] : null),
-      };
+    if (upper.startsWith("SELECT ")) {
+      const mTable = q.match(/FROM\s+([a-zA-Z0-9_]+)/i);
+      if (mTable) {
+        const tbl = this.tables.get(mTable[1]);
+        if (!tbl) return { toArray: () => [], one: () => null };
+        let rows = Array.from(tbl.values());
+
+        const mWhere = q.match(/WHERE\s+(.+?)(?:\s+ORDER BY|\s+LIMIT|$)/i);
+        if (mWhere && bindings.length > 0) {
+          const condCols = mWhere[1].split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
+          rows = rows.filter((r) =>
+            condCols.every((col, idx) => String(r[col]) === String(bindings[idx]))
+          );
+        }
+
+        const mOrder = q.match(/ORDER BY\s+([a-zA-Z0-9_]+)(?:\s+(ASC|DESC))?/i);
+        if (mOrder) {
+          const orderCol = mOrder[1];
+          const desc = (mOrder[2] ?? "ASC").toUpperCase() === "DESC";
+          rows.sort((a, b) => {
+            const va = a[orderCol] as number | string;
+            const vb = b[orderCol] as number | string;
+            if (va === vb) return 0;
+            const cmp = va > vb ? 1 : -1;
+            return desc ? -cmp : cmp;
+          });
+        }
+
+        if (upper.includes("COUNT(*)")) {
+          const cntRow = { cnt: rows.length, "COUNT(*)": rows.length } as unknown as T;
+          return { toArray: () => [cntRow], one: () => cntRow };
+        }
+        return {
+          toArray: () => rows as unknown as T[],
+          one: () => (rows[0] as unknown as T) ?? null,
+        };
+      }
     }
 
     return { toArray: () => [], one: () => null };
   }
 }
 
-/**
- * Alias kept for the scheduler / chaos-drill modules that refer to the in-memory SQLite
- * double as `InMemorySqlStorage`. Same implementation as {@link InMemoryCellSqlStorage}.
- */
-export const InMemorySqlStorage = InMemoryCellSqlStorage;
-export type InMemorySqlStorage = InMemoryCellSqlStorage;
+export class MockDurableObjectState implements DurableObjectStateLike {
+  public readonly id: DurableObjectIdLike;
+  public readonly storage: DurableObjectStorageLike;
+  private readonly kvMap: Map<string, unknown> = new Map();
+  private alarmTime: number | null = null;
 
-export class MockDurableObjectState implements DurableObjectState {
-  public id: { toString(): string; name?: string };
-  public storage: DurableObjectStorage;
-  public container: CompanionContainer;
-  private kv: Map<string, any> = new Map();
-  private sqlStore = new InMemoryCellSqlStorage();
-  private alarmTs: number | null = null;
-  private websockets: Array<{ ws: WebSocketLike; tags: string[]; attachment?: any }> = [];
-
-  constructor(name: string = "default-cell") {
-    this.id = { toString: () => `cell_${name}`, name };
+  constructor(idStr = "cell-default-01") {
+    this.id = { toString: () => idStr, name: idStr };
+    const sql = new InMemoryCellSqlStorage();
     this.storage = {
-      sql: this.sqlStore,
-      get: async <T = any>(key: string) => this.kv.get(key) as T | undefined,
-      put: async <T = any>(key: string, value: T) => {
-        this.kv.set(key, value);
+      sql,
+      get: async <T = unknown>(key: string) => this.kvMap.get(key) as T | undefined,
+      put: async <T = unknown>(key: string, value: T) => {
+        this.kvMap.set(key, value);
       },
-      delete: async (key: string) => this.kv.delete(key),
-      setAlarm: async (time: number | Date) => {
-        this.alarmTs = typeof time === "number" ? time : time.getTime();
+      delete: async (key: string) => this.kvMap.delete(key),
+      setAlarm: async (scheduledTime: number | Date) => {
+        this.alarmTime = typeof scheduledTime === "number" ? scheduledTime : scheduledTime.getTime();
       },
-      getAlarm: async () => this.alarmTs,
-    };
-    this.container = {
-      running: false,
-      allocatedCpuCores: 0.1,
-      start: async () => {
-        this.container.running = true;
-        this.container.allocatedCpuCores = 8.0;
-      },
-      stop: async () => {
-        this.container.running = false;
-        this.container.allocatedCpuCores = 0.0;
-      },
-      fetch: async (req: RequestInfo) => {
-        const url = typeof req === "string" ? req : (req as Request).url;
-        return new Response(
-          JSON.stringify({ container_executed: true, url, burst_cores: this.container.allocatedCpuCores }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      },
+      getAlarm: async () => this.alarmTime,
     };
   }
 
-  public acceptWebSocket(ws: WebSocketLike, tags: string[] = []): void {
-    this.websockets.push({ ws, tags });
+  public async blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T> {
+    return callback();
+  }
+}
+
+export class InMemoryKvNamespace implements KvNamespaceLike {
+  private readonly store: Map<string, string> = new Map();
+  public async get(key: string): Promise<string | null> {
+    return this.store.get(key) ?? null;
+  }
+  public async put(key: string, value: string): Promise<void> {
+    this.store.set(key, value);
+  }
+  public async delete(key: string): Promise<void> {
+    this.store.delete(key);
+  }
+}
+
+export class InMemoryR2Bucket implements R2BucketLike {
+  private readonly objects: Map<string, { bytes: Uint8Array; etag: string; customMetadata: Record<string, string> }> =
+    new Map();
+  private seq = 0;
+
+  public async put(
+    key: string,
+    value: Uint8Array | ArrayBuffer | string,
+    options?: { customMetadata?: Record<string, string>; onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }
+  ): Promise<{ key: string; etag: string; size: number } | null> {
+    const existing = this.objects.get(key);
+    if (options?.onlyIf?.etagDoesNotMatch === "*" && existing) {
+      return null;
+    }
+    if (options?.onlyIf?.etagMatches && (!existing || existing.etag !== options.onlyIf.etagMatches)) {
+      return null;
+    }
+    this.seq += 1;
+    const bytes =
+      typeof value === "string"
+        ? new TextEncoder().encode(value)
+        : value instanceof Uint8Array
+          ? value
+          : new Uint8Array(value);
+    const etag = `"etag-${this.seq}-${bytes.byteLength}"`;
+    this.objects.set(key, {
+      bytes,
+      etag,
+      customMetadata: options?.customMetadata ?? {},
+    });
+    return { key, etag, size: bytes.byteLength };
   }
 
-  public getWebSockets(tag?: string): WebSocketLike[] {
-    return this.websockets
-      .filter((item) => !tag || item.tags.includes(tag))
-      .map((item) => item.ws);
+  public async get(key: string): Promise<R2ObjectBodyLike | null> {
+    const obj = this.objects.get(key);
+    if (!obj) return null;
+    return {
+      key,
+      etag: obj.etag,
+      size: obj.bytes.byteLength,
+      customMetadata: obj.customMetadata,
+      arrayBuffer: async () => {
+        // Copy into an owned ArrayBuffer: `Uint8Array.buffer` is `ArrayBufferLike` (may be shared).
+        const copy = new ArrayBuffer(obj.bytes.byteLength);
+        new Uint8Array(copy).set(obj.bytes);
+        return copy;
+      },
+      text: async () => new TextDecoder().decode(obj.bytes),
+    };
   }
 
-  public waitUntil(_promise: Promise<any>): void {}
+  public async delete(key: string): Promise<void> {
+    this.objects.delete(key);
+  }
+
+  public async list(options?: { prefix?: string }): Promise<{ objects: Array<{ key: string; etag: string; size: number }> }> {
+    const prefix = options?.prefix ?? "";
+    const out: Array<{ key: string; etag: string; size: number }> = [];
+    for (const [k, v] of this.objects.entries()) {
+      if (k.startsWith(prefix)) {
+        out.push({ key: k, etag: v.etag, size: v.bytes.byteLength });
+      }
+    }
+    return { objects: out };
+  }
+}
+
+export class InMemoryQueueProducer<T = unknown> implements QueueProducerLike<T> {
+  public readonly sentMessages: Array<{ body: T; delaySeconds?: number }> = [];
+  public async send(body: T, options?: { delaySeconds?: number }): Promise<void> {
+    this.sentMessages.push({ body, delaySeconds: options?.delaySeconds });
+  }
 }

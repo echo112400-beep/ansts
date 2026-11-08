@@ -1,137 +1,110 @@
 /**
- * TASK-12, TASK-13, TASK-14 Unified: Turn-Level Dynamic Cognitive Router
- * Composing ThreeStateCircuitBreaker, SlidingWindowTokenBucket, and ModelPoolClientAdapter.
+ * @fileoverview M3 TASK-08: Prefix-Cache Aware Cognitive Router with Automatic Degradation.
  */
-
-import { LeaseCoordinator } from "./lease_coordinator";
-import { AgentTask, EFFORT_MULTIPLIERS, FenceToken, ModelPoolName, ReasoningEffort } from "./models";
-import { SlidingWindowTokenBucket, ThreeStateCircuitBreaker } from "./router/breaker_limiter";
-import { ModelPoolClientAdapter, SseTokenChunk, TurnMeteringSummary } from "./router/pool_client";
-
-export interface ModelPoolHealth {
-  poolName: ModelPoolName;
-  breakerState: "CLOSED" | "OPEN" | "HALF_OPEN";
-  errorRate429: number;
-  ttftSec: number;
-  quotaHeadroomRatio: number;
-}
+import * as crypto from "node:crypto";
+import { LlmEndpointMetrics, TaskPriority } from "./models.js";
+import { SlidingWindowTokenBucket, ThreeStateCircuitBreaker } from "./router/breaker_limiter.js";
 
 export class CognitiveRouter {
-  public pools: Record<ModelPoolName, ModelPoolHealth>;
-  public breakers: Record<ModelPoolName, ThreeStateCircuitBreaker>;
-  public tokenBuckets: Record<ModelPoolName, SlidingWindowTokenBucket>;
-  public readonly poolAdapter = new ModelPoolClientAdapter();
+  private readonly endpoints: Map<string, LlmEndpointMetrics> = new Map();
+  private readonly prefixRadixIndex: Map<string, string> = new Map();
+  private readonly breakers: Map<string, ThreeStateCircuitBreaker> = new Map();
+  private readonly limiters: Map<string, SlidingWindowTokenBucket> = new Map();
+  private readonly ewmaAlpha: number;
 
-  constructor(public readonly leaseCoordinator: LeaseCoordinator) {
-    this.pools = {
-      DeepSeek: {
-        poolName: "DeepSeek",
-        breakerState: "CLOSED",
-        errorRate429: 0.01,
-        ttftSec: 0.40,
-        quotaHeadroomRatio: 0.92,
-      },
-      "GLM-5.3": {
-        poolName: "GLM-5.3",
-        breakerState: "CLOSED",
-        errorRate429: 0.01,
-        ttftSec: 0.18,
-        quotaHeadroomRatio: 0.95,
-      },
-      "Qwen-3.8": {
-        poolName: "Qwen-3.8",
-        breakerState: "CLOSED",
-        errorRate429: 0.01,
-        ttftSec: 0.35,
-        quotaHeadroomRatio: 0.94,
-      },
-    };
-    this.breakers = {
-      DeepSeek: new ThreeStateCircuitBreaker("DeepSeek", 0.25, 15.0, 10.0),
-      "GLM-5.3": new ThreeStateCircuitBreaker("GLM-5.3", 0.25, 15.0, 10.0),
-      "Qwen-3.8": new ThreeStateCircuitBreaker("Qwen-3.8", 0.25, 15.0, 10.0),
-    };
-    this.tokenBuckets = {
-      DeepSeek: new SlidingWindowTokenBucket(1800, 3600),
-      "GLM-5.3": new SlidingWindowTokenBucket(2400, 4800),
-      "Qwen-3.8": new SlidingWindowTokenBucket(2000, 4000),
-    };
+  constructor(ewmaAlpha = 0.3) {
+    this.ewmaAlpha = ewmaAlpha;
   }
 
-  public tripPoolBreaker(poolName: ModelPoolName, errorRate: number = 0.45, now: number = 10.0): void {
-    const pool = this.pools[poolName];
-    const brk = this.breakers[poolName];
-    pool.errorRate429 = errorRate;
-    if (errorRate >= 0.25) {
-      for (let i = 0; i < 4; i++) {
-        brk.recordOutcome(false, 2.0, now);
+  public registerEndpoint(ep: LlmEndpointMetrics, maxRpm = 1000, maxTpm = 2_000_000): void {
+    this.endpoints.set(ep.endpoint_id, ep);
+    this.breakers.set(ep.endpoint_id, new ThreeStateCircuitBreaker());
+    this.limiters.set(ep.endpoint_id, new SlidingWindowTokenBucket(maxRpm, maxTpm));
+  }
+
+  public static computePrefixHash(systemPrompt: string, toolDefinitions: string, historyPrefix = ""): string {
+    const raw = `${systemPrompt}||${toolDefinitions}||${historyPrefix.slice(0, 1024)}`;
+    return crypto.createHash("sha256").update(raw, "utf-8").digest("hex").slice(0, 24);
+  }
+
+  public reportInvocationMetrics(
+    endpointId: string,
+    observedTtftMs: number,
+    tokensUsed: number,
+    isRateLimited = false
+  ): void {
+    const ep = this.endpoints.get(endpointId);
+    if (!ep) return;
+    const breaker = this.breakers.get(endpointId);
+    ep.ttft_ewma_ms = this.ewmaAlpha * observedTtftMs + (1.0 - this.ewmaAlpha) * ep.ttft_ewma_ms;
+    ep.tpm_used = Math.min(ep.tpm_limit, ep.tpm_used + tokensUsed);
+    if (isRateLimited) {
+      ep.rate_limit_hits_last_min += 1;
+      breaker?.recordFailure();
+      if (ep.rate_limit_hits_last_min >= 5) {
+        ep.healthy = false;
       }
-      pool.breakerState = brk.state;
-    }
-  }
-
-  public resetPoolBreaker(poolName: ModelPoolName): void {
-    const pool = this.pools[poolName];
-    const brk = this.breakers[poolName];
-    pool.errorRate429 = 0.01;
-    brk.state = "CLOSED";
-    brk.recentOutcomes = [];
-    pool.breakerState = "CLOSED";
-  }
-
-  public routeTurn(
-    task: AgentTask,
-    fence: FenceToken,
-    isReadOnlyTurn: boolean = false,
-    consecutiveToolErrors: number = 0,
-    now: number = 10.0,
-  ): {
-    routedModel: ModelPoolName;
-    effectiveEffort: ReasoningEffort;
-    tokensConsumed: number;
-    pacingDelaySec: number;
-    chunks: SseTokenChunk[];
-    metering: TurnMeteringSummary;
-  } {
-    this.leaseCoordinator.verifyAndAdvanceFence(fence);
-
-    // Sync breaker states (including HALF_OPEN cooldown transitions)
-    for (const name of ["DeepSeek", "GLM-5.3", "Qwen-3.8"] as ModelPoolName[]) {
-      this.breakers[name].allowRequest(now);
-      this.pools[name].breakerState = this.breakers[name].state;
-    }
-
-    let routedModel: ModelPoolName;
-    let effectiveEffort: ReasoningEffort;
-
-    if (isReadOnlyTurn && this.pools[task.fastUtilityModel].breakerState !== "OPEN") {
-      routedModel = task.fastUtilityModel;
-      effectiveEffort = "minimal";
     } else {
-      const primaryPool = this.pools[task.primaryModel];
-      if (primaryPool.breakerState === "OPEN") {
-        routedModel = task.fallbackModels[0];
-        effectiveEffort = task.effort === "high" || task.effort === "max" ? "medium" : task.effort;
-      } else {
-        routedModel = task.primaryModel;
-        effectiveEffort = consecutiveToolErrors >= 2 ? "max" : task.effort;
+      breaker?.recordSuccess();
+    }
+  }
+
+  public selectEndpoint(
+    prefixHash: string,
+    estimatedTokens: number,
+    priority: TaskPriority
+  ): [LlmEndpointMetrics, boolean] {
+    const cachedEpId = this.prefixRadixIndex.get(prefixHash);
+    const candidates = Array.from(this.endpoints.values()).filter(
+      (ep) =>
+        ep.healthy &&
+        (this.breakers.get(ep.endpoint_id)?.canPass() ?? true) &&
+        ep.tpm_remaining >= estimatedTokens &&
+        ep.active_requests < ep.max_concurrency
+    );
+
+    if (candidates.length === 0) {
+      const fallback = Array.from(this.endpoints.values()).filter((ep) => ep.healthy);
+      if (fallback.length === 0) {
+        throw new Error("All LLM endpoints in CognitiveRouter are unhealthy");
+      }
+      fallback.sort((a, b) => a.active_requests - b.active_requests);
+      return [fallback[0], false];
+    }
+
+    const scoreEndpoint = (ep: LlmEndpointMetrics): number => {
+      const cacheHitBonus = ep.endpoint_id === cachedEpId ? 35.0 : 0.0;
+      const ttftScore = Math.max(0.0, 40.0 * (1.0 - ep.ttft_ewma_ms / 2500.0));
+      const quotaRatio = ep.tpm_remaining / Math.max(1, ep.tpm_limit);
+      const quotaScore = 25.0 * quotaRatio;
+      const penalty = ep.rate_limit_hits_last_min * 10.0;
+      if (priority === TaskPriority.P3_BATCH && ep.endpoint_id === cachedEpId) {
+        return cacheHitBonus * 1.5 + quotaScore - penalty;
+      }
+      return cacheHitBonus + ttftScore + quotaScore - penalty;
+    };
+
+    let bestEp = candidates[0];
+    let bestScore = scoreEndpoint(bestEp);
+    for (let i = 1; i < candidates.length; i++) {
+      const s = scoreEndpoint(candidates[i]);
+      if (s > bestScore) {
+        bestScore = s;
+        bestEp = candidates[i];
       }
     }
 
-    const mult = EFFORT_MULTIPLIERS[effectiveEffort] ?? 1.0;
-    const tokensConsumed = Math.round(task.reservedTps * mult * 10);
-    const pacingDelaySec = this.tokenBuckets[routedModel].consumeWithPacing(tokensConsumed, now);
-    const { chunks, summary } = this.poolAdapter.streamCompletion(routedModel, effectiveEffort, 400);
+    const isCacheHit = bestEp.endpoint_id === cachedEpId;
+    this.prefixRadixIndex.set(prefixHash, bestEp.endpoint_id);
+    bestEp.active_requests += 1;
+    bestEp.rpm_used += 1;
+    return [bestEp, isCacheHit];
+  }
 
-    task.usedTokens = Math.min(task.maxTotalTokens, task.usedTokens + tokensConsumed);
-    task.assignedModelPool = routedModel;
-    return {
-      routedModel,
-      effectiveEffort,
-      tokensConsumed,
-      pacingDelaySec,
-      chunks,
-      metering: summary,
-    };
+  public releaseEndpoint(endpointId: string): void {
+    const ep = this.endpoints.get(endpointId);
+    if (ep) {
+      ep.active_requests = Math.max(0, ep.active_requests - 1);
+    }
   }
 }

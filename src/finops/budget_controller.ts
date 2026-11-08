@@ -1,129 +1,158 @@
 /**
- * TASK-62: Multi-Tenant FinOps Real-Time Cost Attribution Ledger & Hard-Cap Circuit Breaker.
- *
- * Tracks per-tenant spend across:
- * - Model pools (`DeepSeek`, `GLM-5.3`, `Qwen-3.8`): separate input, reasoning (CoT), and output token pricing
- * - Dual-clock sandbox compute: active CPU-seconds & RAM GiB-seconds (hibernated wall-clock time is free)
- * Enforces:
- * - `80%` soft watermark warning (`agent.finops.budget.warning`)
- * - `100%` hard-cap circuit breaker (`GRACEFUL_DRAINING` snapshot preservation + new admission freeze)
+ * @fileoverview M12 TASK-44: Real-Time Tenant Token Budget Quota Enforcer & Model Auto-Downgrade Controller.
  */
-
-import { AgentTask, ModelPoolName, TaskState } from "../models";
-
-export interface ModelPricingPer1kTokensUsd {
-  inputUsd: number;
-  reasoningCotUsd: number;
-  outputUsd: number;
+export interface TenantBudgetPolicy {
+  tenantId: string;
+  dailyBudgetUsd: number;
+  softDowngradeThresholdRatio: number;
+  preferredModel: string;
+  fallbackEconomyModel: string;
 }
 
-export interface TenantFinOpsBudget {
+/**
+ * Per-tenant budget ledger exposed through `FinOpsBudgetController.budgets` and rendered by the
+ * console FinOps / W-DRF radar.
+ */
+export interface TenantBudgetState {
   tenantId: string;
   dailyHardCapUsd: number;
-  softWarningRatio: number; // default 0.80
+  softWarnRatio: number;
+  /** LLM token spend attributed to the tenant since the ledger was opened. */
   spentModelUsd: number;
+  /** Sandbox CPU-core-second spend attributed to the tenant since the ledger was opened. */
   spentSandboxUsd: number;
-  warningEmitted: boolean;
-  hardCapTripped: boolean;
+  turnsRecorded: number;
 }
 
+/** Per-1K-token USD price and per-core-second sandbox price used for turn spend attribution. */
+const MODEL_PRICE_PER_1K_TOKENS_USD: Record<string, number> = {
+  DeepSeek: 0.002,
+  "GLM-5.3": 0.0012,
+  "Qwen-3.8": 0.0006,
+};
+const SANDBOX_USD_PER_CPU_CORE_SECOND = 0.00004;
+
 export class FinOpsBudgetController {
-  public readonly modelPricing: Record<ModelPoolName, ModelPricingPer1kTokensUsd> = {
-    DeepSeek: { inputUsd: 0.00055, reasoningCotUsd: 0.00219, outputUsd: 0.00219 },
-    "GLM-5.3": { inputUsd: 0.00025, reasoningCotUsd: 0.0005, outputUsd: 0.0005 },
-    "Qwen-3.8": { inputUsd: 0.00015, reasoningCotUsd: 0.0003, outputUsd: 0.0003 },
-  };
-  public readonly cpuCoreSecondUsd = 0.000025;
-  public readonly budgets = new Map<string, TenantFinOpsBudget>();
+  private readonly policies: Map<string, TenantBudgetPolicy> = new Map();
+  private readonly spendByTenantUsd: Map<string, number> = new Map();
+  public readonly budgets: Map<string, TenantBudgetState> = new Map();
 
-  public registerTenantBudget(tenantId: string, dailyHardCapUsd: number, softWarningRatio = 0.8): void {
-    this.budgets.set(tenantId, {
-      tenantId,
-      dailyHardCapUsd,
-      softWarningRatio,
-      spentModelUsd: 0,
-      spentSandboxUsd: 0,
-      warningEmitted: false,
-      hardCapTripped: false,
-    });
-  }
-
-  public canAdmitTenantTask(tenantId: string): { allowed: boolean; reason?: string } {
-    const b = this.budgets.get(tenantId);
-    if (!b) return { allowed: true };
-    if (b.hardCapTripped || b.spentModelUsd + b.spentSandboxUsd >= b.dailyHardCapUsd) {
-      b.hardCapTripped = true;
-      return {
-        allowed: false,
-        reason: `FinOpsHardCapExceeded: Tenant ${tenantId} reached 100% of daily budget ($${b.dailyHardCapUsd.toFixed(4)})`,
-      };
-    }
-    return { allowed: true };
+  public setPolicy(policy: TenantBudgetPolicy): void {
+    this.policies.set(policy.tenantId, policy);
   }
 
   /**
-   * Charges a completed turn's LLM tokens and active sandbox CPU-seconds to the tenant's FinOps ledger.
-   * If the tenant hits 100% of `dailyHardCapUsd`, transitions running tasks to `GRACEFUL_DRAINING`.
+   * Opens (or replaces) the tenant budget ledger and the matching auto-downgrade policy, so the
+   * console-seeded hard cap and soft warning ratio are the same ones `evaluateBudgetAndModel` enforces.
+   */
+  public registerTenantBudget(
+    tenantId: string,
+    dailyHardCapUsd: number,
+    softWarnRatio: number,
+  ): TenantBudgetState {
+    const existing = this.budgets.get(tenantId);
+    const state: TenantBudgetState = {
+      tenantId,
+      dailyHardCapUsd,
+      softWarnRatio,
+      spentModelUsd: existing?.spentModelUsd ?? 0,
+      spentSandboxUsd: existing?.spentSandboxUsd ?? 0,
+      turnsRecorded: existing?.turnsRecorded ?? 0,
+    };
+    this.budgets.set(tenantId, state);
+    this.setPolicy({
+      tenantId,
+      dailyBudgetUsd: dailyHardCapUsd,
+      softDowngradeThresholdRatio: softWarnRatio,
+      preferredModel: "claude-3-7-sonnet",
+      fallbackEconomyModel: "gpt-4o-mini",
+    });
+    return state;
+  }
+
+  /**
+   * Attributes one executed turn (LLM tokens by model pool + sandbox CPU-core-seconds) to the task's
+   * tenant ledger and to the shared spend tracker consumed by `evaluateBudgetAndModel`.
    */
   public recordTurnSpend(params: {
-    task: AgentTask;
-    pool: ModelPoolName;
+    task: { tenantId: string; taskId: string };
+    pool: string;
     inputTokens: number;
     reasoningTokens: number;
     outputTokens: number;
     activeCpuCoreSeconds: number;
   }): {
-    turnCostUsd: number;
-    totalTenantSpendUsd: number;
-    utilizationRatio: number;
-    status: "OK" | "SOFT_WARNING_80" | "HARD_CAP_DRAINING_100";
+    tenantId: string;
+    taskId: string;
+    modelCostUsd: number;
+    sandboxCostUsd: number;
+    totalCostUsd: number;
+    dailySpendUsd: number;
   } {
-    const pricing = this.modelPricing[params.pool];
-    const modelCost =
-      (params.inputTokens / 1000) * pricing.inputUsd +
-      (params.reasoningTokens / 1000) * pricing.reasoningCotUsd +
-      (params.outputTokens / 1000) * pricing.outputUsd;
-    const sandboxCost = params.activeCpuCoreSeconds * this.cpuCoreSecondUsd;
-    const turnCostUsd = Number((modelCost + sandboxCost).toFixed(6));
+    const pricePer1k = MODEL_PRICE_PER_1K_TOKENS_USD[params.pool] ?? MODEL_PRICE_PER_1K_TOKENS_USD.DeepSeek;
+    const totalTokens = params.inputTokens + params.reasoningTokens + params.outputTokens;
+    const modelCostUsd = Number(((totalTokens / 1000) * pricePer1k).toFixed(6));
+    const sandboxCostUsd = Number(
+      (params.activeCpuCoreSeconds * SANDBOX_USD_PER_CPU_CORE_SECOND).toFixed(6),
+    );
+    const totalCostUsd = Number((modelCostUsd + sandboxCostUsd).toFixed(6));
 
-    let b = this.budgets.get(params.task.tenantId);
-    if (!b) {
-      this.registerTenantBudget(params.task.tenantId, 100.0);
-      b = this.budgets.get(params.task.tenantId)!;
-    }
-
-    b.spentModelUsd = Number((b.spentModelUsd + modelCost).toFixed(6));
-    b.spentSandboxUsd = Number((b.spentSandboxUsd + sandboxCost).toFixed(6));
-    const totalSpend = Number((b.spentModelUsd + b.spentSandboxUsd).toFixed(6));
-    const ratio = totalSpend / Math.max(0.000001, b.dailyHardCapUsd);
-
-    if (ratio >= 1.0) {
-      b.hardCapTripped = true;
-      params.task.state = TaskState.GRACEFUL_DRAINING;
-      params.task.drainSummary = `FinOps 100% budget cap ($${b.dailyHardCapUsd}) reached; snapshot saved cleanly`;
-      return {
-        turnCostUsd,
-        totalTenantSpendUsd: totalSpend,
-        utilizationRatio: Number(ratio.toFixed(4)),
-        status: "HARD_CAP_DRAINING_100",
-      };
-    }
-
-    if (ratio >= b.softWarningRatio) {
-      b.warningEmitted = true;
-      return {
-        turnCostUsd,
-        totalTenantSpendUsd: totalSpend,
-        utilizationRatio: Number(ratio.toFixed(4)),
-        status: "SOFT_WARNING_80",
-      };
-    }
+    const ledger =
+      this.budgets.get(params.task.tenantId) ??
+      this.registerTenantBudget(params.task.tenantId, Number.POSITIVE_INFINITY, 0.8);
+    ledger.spentModelUsd = Number((ledger.spentModelUsd + modelCostUsd).toFixed(6));
+    ledger.spentSandboxUsd = Number((ledger.spentSandboxUsd + sandboxCostUsd).toFixed(6));
+    ledger.turnsRecorded += 1;
 
     return {
-      turnCostUsd,
-      totalTenantSpendUsd: totalSpend,
-      utilizationRatio: Number(ratio.toFixed(4)),
-      status: "OK",
+      tenantId: params.task.tenantId,
+      taskId: params.task.taskId,
+      modelCostUsd,
+      sandboxCostUsd,
+      totalCostUsd,
+      dailySpendUsd: this.recordSpend(params.task.tenantId, totalCostUsd),
+    };
+  }
+
+  public recordSpend(tenantId: string, costUsd: number): number {
+    const next = Number(((this.spendByTenantUsd.get(tenantId) ?? 0) + costUsd).toFixed(6));
+    this.spendByTenantUsd.set(tenantId, next);
+    return next;
+  }
+
+  public evaluateBudgetAndModel(tenantId: string): {
+    allowed: boolean;
+    selectedModel: string;
+    downgraded: boolean;
+    utilizationRatio: number;
+  } {
+    const policy = this.policies.get(tenantId);
+    if (!policy) {
+      return { allowed: true, selectedModel: "claude-3-7-sonnet", downgraded: false, utilizationRatio: 0 };
+    }
+    const spent = this.spendByTenantUsd.get(tenantId) ?? 0;
+    const ratio = Number((spent / Math.max(0.0001, policy.dailyBudgetUsd)).toFixed(4));
+    if (spent >= policy.dailyBudgetUsd) {
+      return {
+        allowed: false,
+        selectedModel: policy.fallbackEconomyModel,
+        downgraded: true,
+        utilizationRatio: ratio,
+      };
+    }
+    if (ratio >= policy.softDowngradeThresholdRatio) {
+      return {
+        allowed: true,
+        selectedModel: policy.fallbackEconomyModel,
+        downgraded: true,
+        utilizationRatio: ratio,
+      };
+    }
+    return {
+      allowed: true,
+      selectedModel: policy.preferredModel,
+      downgraded: false,
+      utilizationRatio: ratio,
     };
   }
 }

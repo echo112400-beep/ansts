@@ -36,6 +36,11 @@ export class ZeroTrustSecurityGuard {
     fs.mkdirSync(this.cgroupRootDir, { recursive: true });
   }
 
+  /** All short-lived credential-broker tokens currently known to this guard (`tokenId -> token`). */
+  public get issuedTokens(): Map<string, CredentialBrokerToken> {
+    return this.credentialTokens;
+  }
+
   public issueShortLivedToken(
     tenantId: string,
     serviceTarget: string,
@@ -118,6 +123,41 @@ export class ZeroTrustSecurityGuard {
       cgroupFreezeValue: "1",
       cgroupFreezeFilePath: freezeFilePath,
       reason,
+    };
+  }
+
+  /**
+   * eBPF LSM enforcement seam: a violating syscall freezes the sandbox Cgroup v2 hierarchy immediately
+   * (`cgroup.freeze=1`). Already-frozen sandboxes are reported as contained without a duplicate audit entry.
+   */
+  public inspectSyscallAndFreezeOnViolation(
+    sandboxId: string,
+    violationSyscall: string,
+  ): {
+    cgroupFrozen: boolean;
+    sandboxId: string;
+    violationSyscall: string;
+    cgroupFreezeFilePath: string;
+    reason: string;
+  } {
+    const freezeFilePath = path.join(this.cgroupRootDir, sandboxId, "cgroup.freeze");
+    if (this.isSandboxCgroupFrozen(sandboxId)) {
+      this.frozenSandboxes.add(sandboxId);
+      return {
+        cgroupFrozen: true,
+        sandboxId,
+        violationSyscall,
+        cgroupFreezeFilePath: freezeFilePath,
+        reason: `Sandbox ${sandboxId} was already frozen on syscall ${violationSyscall}`,
+      };
+    }
+    const containment = this.triggerHighRiskContainment(sandboxId, `syscall ${violationSyscall}`);
+    return {
+      cgroupFrozen: containment.frozen,
+      sandboxId,
+      violationSyscall,
+      cgroupFreezeFilePath: containment.cgroupFreezeFilePath,
+      reason: containment.reason,
     };
   }
 
