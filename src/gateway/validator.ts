@@ -12,15 +12,24 @@ export class TaskSpecValidationError extends Error {
   }
 }
 
+/** Canonical TaskSpec version. `agent.scheduler.io/v1beta1` is accepted and normalized to this value. */
+export const CANONICAL_TASKSPEC_API_VERSION = "scheduler.agent.io/v1beta1";
+const TASKSPEC_API_VERSION_ALIASES = new Set(["agent.scheduler.io/v1beta1"]);
+
+export function canonicalTaskSpecApiVersion(value: unknown): string {
+  const apiVersion = String(value ?? CANONICAL_TASKSPEC_API_VERSION);
+  if (apiVersion === CANONICAL_TASKSPEC_API_VERSION || TASKSPEC_API_VERSION_ALIASES.has(apiVersion)) {
+    return CANONICAL_TASKSPEC_API_VERSION;
+  }
+  throw new TaskSpecValidationError("apiVersion", `Unsupported apiVersion '${apiVersion}'`);
+}
+
 export class TaskSpecValidator {
   public static validateAndNormalize(payload: Record<string, unknown>): TaskSpec {
     if (!payload || typeof payload !== "object") {
       throw new TaskSpecValidationError("root", "Payload must be a JSON object");
     }
-    const apiVersion = (payload.apiVersion as string) ?? "agent.scheduler.io/v1beta1";
-    if (apiVersion !== "agent.scheduler.io/v1beta1") {
-      throw new TaskSpecValidationError("apiVersion", `Unsupported apiVersion '${apiVersion}'`);
-    }
+    canonicalTaskSpecApiVersion(payload.apiVersion);
     const taskId = String(payload.task_id ?? payload.taskId ?? "").trim();
     if (!taskId || !/^[a-zA-Z0-9_\-:.]{3,128}$/.test(taskId)) {
       throw new TaskSpecValidationError("task_id", "task_id must be 3-128 alphanumeric/dash characters");

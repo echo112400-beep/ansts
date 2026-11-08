@@ -60,6 +60,16 @@ export class DurableSchedulerTask {
   public completedNodeId?: string;
   public completedEpoch?: number;
   public completedTurnSeq?: number;
+  public legacy?: {
+    priority: number;
+    prompt: string;
+    maxTurns: number;
+    timeoutSeconds: number;
+    dependencies: string[];
+    idempotencyKey?: string;
+    assignedNodeId?: string;
+    fencingToken: number;
+  };
 
   constructor(params: {
     taskId: string;
@@ -157,6 +167,7 @@ export class SchedulerV25Persistence {
       "/leases/validate",
       "/dag/spawn-escrow",
       "/nodes/heartbeat",
+      "/internal/events/consume",
     ].includes(pathname);
   }
 
@@ -173,6 +184,10 @@ export class SchedulerV25Persistence {
       if (pathname === "/tasks/complete") return this.finish(await this.persist(() => this.applyComplete(body)));
       if (pathname === "/dag/spawn-escrow") return this.finish(await this.persist(() => this.applySpawn(body)));
       if (pathname === "/nodes/heartbeat") return this.finish(await this.persist(() => this.applyHeartbeat(body)));
+      if (pathname === "/internal/events/consume") {
+        const receipt = this.consumeEvent(body);
+        return json(200, receipt);
+      }
       return json(404, { error: "NOT_FOUND" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -204,6 +219,100 @@ export class SchedulerV25Persistence {
   private async finish(result: CommandResult): Promise<Response> {
     if (result.syncFailed) return json(503, { error: "sync failed" });
     return json(result.status, result.json);
+  }
+
+  /** Projects a legacy in-memory mutation back onto the canonical row. Does not delete the source table. */
+  public syncLegacyTask(task: {
+    task_id: string;
+    tenant_id: string;
+    priority: number;
+    state: string;
+    prompt: string;
+    max_turns: number;
+    timeout_seconds: number;
+    dependencies: string[];
+    idempotency_key?: string;
+    assigned_node_id?: string;
+    lease_fencing_token: number;
+  }): void {
+    const write = () => {
+      const existing = this.tasks.get(task.task_id);
+      if (!existing) return;
+      existing.state = task.state as TaskState;
+      existing.legacy = {
+        priority: task.priority,
+        prompt: task.prompt,
+        maxTurns: task.max_turns,
+        timeoutSeconds: task.timeout_seconds,
+        dependencies: task.dependencies,
+        idempotencyKey: task.idempotency_key ?? existing.legacy?.idempotencyKey,
+        assignedNodeId: task.assigned_node_id,
+        fencingToken: task.lease_fencing_token,
+      };
+      this.writeTask(existing);
+      this.writeCheckpoint();
+    };
+    if (this.ctx.storage.transactionSync) this.ctx.storage.transactionSync(write);
+    else write();
+  }
+
+  public async acceptLegacy(task: {
+    task_id: string;
+    tenant_id: string;
+    priority: number;
+    state: string;
+    prompt: string;
+    max_turns: number;
+    timeout_seconds: number;
+    dependencies: string[];
+    idempotency_key?: string;
+    assigned_node_id?: string;
+    lease_fencing_token: number;
+  }): Promise<CommandResult> {
+    const result = await this.persist(() => this.applySubmit({
+      metadata: { task_id: task.task_id, tenant_id: task.tenant_id, idempotency_key: task.idempotency_key ?? "" },
+      legacy: {
+        priority: task.priority,
+        prompt: task.prompt,
+        maxTurns: task.max_turns,
+        timeoutSeconds: task.timeout_seconds,
+        dependencies: task.dependencies,
+        idempotencyKey: task.idempotency_key,
+        assignedNodeId: task.assigned_node_id,
+        fencingToken: task.lease_fencing_token,
+      },
+    }));
+    if (!result.syncFailed && result.mutated) await this.ensureAlarm();
+    return result;
+  }
+
+  /** Records a queue delivery. Ack only after this commits. A repeated event_id is a duplicate, not a second task. */
+  public consumeEvent(event: Record<string, unknown>): { duplicate: boolean; event_id: string } {
+    const eventId = String(event.event_id ?? "");
+    if (!eventId) throw new Error("event_id is required");
+    let duplicate = false;
+    const write = () => {
+      const existing = this.sql("SELECT event_id FROM cell_event_receipts WHERE event_id = ?", eventId);
+      if (existing.length > 0) {
+        duplicate = true;
+        return;
+      }
+      this.sql(
+        "INSERT INTO cell_event_receipts (event_id, task_id, event_type, received_at) VALUES (?, ?, ?, ?)",
+        eventId,
+        String(event.task_id ?? ""),
+        String(event.event_type ?? ""),
+        Date.now(),
+      );
+    };
+    if (this.ctx.storage.transactionSync) this.ctx.storage.transactionSync(write);
+    else write();
+    return { duplicate, event_id: eventId };
+  }
+
+  public receiptCount(eventId?: string): number {
+    if (!eventId) return this.sql("SELECT event_id FROM cell_event_receipts").length;
+    return this.sql("SELECT event_id FROM cell_event_receipts WHERE event_id = ?", eventId).length;
   }
 
   private queueProducer(): QueueProducerLike | undefined {
@@ -244,6 +353,13 @@ export class SchedulerV25Persistence {
         event_type TEXT NOT NULL, payload TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS cell_profiler_snapshots (
         tenant_id TEXT PRIMARY KEY, prior_json TEXT NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS cell_event_receipts (
+        event_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, event_type TEXT NOT NULL, received_at INTEGER NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS ansts_tasks (
+        task_id TEXT PRIMARY KEY, tenant_id TEXT, priority INTEGER, state TEXT, fencing_token INTEGER,
+        assigned_node_id TEXT, payload_json TEXT)`,
+      `CREATE TABLE IF NOT EXISTS scheduler_migration (
+        id INTEGER PRIMARY KEY, source TEXT NOT NULL, copied_count INTEGER NOT NULL, completed_at INTEGER NOT NULL)`,
     ];
     for (const statement of statements) this.sql(statement);
   }
@@ -287,6 +403,65 @@ export class SchedulerV25Persistence {
     this.loadDags();
   }
 
+  /**
+   * Copy `ansts_tasks` rows that the canonical tables do not yet have.
+   * Source rows are left in place. A second call copies nothing new.
+   * The same task id with a different state fails closed instead of picking a winner.
+   */
+  public importLegacyTasks(): { copied: number; alreadyPresent: number } {
+    let copied = 0;
+    let alreadyPresent = 0;
+    const rows = this.sql("SELECT * FROM ansts_tasks");
+    const write = () => {
+      for (const row of rows) {
+        const taskId = String(row.task_id ?? "");
+        if (!taskId) continue;
+        const existing = this.tasks.get(taskId);
+        const legacyState = String(row.state ?? TaskState.QUEUED);
+        if (existing) {
+          if (existing.state !== legacyState && !(existing.state === TaskState.SUCCEEDED && legacyState === TaskState.COMPLETED)) {
+            throw new Error(`legacy ansts_tasks row ${taskId} disagrees with canonical cell_tasks (${existing.state} vs ${legacyState})`);
+          }
+          alreadyPresent += 1;
+          continue;
+        }
+        const parsed = JSON.parse(String(row.payload_json ?? "{}")) as Record<string, unknown>;
+        const task = new DurableSchedulerTask({
+          taskId,
+          tenantId: String(row.tenant_id ?? "default"),
+          state: legacyState as TaskState,
+        });
+        task.state = legacyState as TaskState;
+        task.legacy = {
+          priority: Number(row.priority ?? 2),
+          prompt: String(parsed.prompt ?? ""),
+          maxTurns: Number(parsed.max_turns ?? 30),
+          timeoutSeconds: Number(parsed.timeout_seconds ?? 1800),
+          dependencies: Array.isArray(parsed.dependencies) ? parsed.dependencies.map(String) : [],
+          idempotencyKey: parsed.idempotency_key ? String(parsed.idempotency_key) : undefined,
+          assignedNodeId: row.assigned_node_id ? String(row.assigned_node_id) : undefined,
+          fencingToken: Number(row.fencing_token ?? 0),
+        };
+        this.tasks.set(taskId, task);
+        if (task.state === TaskState.QUEUED) this.enqueueTenant(task);
+        this.writeTask(task);
+        copied += 1;
+      }
+      if (copied > 0) this.writeCheckpoint();
+      this.sql("DELETE FROM scheduler_migration WHERE id = ?", 1);
+      this.sql(
+        "INSERT INTO scheduler_migration (id, source, copied_count, completed_at) VALUES (?, ?, ?, ?)",
+        1,
+        "ansts_tasks",
+        copied,
+        Date.now(),
+      );
+    };
+    if (this.ctx.storage.transactionSync) this.ctx.storage.transactionSync(write);
+    else write();
+    return { copied, alreadyPresent };
+  }
+
   private assertNoLegacyLeases(): void {
     const rows = this.sql("SELECT task_id, node_id, epoch, turn_seq FROM cell_leases");
     for (const row of rows) {
@@ -320,6 +495,8 @@ export class SchedulerV25Persistence {
       if (spec.completedNodeId != null) task.completedNodeId = String(spec.completedNodeId);
       if (spec.completedEpoch != null) task.completedEpoch = Number(spec.completedEpoch);
       if (spec.completedTurnSeq != null) task.completedTurnSeq = Number(spec.completedTurnSeq);
+      const legacy = spec.legacy as DurableSchedulerTask["legacy"] | undefined;
+      if (legacy) task.legacy = legacy;
       this.tasks.set(task.taskId, task);
     }
   }
@@ -429,10 +606,25 @@ export class SchedulerV25Persistence {
     if (existingId) {
       return { mutated: false, status: 200, json: { task_id: existingId, deduplicated: true } };
     }
+    const legacyInput = body.legacy as DurableSchedulerTask["legacy"] | undefined;
     if (this.tasks.has(taskId)) {
+      const currentKey = this.tasks.get(taskId)?.legacy?.idempotencyKey;
+      if (!idempotencyKey || currentKey === idempotencyKey) {
+        return { mutated: false, status: 200, json: { task_id: taskId, deduplicated: true } };
+      }
       return { mutated: false, status: 409, json: { error: "task_id already exists with a different idempotency key" } };
     }
     const task = new DurableSchedulerTask({ taskId, tenantId, state: TaskState.QUEUED });
+    task.legacy = {
+      priority: legacyInput?.priority ?? 2,
+      prompt: legacyInput?.prompt ?? "",
+      maxTurns: legacyInput?.maxTurns ?? 30,
+      timeoutSeconds: legacyInput?.timeoutSeconds ?? 1800,
+      dependencies: legacyInput?.dependencies ?? [],
+      idempotencyKey: idempotencyKey || legacyInput?.idempotencyKey,
+      assignedNodeId: legacyInput?.assignedNodeId,
+      fencingToken: legacyInput?.fencingToken ?? 0,
+    };
     this.tasks.set(taskId, task);
     this.enqueueTenant(task);
     if (idempotencyKey) {
@@ -675,7 +867,9 @@ export class SchedulerV25Persistence {
       completedNodeId: task.completedNodeId ?? null,
       completedEpoch: task.completedEpoch ?? null,
       completedTurnSeq: task.completedTurnSeq ?? null,
+      legacy: task.legacy ?? null,
     };
+    this.projectAnsts(task);
     this.sql("DELETE FROM cell_tasks WHERE task_id = ?", task.taskId);
     this.sql(
       "INSERT INTO cell_tasks (task_id, tenant_id, state, epoch, turn_seq, enqueue_ts, deadline_ts, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -687,6 +881,34 @@ export class SchedulerV25Persistence {
       task.enqueueTs,
       task.deadlineTs,
       JSON.stringify(spec),
+    );
+  }
+
+  private projectAnsts(task: DurableSchedulerTask): void {
+    const legacy = task.legacy ?? {
+      priority: 2,
+      prompt: "",
+      maxTurns: 30,
+      timeoutSeconds: 1800,
+      dependencies: [],
+      fencingToken: task.fence.epoch,
+    };
+    this.sql("DELETE FROM ansts_tasks WHERE task_id = ?", task.taskId);
+    this.sql(
+      "INSERT INTO ansts_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      task.taskId,
+      task.tenantId,
+      legacy.priority,
+      task.state,
+      legacy.fencingToken,
+      legacy.assignedNodeId ?? "",
+      JSON.stringify({
+        prompt: legacy.prompt,
+        max_turns: legacy.maxTurns,
+        timeout_seconds: legacy.timeoutSeconds,
+        dependencies: legacy.dependencies,
+        idempotency_key: legacy.idempotencyKey ?? null,
+      }),
     );
   }
 

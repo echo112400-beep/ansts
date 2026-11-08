@@ -50,6 +50,7 @@ export * from "./cloudflare/celld_admin_client.js";
 export * from "./cloudflare/federation_router.js";
 export * from "./cloudflare/celld_native_optimizations.js";
 export { default as cloudflareCelldWorker } from "./cloudflare/worker.js";
+export { resolveSchedulerNamespace, schedulerClusterName, SCHEDULER_BINDING_ERROR } from "./cloudflare/worker.js";
 export * from "./finops/budget_controller.js";
 export * from "./cli/anstsctl.js";
 export * from "./dashboard/server.js";

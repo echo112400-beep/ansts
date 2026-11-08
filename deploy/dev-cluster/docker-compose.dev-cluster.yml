@@ -17,8 +17,8 @@ x-ansts-common-env: &ansts-common-env
   ANSTS_RUNTIME_PROFILE: "development"
   CELLD_BUCKET: "s3://ansts-fleet"
   S3_ENDPOINT: "http://rustfs:9000"
-  AWS_ACCESS_KEY_ID: "${RUSTFS_ACCESS_KEY:-ansts_rustfs_ak_dev}"
-  AWS_SECRET_ACCESS_KEY: "${RUSTFS_SECRET_KEY:-ansts_rustfs_sk_dev_secret}"
+  AWS_ACCESS_KEY_ID: "${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required}"
+  AWS_SECRET_ACCESS_KEY: "${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required}"
   AWS_REGION: "us-east-1"
   CELLD_DURABILITY: "fleet"
   ANSTS_PEER_BRAIN_URLS: '{"brain-node-01":"http://celld-brain-01:8081","brain-node-02":"http://celld-brain-02:8082","brain-node-03":"http://celld-brain-03:8083"}'
@@ -41,8 +41,8 @@ services:
       RUSTFS_ADDRESS: ":9000"
       RUSTFS_CONSOLE_ADDRESS: ":9001"
       RUSTFS_CONSOLE_ENABLE: "true"
-      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-ansts_rustfs_ak_dev}"
-      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-ansts_rustfs_sk_dev_secret}"
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required}"
     command: ["/data"]
     networks:
       - ansts_mesh_net

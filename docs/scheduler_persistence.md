@@ -4,7 +4,11 @@
 
 每个命名的 `AnstsSchedulerCell` 是一个资源分配的一致性域。所有提交、调度、DAG 和租约变更都经过该 Cell 的 SQLite；内存只是可重建的缓存。celld 负责 Cell 的唯一所有权、复制、租约接管和数据库恢复，应用负责恢复调度对象及业务状态。应用不再另建一个可能与 celld 所有权冲突的选主系统。
 
-默认名称仍是 `global-5d-scheduler`。可通过 Worker 环境变量 `SCHEDULER_CLUSTER_ID` 选择稳定的集群名称，同一部署的 HTTP 和 Cron 路由使用同一名称。该名称是部署配置，不能由不可信请求任意选择。
+默认名称仍是 `global-5d-scheduler`（`/v1beta1`）。`/v1/scheduler` 在未设置 `SCHEDULER_CLUSTER_ID` 时仍使用历史名称 `global-shard-0`，避免把已有 Cell 悄悄指到另一份库。设置 `SCHEDULER_CLUSTER_ID` 后两条路由使用同一个名称。绑定名优先 `SCHEDULER_CELL`（`wrangler.json`），没有时用 `ANSTS_SCHEDULER_CELL`。两个都没有时 HTTP 返回 500，队列消息不 ack。
+
+TaskSpec 的规范版本是 `scheduler.agent.io/v1beta1`（`specs/taskspec_v1beta1_example.yaml`）。网关同时接受历史别名 `agent.scheduler.io/v1beta1`，并把它规范成前者。其它字符串拒绝。
+
+`ansts_tasks` 是兼容投影，不是第二份权威。`/submit` 与 `/tasks/submit` 都写入 v2.5 的 `cell_tasks`，并在同一事务里更新 `ansts_tasks`。只存在 `ansts_tasks` 的旧行会在构造时复制进 v2.5，源行保留。同一 `task_id` 状态不一致时构造失败，不挑选、不删除。复制记在 `scheduler_migration`，重复执行只补尚未复制的行。回滚是停写后丢掉新的 `cell_*` 表，源表还在；不要在承载真实流量的库上做这件事。
 
 多个集群可由不同 Cell 承载，但资源必须隔离：不得把同一节点的全部容量同时注册到多个集群。本次没有实现跨集群容量协调或全局 W-DRF。现有默认节点配置来自 `AnstsClusterRuntime`；实际分片前须为各部署配置不重叠的节点/容量。更改 Cell 名称相当于选择另一份数据库，不是已有任务的迁移。
 

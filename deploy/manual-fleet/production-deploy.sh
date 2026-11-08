@@ -12,8 +12,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export ANSTS_RUNTIME_PROFILE="${ANSTS_RUNTIME_PROFILE:-production}"
 export CELLD_BUCKET="${CELLD_BUCKET:-s3://ansts-fleet}"
 export S3_ENDPOINT="${S3_ENDPOINT:-http://10.240.64.11:9000}"
-export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-ansts_prod_ak_9f8e7d6c5b4a}"
-export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-ansts_prod_sk_1a2b3c4d5e6f7g8h9i0j}"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 
 export CELLD_DURABILITY="${CELLD_DURABILITY:-fleet}"
@@ -34,6 +34,8 @@ log_info()  { printf "\033[1;34m[ANSTS-PROD][INFO]\033[0m  %s\n" "$*"; }
 log_ok()    { printf "\033[1;32m[ANSTS-PROD][OK]\033[0m    %s\n" "$*"; }
 log_warn()  { printf "\033[1;33m[ANSTS-PROD][WARN]\033[0m  %s\n" "$*" >&2; }
 log_fatal() { printf "\033[1;31m[ANSTS-PROD][FATAL]\033[0m %s\n" "$*" >&2; exit 1; }
+
+[[ -n "${AWS_ACCESS_KEY_ID}" && -n "${AWS_SECRET_ACCESS_KEY}" ]] || log_fatal "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set. Refusing to start."
 
 # ==================== 2. Q5 FAIL-FAST PRODUCTION PREFLIGHT GATE ====================
 preflight_check() {
@@ -131,7 +133,11 @@ seed_topology_manifest() {
 }
 EOF
   if command -v aws >/dev/null 2>&1; then
-    aws --endpoint-url "${S3_ENDPOINT}" s3 mb "${CELLD_BUCKET}" 2>/dev/null || true
+    # Creating an existing bucket is not a failure. Any other mb error still fails the script.
+    if ! aws --endpoint-url "${S3_ENDPOINT}" s3 mb "${CELLD_BUCKET}" >/dev/null 2>&1; then
+      bucket_name="${CELLD_BUCKET#s3://}"
+      aws --endpoint-url "${S3_ENDPOINT}" s3api head-bucket --bucket "${bucket_name}" >/dev/null
+    fi
     aws --endpoint-url "${S3_ENDPOINT}" s3 cp "${tmp_topo}" "${CELLD_BUCKET}/control/topology-v1.json"
     log_ok "Uploaded global CAS topology manifest to ${CELLD_BUCKET}/control/topology-v1.json"
   fi
@@ -182,7 +188,7 @@ deploy_body_host() {
 
   mkdir -p "${CGROUP_ROOT}/ansts.slice"
   if [[ -w "${CGROUP_ROOT}/cgroup.subtree_control" ]]; then
-    echo "+cpu +memory +pids" > "${CGROUP_ROOT}/cgroup.subtree_control" || true
+    echo "+cpu +memory +pids" > "${CGROUP_ROOT}/cgroup.subtree_control"
   fi
 
   cp "${REPO_ROOT}/deploy/manual-fleet/systemd/ansts-node-daemon.service" /etc/systemd/system/ansts-node-daemon.service
@@ -239,6 +245,7 @@ scale_virtual_shards() {
 
 # ==================== 9. CLI DISPATCHER ====================
 ACTION="${1:-help}"
+# `help` and `all` have no remaining arguments. shift then fails; that is not a deploy error.
 shift || true
 
 case "${ACTION}" in

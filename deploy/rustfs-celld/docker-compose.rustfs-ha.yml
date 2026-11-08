@@ -3,8 +3,8 @@ x-rustfs-common: &rustfs-common
   image: rustfs/rustfs:latest
   user: "10001:10001"
   environment:
-    RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
-    RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
+    RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY is required}"
+    RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY is required}"
     RUSTFS_ERASURE_SET_DRIVE_COUNT: "16"
     RUSTFS_STORAGE_CLASS_STANDARD: "EC:4"
   command: server http://rustfs-node-{1...4}:9000/data/nvme{1...4} --console-address ":9001"

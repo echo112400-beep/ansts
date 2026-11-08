@@ -21,6 +21,7 @@ export class AnstsSchedulerCell {
     this.persistence = new SchedulerV25Persistence(ctx, env);
     this.cluster = this.persistence.facade;
     this.initSchema();
+    this.persistence.importLegacyTasks();
     this.rehydrateFromSql();
   }
 
@@ -83,31 +84,49 @@ export class AnstsSchedulerCell {
   }
 
   private persistTask(task: TaskSpec): void {
-    this.ctx.storage.sql.exec(
-      "INSERT OR REPLACE INTO ansts_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      task.task_id,
-      task.tenant_id,
-      task.priority,
-      task.state,
-      task.lease_fencing_token,
-      task.assigned_node_id ?? "",
-      JSON.stringify({
-        prompt: task.prompt,
-        max_turns: task.max_turns,
-        timeout_seconds: task.timeout_seconds,
-        dependencies: task.dependencies,
-      })
-    );
+    this.persistence.syncLegacyTask({
+      task_id: task.task_id,
+      tenant_id: task.tenant_id,
+      priority: task.priority,
+      state: task.state,
+      prompt: task.prompt,
+      max_turns: task.max_turns,
+      timeout_seconds: task.timeout_seconds,
+      dependencies: task.dependencies,
+      idempotency_key: task.idempotency_key,
+      assigned_node_id: task.assigned_node_id,
+      lease_fencing_token: task.lease_fencing_token,
+    });
   }
 
   public async submitTask(task: TaskSpec): Promise<TaskSpec> {
-    const submitted = this.scheduler.submitTask(task);
-    this.persistTask(submitted);
-    const currentAlarm = await this.ctx.storage.getAlarm();
-    if (!currentAlarm) {
-      await this.ctx.storage.setAlarm(Date.now() + 1000);
+    const outcome = await this.acceptCanonical(task);
+    if (outcome.status === 409) {
+      throw new Error(String(outcome.json.error ?? "task_id already exists"));
     }
-    return submitted;
+    return this.remember(task);
+  }
+
+  private async acceptCanonical(task: TaskSpec): Promise<{ status: number; json: Record<string, unknown> }> {
+    return this.persistence.acceptLegacy({
+      task_id: task.task_id,
+      tenant_id: task.tenant_id,
+      priority: task.priority,
+      state: task.state,
+      prompt: task.prompt,
+      max_turns: task.max_turns,
+      timeout_seconds: task.timeout_seconds,
+      dependencies: task.dependencies,
+      idempotency_key: task.idempotency_key,
+      assigned_node_id: task.assigned_node_id,
+      lease_fencing_token: task.lease_fencing_token,
+    });
+  }
+
+  private remember(task: TaskSpec): TaskSpec {
+    const existing = this.scheduler.allTasks.get(task.task_id);
+    if (existing) return existing;
+    return this.scheduler.submitTask(task);
   }
 
   public registerNode(hb: NodeHeartbeat): void {
@@ -151,10 +170,12 @@ export class AnstsSchedulerCell {
         tenant_id: String(body.tenant_id ?? "default"),
         priority: Number(body.priority ?? TaskPriority.P2_STANDARD) as TaskPriority,
         prompt: String(body.prompt ?? ""),
+        idempotency_key: body.idempotency_key ? String(body.idempotency_key) : undefined,
       });
-      const submitted = await this.submitTask(spec);
-      return new Response(JSON.stringify({ task_id: submitted.task_id, state: submitted.state }), {
-        status: 202,
+      const outcome = await this.acceptCanonical(spec);
+      if (outcome.status < 300) this.remember(spec);
+      return new Response(JSON.stringify({ task_id: spec.task_id, state: spec.state, ...outcome.json }), {
+        status: outcome.status,
         headers: { "content-type": "application/json" },
       });
     }

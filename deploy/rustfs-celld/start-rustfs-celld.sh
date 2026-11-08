@@ -10,7 +10,9 @@ CELLD_INTERNAL_LISTEN="${CELLD_INTERNAL_LISTEN:-10.240.16.11:9001}"
 CELLD_ADVERTISE="${CELLD_ADVERTISE:-http://10.240.16.11:9001}"
 
 mkdir -p "${RUSTFS_DATA_DIR}"
-chown -R 10001:10001 "${RUSTFS_DATA_DIR}" 2>/dev/null || true
+if [[ "$(stat -c '%u:%g' "${RUSTFS_DATA_DIR}")" != "10001:10001" ]]; then
+  chown -R 10001:10001 "${RUSTFS_DATA_DIR}"
+fi
 
 exec celld \
   --bucket "${CELLD_BUCKET}" \

@@ -124,7 +124,8 @@ export interface DynamicWorkerLoaderBindingLike {
 }
 
 export interface CloudflareCelldEnv {
-  ANSTS_SCHEDULER_CELL: DurableObjectNamespaceLike;
+  /** Legacy binding name. Used when SCHEDULER_CELL is absent. */
+  ANSTS_SCHEDULER_CELL?: DurableObjectNamespaceLike;
   ANSTS_HARNESS_CELL: DurableObjectNamespaceLike;
   ANSTS_IDEMPOTENCY_KV: KvNamespaceLike;
   ANSTS_CHECKPOINT_BUCKET: R2BucketLike;

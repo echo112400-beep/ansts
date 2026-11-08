@@ -5,9 +5,8 @@ WORKDIR /app
 # Install curl & bash for healthchecks and cluster bootstrap scripts
 RUN apk add --no-cache curl bash
 
-COPY package.json tsconfig.json ./
-# If node_modules are pre-bundled or installed via npm
-RUN npm install --no-audit --no-fund || true
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci --no-audit --no-fund
 
 COPY src ./src
 COPY tests ./tests
