@@ -1,0 +1,104 @@
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.SseEventStreamGateway = exports.ClientStreamSubscription = void 0;
+
+
+var _nodeStream = require("node:stream"); /**
+ * @fileoverview M1 TASK-03: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer.
+ */
+
+
+
+
+
+
+
+
+class ClientStreamSubscription {
+  subscriptionId;
+  taskId;
+  stream;
+  closed = false;
+
+  constructor(subscriptionId, taskId) {
+    this.subscriptionId = subscriptionId;
+    this.taskId = taskId;
+    this.stream = new _nodeStream.PassThrough();
+  }
+
+  writeSse(envelope) {
+    if (this.closed) return;
+    const frame =
+    `id: ${envelope.id}\n` +
+    `event: ${envelope.event}\n` +
+    `data: ${JSON.stringify(envelope)}\n\n`;
+    this.stream.write(frame);
+  }
+
+  close() {
+    if (!this.closed) {
+      this.closed = true;
+      this.stream.end();
+    }
+  }
+}exports.ClientStreamSubscription = ClientStreamSubscription;
+
+class SseEventStreamGateway {
+  subscriptionsByTask = new Map();
+  historyByTask = new Map();
+  maxHistoryPerTask;
+
+  constructor(maxHistoryPerTask = 100) {
+    this.maxHistoryPerTask = maxHistoryPerTask;
+  }
+
+  subscribe(taskId, subscriptionId, replayFromEventId) {
+    const sub = new ClientStreamSubscription(subscriptionId, taskId);
+    let taskSubs = this.subscriptionsByTask.get(taskId);
+    if (!taskSubs) {
+      taskSubs = new Map();
+      this.subscriptionsByTask.set(taskId, taskSubs);
+    }
+    taskSubs.set(subscriptionId, sub);
+
+    const history = this.historyByTask.get(taskId) ?? [];
+    let shouldReplay = !replayFromEventId;
+    for (const evt of history) {
+      if (shouldReplay) {
+        sub.writeSse(evt);
+      } else if (evt.id === replayFromEventId) {
+        shouldReplay = true;
+      }
+    }
+    return sub;
+  }
+
+  unsubscribe(taskId, subscriptionId) {
+    const taskSubs = this.subscriptionsByTask.get(taskId);
+    const sub = taskSubs?.get(subscriptionId);
+    if (sub) {
+      sub.close();
+      taskSubs?.delete(subscriptionId);
+    }
+  }
+
+  publish(envelope) {
+    let history = this.historyByTask.get(envelope.taskId);
+    if (!history) {
+      history = [];
+      this.historyByTask.set(envelope.taskId, history);
+    }
+    history.push(envelope);
+    if (history.length > this.maxHistoryPerTask) {
+      history.shift();
+    }
+    const taskSubs = this.subscriptionsByTask.get(envelope.taskId);
+    if (!taskSubs) return 0;
+    let delivered = 0;
+    for (const sub of taskSubs.values()) {
+      if (!sub.closed) {
+        sub.writeSse(envelope);
+        delivered += 1;
+      }
+    }
+    return delivered;
+  }
+}exports.SseEventStreamGateway = SseEventStreamGateway;

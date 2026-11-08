@@ -1,0 +1,11 @@
+{
+  "title": "ANSTS v2.2 & celld HA Production Fleet Dashboard",
+  "uid": "ansts-v2-celld-ha",
+  "schemaVersion": 39,
+  "panels": [
+    { "id": 1, "title": "5D W-DRF Dominant Share by Tenant", "type": "timeseries" },
+    { "id": 2, "title": "SchedulerCell Shard In-Flight Load Distribution (P2C)", "type": "barchart" },
+    { "id": 3, "title": "Model Pool TTFT & Circuit Breaker State", "type": "stat" },
+    { "id": 4, "title": "celld RPO=0 Verified Transactions", "type": "timeseries" }
+  ]
+}

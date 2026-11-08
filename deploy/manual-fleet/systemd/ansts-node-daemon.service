@@ -1,0 +1,8 @@
+[Unit]
+Description=ANSTS v2.2 Sandbox Body Host Daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/ansts/dist/src/cli/anstsctl.js top
+Restart=on-failure

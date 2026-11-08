@@ -1,0 +1,12 @@
+[Unit]
+Description=denoland/celld Distributed Durable Objects Node
+After=network-online.target
+
+[Service]
+Type=simple
+Environment="CELLD_DURABILITY=fleet"
+Environment="CELLD_TTL_MS=10000"
+Environment="CELLD_REBALANCE_INTERVAL_MS=5000"
+Environment="CELLD_LTX_RETENTION_SECS=86400"
+ExecStart=/usr/local/bin/celld --bucket s3://ansts-fleet --endpoint http://127.0.0.1:9000 --listen 0.0.0.0:8080 --internal-listen 127.0.0.1:9001
+Restart=always

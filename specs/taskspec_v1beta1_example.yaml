@@ -1,0 +1,26 @@
+apiVersion: scheduler.agent.io/v1beta1
+kind: AgentTask
+metadata:
+  task_id: "tsk_prod_audit_2026_001"
+  tenant_id: "fin-enterprise"
+  idempotency_key: "idem_fin_audit_001"
+  priority_class: "P1"
+spec:
+  cognitive_routing:
+    primary_model: "DeepSeek"
+    fast_utility_model: "GLM-5.3"
+    fallback_models:
+      - "Qwen-3.8"
+      - "GLM-5.3"
+    reasoning_effort: "high"
+  quotas:
+    reserved_tps: 120
+    max_burst_tps: 400
+    max_total_tokens: 500000
+  sandbox_resources:
+    cognitive_cpu_cores: 0.1
+    execution_cpu_cores: 2.0
+    burst_cpu_cores: 8.0
+    cognitive_memory_mb: 256
+    execution_memory_mb: 4096
+    isolation_driver: "firecracker"

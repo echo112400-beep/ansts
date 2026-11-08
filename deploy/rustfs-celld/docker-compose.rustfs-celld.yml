@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    user: "10001:10001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+  celld-node-01:
+    image: ghcr.io/denoland/celld:latest
+    command: --bucket s3://ansts-fleet --endpoint http://rustfs:9000 --listen 0.0.0.0:8080 --internal-listen 0.0.0.0:9001 --advertise http://celld-node-01:9001

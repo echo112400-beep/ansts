@@ -1,0 +1,65 @@
+{
+  "name": "ansts-v2-celld-scheduler",
+  "main": "src/cloudflare/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SCHEDULER_CELL",
+        "class_name": "AnstsSchedulerCell"
+      },
+      {
+        "name": "AGENT_HARNESS_CELL",
+        "class_name": "AgentTaskHarnessCell"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "AnstsSchedulerCell",
+        "AgentTaskHarnessCell"
+      ]
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "ANSTS_KV",
+      "id": "ansts_idempotency_kv"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ANSTS_CHECKPOINTS_R2",
+      "bucket_name": "ansts-checkpoints-l1"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "ANSTS_D1",
+      "database_name": "ansts_audit_d1",
+      "database_id": "ansts-d1-prod-001"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "ANSTS_EVENTS_QUEUE",
+        "queue": "ansts-cloudevents-outbox"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "ansts-cloudevents-outbox",
+        "max_batch_size": 50,
+        "max_retries": 5
+      }
+    ]
+  },
+  "worker_loaders": [
+    {
+      "binding": "ANSTS_DYNAMIC_WORKER_LOADER"
+    }
+  ]
+}

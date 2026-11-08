@@ -1,0 +1,26 @@
+syntax = "proto3";
+package ansts.v2;
+
+message FenceTokenProto {
+  uint64 epoch = 1;
+  uint64 turn_seq = 2;
+  string task_id = 3;
+}
+
+message SubmitTaskRequest {
+  string tenant_id = 1;
+  string task_id = 2;
+  string idempotency_key = 3;
+  string priority_class = 4;
+  string primary_model = 5;
+}
+
+message SubmitTaskResponse {
+  string task_id = 1;
+  string status = 2;
+  string scheduler_shard_id = 3;
+}
+
+service AnstsSchedulerService {
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+}
