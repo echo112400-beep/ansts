@@ -129,11 +129,37 @@ export interface CloudflareCelldEnv {
 }
 
 export class InMemoryCellSqlStorage implements SqlStorageLike {
-  private readonly tables: Map<string, Map<string, Record<string, unknown>>> = new Map();
+  private tables: Map<string, Map<string, Record<string, unknown>>> = new Map();
+  private txSnapshot: Map<string, Map<string, Record<string, unknown>>> | null = null;
 
   public exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): SqlCursorLike<T> {
     const q = query.trim().replace(/\s+/g, " ");
     const upper = q.toUpperCase();
+
+    if (upper === "BEGIN" || upper === "BEGIN TRANSACTION") {
+      this.txSnapshot = new Map();
+      for (const [tName, rows] of this.tables.entries()) {
+        const clonedRows = new Map<string, Record<string, unknown>>();
+        for (const [pk, r] of rows.entries()) {
+          clonedRows.set(pk, { ...r });
+        }
+        this.txSnapshot.set(tName, clonedRows);
+      }
+      return { toArray: () => [], one: () => null };
+    }
+
+    if (upper === "COMMIT" || upper === "COMMIT TRANSACTION") {
+      this.txSnapshot = null;
+      return { toArray: () => [], one: () => null };
+    }
+
+    if (upper === "ROLLBACK" || upper === "ROLLBACK TRANSACTION") {
+      if (this.txSnapshot) {
+        this.tables = this.txSnapshot;
+        this.txSnapshot = null;
+      }
+      return { toArray: () => [], one: () => null };
+    }
 
     if (upper.startsWith("CREATE TABLE") || upper.startsWith("CREATE INDEX") || upper.startsWith("PRAGMA")) {
       const m = q.match(/CREATE TABLE(?: IF NOT EXISTS)?\s+([a-zA-Z0-9_]+)/i);
@@ -186,12 +212,16 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
     }
 
     if (upper.startsWith("DELETE FROM")) {
-      const m = q.match(/DELETE FROM\s+([a-zA-Z0-9_]+)(?:\s+WHERE\s+([a-zA-Z0-9_]+)\s*=\s*\?)?/i);
+      const m = q.match(/DELETE FROM\s+([a-zA-Z0-9_]+)(?:\s+WHERE\s+(.+))?/i);
       if (m) {
         const tbl = this.tables.get(m[1]);
         if (tbl) {
           if (m[2] && bindings.length > 0) {
-            tbl.delete(String(bindings[0]));
+            const condCols = m[2].split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
+            for (const [pk, row] of tbl.entries()) {
+              const matchAll = condCols.every((col, idx) => String(row[col]) === String(bindings[idx]));
+              if (matchAll) tbl.delete(pk);
+            }
           } else {
             tbl.clear();
           }
@@ -201,15 +231,33 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
     }
 
     if (upper.startsWith("SELECT ")) {
-      const m = q.match(/FROM\s+([a-zA-Z0-9_]+)(?:\s+WHERE\s+([a-zA-Z0-9_]+)\s*=\s*\?)?/i);
-      if (m) {
-        const tbl = this.tables.get(m[1]);
+      const mTable = q.match(/FROM\s+([a-zA-Z0-9_]+)/i);
+      if (mTable) {
+        const tbl = this.tables.get(mTable[1]);
         if (!tbl) return { toArray: () => [], one: () => null };
         let rows = Array.from(tbl.values());
-        if (m[2] && bindings.length > 0) {
-          const col = m[2];
-          rows = rows.filter((r) => String(r[col]) === String(bindings[0]));
+
+        const mWhere = q.match(/WHERE\s+(.+?)(?:\s+ORDER BY|\s+LIMIT|$)/i);
+        if (mWhere && bindings.length > 0) {
+          const condCols = mWhere[1].split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
+          rows = rows.filter((r) =>
+            condCols.every((col, idx) => String(r[col]) === String(bindings[idx]))
+          );
         }
+
+        const mOrder = q.match(/ORDER BY\s+([a-zA-Z0-9_]+)(?:\s+(ASC|DESC))?/i);
+        if (mOrder) {
+          const orderCol = mOrder[1];
+          const desc = (mOrder[2] ?? "ASC").toUpperCase() === "DESC";
+          rows.sort((a, b) => {
+            const va = a[orderCol] as number | string;
+            const vb = b[orderCol] as number | string;
+            if (va === vb) return 0;
+            const cmp = va > vb ? 1 : -1;
+            return desc ? -cmp : cmp;
+          });
+        }
+
         if (upper.includes("COUNT(*)")) {
           const cntRow = { cnt: rows.length, "COUNT(*)": rows.length } as unknown as T;
           return { toArray: () => [cntRow], one: () => cntRow };

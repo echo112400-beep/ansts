@@ -1,8 +1,10 @@
 /**
  * @fileoverview M15 TASK-67 ~ TASK-70: denoland/celld Native Durable Object Facets (`ctx.facets`),
- * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER`), KV Single-Writer Sharding & V8 128MB Heap/SQL Budget Guard.
+ * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution),
+ * KV Single-Writer Sharding & V8 128MB Heap/SQL Real Wall-Clock Budget Guard.
  */
 import * as crypto from "node:crypto";
+import * as vm from "node:vm";
 import {
   DynamicWorkerLoaderBindingLike,
   DynamicWorkerLoaderModuleSpec,
@@ -88,6 +90,7 @@ export class DynamicWorkerSandboxLoader {
     coldStartLatencyMs: number;
     output: Record<string, unknown>;
   }> {
+    const t0 = performance.now();
     const codeHash = crypto.createHash("sha256").update(params.jsSourceCode, "utf-8").digest("hex").slice(0, 12);
     const isolateId = `dyn-worker-${params.taskId}-t${params.turnIndex}-${codeHash}`;
     const globalOutboundBlocked = !(params.allowInternetEgress ?? false);
@@ -111,23 +114,58 @@ export class DynamicWorkerSandboxLoader {
         body: JSON.stringify(params.inputPayload ?? {}),
       });
       const out = (await resp.json()) as Record<string, unknown>;
+      const coldStartLatencyMs = Number((performance.now() - t0).toFixed(3));
       return {
         isolateId,
         globalOutboundBlocked,
-        coldStartLatencyMs: 3.2,
+        coldStartLatencyMs,
         output: out,
       };
     }
 
+    const transformedCode = params.jsSourceCode.replace(/export\s+default\s+/, "globalThis.__workerExport = ");
+    const sandboxGlobals: Record<string, unknown> = {
+      Response,
+      Request,
+      Headers,
+      URL,
+      JSON,
+      Math,
+      Date,
+      inputPayload: params.inputPayload ?? {},
+      env: spec.env,
+      fetch: globalOutboundBlocked
+        ? async () => {
+            throw new Error("DynamicWorker Egress Blocked: globalOutbound is null");
+          }
+        : globalThis.fetch,
+    };
+    const context = vm.createContext(sandboxGlobals);
+    const script = new vm.Script(transformedCode, { filename: "sandbox_entry.js" });
+    script.runInContext(context, { timeout: 1000 });
+
+    let output: Record<string, unknown> = {};
+    const workerExport = sandboxGlobals.__workerExport as
+      | { fetch?: (req: Request, env: unknown) => Promise<Response> | Response }
+      | undefined;
+    if (workerExport && typeof workerExport.fetch === "function") {
+      const req = new Request("http://sandbox.internal/run", {
+        method: "POST",
+        body: JSON.stringify(params.inputPayload ?? {}),
+      });
+      const resp = await workerExport.fetch(req, spec.env);
+      const text = await resp.text();
+      output = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    } else if (sandboxGlobals.__result !== undefined) {
+      output = sandboxGlobals.__result as Record<string, unknown>;
+    }
+
+    const coldStartLatencyMs = Math.max(0.001, Number((performance.now() - t0).toFixed(3)));
     return {
       isolateId,
       globalOutboundBlocked,
-      coldStartLatencyMs: 2.8,
-      output: {
-        executedInDynamicWorker: true,
-        isolateId,
-        inputEcho: params.inputPayload ?? {},
-      },
+      coldStartLatencyMs,
+      output,
     };
   }
 
@@ -189,31 +227,36 @@ export class V8HeapAndSqlBudgetGuard {
     this.sqlTimeoutMs = sqlTimeoutMs;
   }
 
-  public evaluateHeapPressure(currentHeapUsedMb: number): {
+  public evaluateHeapPressure(currentHeapUsedMb?: number): {
     status: "HEALTHY" | "EVICT_WARM_BUFFERS" | "REJECT_NEW_STREAMS";
     heapUtilizationPct: number;
+    measuredHeapMb: number;
   } {
-    const pct = Number(((currentHeapUsedMb / this.hardHeapLimitMb) * 100).toFixed(1));
-    if (currentHeapUsedMb >= this.hardHeapLimitMb * 0.92) {
-      return { status: "REJECT_NEW_STREAMS", heapUtilizationPct: pct };
+    const measuredHeapMb =
+      currentHeapUsedMb ?? Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(2));
+    const pct = Number(((measuredHeapMb / this.hardHeapLimitMb) * 100).toFixed(1));
+    if (measuredHeapMb >= this.hardHeapLimitMb * 0.92) {
+      return { status: "REJECT_NEW_STREAMS", heapUtilizationPct: pct, measuredHeapMb };
     }
-    if (currentHeapUsedMb >= this.softHeapLimitMb) {
-      return { status: "EVICT_WARM_BUFFERS", heapUtilizationPct: pct };
+    if (measuredHeapMb >= this.softHeapLimitMb) {
+      return { status: "EVICT_WARM_BUFFERS", heapUtilizationPct: pct, measuredHeapMb };
     }
-    return { status: "HEALTHY", heapUtilizationPct: pct };
+    return { status: "HEALTHY", heapUtilizationPct: pct, measuredHeapMb };
   }
 
   public execWithBudget<T = Record<string, unknown>>(
     sql: SqlStorageLike,
     query: string,
-    simulatedDurationMs: number,
     ...bindings: unknown[]
-  ): SqlCursorLike<T> {
-    if (simulatedDurationMs > this.sqlTimeoutMs) {
+  ): { cursor: SqlCursorLike<T>; elapsedMs: number } {
+    const t0 = performance.now();
+    const cursor = sql.exec<T>(query, ...bindings);
+    const elapsedMs = Number((performance.now() - t0).toFixed(3));
+    if (elapsedMs > this.sqlTimeoutMs) {
       throw new Error(
-        `SQLite statement exceeded celld per-statement timeout (${simulatedDurationMs}ms > ${this.sqlTimeoutMs}ms): ${query.slice(0, 60)}`
+        `SQLite statement exceeded celld per-statement timeout (${elapsedMs}ms > ${this.sqlTimeoutMs}ms): ${query.slice(0, 60)}`
       );
     }
-    return sql.exec<T>(query, ...bindings);
+    return { cursor, elapsedMs };
   }
 }

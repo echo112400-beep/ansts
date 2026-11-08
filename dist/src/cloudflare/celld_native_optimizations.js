@@ -2,11 +2,13 @@
 
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M15 TASK-67 ~ TASK-70: denoland/celld Native Durable Object Facets (`ctx.facets`),
- * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER`), KV Single-Writer Sharding & V8 128MB Heap/SQL Budget Guard.
- */
 
+var crypto = _interopRequireWildcard(require("node:crypto"));
+var vm = _interopRequireWildcard(require("node:vm"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+ * @fileoverview M15 TASK-67 ~ TASK-70: denoland/celld Native Durable Object Facets (`ctx.facets`),
+ * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution),
+ * KV Single-Writer Sharding & V8 128MB Heap/SQL Real Wall-Clock Budget Guard.
+ */
 
 
 
@@ -88,6 +90,7 @@ class DynamicWorkerSandboxLoader {
 
 
   {
+    const t0 = performance.now();
     const codeHash = crypto.createHash("sha256").update(params.jsSourceCode, "utf-8").digest("hex").slice(0, 12);
     const isolateId = `dyn-worker-${params.taskId}-t${params.turnIndex}-${codeHash}`;
     const globalOutboundBlocked = !(params.allowInternetEgress ?? false);
@@ -111,23 +114,58 @@ class DynamicWorkerSandboxLoader {
         body: JSON.stringify(params.inputPayload ?? {})
       });
       const out = await resp.json();
+      const coldStartLatencyMs = Number((performance.now() - t0).toFixed(3));
       return {
         isolateId,
         globalOutboundBlocked,
-        coldStartLatencyMs: 3.2,
+        coldStartLatencyMs,
         output: out
       };
     }
 
+    const transformedCode = params.jsSourceCode.replace(/export\s+default\s+/, "globalThis.__workerExport = ");
+    const sandboxGlobals = {
+      Response,
+      Request,
+      Headers,
+      URL,
+      JSON,
+      Math,
+      Date,
+      inputPayload: params.inputPayload ?? {},
+      env: spec.env,
+      fetch: globalOutboundBlocked ?
+      async () => {
+        throw new Error("DynamicWorker Egress Blocked: globalOutbound is null");
+      } :
+      globalThis.fetch
+    };
+    const context = vm.createContext(sandboxGlobals);
+    const script = new vm.Script(transformedCode, { filename: "sandbox_entry.js" });
+    script.runInContext(context, { timeout: 1000 });
+
+    let output = {};
+    const workerExport = sandboxGlobals.__workerExport;
+
+
+    if (workerExport && typeof workerExport.fetch === "function") {
+      const req = new Request("http://sandbox.internal/run", {
+        method: "POST",
+        body: JSON.stringify(params.inputPayload ?? {})
+      });
+      const resp = await workerExport.fetch(req, spec.env);
+      const text = await resp.text();
+      output = text ? JSON.parse(text) : {};
+    } else if (sandboxGlobals.__result !== undefined) {
+      output = sandboxGlobals.__result;
+    }
+
+    const coldStartLatencyMs = Math.max(0.001, Number((performance.now() - t0).toFixed(3)));
     return {
       isolateId,
       globalOutboundBlocked,
-      coldStartLatencyMs: 2.8,
-      output: {
-        executedInDynamicWorker: true,
-        isolateId,
-        inputEcho: params.inputPayload ?? {}
-      }
+      coldStartLatencyMs,
+      output
     };
   }
 
@@ -192,28 +230,33 @@ class V8HeapAndSqlBudgetGuard {
   evaluateHeapPressure(currentHeapUsedMb)
 
 
+
   {
-    const pct = Number((currentHeapUsedMb / this.hardHeapLimitMb * 100).toFixed(1));
-    if (currentHeapUsedMb >= this.hardHeapLimitMb * 0.92) {
-      return { status: "REJECT_NEW_STREAMS", heapUtilizationPct: pct };
+    const measuredHeapMb =
+    currentHeapUsedMb ?? Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(2));
+    const pct = Number((measuredHeapMb / this.hardHeapLimitMb * 100).toFixed(1));
+    if (measuredHeapMb >= this.hardHeapLimitMb * 0.92) {
+      return { status: "REJECT_NEW_STREAMS", heapUtilizationPct: pct, measuredHeapMb };
     }
-    if (currentHeapUsedMb >= this.softHeapLimitMb) {
-      return { status: "EVICT_WARM_BUFFERS", heapUtilizationPct: pct };
+    if (measuredHeapMb >= this.softHeapLimitMb) {
+      return { status: "EVICT_WARM_BUFFERS", heapUtilizationPct: pct, measuredHeapMb };
     }
-    return { status: "HEALTHY", heapUtilizationPct: pct };
+    return { status: "HEALTHY", heapUtilizationPct: pct, measuredHeapMb };
   }
 
   execWithBudget(
   sql,
   query,
-  simulatedDurationMs,
   ...bindings)
   {
-    if (simulatedDurationMs > this.sqlTimeoutMs) {
+    const t0 = performance.now();
+    const cursor = sql.exec(query, ...bindings);
+    const elapsedMs = Number((performance.now() - t0).toFixed(3));
+    if (elapsedMs > this.sqlTimeoutMs) {
       throw new Error(
-      `SQLite statement exceeded celld per-statement timeout (${simulatedDurationMs}ms > ${this.sqlTimeoutMs}ms): ${query.slice(0, 60)}`);
+      `SQLite statement exceeded celld per-statement timeout (${elapsedMs}ms > ${this.sqlTimeoutMs}ms): ${query.slice(0, 60)}`);
 
     }
-    return sql.exec(query, ...bindings);
+    return { cursor, elapsedMs };
   }
 }exports.V8HeapAndSqlBudgetGuard = V8HeapAndSqlBudgetGuard;

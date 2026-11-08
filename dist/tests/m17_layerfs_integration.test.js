@@ -4,7 +4,7 @@
 var _nodeTest = require("node:test");
 var assert = _interopRequireWildcard(require("node:assert/strict"));
 var _index = require("../src/index.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M17 (TASK-83 ~ TASK-88) LayerFS (`layerfs.ai` v1.1.0 / v2.0) Deep Integration Suite (6 tests).
+ * @fileoverview M17 (TASK-83 ~ TASK-88) LayerFS (`layerfs.ai` v1.1.0 / v2.0) Real Compression, Real Workspace Mount & Multi-Agent Merge Suite (6 tests).
  */
 
 
@@ -18,26 +18,30 @@ var _index = require("../src/index.js");function _getRequireWildcardCache(nodeIn
 
 
 (0, _nodeTest.describe)("M17 (TASK-83 ~ TASK-88) LayerFS Deep Integration Suite", () => {
-  (0, _nodeTest.it)("1. [TASK-83] LayerFsContentStoreEngine deduplicates chunks with layerfs/object/v2 digest, FULL/PREFIX/DELTA encodings & 8KiB B-Tree pages", () => {
+  (0, _nodeTest.it)("1. [TASK-83] LayerFsContentStoreEngine performs real zlib compression, PREFIX/DELTA encoding, and bit-exact lossless reconstruction", () => {
     const store = new _index.LayerFsContentStoreEngine();
-    const baseText = "const x = 1;\n".repeat(100);
+    const baseText = "export function computeItem(idx: number) { return idx * 42; }\n".repeat(40);
     const r1 = store.putFileObject("src/app.ts", baseText);
     const r2 = store.putFileObject("src/app_copy.ts", baseText);
     assert.equal(r1.deduplicated, false);
     assert.equal(r2.deduplicated, true);
+    assert.ok(r1.object.compressedBytes < r1.object.logicalBytes);
+    assert.equal(store.reconstructObjectContent(r1.object.objectId), baseText);
 
-    const editedText = baseText + "export const added = true;\n";
+    const editedText = baseText + "export const tailFlag = 'verified-prefix-delta';\n";
     const r3 = store.putFileObject("src/app.ts", editedText, baseText);
     assert.equal(r3.object.encoding, "PREFIX");
+    assert.ok(r3.object.compressedBytes < 60);
+    assert.equal(store.reconstructObjectContent(r3.object.objectId), editedText);
 
     const btree = store.updateDirectoryBTreePages("C1", null, [
     { path: "src/app.ts", objectId: r3.object.objectId, mode: 0o644, turnId: "step-1" }]);
 
     assert.equal(btree.rewrittenLeafPages, 1);
-    assert.ok(store.getStorageStats().dedupAndCompressionRatio > 2.5);
+    assert.ok(store.getStorageStats().dedupAndCompressionRatio > 5.0);
   });
 
-  (0, _nodeTest.it)("2. [TASK-84] LayerFsWorkspaceDriver separates In-Process File Fast-Path (0 container) from Ephemeral Bash Mount (node_modules pre-mounted in <20ms)", () => {
+  (0, _nodeTest.it)("2. [TASK-84] LayerFsWorkspaceDriver materializes real temp workspace with pre-mounted node_modules and runs real shell command to capture changes", () => {
     const driver = new _index.LayerFsWorkspaceDriver();
     driver.forkBranch("main", "agent-alpha");
 
@@ -46,32 +50,30 @@ var _index = require("../src/index.js");function _getRequireWildcardCache(nodeIn
       agentId: "agent-alpha",
       stepId: "turn-1-write",
       operation: "write",
-      filePath: "src/index.tsx",
-      newContent: "import React from 'react';\nexport const App = () => <div />;"
+      filePath: "src/index.js",
+      newContent: "const react = require('react');\nconsole.log('react-ver:' + react.version);\n"
     });
     assert.equal(fileOp.committedNewSnapshot, true);
     assert.equal(fileOp.containerSpawned, false);
 
-    const noopRead = driver.executeInProcessFileTool({
-      branchName: "agent-alpha",
-      agentId: "agent-alpha",
-      stepId: "turn-2-read",
-      operation: "read",
-      filePath: "src/index.tsx"
-    });
-    assert.equal(noopRead.committedNewSnapshot, false);
-    assert.ok(noopRead.readResult?.includes("React"));
-
     const bashOp = driver.executeEphemeralBashWorkspace({
       branchName: "agent-alpha",
       agentId: "agent-alpha",
-      stepId: "turn-3-bash",
-      command: "npm test",
-      overlayMutations: [{ filePath: "dist/bundle.js", content: "console.log('built');" }]
+      stepId: "turn-2-bash",
+      command: "node src/index.js > build_output.txt"
     });
     assert.equal(bashOp.committedNewSnapshot, true);
     assert.equal(bashOp.nodeModulesPreMounted, true);
-    assert.ok(bashOp.mountLatencyMs <= 20);
+    assert.ok(bashOp.mountLatencyMs > 0 && bashOp.mountLatencyMs < 250);
+
+    const readGenerated = driver.executeInProcessFileTool({
+      branchName: "agent-alpha",
+      agentId: "agent-alpha",
+      stepId: "turn-3-read",
+      operation: "read",
+      filePath: "build_output.txt"
+    });
+    assert.equal(readGenerated.readResult?.trim(), "react-ver:19.0.0");
   });
 
   (0, _nodeTest.it)("3. [TASK-85] LayerFsMultiAgentBranchCoordinator merges identical bytes, applies .lww rules, preserves chmod, and refuses real conflicts", () => {

@@ -2,10 +2,12 @@
 
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var crypto = _interopRequireWildcard(require("node:crypto"));
+var zlib = _interopRequireWildcard(require("node:zlib"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M17 TASK-83: LayerFS Content-Addressed Store Engine (`layerfs/object/v2` Domain-Separated Digest,
- * 128 KiB Content-Defined Chunker, 8 KiB B-Tree Directory Pages, 4 Pack Lanes & FULL/PREFIX/DELTA Encodings).
+ * Real `node:zlib` Deflate Compression, Lossless `FULL`/`PREFIX`/`DELTA` Reconstruction & 8 KiB B-Tree Pages).
  */
+
 
 
 
@@ -50,10 +52,11 @@ class LayerFsContentStoreEngine {
   previousContent,
   mode = 0o644)
   {
-    const logicalBytes = Buffer.byteLength(content, "utf-8");
+    const contentBuf = Buffer.from(content, "utf-8");
+    const logicalBytes = contentBuf.byteLength;
     this.logicalTotalBytes += logicalBytes;
 
-    const objectId = LayerFsContentStoreEngine.computeCanonicalObjectId(content);
+    const objectId = LayerFsContentStoreEngine.computeCanonicalObjectId(contentBuf);
     const existing = this.objects.get(objectId);
     if (existing) {
       return { object: existing, deduplicated: true };
@@ -68,33 +71,76 @@ class LayerFsContentStoreEngine {
 
     let encoding = "FULL";
     let baseObjectId;
-    let compressedBytes = Math.max(16, Math.ceil(logicalBytes * 0.31));
+    let sharedPrefixByteLength;
+    let payloadToCompress = contentBuf;
 
     if (previousContent && previousContent.length > 0) {
-      baseObjectId = LayerFsContentStoreEngine.computeCanonicalObjectId(previousContent);
-      if (content.startsWith(previousContent.slice(0, Math.min(64, previousContent.length)))) {
+      const prevBuf = Buffer.from(previousContent, "utf-8");
+      const baseId = LayerFsContentStoreEngine.computeCanonicalObjectId(prevBuf);
+      if (!this.objects.has(baseId)) {
+        this.putFileObject(filePath, previousContent, undefined, mode);
+      }
+      baseObjectId = baseId;
+
+      let commonPrefix = 0;
+      const maxCheck = Math.min(contentBuf.length, prevBuf.length);
+      while (commonPrefix < maxCheck && contentBuf[commonPrefix] === prevBuf[commonPrefix]) {
+        commonPrefix += 1;
+      }
+
+      if (commonPrefix >= 32) {
         encoding = "PREFIX";
-        const diffLen = Math.max(8, Math.abs(content.length - previousContent.length));
-        compressedBytes = Math.max(12, Math.ceil(diffLen * 0.35));
+        sharedPrefixByteLength = commonPrefix;
+        payloadToCompress = contentBuf.subarray(commonPrefix);
       } else {
         encoding = "DELTA";
-        compressedBytes = Math.max(14, Math.ceil(logicalBytes * 0.22));
+        const deltaEnvelope = JSON.stringify({
+          baseLen: prevBuf.length,
+          newText: content
+        });
+        payloadToCompress = Buffer.from(deltaEnvelope, "utf-8");
       }
     }
+
+    const compressedBuf = zlib.deflateRawSync(payloadToCompress, { level: 6 });
+    const compressedBytes = compressedBuf.byteLength;
 
     const stored = {
       objectId,
       lane,
       encoding,
       baseObjectId,
+      sharedPrefixByteLength,
       logicalBytes,
       compressedBytes,
-      contentText: content,
+      compressedPayload: new Uint8Array(compressedBuf),
       mode
     };
     this.objects.set(objectId, stored);
     this.storedCompressedBytes += compressedBytes;
     return { object: stored, deduplicated: false };
+  }
+
+  reconstructObjectContent(objectId) {
+    const obj = this.objects.get(objectId);
+    if (!obj) {
+      throw new Error(`LayerFS object '${objectId}' not found in Store`);
+    }
+    const decompressed = zlib.inflateRawSync(Buffer.from(obj.compressedPayload));
+    if (obj.encoding === "FULL") {
+      return decompressed.toString("utf-8");
+    }
+    if (!obj.baseObjectId) {
+      throw new Error(`Corrupt ${obj.encoding} object '${objectId}': missing baseObjectId`);
+    }
+    const baseText = this.reconstructObjectContent(obj.baseObjectId);
+    if (obj.encoding === "PREFIX") {
+      const baseBuf = Buffer.from(baseText, "utf-8");
+      const prefixSlice = baseBuf.subarray(0, obj.sharedPrefixByteLength ?? 0);
+      return Buffer.concat([prefixSlice, decompressed]).toString("utf-8");
+    }
+    const deltaParsed = JSON.parse(decompressed.toString("utf-8"));
+    return deltaParsed.newText;
   }
 
   updateDirectoryBTreePages(
@@ -119,20 +165,18 @@ class LayerFsContentStoreEngine {
       const hashNum = crypto.createHash("md5").update(item.path, "utf-8").digest().readUInt16BE(0);
       const bucketIdx = hashNum % 64;
       touchedBuckets.add(bucketIdx);
-      let page = nextPages.get(bucketIdx);
-      if (!page) {
-        page = {
-          pageId: `page-${commitId}-${bucketIdx}`,
-          entries: new Map(),
-          byteSize: 128
-        };
-      } else {
-        page = {
-          pageId: `page-${commitId}-${bucketIdx}`,
-          entries: new Map(page.entries),
-          byteSize: page.byteSize
-        };
-      }
+      const existing = nextPages.get(bucketIdx);
+      const page = existing ?
+      {
+        pageId: `page-${commitId}-${bucketIdx}`,
+        entries: new Map(existing.entries),
+        byteSize: existing.byteSize
+      } :
+      {
+        pageId: `page-${commitId}-${bucketIdx}`,
+        entries: new Map(),
+        byteSize: 128
+      };
       page.entries.set(item.path, {
         objectId: item.objectId,
         mode: item.mode,

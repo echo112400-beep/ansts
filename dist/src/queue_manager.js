@@ -2,7 +2,7 @@
 
 
 var _models = require("./models.js"); /**
- * @fileoverview M2 TASK-06 & M16 TASK-80: O(log N) Indexed Binary Max-Heap Priority + DRF Fairness + Aging Queue Manager.
+ * @fileoverview M2 TASK-06 & M16 TASK-80: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging Tournament Queue Manager.
  */
 
 
@@ -10,7 +10,7 @@ var _models = require("./models.js"); /**
 
 class HierarchicalQueueManager {
   queuedTasks = new Map();
-  maxHeap = [];
+  tenantHeaps = new Map();
   tenantActiveCount = new Map();
   agingBoostPerSec;
 
@@ -18,13 +18,26 @@ class HierarchicalQueueManager {
     this.agingBoostPerSec = agingBoostPerSec;
   }
 
+  getBasePriorityScore(priority) {
+    const basePriorityScore = {
+      [_models.TaskPriority.P0_EMERGENCY]: 1000,
+      [_models.TaskPriority.P1_HIGH]: 300,
+      [_models.TaskPriority.P2_STANDARD]: 150,
+      [_models.TaskPriority.P3_BATCH]: 50
+    };
+    return basePriorityScore[priority] ?? 100;
+  }
+
   enqueue(task) {
     this.queuedTasks.set(task.task_id, task);
-    const nowSec = Date.now() / 1000;
-    this.heapPush({
-      task,
-      enqueuedScore: this.computeEffectiveScore(task, nowSec)
-    });
+    let heap = this.tenantHeaps.get(task.tenant_id);
+    if (!heap) {
+      heap = [];
+      this.tenantHeaps.set(task.tenant_id, heap);
+    }
+    const intraTenantStaticKey =
+    this.getBasePriorityScore(task.priority) - task.created_at * this.agingBoostPerSec;
+    this.heapPush(heap, { task, intraTenantStaticKey });
   }
 
   getTenantActiveCount(tenantId) {
@@ -36,13 +49,7 @@ class HierarchicalQueueManager {
   }
 
   computeEffectiveScore(task, nowSec) {
-    const basePriorityScore = {
-      [_models.TaskPriority.P0_EMERGENCY]: 1000,
-      [_models.TaskPriority.P1_HIGH]: 300,
-      [_models.TaskPriority.P2_STANDARD]: 150,
-      [_models.TaskPriority.P3_BATCH]: 50
-    };
-    const base = basePriorityScore[task.priority] ?? 100;
+    const base = this.getBasePriorityScore(task.priority);
     const waitSeconds = Math.max(0, nowSec - task.created_at);
     const agingBonus = waitSeconds * this.agingBoostPerSec;
     const activeForTenant = this.getTenantActiveCount(task.tenant_id);
@@ -54,37 +61,33 @@ class HierarchicalQueueManager {
     if (this.queuedTasks.size === 0) return null;
     const nowSec = Date.now() / 1000;
 
-    if (this.queuedTasks.size <= 64) {
-      let bestTask = null;
-      let bestScore = -Infinity;
-      for (const candidate of this.queuedTasks.values()) {
-        const score = this.computeEffectiveScore(candidate, nowSec);
-        if (score > bestScore) {
-          bestScore = score;
-          bestTask = candidate;
-        }
-      }
-      if (bestTask) {
-        this.queuedTasks.delete(bestTask.task_id);
-        this.tenantActiveCount.set(
-        bestTask.tenant_id,
-        this.getTenantActiveCount(bestTask.tenant_id) + 1);
+    let winningTenantId = null;
+    let winningScore = -Infinity;
 
+    for (const [tenantId, heap] of this.tenantHeaps.entries()) {
+      while (heap.length > 0 && !this.queuedTasks.has(heap[0].task.task_id)) {
+        this.heapPop(heap);
       }
-      return bestTask;
+      if (heap.length === 0) continue;
+      const topTask = heap[0].task;
+      const dynamicScore = this.computeEffectiveScore(topTask, nowSec);
+      if (dynamicScore > winningScore) {
+        winningScore = dynamicScore;
+        winningTenantId = tenantId;
+      }
     }
 
-    while (this.maxHeap.length > 0) {
-      const top = this.heapPop();
-      if (!this.queuedTasks.has(top.task.task_id)) continue;
-      this.queuedTasks.delete(top.task.task_id);
-      this.tenantActiveCount.set(
-      top.task.tenant_id,
-      this.getTenantActiveCount(top.task.tenant_id) + 1);
+    if (!winningTenantId) return null;
+    const winningHeap = this.tenantHeaps.get(winningTenantId);
+    const poppedNode = this.heapPop(winningHeap);
+    const bestTask = poppedNode.task;
 
-      return top.task;
-    }
-    return null;
+    this.queuedTasks.delete(bestTask.task_id);
+    this.tenantActiveCount.set(
+    bestTask.tenant_id,
+    this.getTenantActiveCount(bestTask.tenant_id) + 1);
+
+    return bestTask;
   }
 
   completeTask(task) {
@@ -95,41 +98,41 @@ class HierarchicalQueueManager {
     }
   }
 
-  heapPush(entry) {
-    this.maxHeap.push(entry);
-    let idx = this.maxHeap.length - 1;
+  heapPush(heap, node) {
+    heap.push(node);
+    let idx = heap.length - 1;
     while (idx > 0) {
       const parentIdx = idx - 1 >> 1;
-      if (this.maxHeap[parentIdx].enqueuedScore >= this.maxHeap[idx].enqueuedScore) break;
-      const tmp = this.maxHeap[parentIdx];
-      this.maxHeap[parentIdx] = this.maxHeap[idx];
-      this.maxHeap[idx] = tmp;
+      if (heap[parentIdx].intraTenantStaticKey >= heap[idx].intraTenantStaticKey) break;
+      const tmp = heap[parentIdx];
+      heap[parentIdx] = heap[idx];
+      heap[idx] = tmp;
       idx = parentIdx;
     }
   }
 
-  heapPop() {
-    if (this.maxHeap.length === 0) return undefined;
-    const top = this.maxHeap[0];
-    const last = this.maxHeap.pop();
-    if (this.maxHeap.length > 0) {
-      this.maxHeap[0] = last;
+  heapPop(heap) {
+    if (heap.length === 0) return undefined;
+    const top = heap[0];
+    const last = heap.pop();
+    if (heap.length > 0) {
+      heap[0] = last;
       let idx = 0;
-      const len = this.maxHeap.length;
+      const len = heap.length;
       while (true) {
         const left = (idx << 1) + 1;
         const right = left + 1;
         let largest = idx;
-        if (left < len && this.maxHeap[left].enqueuedScore > this.maxHeap[largest].enqueuedScore) {
+        if (left < len && heap[left].intraTenantStaticKey > heap[largest].intraTenantStaticKey) {
           largest = left;
         }
-        if (right < len && this.maxHeap[right].enqueuedScore > this.maxHeap[largest].enqueuedScore) {
+        if (right < len && heap[right].intraTenantStaticKey > heap[largest].intraTenantStaticKey) {
           largest = right;
         }
         if (largest === idx) break;
-        const tmp = this.maxHeap[idx];
-        this.maxHeap[idx] = this.maxHeap[largest];
-        this.maxHeap[largest] = tmp;
+        const tmp = heap[idx];
+        heap[idx] = heap[largest];
+        heap[largest] = tmp;
         idx = largest;
       }
     }

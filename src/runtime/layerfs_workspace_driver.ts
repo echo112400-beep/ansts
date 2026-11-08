@@ -1,8 +1,12 @@
 /**
  * @fileoverview M17 TASK-84: LayerFS Dual-Path Execution Driver
  * - Fast Path (`@layerfs/agent` + `@layerfs/backend`): In-process file tool ops (`read`, `write`, `edit`, `grep`) -> atomic Commit (0 container boot)
- * - Sandbox Path (`@layerfs/runtime`): Ephemeral FUSE Workspace (`mount -> exec -> commit -> unmount` in 5-20ms with Instant Bootstrap `node_modules`)
+ * - Sandbox Path (`@layerfs/runtime`): Real Ephemeral Workspace (`mount -> real child_process exec -> scan diff -> commit -> unmount`)
  */
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as childProcess from "node:child_process";
 import { LayerFsContentStoreEngine } from "../checkpoint/layerfs_store_engine.js";
 
 export type LayerFsToolCategory = "FILE_FAST_PATH" | "BASH_SANDBOX_MOUNT";
@@ -162,6 +166,7 @@ export class LayerFsWorkspaceDriver {
     mountLatencyMs: number;
     nodeModulesPreMounted: boolean;
     unmountedCleanly: boolean;
+    stdout: string;
   } {
     if (params.uncommittedDirtyExit) {
       throw new Error("LayerFS Workspace clean End refused uncommitted dirty state without explicit Commit or Abort");
@@ -171,41 +176,82 @@ export class LayerFsWorkspaceDriver {
       throw new Error(`Branch '${params.branchName}' not found`);
     }
     const parentCommit = this.commits.get(headId)!;
-    const nodeModulesPreMounted = parentCommit.filesTree.has("node_modules/react/index.js");
-    const mountLatencyMs = 8.5;
 
-    const mutations = params.overlayMutations ?? [];
-    if (mutations.length === 0) {
+    const tMountStart = performance.now();
+    const mountDir = fs.mkdtempSync(path.join(os.tmpdir(), `layerfs-ws-${params.branchName}-`));
+    let stdout = "";
+    try {
+      for (const [relPath, fileEntry] of parentCommit.filesTree.entries()) {
+        const fullPath = path.join(mountDir, relPath);
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        fs.writeFileSync(fullPath, fileEntry.content, { encoding: "utf-8", mode: fileEntry.mode });
+      }
+      const mountLatencyMs = Math.max(0.01, Number((performance.now() - tMountStart).toFixed(3)));
+      const nodeModulesPreMounted = fs.existsSync(path.join(mountDir, "node_modules/react/index.js"));
+
+      if (params.command && params.command.trim().length > 0) {
+        stdout = childProcess
+          .execSync(params.command, { cwd: mountDir, stdio: "pipe", timeout: 10_000 })
+          .toString("utf-8");
+      }
+
+      for (const mut of params.overlayMutations ?? []) {
+        const fullPath = path.join(mountDir, mut.filePath);
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        fs.writeFileSync(fullPath, mut.content, { encoding: "utf-8", mode: mut.mode ?? 0o644 });
+      }
+
+      const discoveredMutations: Array<{ filePath: string; content: string; mode: number }> = [];
+      const scanDir = (dir: string): void => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            scanDir(full);
+          } else if (entry.isFile()) {
+            const rel = path.relative(mountDir, full).split(path.sep).join("/");
+            const content = fs.readFileSync(full, "utf-8");
+            const mode = fs.statSync(full).mode & 0o777;
+            const prev = parentCommit.filesTree.get(rel);
+            if (!prev || prev.content !== content || prev.mode !== mode) {
+              discoveredMutations.push({ filePath: rel, content, mode });
+            }
+          }
+        }
+      };
+      scanDir(mountDir);
+
+      if (discoveredMutations.length === 0) {
+        return {
+          commitId: headId,
+          committedNewSnapshot: false,
+          mountLatencyMs,
+          nodeModulesPreMounted,
+          unmountedCleanly: true,
+          stdout,
+        };
+      }
+
+      const nextCommit = this.createChildCommit({
+        parentCommit,
+        branchName: params.branchName,
+        agentId: params.agentId,
+        stepId: params.stepId,
+        toolCategory: "BASH_SANDBOX_MOUNT",
+        mountLatencyMs,
+        mutations: discoveredMutations,
+      });
+
       return {
-        commitId: headId,
-        committedNewSnapshot: false,
+        commitId: nextCommit.commitId,
+        committedNewSnapshot: true,
         mountLatencyMs,
         nodeModulesPreMounted,
         unmountedCleanly: true,
+        stdout,
       };
+    } finally {
+      fs.rmSync(mountDir, { recursive: true, force: true });
     }
-
-    const nextCommit = this.createChildCommit({
-      parentCommit,
-      branchName: params.branchName,
-      agentId: params.agentId,
-      stepId: params.stepId,
-      toolCategory: "BASH_SANDBOX_MOUNT",
-      mountLatencyMs,
-      mutations: mutations.map((m) => ({
-        filePath: m.filePath,
-        content: m.content,
-        mode: m.mode ?? 0o644,
-      })),
-    });
-
-    return {
-      commitId: nextCommit.commitId,
-      committedNewSnapshot: true,
-      mountLatencyMs,
-      nodeModulesPreMounted,
-      unmountedCleanly: true,
-    };
   }
 
   private createChildCommit(params: {
