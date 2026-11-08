@@ -355,7 +355,7 @@ class InMemoryR2Bucket {
       etag: obj.etag,
       size: obj.bytes.byteLength,
       customMetadata: obj.customMetadata,
-      arrayBuffer: async () => obj.bytes.buffer.slice(obj.bytes.byteOffset, obj.bytes.byteOffset + obj.bytes.byteLength),
+      arrayBuffer: async () => obj.bytes.slice().buffer,
       text: async () => new TextDecoder().decode(obj.bytes)
     };
   }

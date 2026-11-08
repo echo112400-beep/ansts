@@ -72,7 +72,7 @@ export class LayerFsContentStoreEngine {
     let encoding: LayerFsRecordEncoding = "FULL";
     let baseObjectId: string | undefined;
     let sharedPrefixByteLength: number | undefined;
-    let payloadToCompress: Buffer = contentBuf;
+    let payloadToCompress: Uint8Array = contentBuf;
 
     if (previousContent && previousContent.length > 0) {
       const prevBuf = Buffer.from(previousContent, "utf-8");

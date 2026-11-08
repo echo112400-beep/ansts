@@ -89,7 +89,7 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
         idFromName: (name) => ({ toString: () => name }),
         get: () => ({
           id: { toString: () => "cell-0" },
-          fetch: (input, init) => cell.fetch(new Request(input, init)),
+          fetch: (input, init) => cell.fetch(input instanceof Request ? input : new Request(String(input), init)),
         }),
       },
       ANSTS_HARNESS_CELL: {

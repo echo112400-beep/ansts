@@ -1,7 +1,9 @@
 /**
- * @fileoverview M7 TASK-27B: Cloudflare Workers / denoland/celld Default Fetch & Queue Entrypoint.
+ * @fileoverview M7 TASK-27B: Cloudflare Workers / denoland/celld Default Fetch, Queue & Durable Object Class Entrypoint.
  */
 import { CloudflareCelldEnv, QueueBatchLike } from "./env.js";
+export { AnstsSchedulerCell } from "./scheduler_cell.js";
+export { AgentTaskHarnessCell } from "./harness_cell.js";
 
 export default {
   async fetch(request: Request, env: CloudflareCelldEnv): Promise<Response> {
