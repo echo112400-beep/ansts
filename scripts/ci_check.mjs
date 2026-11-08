@@ -126,7 +126,22 @@ function runBuild() {
   console.log("===> [Stage 2/3: TYPESCRIPT BUILD PASSED]\n");
 }
 
+function assertNodeSqlite() {
+  try {
+    const sqlite = createRequire(import.meta.url)("node:sqlite");
+    if (typeof sqlite.DatabaseSync !== "function") {
+      throw new Error("DatabaseSync export missing");
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `node:sqlite DatabaseSync is required (Node.js >= 22.13, unflagged). Current runtime ${process.version}. ${reason}`,
+    );
+  }
+}
+
 function runTests() {
+  assertNodeSqlite();
   const distTestsDir = path.join(ROOT_DIR, "dist", "tests");
   if (!fs.existsSync(distTestsDir)) {
     runBuild();

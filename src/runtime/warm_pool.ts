@@ -1,6 +1,8 @@
 /**
  * @fileoverview M4 TASK-12: Pre-warmed Firecracker / Kata MicroVM Snapshot Pool Manager.
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 export interface MicroVmInstance {
   vmId: string;
   nodeId: string;
@@ -13,14 +15,36 @@ export interface MicroVmInstance {
 export class WarmSandboxPoolManager {
   private readonly nodeId: string;
   private readonly targetWarmCount: number;
+  private readonly scratchRoot?: string;
   private readonly warmPool: MicroVmInstance[] = [];
   private readonly activeVms: Map<string, MicroVmInstance> = new Map();
   private vmSeq = 0;
 
-  constructor(nodeId: string, targetWarmCount = 8) {
-    this.nodeId = nodeId;
-    this.targetWarmCount = targetWarmCount;
+  constructor(nodeIdOrPoolSize: string | number = "local", targetWarmCountOrDir: number | string = 8) {
+    if (typeof nodeIdOrPoolSize === "number") {
+      this.nodeId = "warm-pool";
+      this.targetWarmCount = nodeIdOrPoolSize;
+      this.scratchRoot = typeof targetWarmCountOrDir === "string" ? targetWarmCountOrDir : undefined;
+    } else {
+      this.nodeId = nodeIdOrPoolSize;
+      this.targetWarmCount = typeof targetWarmCountOrDir === "number" ? targetWarmCountOrDir : 8;
+    }
     this.replenishPool();
+  }
+
+  public acquireWarmSandbox(poolId: string, runtime: string): { scratchFilePath: string; poolId: string; runtime: string } {
+    const dir = this.scratchRoot ?? path.join("/tmp", `ansts-warm-${this.nodeId}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const scratchFilePath = path.join(dir, `${poolId}.img`);
+    fs.writeFileSync(scratchFilePath, Buffer.alloc(4096));
+    return { scratchFilePath, poolId, runtime };
+  }
+
+  public teardownAndZeroBlocks(sandbox: { scratchFilePath?: string }): void {
+    if (!sandbox.scratchFilePath || !fs.existsSync(sandbox.scratchFilePath)) return;
+    const size = fs.statSync(sandbox.scratchFilePath).size;
+    fs.writeFileSync(sandbox.scratchFilePath, Buffer.alloc(size));
+    fs.unlinkSync(sandbox.scratchFilePath);
   }
 
   public replenishPool(templateHash = "ubuntu24-py312-node22-v1"): number {

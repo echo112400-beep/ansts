@@ -75,7 +75,9 @@ export class DistributedOrphanGcSweeper {
           continue;
         }
         const stat = fs.statSync(fullPath);
-        if (nowMs - stat.mtimeMs >= retentionMs) {
+        // retention 0 means "delete now". A fresh file's mtime can be a few milliseconds
+        // ahead of Date.now() on some runners, which must not keep an orphan alive.
+        if (retentionMs <= 0 || nowMs - stat.mtimeMs >= retentionMs) {
           reclaimedBytes += entry.isDirectory()
             ? this.getDirectorySizeBytes(fullPath)
             : stat.size;
@@ -98,7 +100,7 @@ export class DistributedOrphanGcSweeper {
           continue;
         }
         const stat = fs.statSync(fullPath);
-        if (nowMs - stat.mtimeMs >= retentionMs) {
+        if (retentionMs <= 0 || nowMs - stat.mtimeMs >= retentionMs) {
           reclaimedBytes += stat.size;
           fs.unlinkSync(fullPath);
           deletedExpiredLtxFiles.push(entry.name);

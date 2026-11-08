@@ -120,6 +120,9 @@ export class MultiNodeClusterDaemonServer {
     });
     this.canaryController = new CanaryRolloutController("v2.5.0", "v2.5.1-canary");
     this.consoleBff = new ConsoleBffController(this.tunnelRouter, this.geoRouter, this.streamPublisher, this.mesh, this.canaryController);
+    // The dev server is not a production roster. Tests and local compose read this seeded table.
+    // Production cells stay empty unless ANSTS_CONSOLE_SEED_DEMO=1.
+    this.consoleBff.ensureDefaultConsoleSeedData();
   }
 
   public async start(): Promise<number> {
@@ -295,6 +298,21 @@ export class MultiNodeClusterDaemonServer {
         cpuBurstCores: 8.0,
       });
     }
+
+    this.consoleBff.recordLiveTaskExecution({
+      cellId: `AgentTaskHarnessCell_#${taskId}`,
+      taskId,
+      tenantId,
+      ownerBrainNode: this.config.nodeId,
+      heapUsedMb: Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1)),
+      heapLimitMb: 128,
+      sqliteState: "Synced (RPO=0 Bucket + LTX Archive)",
+      fenceEpoch: fence.epoch,
+      fenceTurnSeq: fence.turnSeq,
+      routedModelPool: "DeepSeek",
+      kvCacheHit: Boolean(llmRoute.selectedBackendId),
+      phase: "EXECUTION_8C",
+    });
 
     return {
       status: "EXECUTED",

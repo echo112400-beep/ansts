@@ -2,20 +2,23 @@ name: ANSTS v2.2 TypeScript & celld HA CI Pipeline
 
 on:
   push:
-    branches: ["main", "master", "release/**"]
+    branches: ["main", "master", "release/**", "feat/celld-v25"]
   pull_request:
-    branches: ["main", "master"]
+    branches: ["main", "master", "feat/celld-v25"]
   workflow_dispatch:
 
 jobs:
   lint-build-and-test:
-    name: "Verify TypeScript AST, Build & 55 Integration/Chaos Tests (Node ${{ matrix.node-version }})"
+    name: "Verify TypeScript AST, Build & Integration Tests (Node ${{ matrix.node-version }})"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["18.x", "20.x", "22.x"]
+        # scheduler_persistence.test.ts loads node:sqlite at import time.
+        # That built-in is absent on Node 18/20 (ERR_UNKNOWN_BUILTIN_MODULE) and
+        # unflagged starting with Node 22.13. Do not re-add 18.x/20.x or skip the test.
+        node-version: ["22.x"]
 
     steps:
       - name: Checkout repository
@@ -26,14 +29,14 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Install dependencies (tolerant of missing lockfile)
-        run: npm install --no-audit --no-fund || true
+      - name: Install dependencies from the lockfile
+        run: npm ci --no-audit --no-fund
 
       - name: Stage 1 — TypeScript AST, Google Style & Schema Lint
         run: npm run lint
 
-      - name: Stage 2 — Compile 66 TypeScript Modules to CommonJS (dist/)
+      - name: Stage 2 — Compile TypeScript modules to CommonJS (dist/)
         run: npm run build
 
-      - name: Stage 3 — Execute Full 55-Test Integration, Chaos & celld HA Suite
+      - name: Stage 3 — Execute the full integration, chaos & celld suite
         run: npm test

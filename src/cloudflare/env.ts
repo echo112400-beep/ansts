@@ -1,6 +1,8 @@
 /**
  * @fileoverview M7 TASK-25: Cloudflare Workers & denoland/celld Unified Runtime Bindings & SQL/KV/R2 Mock Layer.
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 export interface DurableObjectIdLike {
   toString(): string;
   name?: string;
@@ -32,6 +34,10 @@ export interface DurableObjectStorageLike {
   delete(key: string): Promise<boolean>;
   setAlarm(scheduledTime: number | Date): Promise<void>;
   getAlarm(): Promise<number | null>;
+  /** Host SQLite transaction. Absent on the in-memory simulator. */
+  transactionSync?<T>(callback: () => T): T;
+  /** Durability barrier after commit. Failure is ambiguous: the SQL may already be durable. */
+  sync?(): Promise<void>;
 }
 
 export interface DurableObjectFacetsLike {
@@ -125,12 +131,47 @@ export interface CloudflareCelldEnv {
   ANSTS_TASK_DISPATCH_QUEUE: QueueProducerLike;
   ANSTS_WEBHOOK_OUTBOX_QUEUE: QueueProducerLike;
   ANSTS_SANDBOX_LOADER?: DynamicWorkerLoaderBindingLike;
+  /** wrangler.json binding name. v1beta1 routing prefers this over ANSTS_SCHEDULER_CELL. */
+  SCHEDULER_CELL?: DurableObjectNamespaceLike;
+  /** Stable cell name. Not taken from an untrusted request. */
+  SCHEDULER_CLUSTER_ID?: string;
+  /** Transactional outbox target. At-least-once; consumers dedupe on event_id. */
+  ANSTS_EVENTS_QUEUE?: QueueProducerLike;
   CELLD_REGION?: string;
 }
 
 export class InMemoryCellSqlStorage implements SqlStorageLike {
   private tables: Map<string, Map<string, Record<string, unknown>>> = new Map();
   private txSnapshot: Map<string, Map<string, Record<string, unknown>>> | null = null;
+
+  constructor(private readonly diskPath?: string) {
+    if (!diskPath || !fs.existsSync(diskPath)) return;
+    const parsed = JSON.parse(fs.readFileSync(diskPath, "utf8")) as {
+      tables?: Record<string, Array<Record<string, unknown>>>;
+    };
+    for (const [name, rows] of Object.entries(parsed.tables ?? {})) {
+      const table = new Map<string, Record<string, unknown>>();
+      rows.forEach((row, index) => {
+        const pk = String(row.id ?? row.task_id ?? row.idem_key ?? row.seq ?? index + 1);
+        table.set(pk, row);
+      });
+      this.tables.set(name, table);
+    }
+  }
+
+  private persist(): void {
+    if (!this.diskPath) return;
+    const tables: Record<string, Array<Record<string, unknown>>> = {};
+    for (const [name, rows] of this.tables) tables[name] = [...rows.values()];
+    fs.mkdirSync(path.dirname(this.diskPath), { recursive: true });
+    fs.writeFileSync(this.diskPath, JSON.stringify({ tables }));
+    const fd = fs.openSync(this.diskPath, "r+");
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
 
   public exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): SqlCursorLike<T> {
     const q = query.trim().replace(/\s+/g, " ");
@@ -150,6 +191,7 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
 
     if (upper === "COMMIT" || upper === "COMMIT TRANSACTION") {
       this.txSnapshot = null;
+      this.persist();
       return { toArray: () => [], one: () => null };
     }
 
@@ -169,6 +211,7 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
           this.tables.set(tbl, new Map());
         }
       }
+      this.persist();
       return { toArray: () => [], one: () => null };
     }
 
@@ -189,6 +232,7 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
         const pk = String(bindings[0] ?? `${tbl.size + 1}`);
         tbl.set(pk, row);
       }
+      this.persist();
       return { toArray: () => [], one: () => null };
     }
 
@@ -208,6 +252,7 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
           });
         }
       }
+      this.persist();
       return { toArray: () => [], one: () => null };
     }
 
@@ -227,6 +272,7 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
           }
         }
       }
+      this.persist();
       return { toArray: () => [], one: () => null };
     }
 
@@ -239,9 +285,21 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
 
         const mWhere = q.match(/WHERE\s+(.+?)(?:\s+ORDER BY|\s+LIMIT|$)/i);
         if (mWhere && bindings.length > 0) {
-          const condCols = mWhere[1].split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
-          rows = rows.filter((r) =>
-            condCols.every((col, idx) => String(r[col]) === String(bindings[idx]))
+          const parts = mWhere[1].split(/\s+AND\s+/i);
+          rows = rows.filter((row) =>
+            parts.every((part, idx) => {
+              const match = part.trim().match(/^([a-zA-Z0-9_]+)\s*(=|>=|<=|>|<)\s*\?$/);
+              if (!match) return String(row[part.split(/\s+/)[0]]) === String(bindings[idx]);
+              const actual = row[match[1]];
+              const expected = bindings[idx];
+              if (match[2] === "=") return String(actual) === String(expected);
+              const left = Number(actual);
+              const right = Number(expected);
+              if (match[2] === ">") return left > right;
+              if (match[2] === "<") return left < right;
+              if (match[2] === ">=") return left >= right;
+              return left <= right;
+            }),
           );
         }
 

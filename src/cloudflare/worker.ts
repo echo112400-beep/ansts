@@ -16,6 +16,12 @@ export default {
         { status: 200, headers: { "content-type": "application/json" } }
       );
     }
+    if (url.pathname.startsWith("/v1beta1/")) {
+      const namespace = env.SCHEDULER_CELL ?? env.ANSTS_SCHEDULER_CELL;
+      const clusterId = env.SCHEDULER_CLUSTER_ID || "global-5d-scheduler";
+      const id = namespace.idFromName(clusterId);
+      return namespace.get(id).fetch(request);
+    }
     if (url.pathname.startsWith("/v1/scheduler")) {
       const id = env.ANSTS_SCHEDULER_CELL.idFromName("global-shard-0");
       const stub = env.ANSTS_SCHEDULER_CELL.get(id);

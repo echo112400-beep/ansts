@@ -210,9 +210,12 @@ export class TurnWalEngine {
     const alreadyPresent = fs.existsSync(filePath) || existingEtag !== undefined;
     if (alreadyPresent && (ifNoneMatchEtag === undefined || ifNoneMatchEtag === existingEtag)) {
       this.idempotentSkipObjectKeys.push(objectKey);
-      // The frame is already durable, but it still belongs in the in-memory index or catch-up replay
-      // would silently drop it.
-      this.recordFrame(frame);
+      // The file is already durable. Index it once so catch-up still sees the frame after a restart,
+      // without appending a duplicate when this process already recorded the turn.
+      const known = this.getTaskWalFrames(frame.taskId).some(
+        (existing) => existing.fence.epoch === frame.fence.epoch && existing.fence.turnSeq === frame.fence.turnSeq,
+      );
+      if (!known) this.recordFrame(frame);
       return objectKey;
     }
 

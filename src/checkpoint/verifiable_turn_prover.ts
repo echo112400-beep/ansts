@@ -1,3 +1,6 @@
+/**
+ * @fileoverview Verifiable turn execution proofs bound to a fence and workspace hash.
+ */
 import * as crypto from "node:crypto";
 import { TurnWalFrame } from "../models";
 export interface VerifiableTurnProofStatement {

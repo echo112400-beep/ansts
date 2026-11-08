@@ -329,6 +329,20 @@ export class ConsoleBffController {
         kvCacheHit: true,
         phase: "EXECUTION_8C",
       });
+      this.recordLiveTaskExecution({
+        cellId: "AgentTaskHarnessCell_#task-prod-102",
+        taskId: "task-prod-102",
+        tenantId: "quant-alpha",
+        ownerBrainNode: "brain-node-02",
+        heapUsedMb: heapMb,
+        heapLimitMb: 128,
+        sqliteState: "Synced (RPO=0 Bucket + LTX Archive)",
+        fenceEpoch: 2,
+        fenceTurnSeq: 4,
+        routedModelPool: "Qwen-3.8",
+        kvCacheHit: false,
+        phase: "THINKING_0_25C",
+      });
 
       // Seed FinOps budget & real turn spend
       this.finOpsController.registerTenantBudget("fin-enterprise", 50.0, 0.8);

@@ -1,3 +1,6 @@
+/**
+ * @fileoverview Parallel copy-on-write git bisect across sandbox branches.
+ */
 import { SandboxBranchForker } from "../runtime/sandbox_branch_forker";
 export interface GitBisectRunReport {
   bisectRunId: string;

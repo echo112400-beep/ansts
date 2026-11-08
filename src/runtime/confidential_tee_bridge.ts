@@ -1,3 +1,6 @@
+/**
+ * @fileoverview Confidential TEE measurement quotes and sealed workspace unwrapping.
+ */
 import * as crypto from "node:crypto";
 export interface TeeMeasurementQuote {
   platform: "AMDSecureNestedPaging" | "IntelTrustDomainExtensions" | "AWSNitroEnclave";
