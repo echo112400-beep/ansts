@@ -7,15 +7,139 @@ import * as crypto from "node:crypto";
  * Consistent Hash Virtual Slot Ring Manager (`VirtualHashSlotRingManager`) for Non-K8s Bare-Metal Manual Scale-Out/In.
  * Maps keys onto a ring of `totalVirtualSlots` (default 1024) with configurable virtual nodes per physical node.
  */
+export type SlotMigrationPhase = "STEADY" | "DRAINING" | "SNAPSHOT_TRANSFERRED";
+
+/**
+ * Persisted (S3 LTX / SQLite) ledger snapshot handed over during the 3-phase online slot migration.
+ */
+export interface SlotLedgerSnapshot {
+  slotIndex: number;
+  fromShardId: string;
+  toShardId: string;
+  generation: number;
+  tenantWdrfShares: Record<string, number>;
+  queuedTaskIds: string[];
+  dagEscrowVoucherIds: string[];
+}
+
+export interface VirtualSlotLedgerEntry {
+  slotIndex: number;
+  ownerShardId: string;
+  generation: number;
+  phase: SlotMigrationPhase;
+  targetShardId: string | null;
+  lastSnapshot: SlotLedgerSnapshot | null;
+  /** Alias of `phase`, kept in sync by the ledger mutators (console 256-slot heatmap reads it). */
+  state?: SlotMigrationPhase;
+  /** Alias of `generation`, kept in sync by the ledger mutators (console 256-slot heatmap reads it). */
+  epoch?: number;
+}
+
 export class VirtualHashSlotRingManager {
   public readonly totalVirtualSlots: number;
   public readonly vnodesPerNode: number;
   private readonly ring: Array<{ tokenHash: number; nodeId: string }> = [];
   private readonly activeNodeIds: Set<string> = new Set();
+  /** Authoritative L2 slot ledger: `slotIndex -> owner/generation/migration phase` (256 slots for scheduler meshes). */
+  public readonly slots: Map<number, VirtualSlotLedgerEntry> = new Map();
+  /** Monotonic topology generation, bumped on every slot cutover / failover reassignment. */
+  public generation = 1;
 
-  constructor(totalVirtualSlots = 1024, vnodesPerNode = 16) {
-    this.totalVirtualSlots = totalVirtualSlots;
+  constructor(totalVirtualSlots?: number, vnodesPerNode?: number);
+  constructor(shardIds: string[]);
+  constructor(totalVirtualSlotsOrShardIds: number | string[] = 1024, vnodesPerNode = 16) {
+    if (Array.isArray(totalVirtualSlotsOrShardIds)) {
+      this.totalVirtualSlots = 256;
+      this.vnodesPerNode = vnodesPerNode;
+      this.initializeSlotLedger(totalVirtualSlotsOrShardIds);
+      return;
+    }
+    this.totalVirtualSlots = totalVirtualSlotsOrShardIds;
     this.vnodesPerNode = vnodesPerNode;
+  }
+
+  /**
+   * Seeds the 256-slot ledger by round-robin distributing slots over the initial scheduler shards.
+   * Each shard is also registered as a consistent-hash ring node so `getOwnerNodeForKey` keeps working.
+   */
+  private initializeSlotLedger(shardIds: string[]): void {
+    for (const shardId of shardIds) {
+      this.addNode(shardId);
+    }
+    if (shardIds.length === 0) return;
+    for (let slotIndex = 0; slotIndex < this.totalVirtualSlots; slotIndex++) {
+      this.slots.set(slotIndex, {
+        slotIndex,
+        ownerShardId: shardIds[slotIndex % shardIds.length],
+        generation: this.generation,
+        phase: "STEADY",
+        targetShardId: null,
+        lastSnapshot: null,
+        state: "STEADY",
+        epoch: this.generation,
+      });
+    }
+  }
+
+  private requireSlot(slotIndex: number): VirtualSlotLedgerEntry {
+    const entry = this.slots.get(slotIndex);
+    if (!entry) {
+      throw new Error(`Slot ${slotIndex} not present in this slot ledger`);
+    }
+    return entry;
+  }
+
+  /** Deterministic `SHA256(tenantId) % 256` slot lookup used by the scheduler mesh router. */
+  public resolveOwnerShardForTenant(tenantId: string): VirtualSlotLedgerEntry {
+    return this.resolveOwnerShardForKey(tenantId);
+  }
+
+  public resolveOwnerShardForKey(routingKey: string): VirtualSlotLedgerEntry {
+    let ledgerSize = this.slots.size;
+    if (ledgerSize === 0) {
+      throw new Error("Slot ledger is empty; construct the manager with initial shard ids");
+    }
+    const digest = crypto.createHash("sha256").update(routingKey, "utf-8").digest();
+    return this.requireSlot(digest[0] % ledgerSize);
+  }
+
+  /** Phase 1 (`STEADY -> DRAINING`): new requests for this slot are micro-buffered by the router. */
+  public beginSlotDrain(slotIndex: number, targetShardId: string): VirtualSlotLedgerEntry {
+    const entry = this.requireSlot(slotIndex);
+    entry.targetShardId = targetShardId;
+    entry.phase = "DRAINING";
+    entry.state = entry.phase;
+    entry.epoch = entry.generation;
+    return entry;
+  }
+
+  /** Phase 2 (`DRAINING -> SNAPSHOT_TRANSFERRED`): the ledger snapshot has been copied to the target shard. */
+  public transferSlotSnapshot(snapshot: SlotLedgerSnapshot): VirtualSlotLedgerEntry {
+    const entry = this.requireSlot(snapshot.slotIndex);
+    entry.targetShardId = snapshot.toShardId;
+    entry.lastSnapshot = snapshot;
+    entry.phase = "SNAPSHOT_TRANSFERRED";
+    entry.state = entry.phase;
+    entry.epoch = entry.generation;
+    return entry;
+  }
+
+  /** Phase 3 (`-> STEADY`): atomically cuts the slot over to its target shard and bumps the generation. */
+  public commitSlotCutover(slotIndex: number): VirtualSlotLedgerEntry {
+    const entry = this.requireSlot(slotIndex);
+    const nextOwner = entry.targetShardId ?? entry.lastSnapshot?.toShardId;
+    if (!nextOwner) {
+      throw new Error(`Slot ${slotIndex} has no cutover target; call beginSlotDrain first`);
+    }
+    entry.ownerShardId = nextOwner;
+    entry.phase = "STEADY";
+    entry.state = entry.phase;
+    entry.targetShardId = null;
+    entry.lastSnapshot = null;
+    this.generation += 1;
+    entry.generation = this.generation;
+    entry.epoch = entry.generation;
+    return entry;
   }
 
   private static hashString(input: string): number {
@@ -74,6 +198,15 @@ export class VirtualHashSlotRingManager {
     for (let s = 0; s < this.totalVirtualSlots; s++) {
       const owner = this.getOwnerNodeForSlot(s)!;
       counts.set(owner, (counts.get(owner) ?? 0) + 1);
+    }
+    return counts;
+  }
+
+  /** Counts how many ledger slots each shard currently owns (slot-ledger view). */
+  public computeLedgerSlotDistribution(): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const entry of this.slots.values()) {
+      counts.set(entry.ownerShardId, (counts.get(entry.ownerShardId) ?? 0) + 1);
     }
     return counts;
   }

@@ -4,6 +4,10 @@
 import { SqlStorageLike } from "../cloudflare/env.js";
 import { CoreScheduler5D } from "../scheduler.js";
 import { TaskPriority, TaskSpec, TaskState } from "../models.js";
+import {
+  ContinuitySpanRecord,
+  FaultTolerantObservabilityCoordinator,
+} from "../telemetry/observability_recovery.js";
 
 export class UnifiedComponentPersistenceStore {
   private readonly sql: SqlStorageLike;
@@ -23,6 +27,7 @@ export class UnifiedComponentPersistenceStore {
       "CREATE TABLE IF NOT EXISTS persisted_approval_tickets (ticket_id TEXT PRIMARY KEY, payload_json TEXT)",
       "CREATE TABLE IF NOT EXISTS persisted_finops_ledgers (tenant_id TEXT PRIMARY KEY, payload_json TEXT)",
       "CREATE TABLE IF NOT EXISTS persisted_mcp_tools (tool_name TEXT PRIMARY KEY, payload_json TEXT)",
+      "CREATE TABLE IF NOT EXISTS persisted_observability (cell_id TEXT PRIMARY KEY, payload_json TEXT)",
     ];
     for (const ddl of tables) {
       this.sql.exec(ddl);
@@ -68,6 +73,69 @@ export class UnifiedComponentPersistenceStore {
       restored += 1;
     }
     return restored;
+  }
+
+  /**
+   * Persists the bounded ring spool (spooled OTLP spans + CloudEvents + drop counters + active trace
+   * contexts) so in-flight telemetry survives `celld` Isolate hibernation or a node crash.
+   */
+  public persistObservabilityState(
+    coordinator: FaultTolerantObservabilityCoordinator,
+    cellId: string,
+  ): { spansSaved: number; cloudEventsSaved: number } {
+    const spooler = coordinator.spooler;
+    const payload = {
+      cellId,
+      spooledSpans: spooler.spooledSpans,
+      spooledCloudEvents: spooler.spooledCloudEvents,
+      droppedSpansCount: spooler.droppedSpansCount,
+      droppedCloudEventsCount: spooler.droppedCloudEventsCount,
+      activeTaskTraceMap: Array.from(coordinator.tracePropagator.activeTaskTraceMap.entries()),
+      savedAtMs: Date.now(),
+    };
+    this.sql.exec(
+      "INSERT OR REPLACE INTO persisted_observability (cell_id, payload_json) VALUES (?, ?)",
+      cellId,
+      JSON.stringify(payload),
+    );
+    return {
+      spansSaved: spooler.spooledSpans.length,
+      cloudEventsSaved: spooler.spooledCloudEvents.length,
+    };
+  }
+
+  /**
+   * Rehydrates a fresh `FaultTolerantObservabilityCoordinator` from its persisted spool. Returns `false`
+   * when the cell has no persisted observability state yet.
+   */
+  public rehydrateObservabilityState(
+    coordinator: FaultTolerantObservabilityCoordinator,
+    cellId: string,
+  ): boolean {
+    const row = this.sql
+      .exec<Record<string, unknown>>(
+        "SELECT * FROM persisted_observability WHERE cell_id = ?",
+        cellId,
+      )
+      .one();
+    if (!row || row.payload_json === undefined) {
+      return false;
+    }
+    const payload = JSON.parse(String(row.payload_json)) as {
+      spooledSpans?: ContinuitySpanRecord[];
+      spooledCloudEvents?: Array<Record<string, any>>;
+      droppedSpansCount?: number;
+      droppedCloudEventsCount?: number;
+      activeTaskTraceMap?: Array<[string, { traceId: string; lastSpanId: string }]>;
+    };
+    coordinator.spooler.spooledSpans = payload.spooledSpans ?? [];
+    coordinator.spooler.spooledCloudEvents = payload.spooledCloudEvents ?? [];
+    coordinator.spooler.droppedSpansCount = payload.droppedSpansCount ?? 0;
+    coordinator.spooler.droppedCloudEventsCount = payload.droppedCloudEventsCount ?? 0;
+    for (const [taskId, ctx] of payload.activeTaskTraceMap ?? []) {
+      coordinator.tracePropagator.activeTaskTraceMap.set(taskId, ctx);
+    }
+    return true;
   }
 
   public saveComponentRecord(

@@ -7,7 +7,7 @@ var fs = _interopRequireWildcard(require("node:fs"));
 var os = _interopRequireWildcard(require("node:os"));
 var path = _interopRequireWildcard(require("node:path"));
 var childProcess = _interopRequireWildcard(require("node:child_process"));
-var _layerfs_store_engine = require("../checkpoint/layerfs_store_engine.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var _layerfs_store_engine = require("../checkpoint/layerfs_store_engine.js");var cache;function _interopRequireWildcard(e, t) {if (!t && e && e.__esModule) return e;var r,c,a = Object.defineProperty,n = { __proto__: null, default: e };if (Object(e) !== e) return n;if (cache || "function" != typeof WeakMap || (cache = new WeakMap()), cache) {if (cache.has(e)) return cache.get(e);cache.set(e, n);}for (c in e) "default" !== c && {}.hasOwnProperty.call(e, c) && ((r = a && Object.getOwnPropertyDescriptor(e, c)) && (r.get || r.set) ? a(n, c, r) : n[c] = e[c]);return n;} /**
  * @fileoverview M17 TASK-84: LayerFS Dual-Path Execution Driver
  * - Fast Path (`@layerfs/agent` + `@layerfs/backend`): In-process file tool ops (`read`, `write`, `edit`, `grep`) -> atomic Commit (0 container boot)
  * - Sandbox Path (`@layerfs/runtime`): Real Ephemeral Workspace (`mount -> real child_process exec -> scan diff -> commit -> unmount`)
@@ -66,8 +66,8 @@ class LayerFsWorkspaceDriver {
       filesTree,
       lineBlameMap: new Map([
       ["package.json", ["bootstrap-init"]],
-      ["node_modules/react/index.js", ["bootstrap-init"]]]),
-
+      ["node_modules/react/index.js", ["bootstrap-init"]]]
+      ),
       includesIgnoredDependencies: true,
       mountLatencyMs: 0
     };
@@ -275,11 +275,11 @@ class LayerFsWorkspaceDriver {
     for (const mut of params.mutations) {
       const prev = filesTree.get(mut.filePath);
       const { object } = this.storeEngine.putFileObject(
-      mut.filePath,
-      mut.content,
-      prev?.content,
-      mut.mode);
-
+        mut.filePath,
+        mut.content,
+        prev?.content,
+        mut.mode
+      );
       filesTree.set(mut.filePath, {
         content: mut.content,
         mode: mut.mode,
@@ -293,8 +293,8 @@ class LayerFsWorkspaceDriver {
       const nextBlame = newLines.map((line, idx) =>
       idx < oldLines.length && oldLines[idx] === line ?
       oldBlame[idx] ?? params.stepId :
-      params.stepId);
-
+      params.stepId
+      );
       lineBlameMap.set(mut.filePath, nextBlame);
       changedForBtree.push({
         path: mut.filePath,
@@ -305,10 +305,10 @@ class LayerFsWorkspaceDriver {
     }
 
     this.storeEngine.updateDirectoryBTreePages(
-    commitId,
-    params.parentCommit.commitId,
-    changedForBtree);
-
+      commitId,
+      params.parentCommit.commitId,
+      changedForBtree
+    );
 
     const record = {
       commitId,

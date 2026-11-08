@@ -12,6 +12,20 @@ export interface SseEventEnvelope {
   data: Record<string, unknown>;
 }
 
+/**
+ * One dispatched SSE frame plus the credit-window bookkeeping the stream publisher reports back to the client.
+ */
+export interface SseEventFrame {
+  id: string;
+  event: string;
+  taskId: string;
+  clientId: string;
+  /** Monotonic gateway-assigned stream cursor, replayed through the `Last-Event-ID` header. */
+  eventSeq: number;
+  timestampMs: number;
+  payload: string;
+}
+
 export class ClientStreamSubscription {
   public readonly subscriptionId: string;
   public readonly taskId: string;
@@ -44,10 +58,81 @@ export class ClientStreamSubscription {
 export class SseEventStreamGateway {
   private readonly subscriptionsByTask: Map<string, Map<string, ClientStreamSubscription>> = new Map();
   private readonly historyByTask: Map<string, SseEventEnvelope[]> = new Map();
+  /** Per-client credit window (`clientId -> credits remaining`) for backpressure-controlled fan-out. */
+  private readonly creditsByClient: Map<string, number> = new Map();
   private readonly maxHistoryPerTask: number;
+  private eventSeq = 0;
 
   constructor(maxHistoryPerTask = 100) {
     this.maxHistoryPerTask = maxHistoryPerTask;
+  }
+
+  /**
+   * Registers a client with an initial credit window. A client whose credits are exhausted stops
+   * receiving `publishEvent` frames until `ackCredits` replenishes the window.
+   */
+  public registerClient(clientId: string, initialCredits = 100): void {
+    this.creditsByClient.set(clientId, initialCredits);
+  }
+
+  /** Replenishes a client's credit window and returns the new remaining balance. */
+  public ackCredits(clientId: string, credits: number): number {
+    const next = (this.creditsByClient.get(clientId) ?? 0) + credits;
+    this.creditsByClient.set(clientId, next);
+    return next;
+  }
+
+  public getRemainingCredits(clientId: string): number {
+    return this.creditsByClient.get(clientId) ?? 0;
+  }
+
+  /**
+   * Publishes a serialized task stream event to the task's subscribers subject to the client's credit
+   * window. Returns the dispatched frames; an empty array means the frame was withheld (no credits left).
+   */
+  public publishEvent(
+    clientId: string,
+    eventType: string,
+    taskId: string,
+    payload: string,
+  ): SseEventFrame[] {
+    const remaining = this.creditsByClient.get(clientId);
+    if (remaining !== undefined && remaining <= 0) {
+      return [];
+    }
+
+    this.eventSeq += 1;
+    const frame: SseEventFrame = {
+      id: `${taskId}-${this.eventSeq}`,
+      event: eventType,
+      taskId,
+      clientId,
+      eventSeq: this.eventSeq,
+      timestampMs: Date.now(),
+      payload,
+    };
+
+    let data: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(payload) as unknown;
+      data = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : { value: parsed };
+    } catch {
+      data = { value: payload };
+    }
+
+    this.publish({
+      id: frame.id,
+      event: eventType,
+      taskId,
+      turnIndex: frame.eventSeq,
+      timestampMs: frame.timestampMs,
+      data,
+    });
+
+    if (remaining !== undefined) {
+      this.creditsByClient.set(clientId, remaining - 1);
+    }
+    return [frame];
   }
 
   public subscribe(taskId: string, subscriptionId: string, replayFromEventId?: string): ClientStreamSubscription {

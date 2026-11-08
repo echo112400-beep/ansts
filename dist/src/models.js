@@ -1,14 +1,14 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TurnWalFrame = exports.ToolCallEffectClass = exports.TaskState = exports.TaskSpec = exports.TaskPriority = exports.NodeHeartbeat = exports.LlmEndpointMetrics = exports.FenceToken = void 0; /**
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TurnWalFrame = exports.ToolCallEffectClass = exports.TaskState = exports.TaskSpec = exports.TaskPriority = exports.NodeHeartbeat = exports.LlmEndpointMetrics = exports.FenceToken = exports.AgentTask = void 0; /**
  * @fileoverview Core Domain Models, TaskSpec v1beta1, 5D Resource Profiles, Monotonic Lease Fencing & LlmEndpointMetrics.
  */let
-TaskPriority;exports.TaskPriority = TaskPriority;(function (TaskPriority) {TaskPriority[TaskPriority["P0_EMERGENCY"] = 0] = "P0_EMERGENCY";TaskPriority[TaskPriority["P1_HIGH"] = 1] = "P1_HIGH";TaskPriority[TaskPriority["P2_STANDARD"] = 2] = "P2_STANDARD";TaskPriority[TaskPriority["P3_BATCH"] = 3] = "P3_BATCH";})(TaskPriority || (exports.TaskPriority = TaskPriority = {}));let
+TaskPriority = exports.TaskPriority = /*#__PURE__*/function (TaskPriority) {TaskPriority[TaskPriority["P0_EMERGENCY"] = 0] = "P0_EMERGENCY";TaskPriority[TaskPriority["P1_HIGH"] = 1] = "P1_HIGH";TaskPriority[TaskPriority["P2_STANDARD"] = 2] = "P2_STANDARD";TaskPriority[TaskPriority["P3_BATCH"] = 3] = "P3_BATCH";return TaskPriority;}({});let
 
 
 
 
 
 
-TaskState;exports.TaskState = TaskState;(function (TaskState) {TaskState["SUBMITTED"] = "SUBMITTED";TaskState["QUEUED"] = "QUEUED";TaskState["LEASED"] = "LEASED";TaskState["RUNNING_THINK"] = "RUNNING_THINK";TaskState["RUNNING_ACT"] = "RUNNING_ACT";TaskState["WAITING_SUB_AGENT"] = "WAITING_SUB_AGENT";TaskState["SUSPENDED_APPROVAL"] = "SUSPENDED_APPROVAL";TaskState["PREEMPTING"] = "PREEMPTING";TaskState["COMPLETED"] = "COMPLETED";TaskState["FAILED"] = "FAILED";TaskState["DEAD_LETTER"] = "DEAD_LETTER";})(TaskState || (exports.TaskState = TaskState = {}));let
+TaskState = exports.TaskState = /*#__PURE__*/function (TaskState) {TaskState["SUBMITTED"] = "SUBMITTED";TaskState["QUEUED"] = "QUEUED";TaskState["LEASED"] = "LEASED";TaskState["RUNNING"] = "RUNNING";TaskState["RUNNING_THINK"] = "RUNNING_THINK";TaskState["THINKING_GEN"] = "THINKING_GEN";TaskState["RUNNING_ACT"] = "RUNNING_ACT";TaskState["TOOL_EXEC"] = "TOOL_EXEC";TaskState["WAITING_SUB_AGENT"] = "WAITING_SUB_AGENT";TaskState["SUSPENDED_APPROVAL"] = "SUSPENDED_APPROVAL";TaskState["PREEMPTING"] = "PREEMPTING";TaskState["HIBERNATED"] = "HIBERNATED";TaskState["COMPLETED"] = "COMPLETED";TaskState["SUCCEEDED"] = "COMPLETED";TaskState["FAILED"] = "FAILED";TaskState["DEAD_LETTER"] = "DEAD_LETTER";return TaskState;}({});
 
 
 
@@ -22,7 +22,15 @@ TaskState;exports.TaskState = TaskState;(function (TaskState) {TaskState["SUBMIT
 
 
 
-ToolCallEffectClass;exports.ToolCallEffectClass = ToolCallEffectClass;(function (ToolCallEffectClass) {ToolCallEffectClass["READ_ONLY"] = "READ_ONLY";ToolCallEffectClass["PURE_READ"] = "READ_ONLY";ToolCallEffectClass["IDEMPOTENT_WRITE"] = "IDEMPOTENT_WRITE";ToolCallEffectClass["COMPENSATABLE"] = "COMPENSATABLE";ToolCallEffectClass["SAGA_COMPENSATABLE"] = "COMPENSATABLE";ToolCallEffectClass["STAGED_COMMIT"] = "STAGED_COMMIT";ToolCallEffectClass["IRREVERSIBLE"] = "IRREVERSIBLE";})(ToolCallEffectClass || (exports.ToolCallEffectClass = ToolCallEffectClass = {}));
+
+
+
+
+
+/** Inference model pools that requests can be routed to (`PrefixCacheAffinityRouter`). */let
+
+
+ToolCallEffectClass = exports.ToolCallEffectClass = /*#__PURE__*/function (ToolCallEffectClass) {ToolCallEffectClass["READ_ONLY"] = "READ_ONLY";ToolCallEffectClass["PURE_READ"] = "READ_ONLY";ToolCallEffectClass["IDEMPOTENT_WRITE"] = "IDEMPOTENT_WRITE";ToolCallEffectClass["COMPENSATABLE"] = "COMPENSATABLE";ToolCallEffectClass["SAGA_COMPENSATABLE"] = "COMPENSATABLE";ToolCallEffectClass["STAGED_COMMIT"] = "STAGED_COMMIT";ToolCallEffectClass["IRREVERSIBLE"] = "IRREVERSIBLE";return ToolCallEffectClass;}({});
 
 
 
@@ -97,8 +105,30 @@ class TurnWalFrame {
   sqliteWalPages;
   crc32Hex;
   createdAtMs;
+  /** Task state at the moment the frame was written (`THINKING_GEN` / `TOOL_EXEC` / ...). */
+  state;
+  routedModel;
+  tokensUsed;
+  /** Evaluation telemetry persisted for shadow replay / scorecards. */
+  passRate;
+  errorCount;
+  diffEntropy;
+  workspaceMerkleHash;
+  diffSnapshot;
+  contextMessages;
 
   constructor(params)
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -114,8 +144,52 @@ class TurnWalFrame {
     this.fence = params.fence;
     this.changedFiles = [...params.changedFiles];
     this.sqliteWalPages = params.sqliteWalPages;
-    this.createdAtMs = params.createdAtMs ?? Date.now();
+    this.createdAtMs = params.createdAtMs ?? params.timestampMs ?? Date.now();
+    this.state = params.state ?? TaskState.RUNNING_ACT;
+    this.routedModel = params.routedModel ?? "";
+    this.tokensUsed = params.tokensUsed ?? 0;
+    this.passRate = params.passRate ?? 1;
+    this.errorCount = params.errorCount ?? 0;
+    this.diffEntropy = params.diffEntropy ?? 0;
+    this.diffSnapshot = params.diffSnapshot ?? "";
+    this.contextMessages = params.contextMessages ? [...params.contextMessages] : [];
     this.crc32Hex = params.crc32Hex ?? TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+    this.workspaceMerkleHash = params.workspaceMerkleHash ?? `merkle_${this.crc32Hex}`;
+  }
+
+  /**
+   * Builds a frame from the sparse trajectory literals used by shadow replay / stream publishing:
+   * frame identity (`frameId`, `turnIndex`, `changedFiles`, `sqliteWalPages`) is derived from the
+   * `FenceToken` and every telemetry field falls back to the constructor default.
+   */
+  static fromPartial(params)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    const turnIndex = params.turnIndex ?? params.fence.turnSeq;
+    return new TurnWalFrame({
+      ...params,
+      frameId: params.frameId ?? `frame-${params.taskId}-t${turnIndex}`,
+      turnIndex,
+      changedFiles: params.changedFiles ?? [],
+      sqliteWalPages: params.sqliteWalPages ?? 0
+    });
   }
 
   static computeCrc32Hex(
@@ -137,14 +211,52 @@ class TurnWalFrame {
 
   verifyIntegrity() {
     const expected = TurnWalFrame.computeCrc32Hex(
-    this.taskId,
-    this.turnIndex,
-    this.fence,
-    this.changedFiles);
-
+      this.taskId,
+      this.turnIndex,
+      this.fence,
+      this.changedFiles
+    );
     return this.crc32Hex === expected;
   }
-}exports.TurnWalFrame = TurnWalFrame;
+}
+
+/**
+ * Mutable per-task runtime record used by the console BFF / HITL approval gate.
+ * It is intentionally thin: the durable task specification lives in `TaskSpec`.
+ */exports.TurnWalFrame = TurnWalFrame;
+
+
+
+
+
+
+
+
+
+class AgentTask {
+  taskId;
+  tenantId;
+  state;
+  priority;
+  fence;
+  createdAtMs;
+
+  constructor(params) {
+    if (!params.taskId) {
+      throw new Error("AgentTask requires a non-empty taskId");
+    }
+    this.taskId = params.taskId;
+    this.tenantId = params.tenantId;
+    this.state = params.state ?? TaskState.SUBMITTED;
+    this.priority = params.priority ?? TaskPriority.P2_STANDARD;
+    this.fence = params.fence ?? null;
+    this.createdAtMs = params.createdAtMs ?? Date.now();
+  }
+
+  transitionTo(nextState) {
+    this.state = nextState;
+  }
+}exports.AgentTask = AgentTask;
 
 
 

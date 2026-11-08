@@ -4,7 +4,7 @@
 
 
 var crypto = _interopRequireWildcard(require("node:crypto"));
-var vm = _interopRequireWildcard(require("node:vm"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var vm = _interopRequireWildcard(require("node:vm"));var cache;function _interopRequireWildcard(e, t) {if (!t && e && e.__esModule) return e;var r,c,a = Object.defineProperty,n = { __proto__: null, default: e };if (Object(e) !== e) return n;if (cache || "function" != typeof WeakMap || (cache = new WeakMap()), cache) {if (cache.has(e)) return cache.get(e);cache.set(e, n);}for (c in e) "default" !== c && {}.hasOwnProperty.call(e, c) && ((r = a && Object.getOwnPropertyDescriptor(e, c)) && (r.get || r.set) ? a(n, c, r) : n[c] = e[c]);return n;} /**
  * @fileoverview M15 TASK-67 ~ TASK-70: denoland/celld Native Durable Object Facets (`ctx.facets`),
  * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution),
  * KV Single-Writer Sharding & V8 128MB Heap/SQL Real Wall-Clock Budget Guard.
@@ -202,8 +202,8 @@ class CelldKvOptimizerAndGuard {
     const byteLength = Buffer.byteLength(value, "utf-8");
     if (byteLength > CelldKvOptimizerAndGuard.MAX_KV_VALUE_BYTES) {
       throw new Error(
-      `KV value size (${byteLength} bytes) exceeds celld 25 MiB limit (${CelldKvOptimizerAndGuard.MAX_KV_VALUE_BYTES})`);
-
+        `KV value size (${byteLength} bytes) exceeds celld 25 MiB limit (${CelldKvOptimizerAndGuard.MAX_KV_VALUE_BYTES})`
+      );
     }
     const { shardId, physicalKey } = this.computeShardedKey(logicalNamespace, key);
     await this.kv.put(physicalKey, value, expirationTtl ? { expirationTtl } : undefined);
@@ -254,9 +254,28 @@ class V8HeapAndSqlBudgetGuard {
     const elapsedMs = Number((performance.now() - t0).toFixed(3));
     if (elapsedMs > this.sqlTimeoutMs) {
       throw new Error(
-      `SQLite statement exceeded celld per-statement timeout (${elapsedMs}ms > ${this.sqlTimeoutMs}ms): ${query.slice(0, 60)}`);
-
+        `SQLite statement exceeded celld per-statement timeout (${elapsedMs}ms > ${this.sqlTimeoutMs}ms): ${query.slice(0, 60)}`
+      );
     }
     return { cursor, elapsedMs };
+  }
+
+  /**
+   * Runs a caller-supplied SQLite executor (any cursor shape) inside the celld per-statement budget and
+   * reports the measured wall-clock duration of the execution.
+   */
+  executeBoundedSql(params)
+
+
+  {
+    const t0 = performance.now();
+    const rows = params.executor();
+    const elapsedMs = Number((performance.now() - t0).toFixed(3));
+    if (elapsedMs > this.sqlTimeoutMs) {
+      throw new Error(
+        `SQLite statement exceeded celld per-statement timeout (${elapsedMs}ms > ${this.sqlTimeoutMs}ms): ${params.query.slice(0, 60)}`
+      );
+    }
+    return { rows, elapsedMs };
   }
 }exports.V8HeapAndSqlBudgetGuard = V8HeapAndSqlBudgetGuard;

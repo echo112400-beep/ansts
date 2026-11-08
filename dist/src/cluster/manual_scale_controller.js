@@ -1,21 +1,145 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.VirtualHashSlotRingManager = exports.ManualFleetScaleController = exports.CelldStateAwareFleetAutoscaler = void 0;
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var crypto = _interopRequireWildcard(require("node:crypto"));var cache;function _interopRequireWildcard(e, t) {if (!t && e && e.__esModule) return e;var r,c,a = Object.defineProperty,n = { __proto__: null, default: e };if (Object(e) !== e) return n;if (cache || "function" != typeof WeakMap || (cache = new WeakMap()), cache) {if (cache.has(e)) return cache.get(e);cache.set(e, n);}for (c in e) "default" !== c && {}.hasOwnProperty.call(e, c) && ((r = a && Object.getOwnPropertyDescriptor(e, c)) && (r.get || r.set) ? a(n, c, r) : n[c] = e[c]);return n;} /**
  * @fileoverview M13 TASK-62: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller.
  */ /**
  * Consistent Hash Virtual Slot Ring Manager (`VirtualHashSlotRingManager`) for Non-K8s Bare-Metal Manual Scale-Out/In.
  * Maps keys onto a ring of `totalVirtualSlots` (default 1024) with configurable virtual nodes per physical node.
  */
+
+
+/**
+ * Persisted (S3 LTX / SQLite) ledger snapshot handed over during the 3-phase online slot migration.
+ */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class VirtualHashSlotRingManager {
   totalVirtualSlots;
   vnodesPerNode;
   ring = [];
   activeNodeIds = new Set();
+  /** Authoritative L2 slot ledger: `slotIndex -> owner/generation/migration phase` (256 slots for scheduler meshes). */
+  slots = new Map();
+  /** Monotonic topology generation, bumped on every slot cutover / failover reassignment. */
+  generation = 1;
 
-  constructor(totalVirtualSlots = 1024, vnodesPerNode = 16) {
-    this.totalVirtualSlots = totalVirtualSlots;
+
+
+  constructor(totalVirtualSlotsOrShardIds = 1024, vnodesPerNode = 16) {
+    if (Array.isArray(totalVirtualSlotsOrShardIds)) {
+      this.totalVirtualSlots = 256;
+      this.vnodesPerNode = vnodesPerNode;
+      this.initializeSlotLedger(totalVirtualSlotsOrShardIds);
+      return;
+    }
+    this.totalVirtualSlots = totalVirtualSlotsOrShardIds;
     this.vnodesPerNode = vnodesPerNode;
+  }
+
+  /**
+   * Seeds the 256-slot ledger by round-robin distributing slots over the initial scheduler shards.
+   * Each shard is also registered as a consistent-hash ring node so `getOwnerNodeForKey` keeps working.
+   */
+  initializeSlotLedger(shardIds) {
+    for (const shardId of shardIds) {
+      this.addNode(shardId);
+    }
+    if (shardIds.length === 0) return;
+    for (let slotIndex = 0; slotIndex < this.totalVirtualSlots; slotIndex++) {
+      this.slots.set(slotIndex, {
+        slotIndex,
+        ownerShardId: shardIds[slotIndex % shardIds.length],
+        generation: this.generation,
+        phase: "STEADY",
+        targetShardId: null,
+        lastSnapshot: null,
+        state: "STEADY",
+        epoch: this.generation
+      });
+    }
+  }
+
+  requireSlot(slotIndex) {
+    const entry = this.slots.get(slotIndex);
+    if (!entry) {
+      throw new Error(`Slot ${slotIndex} not present in this slot ledger`);
+    }
+    return entry;
+  }
+
+  /** Deterministic `SHA256(tenantId) % 256` slot lookup used by the scheduler mesh router. */
+  resolveOwnerShardForTenant(tenantId) {
+    return this.resolveOwnerShardForKey(tenantId);
+  }
+
+  resolveOwnerShardForKey(routingKey) {
+    let ledgerSize = this.slots.size;
+    if (ledgerSize === 0) {
+      throw new Error("Slot ledger is empty; construct the manager with initial shard ids");
+    }
+    const digest = crypto.createHash("sha256").update(routingKey, "utf-8").digest();
+    return this.requireSlot(digest[0] % ledgerSize);
+  }
+
+  /** Phase 1 (`STEADY -> DRAINING`): new requests for this slot are micro-buffered by the router. */
+  beginSlotDrain(slotIndex, targetShardId) {
+    const entry = this.requireSlot(slotIndex);
+    entry.targetShardId = targetShardId;
+    entry.phase = "DRAINING";
+    entry.state = entry.phase;
+    entry.epoch = entry.generation;
+    return entry;
+  }
+
+  /** Phase 2 (`DRAINING -> SNAPSHOT_TRANSFERRED`): the ledger snapshot has been copied to the target shard. */
+  transferSlotSnapshot(snapshot) {
+    const entry = this.requireSlot(snapshot.slotIndex);
+    entry.targetShardId = snapshot.toShardId;
+    entry.lastSnapshot = snapshot;
+    entry.phase = "SNAPSHOT_TRANSFERRED";
+    entry.state = entry.phase;
+    entry.epoch = entry.generation;
+    return entry;
+  }
+
+  /** Phase 3 (`-> STEADY`): atomically cuts the slot over to its target shard and bumps the generation. */
+  commitSlotCutover(slotIndex) {
+    const entry = this.requireSlot(slotIndex);
+    const nextOwner = entry.targetShardId ?? entry.lastSnapshot?.toShardId;
+    if (!nextOwner) {
+      throw new Error(`Slot ${slotIndex} has no cutover target; call beginSlotDrain first`);
+    }
+    entry.ownerShardId = nextOwner;
+    entry.phase = "STEADY";
+    entry.state = entry.phase;
+    entry.targetShardId = null;
+    entry.lastSnapshot = null;
+    this.generation += 1;
+    entry.generation = this.generation;
+    entry.epoch = entry.generation;
+    return entry;
   }
 
   static hashString(input) {
@@ -74,6 +198,15 @@ class VirtualHashSlotRingManager {
     for (let s = 0; s < this.totalVirtualSlots; s++) {
       const owner = this.getOwnerNodeForSlot(s);
       counts.set(owner, (counts.get(owner) ?? 0) + 1);
+    }
+    return counts;
+  }
+
+  /** Counts how many ledger slots each shard currently owns (slot-ledger view). */
+  computeLedgerSlotDistribution() {
+    const counts = new Map();
+    for (const entry of this.slots.values()) {
+      counts.set(entry.ownerShardId, (counts.get(entry.ownerShardId) ?? 0) + 1);
     }
     return counts;
   }
@@ -136,8 +269,8 @@ class ManualFleetScaleController {
     }
     source.state = "CORDONED";
     const activeTargets = Array.from(this.nodes.values()).filter(
-    (n) => n.nodeId !== nodeId && n.state === "ACTIVE" && n.role === source.role);
-
+      (n) => n.nodeId !== nodeId && n.state === "ACTIVE" && n.role === source.role
+    );
     if (activeTargets.length === 0 && source.runningCells.length > 0) {
       throw new Error(`Cannot drain node '${nodeId}': no other ACTIVE nodes with role '${source.role}'`);
     }
@@ -201,8 +334,8 @@ class CelldStateAwareFleetAutoscaler {
   {
     const anyRestoring = samples.some((s) => s.restoring > 0);
     const isolateMaintenanceWarning = samples.some(
-    (s) => (s.live_empty_isolates_sec ?? 0) > 30 || (s.retiring_isolates_sec ?? 0) > 30);
-
+      (s) => (s.live_empty_isolates_sec ?? 0) > 30 || (s.retiring_isolates_sec ?? 0) > 30
+    );
 
     if (samples.some((s) => s.capacity_waiting > 0 || s.pressured)) {
       return {
@@ -245,8 +378,8 @@ class CelldStateAwareFleetAutoscaler {
   {
     if (params.systemdTimeoutStopSec <= this.shutdownTotalMs / 1000) {
       throw new Error(
-      `systemd TimeoutStopSec (${params.systemdTimeoutStopSec}s) must exceed CELLD_SHUTDOWN_TOTAL_MS (${this.shutdownTotalMs / 1000}s)`);
-
+        `systemd TimeoutStopSec (${params.systemdTimeoutStopSec}s) must exceed CELLD_SHUTDOWN_TOTAL_MS (${this.shutdownTotalMs / 1000}s)`
+      );
     }
     const claimedDrainToken = this.activeDrainTokenHolder === null || this.activeDrainTokenHolder === params.nodeId;
     if (claimedDrainToken) {

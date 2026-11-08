@@ -241,8 +241,8 @@ class InMemoryCellSqlStorage {
         if (mWhere && bindings.length > 0) {
           const condCols = mWhere[1].split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
           rows = rows.filter((r) =>
-          condCols.every((col, idx) => String(r[col]) === String(bindings[idx])));
-
+          condCols.every((col, idx) => String(r[col]) === String(bindings[idx]))
+          );
         }
 
         const mOrder = q.match(/ORDER BY\s+([a-zA-Z0-9_]+)(?:\s+(ASC|DESC))?/i);
@@ -355,7 +355,12 @@ class InMemoryR2Bucket {
       etag: obj.etag,
       size: obj.bytes.byteLength,
       customMetadata: obj.customMetadata,
-      arrayBuffer: async () => obj.bytes.buffer.slice(obj.bytes.byteOffset, obj.bytes.byteOffset + obj.bytes.byteLength),
+      arrayBuffer: async () => {
+        // Copy into an owned ArrayBuffer: `Uint8Array.buffer` is `ArrayBufferLike` (may be shared).
+        const copy = new ArrayBuffer(obj.bytes.byteLength);
+        new Uint8Array(copy).set(obj.bytes);
+        return copy;
+      },
       text: async () => new TextDecoder().decode(obj.bytes)
     };
   }

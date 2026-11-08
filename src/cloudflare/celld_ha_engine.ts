@@ -59,6 +59,10 @@ export class RpoZeroDurabilityEngine {
 export class DurableWorkflowContext {
   private readonly sql: SqlStorageLike;
   private readonly workflowId: string;
+  /** `true` while the owning Isolate is hibernated (`0.1C`); an inbound workflow event wakes it. */
+  public isolateHibernated = false;
+  private readonly pendingEventsByType: Map<string, Array<Record<string, unknown>>> = new Map();
+  private readonly eventWaitersByType: Map<string, Array<(event: Record<string, unknown>) => void>> = new Map();
 
   constructor(sql: SqlStorageLike, workflowId: string) {
     this.sql = sql;
@@ -66,6 +70,37 @@ export class DurableWorkflowContext {
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS workflow_steps (step_key TEXT PRIMARY KEY, workflow_id TEXT, output_json TEXT, completed_at INTEGER)"
     );
+  }
+
+  /**
+   * Delivers an external event (`MCP` notification, CI/CD completion, ...) to this workflow. A waiter
+   * already parked on the event type is resumed immediately, otherwise the event is buffered for the
+   * next `waitForEvent` call.
+   */
+  public sendEvent(eventType: string, payload: Record<string, unknown>): void {
+    const waiters = this.eventWaitersByType.get(eventType);
+    const waiter = waiters?.shift();
+    if (waiter) {
+      waiter(payload);
+      return;
+    }
+    const pending = this.pendingEventsByType.get(eventType) ?? [];
+    pending.push(payload);
+    this.pendingEventsByType.set(eventType, pending);
+  }
+
+  /** Resolves with the next event of `eventType`, replaying a buffered one first. */
+  public waitForEvent(eventType: string): Promise<Record<string, unknown>> {
+    const pending = this.pendingEventsByType.get(eventType);
+    const buffered = pending?.shift();
+    if (buffered) {
+      return Promise.resolve(buffered);
+    }
+    return new Promise((resolve) => {
+      const waiters = this.eventWaitersByType.get(eventType) ?? [];
+      waiters.push(resolve);
+      this.eventWaitersByType.set(eventType, waiters);
+    });
   }
 
   public async stepDo<T>(stepName: string, fn: () => Promise<T> | T): Promise<{ result: T; replayedFromJournal: boolean }> {

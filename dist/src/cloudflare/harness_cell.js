@@ -22,8 +22,8 @@ class AgentTaskHarnessCell {
     this.r2Bucket = r2Bucket;
     this.taskId = taskId;
     this.ctx.storage.sql.exec(
-    "CREATE TABLE IF NOT EXISTS harness_turns (turn_index INTEGER PRIMARY KEY, fencing_token INTEGER, tool_name TEXT, output_json TEXT, r2_key TEXT)");
-
+      "CREATE TABLE IF NOT EXISTS harness_turns (turn_index INTEGER PRIMARY KEY, fencing_token INTEGER, tool_name TEXT, output_json TEXT, r2_key TEXT)"
+    );
   }
 
   async executeAndCheckpointTurn(params)
@@ -34,8 +34,8 @@ class AgentTaskHarnessCell {
   {
     if (params.fencingToken < this.highestFencingToken) {
       throw new Error(
-      `Stale fencing token ${params.fencingToken} < highest ${this.highestFencingToken} in AgentTaskHarnessCell`);
-
+        `Stale fencing token ${params.fencingToken} < highest ${this.highestFencingToken} in AgentTaskHarnessCell`
+      );
     }
     this.highestFencingToken = params.fencingToken;
 
@@ -56,13 +56,13 @@ class AgentTaskHarnessCell {
     });
 
     this.ctx.storage.sql.exec(
-    "INSERT OR REPLACE INTO harness_turns (turn_index, fencing_token, tool_name, output_json, r2_key) VALUES (?, ?, ?, ?, ?)",
-    params.turnIndex,
-    params.fencingToken,
-    params.toolName,
-    JSON.stringify(params.toolOutput),
-    r2Key);
-
+      "INSERT OR REPLACE INTO harness_turns (turn_index, fencing_token, tool_name, output_json, r2_key) VALUES (?, ?, ?, ?, ?)",
+      params.turnIndex,
+      params.fencingToken,
+      params.toolName,
+      JSON.stringify(params.toolOutput),
+      r2Key
+    );
 
     return {
       turnIndex: params.turnIndex,

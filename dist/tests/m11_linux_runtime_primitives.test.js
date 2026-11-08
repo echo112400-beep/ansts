@@ -7,7 +7,7 @@ var fs = _interopRequireWildcard(require("node:fs"));
 var os = _interopRequireWildcard(require("node:os"));
 var path = _interopRequireWildcard(require("node:path"));
 var net = _interopRequireWildcard(require("node:net"));
-var _index = require("../src/index.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var _index = require("../src/index.js");var cache;function _interopRequireWildcard(e, t) {if (!t && e && e.__esModule) return e;var r,c,a = Object.defineProperty,n = { __proto__: null, default: e };if (Object(e) !== e) return n;if (cache || "function" != typeof WeakMap || (cache = new WeakMap()), cache) {if (cache.has(e)) return cache.get(e);cache.set(e, n);}for (c in e) "default" !== c && {}.hasOwnProperty.call(e, c) && ((r = a && Object.getOwnPropertyDescriptor(e, c)) && (r.get || r.set) ? a(n, c, r) : n[c] = e[c]);return n;} /**
  * @fileoverview M11 Real Linux Runtime Primitives Suite (4 tests).
  */
 
@@ -24,8 +24,8 @@ var _index = require("../src/index.js");function _getRequireWildcardCache(nodeIn
     assert.equal(driver.setFreezeState("task-cg-1", true), "1");
 
     const psi = _index.LinuxCgroupV2AndPsiDriver.parseProcPressureMemory(
-    "some avg10=12.45 avg60=5.00 avg300=1.00 total=100\nfull avg10=3.20 avg60=1.00 avg300=0.00 total=20\n");
-
+      "some avg10=12.45 avg60=5.00 avg300=1.00 total=100\nfull avg10=3.20 avg60=1.00 avg300=0.00 total=20\n"
+    );
     assert.equal(psi.someAvg10, 12.45);
     assert.equal(psi.fullAvg10, 3.2);
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -49,12 +49,12 @@ var _index = require("../src/index.js");function _getRequireWildcardCache(nodeIn
     const response = await new Promise((resolve, reject) => {
       const client = net.createConnection(sockPath, () => {
         client.write(
-        _index.ZeroTrustVsockHostDaemon.encodeFrame({
-          requestId: "req-1",
-          type: "EGRESS_CHECK",
-          hostname: "untrusted.evil.org"
-        }));
-
+          _index.ZeroTrustVsockHostDaemon.encodeFrame({
+            requestId: "req-1",
+            type: "EGRESS_CHECK",
+            hostname: "untrusted.evil.org"
+          })
+        );
       });
       client.on("data", (chunk) => {
         resolve(_index.ZeroTrustVsockHostDaemon.decodeFrame(chunk));

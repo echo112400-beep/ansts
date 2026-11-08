@@ -9,8 +9,8 @@ class LayerFsStalePushRefusedError extends Error {
   actualRemoteGeneration;
   constructor(expectedRemoteGeneration, actualRemoteGeneration) {
     super(
-    `LayerFS push refused (Rule D9): remote Store changed since last pull (expected gen=${expectedRemoteGeneration}, actual=${actualRemoteGeneration})`);
-
+      `LayerFS push refused (Rule D9): remote Store changed since last pull (expected gen=${expectedRemoteGeneration}, actual=${actualRemoteGeneration})`
+    );
     this.name = "LayerFsStalePushRefusedError";
     this.expectedRemoteGeneration = expectedRemoteGeneration;
     this.actualRemoteGeneration = actualRemoteGeneration;

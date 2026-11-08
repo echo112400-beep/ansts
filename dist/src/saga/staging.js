@@ -13,6 +13,25 @@ var _models = require("../models.js"); /**
 
 
 
+/** A high-risk tool write held in the HITL staging buffer before it touches production. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -25,6 +44,78 @@ var _models = require("../models.js"); /**
 class StagingCommitAndApprovalGate {
   stagedByTask = new Map();
   tickets = new Map();
+  /** Staged high-risk writes per task, waiting for a human decision. */
+  stagedItems = new Map();
+  /** Append-only ledger of writes that were approved and flushed to production. */
+  committedProductionLedger = [];
+
+  /**
+   * Stages a high-risk production write. When `requireHumanApproval` is set, the task is parked in
+   * `SUSPENDED_APPROVAL` until `approveAndResume` runs.
+   */
+  stageWrite(
+  task,
+  fence,
+  toolName,
+  payload,
+  requireHumanApproval = true)
+  {
+    const item = {
+      taskId: task.taskId,
+      toolName,
+      payload,
+      fence,
+      requireHumanApproval,
+      approved: false,
+      stagedAtMs: Date.now()
+    };
+    const list = this.stagedItems.get(task.taskId);
+    if (list) {
+      list.push(item);
+    } else {
+      this.stagedItems.set(task.taskId, [item]);
+    }
+    if (requireHumanApproval) {
+      task.state = _models.TaskState.SUSPENDED_APPROVAL;
+    }
+    return item;
+  }
+
+  /** Marks every staged write of `task` as human-approved and resumes the task. */
+  approveAndResume(task) {
+    const list = this.stagedItems.get(task.taskId) ?? [];
+    let approvedCount = 0;
+    for (const item of list) {
+      if (!item.approved) {
+        item.approved = true;
+        approvedCount += 1;
+      }
+    }
+    task.state = _models.TaskState.RUNNING_ACT;
+    return approvedCount;
+  }
+
+  /** Moves all approved writes of `taskId` into the committed production ledger. */
+  atomicFlush(taskId) {
+    const list = this.stagedItems.get(taskId) ?? [];
+    const approved = list.filter((item) => item.approved);
+    for (const item of approved) {
+      this.committedProductionLedger.push({
+        taskId: item.taskId,
+        toolName: item.toolName,
+        payload: item.payload,
+        fence: item.fence,
+        committedAtMs: Date.now()
+      });
+    }
+    const remaining = list.filter((item) => !item.approved);
+    if (remaining.length === 0) {
+      this.stagedItems.delete(taskId);
+    } else {
+      this.stagedItems.set(taskId, remaining);
+    }
+    return approved.length;
+  }
 
   stageEffect(effect) {
     const full = { ...effect, committed: false, aborted: false };

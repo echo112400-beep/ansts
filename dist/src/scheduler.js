@@ -122,12 +122,12 @@ var _queue_manager = require("./queue_manager.js"); /**
 
   tryPreemptBatchTask(urgentTask) {
     const batchVictims = Array.from(this.allTasks.values()).filter(
-    (t) =>
-    t.priority === _models.TaskPriority.P3_BATCH && (
-    t.state === _models.TaskState.LEASED ||
-    t.state === _models.TaskState.RUNNING_THINK ||
-    t.state === _models.TaskState.RUNNING_ACT));
-
+      (t) =>
+      t.priority === _models.TaskPriority.P3_BATCH && (
+      t.state === _models.TaskState.LEASED ||
+      t.state === _models.TaskState.RUNNING_THINK ||
+      t.state === _models.TaskState.RUNNING_ACT)
+    );
     if (batchVictims.length === 0) return false;
 
     const victim = batchVictims[0];
@@ -137,13 +137,13 @@ var _queue_manager = require("./queue_manager.js"); /**
     if (nodeId && this.nodes.has(nodeId)) {
       const node = this.nodes.get(nodeId);
       node.free_cpu_cores = Math.min(
-      node.total_cpu_cores,
-      node.free_cpu_cores + Math.max(urgentTask.resource_profile.think_cpu_cores, 1.0));
-
+        node.total_cpu_cores,
+        node.free_cpu_cores + Math.max(urgentTask.resource_profile.think_cpu_cores, 1.0)
+      );
       node.free_memory_mb = Math.min(
-      node.total_memory_mb,
-      node.free_memory_mb + urgentTask.resource_profile.act_memory_mb);
-
+        node.total_memory_mb,
+        node.free_memory_mb + urgentTask.resource_profile.act_memory_mb
+      );
       node.running_tasks = Math.max(0, node.running_tasks - 1);
     }
 
@@ -177,13 +177,13 @@ var _queue_manager = require("./queue_manager.js"); /**
     const node = this.nodes.get(nodeId);
     if (node) {
       node.free_cpu_cores = Math.min(
-      node.total_cpu_cores,
-      node.free_cpu_cores + task.resource_profile.think_cpu_cores);
-
+        node.total_cpu_cores,
+        node.free_cpu_cores + task.resource_profile.think_cpu_cores
+      );
       node.free_memory_mb = Math.min(
-      node.total_memory_mb,
-      node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25));
-
+        node.total_memory_mb,
+        node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25)
+      );
       node.running_tasks = Math.max(0, node.running_tasks - 1);
     }
 

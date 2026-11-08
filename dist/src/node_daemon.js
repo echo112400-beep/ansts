@@ -43,10 +43,10 @@ class NodeDaemon {
   {
     if (!scheduler.leaseCoordinator.validateFencingToken(task.task_id, task.lease_fencing_token)) {
       throw new _lease_coordinator.StaleFenceError(
-      task.task_id,
-      task.lease_fencing_token,
-      scheduler.leaseCoordinator.getLease(task.task_id)?.fencing_token ?? -1);
-
+        task.task_id,
+        task.lease_fencing_token,
+        scheduler.leaseCoordinator.getLease(task.task_id)?.fencing_token ?? -1
+      );
     }
     task.current_turn = turnIndex;
     const record = {
@@ -88,12 +88,12 @@ class NodeDaemon {
     const [result, deduplicated] = sagaGateway.invokeTool(task.task_id, nextTurn, toolName, toolArgs);
 
     this.writeTurnCheckpoint(
-    scheduler,
-    task,
-    nextTurn,
-    `sha256:turn-${nextTurn}`,
-    `s3://checkpoints/${task.task_id}/turn-${nextTurn}.tar.zst`);
-
+      scheduler,
+      task,
+      nextTurn,
+      `sha256:turn-${nextTurn}`,
+      `s3://checkpoints/${task.task_id}/turn-${nextTurn}.tar.zst`
+    );
     return { turn: nextTurn, result, deduplicated };
   }
 }exports.NodeDaemon = NodeDaemon;

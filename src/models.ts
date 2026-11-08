@@ -12,15 +12,23 @@ export enum TaskState {
   SUBMITTED = "SUBMITTED",
   QUEUED = "QUEUED",
   LEASED = "LEASED",
+  RUNNING = "RUNNING",
   RUNNING_THINK = "RUNNING_THINK",
+  THINKING_GEN = "THINKING_GEN",
   RUNNING_ACT = "RUNNING_ACT",
+  TOOL_EXEC = "TOOL_EXEC",
   WAITING_SUB_AGENT = "WAITING_SUB_AGENT",
   SUSPENDED_APPROVAL = "SUSPENDED_APPROVAL",
   PREEMPTING = "PREEMPTING",
+  HIBERNATED = "HIBERNATED",
   COMPLETED = "COMPLETED",
+  SUCCEEDED = "COMPLETED",
   FAILED = "FAILED",
   DEAD_LETTER = "DEAD_LETTER",
 }
+
+/** Inference model pools that requests can be routed to (`PrefixCacheAffinityRouter`). */
+export type ModelPoolName = "DeepSeek" | "GLM-5.3" | "Qwen-3.8";
 
 export enum ToolCallEffectClass {
   READ_ONLY = "READ_ONLY",
@@ -97,6 +105,17 @@ export class TurnWalFrame {
   public readonly sqliteWalPages: number;
   public readonly crc32Hex: string;
   public readonly createdAtMs: number;
+  /** Task state at the moment the frame was written (`THINKING_GEN` / `TOOL_EXEC` / ...). */
+  public readonly state: TaskState;
+  public readonly routedModel: string;
+  public readonly tokensUsed: number;
+  /** Evaluation telemetry persisted for shadow replay / scorecards. */
+  public readonly passRate: number;
+  public readonly errorCount: number;
+  public readonly diffEntropy: number;
+  public readonly workspaceMerkleHash: string;
+  public readonly diffSnapshot: string;
+  public readonly contextMessages: string[];
 
   constructor(params: {
     frameId: string;
@@ -107,6 +126,17 @@ export class TurnWalFrame {
     sqliteWalPages: number;
     crc32Hex?: string;
     createdAtMs?: number;
+    /** Alias of `createdAtMs` used by the stream publisher's WAL frame literals. */
+    timestampMs?: number;
+    state?: TaskState;
+    routedModel?: string;
+    tokensUsed?: number;
+    passRate?: number;
+    errorCount?: number;
+    diffEntropy?: number;
+    workspaceMerkleHash?: string;
+    diffSnapshot?: string;
+    contextMessages?: string[];
   }) {
     this.frameId = params.frameId;
     this.taskId = params.taskId;
@@ -114,8 +144,52 @@ export class TurnWalFrame {
     this.fence = params.fence;
     this.changedFiles = [...params.changedFiles];
     this.sqliteWalPages = params.sqliteWalPages;
-    this.createdAtMs = params.createdAtMs ?? Date.now();
+    this.createdAtMs = params.createdAtMs ?? params.timestampMs ?? Date.now();
+    this.state = params.state ?? TaskState.RUNNING_ACT;
+    this.routedModel = params.routedModel ?? "";
+    this.tokensUsed = params.tokensUsed ?? 0;
+    this.passRate = params.passRate ?? 1;
+    this.errorCount = params.errorCount ?? 0;
+    this.diffEntropy = params.diffEntropy ?? 0;
+    this.diffSnapshot = params.diffSnapshot ?? "";
+    this.contextMessages = params.contextMessages ? [...params.contextMessages] : [];
     this.crc32Hex = params.crc32Hex ?? TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+    this.workspaceMerkleHash = params.workspaceMerkleHash ?? `merkle_${this.crc32Hex}`;
+  }
+
+  /**
+   * Builds a frame from the sparse trajectory literals used by shadow replay / stream publishing:
+   * frame identity (`frameId`, `turnIndex`, `changedFiles`, `sqliteWalPages`) is derived from the
+   * `FenceToken` and every telemetry field falls back to the constructor default.
+   */
+  public static fromPartial(params: {
+    taskId: string;
+    fence: FenceToken;
+    frameId?: string;
+    turnIndex?: number;
+    changedFiles?: string[];
+    sqliteWalPages?: number;
+    crc32Hex?: string;
+    createdAtMs?: number;
+    timestampMs?: number;
+    state?: TaskState;
+    routedModel?: string;
+    tokensUsed?: number;
+    passRate?: number;
+    errorCount?: number;
+    diffEntropy?: number;
+    workspaceMerkleHash?: string;
+    diffSnapshot?: string;
+    contextMessages?: string[];
+  }): TurnWalFrame {
+    const turnIndex = params.turnIndex ?? params.fence.turnSeq;
+    return new TurnWalFrame({
+      ...params,
+      frameId: params.frameId ?? `frame-${params.taskId}-t${turnIndex}`,
+      turnIndex,
+      changedFiles: params.changedFiles ?? [],
+      sqliteWalPages: params.sqliteWalPages ?? 0,
+    });
   }
 
   public static computeCrc32Hex(
@@ -143,6 +217,44 @@ export class TurnWalFrame {
       this.changedFiles
     );
     return this.crc32Hex === expected;
+  }
+}
+
+/**
+ * Mutable per-task runtime record used by the console BFF / HITL approval gate.
+ * It is intentionally thin: the durable task specification lives in `TaskSpec`.
+ */
+export interface AgentTaskParams {
+  taskId: string;
+  tenantId: string;
+  state?: TaskState;
+  priority?: TaskPriority;
+  fence?: FenceToken | null;
+  createdAtMs?: number;
+}
+
+export class AgentTask {
+  public readonly taskId: string;
+  public readonly tenantId: string;
+  public state: TaskState;
+  public readonly priority: TaskPriority;
+  public fence: FenceToken | null;
+  public readonly createdAtMs: number;
+
+  constructor(params: AgentTaskParams) {
+    if (!params.taskId) {
+      throw new Error("AgentTask requires a non-empty taskId");
+    }
+    this.taskId = params.taskId;
+    this.tenantId = params.tenantId;
+    this.state = params.state ?? TaskState.SUBMITTED;
+    this.priority = params.priority ?? TaskPriority.P2_STANDARD;
+    this.fence = params.fence ?? null;
+    this.createdAtMs = params.createdAtMs ?? Date.now();
+  }
+
+  public transitionTo(nextState: TaskState): void {
+    this.state = nextState;
   }
 }
 

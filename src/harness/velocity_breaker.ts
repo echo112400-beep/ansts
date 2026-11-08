@@ -31,6 +31,24 @@ export class SyntacticAndVelocityBreaker {
     }
   }
 
+  /**
+   * Computes the Progress Velocity `V_k` of a turn from its pass rate, the share of errors it eliminated
+   * relative to the previous turn, and the entropy of its diff. Deterministic blend in `[0, 1]`:
+   * a value below `0.15` means the turn made no measurable progress (the shadow replay lab counts it as a
+   * velocity-breaker backtrack).
+   */
+  public computeProgressVelocity(
+    passRate: number,
+    errorReductionRatio: number,
+    diffEntropy: number
+  ): number {
+    const clamp01 = (v: number): number => (Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0);
+    const passComponent = clamp01(passRate) * 0.5;
+    const errorComponent = clamp01(errorReductionRatio) * 0.3;
+    const focusComponent = (1 - clamp01(diffEntropy)) * 0.2;
+    return Number(clamp01(passComponent + errorComponent + focusComponent).toFixed(4));
+  }
+
   public recordAndCheckTurn(
     taskId: string,
     diag: TurnDiagnostic

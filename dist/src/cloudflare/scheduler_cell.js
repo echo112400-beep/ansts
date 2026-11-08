@@ -18,11 +18,11 @@ var _models = require("../models.js"); /**
 
   initSchema() {
     this.ctx.storage.sql.exec(
-    "CREATE TABLE IF NOT EXISTS ansts_tasks (task_id TEXT PRIMARY KEY, tenant_id TEXT, priority INTEGER, state TEXT, fencing_token INTEGER, assigned_node_id TEXT, payload_json TEXT)");
-
+      "CREATE TABLE IF NOT EXISTS ansts_tasks (task_id TEXT PRIMARY KEY, tenant_id TEXT, priority INTEGER, state TEXT, fencing_token INTEGER, assigned_node_id TEXT, payload_json TEXT)"
+    );
     this.ctx.storage.sql.exec(
-    "CREATE TABLE IF NOT EXISTS ansts_nodes (node_id TEXT PRIMARY KEY, heartbeat_json TEXT, updated_at INTEGER)");
-
+      "CREATE TABLE IF NOT EXISTS ansts_nodes (node_id TEXT PRIMARY KEY, heartbeat_json TEXT, updated_at INTEGER)"
+    );
   }
 
   rehydrateSchedulerFromSql() {
@@ -76,20 +76,20 @@ var _models = require("../models.js"); /**
 
   persistTask(task) {
     this.ctx.storage.sql.exec(
-    "INSERT OR REPLACE INTO ansts_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    task.task_id,
-    task.tenant_id,
-    task.priority,
-    task.state,
-    task.lease_fencing_token,
-    task.assigned_node_id ?? "",
-    JSON.stringify({
-      prompt: task.prompt,
-      max_turns: task.max_turns,
-      timeout_seconds: task.timeout_seconds,
-      dependencies: task.dependencies
-    }));
-
+      "INSERT OR REPLACE INTO ansts_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      task.task_id,
+      task.tenant_id,
+      task.priority,
+      task.state,
+      task.lease_fencing_token,
+      task.assigned_node_id ?? "",
+      JSON.stringify({
+        prompt: task.prompt,
+        max_turns: task.max_turns,
+        timeout_seconds: task.timeout_seconds,
+        dependencies: task.dependencies
+      })
+    );
   }
 
   async submitTask(task) {
@@ -105,11 +105,11 @@ var _models = require("../models.js"); /**
   registerNode(hb) {
     this.scheduler.registerOrUpdateNode(hb);
     this.ctx.storage.sql.exec(
-    "INSERT OR REPLACE INTO ansts_nodes (node_id, heartbeat_json, updated_at) VALUES (?, ?, ?)",
-    hb.node_id,
-    JSON.stringify(hb),
-    Date.now());
-
+      "INSERT OR REPLACE INTO ansts_nodes (node_id, heartbeat_json, updated_at) VALUES (?, ?, ?)",
+      hb.node_id,
+      JSON.stringify(hb),
+      Date.now()
+    );
   }
 
   async alarm() {

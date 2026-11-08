@@ -6,15 +6,47 @@ import { AnstsSchedulerCell } from "./scheduler_cell.js";
 import { MockDurableObjectState } from "./env.js";
 import { TaskSpec } from "../models.js";
 
+/**
+ * The virtual slot ring (consistent-hash ring + 256-slot ledger) is owned by the fleet manual scale
+ * controller; it is re-exported here because the scheduler HA mesh imports the slot ledger API from
+ * this module.
+ */
+export { VirtualHashSlotRingManager } from "../cluster/manual_scale_controller.js";
+export type {
+  SlotLedgerSnapshot,
+  SlotMigrationPhase,
+  VirtualSlotLedgerEntry,
+} from "../cluster/manual_scale_controller.js";
+
+/** Per-shard counters of the stateless router mesh, read by the console shard matrix. */
+export interface SchedulerRouterShardStat {
+  shardId: string;
+  ewmaLatencyMs: number;
+  inFlightRequests: number;
+}
+
 export class PartitionedSchedulerRouter {
   public readonly numPartitions: number;
   private readonly partitions: Map<number, AnstsSchedulerCell> = new Map();
+  /** `scheduler-shard-<n> -> live router counters` for every shard the router owns. */
+  public readonly shards: Map<string, SchedulerRouterShardStat> = new Map();
 
-  constructor(numPartitions = 64) {
+  constructor(numPartitionsOrConfig: number | { initialShardCount: number } = 64) {
+    const numPartitions =
+      typeof numPartitionsOrConfig === "number"
+        ? numPartitionsOrConfig
+        : numPartitionsOrConfig.initialShardCount;
     this.numPartitions = numPartitions;
     for (let i = 0; i < numPartitions; i++) {
-      const state = new MockDurableObjectState(`scheduler-shard-${i}`);
+      const shardId = `scheduler-shard-${String(i).padStart(2, "0")}`;
+      const state = new MockDurableObjectState(shardId);
       this.partitions.set(i, new AnstsSchedulerCell(state));
+      this.shards.set(shardId, {
+        shardId,
+        // No latency samples recorded yet; the console renders its cold-start fallback until observed.
+        ewmaLatencyMs: 0,
+        inFlightRequests: 0,
+      });
     }
   }
 

@@ -10,13 +10,17 @@ export interface OtelSpanRecord {
   name: string;
   startTimeMs: number;
   endTimeMs: number;
+  /** OTLP nanosecond start/end timestamps, set by the W3C trace-continuity propagator. */
+  startTimeUnixNano?: string;
+  endTimeUnixNano?: string;
   attributes: Record<string, string | number>;
 }
 
 export class OtelAndPrometheusExporter {
   private readonly counters: Map<string, number> = new Map();
   private readonly gauges: Map<string, number> = new Map();
-  private readonly spans: OtelSpanRecord[] = [];
+  /** Every span exported by this isolate, in emission order. */
+  public readonly exportedSpans: OtelSpanRecord[] = [];
 
   public static createTraceparent(traceId?: string, spanId?: string): string {
     const tid = traceId ?? crypto.randomBytes(16).toString("hex");
@@ -38,7 +42,7 @@ export class OtelAndPrometheusExporter {
   }
 
   public recordSpan(span: OtelSpanRecord): void {
-    this.spans.push(span);
+    this.exportedSpans.push(span);
   }
 
   public incCounter(name: string, delta = 1): void {
@@ -63,6 +67,6 @@ export class OtelAndPrometheusExporter {
   }
 
   public getRecordedSpans(): OtelSpanRecord[] {
-    return [...this.spans];
+    return [...this.exportedSpans];
   }
 }

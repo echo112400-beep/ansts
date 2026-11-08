@@ -9,7 +9,25 @@ var _models = require("./models.js"); /**
   attemptedFence;
   currentHighestFence;
 
-  constructor(taskId, attemptedFence, currentHighestFence) {
+  /**
+   * Domain call sites raise the error from a fully formatted `409 <Reason>: ...` message, while the
+   * lease coordinator raises it from the `(taskId, attemptedFence, highestFence)` triple.
+   */
+
+
+  constructor(
+  taskIdOrMessage,
+  attemptedFence,
+  currentHighestFence)
+  {
+    if (attemptedFence === undefined || currentHighestFence === undefined) {
+      super(taskIdOrMessage);
+      this.name = "StaleFenceError";
+      this.taskId = "";
+      this.attemptedFence = "";
+      this.currentHighestFence = "";
+      return;
+    }
     const att =
     attemptedFence instanceof _models.FenceToken ?
     `(${attemptedFence.epoch},${attemptedFence.turnSeq})` :
@@ -19,10 +37,10 @@ var _models = require("./models.js"); /**
     `(${currentHighestFence.epoch},${currentHighestFence.turnSeq})` :
     String(currentHighestFence);
     super(
-    `StaleFenceError [409]: Fencing token ${att} rejected for task ${taskId} (highest=${cur})`);
-
+      `StaleFenceError [409]: Fencing token ${att} rejected for task ${taskIdOrMessage} (highest=${cur})`
+    );
     this.name = "StaleFenceError";
-    this.taskId = taskId;
+    this.taskId = taskIdOrMessage;
     this.attemptedFence = att;
     this.currentHighestFence = cur;
   }

@@ -3,7 +3,7 @@
 
 var _nodeTest = require("node:test");
 var assert = _interopRequireWildcard(require("node:assert/strict"));
-var _index = require("../src/index.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var _index = require("../src/index.js");var cache;function _interopRequireWildcard(e, t) {if (!t && e && e.__esModule) return e;var r,c,a = Object.defineProperty,n = { __proto__: null, default: e };if (Object(e) !== e) return n;if (cache || "function" != typeof WeakMap || (cache = new WeakMap()), cache) {if (cache.has(e)) return cache.get(e);cache.set(e, n);}for (c in e) "default" !== c && {}.hasOwnProperty.call(e, c) && ((r = a && Object.getOwnPropertyDescriptor(e, c)) && (r.get || r.set) ? a(n, c, r) : n[c] = e[c]);return n;} /**
  * @fileoverview M1-M6 Core End-to-End Integration Suite (7 tests).
  */
 
@@ -111,23 +111,23 @@ var _index = require("../src/index.js");function _getRequireWildcardCache(nodeIn
   (0, _nodeTest.it)("6. Prefix-Cache Aware CognitiveRouter routes repeated prefix hash to sticky KV-warm endpoint", () => {
     const router = new _index.CognitiveRouter();
     router.registerEndpoint(
-    new _index.LlmEndpointMetrics({
-      endpoint_id: "ep-openai-1",
-      provider: "openai",
-      model_name: "gpt-4o",
-      ttft_ewma_ms: 220,
-      tpm_limit: 500_000
-    }));
-
+      new _index.LlmEndpointMetrics({
+        endpoint_id: "ep-openai-1",
+        provider: "openai",
+        model_name: "gpt-4o",
+        ttft_ewma_ms: 220,
+        tpm_limit: 500_000
+      })
+    );
     router.registerEndpoint(
-    new _index.LlmEndpointMetrics({
-      endpoint_id: "ep-anthropic-1",
-      provider: "anthropic",
-      model_name: "claude-3-7-sonnet",
-      ttft_ewma_ms: 210,
-      tpm_limit: 500_000
-    }));
-
+      new _index.LlmEndpointMetrics({
+        endpoint_id: "ep-anthropic-1",
+        provider: "anthropic",
+        model_name: "claude-3-7-sonnet",
+        ttft_ewma_ms: 210,
+        tpm_limit: 500_000
+      })
+    );
 
     const prefix = _index.CognitiveRouter.computePrefixHash("sys", "tools", "ctx");
     const [firstEp, hit1] = router.selectEndpoint(prefix, 1000, _index.TaskPriority.P1_HIGH);

@@ -28,8 +28,8 @@ class LayerFsMultiAgentBranchCoordinator {
 
   isLwwPath(filePath) {
     return this.lwwPatterns.some((pat) =>
-    pat.endsWith("/") ? filePath.startsWith(pat) : filePath === pat || filePath.endsWith(`/${pat}`));
-
+    pat.endsWith("/") ? filePath.startsWith(pat) : filePath === pat || filePath.endsWith(`/${pat}`)
+    );
   }
 
   mergeBranchIntoTarget(sourceBranch, targetBranch, baseCommitId = "C0")
@@ -47,8 +47,8 @@ class LayerFsMultiAgentBranchCoordinator {
 
     const allPaths = new Set([
     ...sourceHead.filesTree.keys(),
-    ...targetHead.filesTree.keys()]);
-
+    ...targetHead.filesTree.keys()]
+    );
 
     const conflicts = [];
     const autoResolvedByByteIdentity = [];

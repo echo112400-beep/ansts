@@ -84,9 +84,9 @@ class HierarchicalQueueManager {
 
     this.queuedTasks.delete(bestTask.task_id);
     this.tenantActiveCount.set(
-    bestTask.tenant_id,
-    this.getTenantActiveCount(bestTask.tenant_id) + 1);
-
+      bestTask.tenant_id,
+      this.getTenantActiveCount(bestTask.tenant_id) + 1
+    );
     return bestTask;
   }
 

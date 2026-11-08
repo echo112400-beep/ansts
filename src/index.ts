@@ -40,6 +40,7 @@ export * from "./telemetry/outbox_webhook.js";
 export * from "./telemetry/otel_prometheus.js";
 export * from "./cluster/backpressure_loop.js";
 export * from "./cluster/manual_scale_controller.js";
+export * from "./cluster/multi_node_dev_server.js";
 export * from "./cloudflare/env.js";
 export * from "./cloudflare/scheduler_cell.js";
 export * from "./cloudflare/harness_cell.js";

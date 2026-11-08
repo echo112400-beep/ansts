@@ -12,6 +12,20 @@ var _nodeStream = require("node:stream"); /**
 
 
 
+/**
+ * One dispatched SSE frame plus the credit-window bookkeeping the stream publisher reports back to the client.
+ */
+
+
+
+
+
+
+
+
+
+
+
 class ClientStreamSubscription {
   subscriptionId;
   taskId;
@@ -44,10 +58,81 @@ class ClientStreamSubscription {
 class SseEventStreamGateway {
   subscriptionsByTask = new Map();
   historyByTask = new Map();
+  /** Per-client credit window (`clientId -> credits remaining`) for backpressure-controlled fan-out. */
+  creditsByClient = new Map();
   maxHistoryPerTask;
+  eventSeq = 0;
 
   constructor(maxHistoryPerTask = 100) {
     this.maxHistoryPerTask = maxHistoryPerTask;
+  }
+
+  /**
+   * Registers a client with an initial credit window. A client whose credits are exhausted stops
+   * receiving `publishEvent` frames until `ackCredits` replenishes the window.
+   */
+  registerClient(clientId, initialCredits = 100) {
+    this.creditsByClient.set(clientId, initialCredits);
+  }
+
+  /** Replenishes a client's credit window and returns the new remaining balance. */
+  ackCredits(clientId, credits) {
+    const next = (this.creditsByClient.get(clientId) ?? 0) + credits;
+    this.creditsByClient.set(clientId, next);
+    return next;
+  }
+
+  getRemainingCredits(clientId) {
+    return this.creditsByClient.get(clientId) ?? 0;
+  }
+
+  /**
+   * Publishes a serialized task stream event to the task's subscribers subject to the client's credit
+   * window. Returns the dispatched frames; an empty array means the frame was withheld (no credits left).
+   */
+  publishEvent(
+  clientId,
+  eventType,
+  taskId,
+  payload)
+  {
+    const remaining = this.creditsByClient.get(clientId);
+    if (remaining !== undefined && remaining <= 0) {
+      return [];
+    }
+
+    this.eventSeq += 1;
+    const frame = {
+      id: `${taskId}-${this.eventSeq}`,
+      event: eventType,
+      taskId,
+      clientId,
+      eventSeq: this.eventSeq,
+      timestampMs: Date.now(),
+      payload
+    };
+
+    let data;
+    try {
+      const parsed = JSON.parse(payload);
+      data = parsed && typeof parsed === "object" ? parsed : { value: parsed };
+    } catch {
+      data = { value: payload };
+    }
+
+    this.publish({
+      id: frame.id,
+      event: eventType,
+      taskId,
+      turnIndex: frame.eventSeq,
+      timestampMs: frame.timestampMs,
+      data
+    });
+
+    if (remaining !== undefined) {
+      this.creditsByClient.set(clientId, remaining - 1);
+    }
+    return [frame];
   }
 
   subscribe(taskId, subscriptionId, replayFromEventId) {

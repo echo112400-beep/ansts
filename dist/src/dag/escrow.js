@@ -19,8 +19,8 @@ class DagEscrowCoordinator {
     const requestedEscrow = Math.max(0, parent.expected_SubAgent_count);
     if (currentTenantUsed + 1 + requestedEscrow > maxTenantQuota) {
       throw new Error(
-      `Insufficient tenant quota to escrow ${requestedEscrow} SubAgent slots for parent ${parent.task_id}`);
-
+        `Insufficient tenant quota to escrow ${requestedEscrow} SubAgent slots for parent ${parent.task_id}`
+      );
     }
     const record = {
       parentTaskId: parent.task_id,

@@ -64,11 +64,11 @@ class AgentHarnessRunner {
 
       task.state = _models.TaskState.RUNNING_ACT;
       const [toolOutput, deduplicated] = this.sagaGateway.invokeTool(
-      task.task_id,
-      nextTurn,
-      toolName,
-      toolArgs);
-
+        task.task_id,
+        nextTurn,
+        toolName,
+        toolArgs
+      );
       task.current_turn = nextTurn;
       return {
         taskId: task.task_id,

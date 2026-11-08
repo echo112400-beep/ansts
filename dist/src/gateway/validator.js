@@ -50,9 +50,9 @@ class TaskSpecValidator {
     };
     if (resourceProfile.think_cpu_cores <= 0 || resourceProfile.act_cpu_cores < resourceProfile.think_cpu_cores) {
       throw new TaskSpecValidationError(
-      "resource_profile.cpu",
-      "act_cpu_cores must be >= think_cpu_cores and > 0");
-
+        "resource_profile.cpu",
+        "act_cpu_cores must be >= think_cpu_cores and > 0"
+      );
     }
     const deps = Array.isArray(payload.dependencies) ? payload.dependencies.map(String) : [];
     if (deps.includes(taskId)) {

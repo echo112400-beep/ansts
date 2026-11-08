@@ -259,4 +259,23 @@ export class V8HeapAndSqlBudgetGuard {
     }
     return { cursor, elapsedMs };
   }
+
+  /**
+   * Runs a caller-supplied SQLite executor (any cursor shape) inside the celld per-statement budget and
+   * reports the measured wall-clock duration of the execution.
+   */
+  public executeBoundedSql<T = Record<string, unknown>>(params: {
+    query: string;
+    executor: () => T[];
+  }): { rows: T[]; elapsedMs: number } {
+    const t0 = performance.now();
+    const rows = params.executor();
+    const elapsedMs = Number((performance.now() - t0).toFixed(3));
+    if (elapsedMs > this.sqlTimeoutMs) {
+      throw new Error(
+        `SQLite statement exceeded celld per-statement timeout (${elapsedMs}ms > ${this.sqlTimeoutMs}ms): ${params.query.slice(0, 60)}`
+      );
+    }
+    return { rows, elapsedMs };
+  }
 }

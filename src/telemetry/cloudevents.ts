@@ -1,6 +1,15 @@
 /**
  * @fileoverview M6 TASK-22: CloudEvents v1.0 Telemetry Bus & FinOps Cost Attribution Ledger.
  */
+import * as crypto from "node:crypto";
+
+/**
+ * CloudEvents v1.0 envelope enriched with the W3C `traceparent` of the span that emitted it.
+ */
+export interface TracedCloudEventV1 extends CloudEventV1 {
+  traceparent: string;
+}
+
 export interface CloudEventV1 {
   specversion: "1.0";
   id: string;
@@ -66,10 +75,29 @@ export class CloudEventsBus {
     return evt;
   }
 
+  /**
+   * Emits a CloudEvent stamped with a fresh (or caller-supplied) W3C `traceparent` so the event can be
+   * correlated with the OTLP span that produced it.
+   */
+  public emit(
+    type: string,
+    taskId: string,
+    tenantId: string,
+    data: Record<string, unknown> = {},
+    options?: { traceparent?: string },
+  ): TracedCloudEventV1 {
+    const evt = this.emitEvent({ type, subject: taskId, tenantId, data });
+    const traceparent =
+      options?.traceparent ??
+      `00-${crypto.randomBytes(16).toString("hex")}-${crypto.randomBytes(8).toString("hex")}-01`;
+    // `emitEvent` returns the stored envelope; widening it in place keeps `allEvents()` consistent.
+    (evt as TracedCloudEventV1).traceparent = traceparent;
+    return evt as TracedCloudEventV1;
+  }
+
   public getTenantReport(tenantId: string): TenantFinOpsSummary | undefined {
     return this.tenantCosts.get(tenantId);
   }
-
   public allEvents(): CloudEventV1[] {
     return [...this.events];
   }

@@ -21,10 +21,10 @@ class MultiRegionFederationRouter {
 
   {
     const candidates = Array.from(this.regions.values()).filter(
-    (r) =>
-    r.healthy && (
-    !params.requiredSovereigntyZone || r.sovereigntyZone === params.requiredSovereigntyZone));
-
+      (r) =>
+      r.healthy && (
+      !params.requiredSovereigntyZone || r.sovereigntyZone === params.requiredSovereigntyZone)
+    );
     if (candidates.length === 0) {
       throw new Error("No healthy federated region matches sovereignty constraints");
     }

@@ -1,7 +1,7 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ShardedQueueBrokerPool = exports.SafeEpochGarbageCollector = exports.RpoZeroDurabilityEngine = exports.FleetReplicatedDurabilityEngine = exports.FleetHaAndAutoscalerController = exports.DurableWorkflowContext = void 0;
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var crypto = _interopRequireWildcard(require("node:crypto"));var cache;function _interopRequireWildcard(e, t) {if (!t && e && e.__esModule) return e;var r,c,a = Object.defineProperty,n = { __proto__: null, default: e };if (Object(e) !== e) return n;if (cache || "function" != typeof WeakMap || (cache = new WeakMap()), cache) {if (cache.has(e)) return cache.get(e);cache.set(e, n);}for (c in e) "default" !== c && {}.hasOwnProperty.call(e, c) && ((r = a && Object.getOwnPropertyDescriptor(e, c)) && (r.get || r.set) ? a(n, c, r) : n[c] = e[c]);return n;} /**
  * @fileoverview M8 TASK-28 ~ TASK-31: RPO=0 LTX Durability Engine, DurableWorkflowContext, Sharded Queue Broker & Safe Epoch GC.
  */
 
@@ -59,13 +59,48 @@ class RpoZeroDurabilityEngine {
 class DurableWorkflowContext {
   sql;
   workflowId;
+  /** `true` while the owning Isolate is hibernated (`0.1C`); an inbound workflow event wakes it. */
+  isolateHibernated = false;
+  pendingEventsByType = new Map();
+  eventWaitersByType = new Map();
 
   constructor(sql, workflowId) {
     this.sql = sql;
     this.workflowId = workflowId;
     this.sql.exec(
-    "CREATE TABLE IF NOT EXISTS workflow_steps (step_key TEXT PRIMARY KEY, workflow_id TEXT, output_json TEXT, completed_at INTEGER)");
+      "CREATE TABLE IF NOT EXISTS workflow_steps (step_key TEXT PRIMARY KEY, workflow_id TEXT, output_json TEXT, completed_at INTEGER)"
+    );
+  }
 
+  /**
+   * Delivers an external event (`MCP` notification, CI/CD completion, ...) to this workflow. A waiter
+   * already parked on the event type is resumed immediately, otherwise the event is buffered for the
+   * next `waitForEvent` call.
+   */
+  sendEvent(eventType, payload) {
+    const waiters = this.eventWaitersByType.get(eventType);
+    const waiter = waiters?.shift();
+    if (waiter) {
+      waiter(payload);
+      return;
+    }
+    const pending = this.pendingEventsByType.get(eventType) ?? [];
+    pending.push(payload);
+    this.pendingEventsByType.set(eventType, pending);
+  }
+
+  /** Resolves with the next event of `eventType`, replaying a buffered one first. */
+  waitForEvent(eventType) {
+    const pending = this.pendingEventsByType.get(eventType);
+    const buffered = pending?.shift();
+    if (buffered) {
+      return Promise.resolve(buffered);
+    }
+    return new Promise((resolve) => {
+      const waiters = this.eventWaitersByType.get(eventType) ?? [];
+      waiters.push(resolve);
+      this.eventWaitersByType.set(eventType, waiters);
+    });
   }
 
   async stepDo(stepName, fn) {
@@ -81,12 +116,12 @@ class DurableWorkflowContext {
     }
     const result = await fn();
     this.sql.exec(
-    "INSERT OR REPLACE INTO workflow_steps (step_key, workflow_id, output_json, completed_at) VALUES (?, ?, ?, ?)",
-    stepKey,
-    this.workflowId,
-    JSON.stringify(result),
-    Date.now());
-
+      "INSERT OR REPLACE INTO workflow_steps (step_key, workflow_id, output_json, completed_at) VALUES (?, ?, ?, ?)",
+      stepKey,
+      this.workflowId,
+      JSON.stringify(result),
+      Date.now()
+    );
     return { result, replayedFromJournal: false };
   }
 }exports.DurableWorkflowContext = DurableWorkflowContext;
@@ -133,11 +168,11 @@ class SafeEpochGarbageCollector {
   {
     return snapshots.
     filter(
-    (s) =>
-    !s.referencedByActiveCell &&
-    s.fencingToken < activeMinFencingToken &&
-    nowMs - s.createdAtMs >= this.gracePeriodMs).
-
+      (s) =>
+      !s.referencedByActiveCell &&
+      s.fencingToken < activeMinFencingToken &&
+      nowMs - s.createdAtMs >= this.gracePeriodMs
+    ).
     map((s) => s.key);
   }
 }exports.SafeEpochGarbageCollector = SafeEpochGarbageCollector;

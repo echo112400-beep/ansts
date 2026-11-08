@@ -5,7 +5,11 @@
 
 var _models = require("../models.js"); /**
  * @fileoverview M14 TASK-63 ~ TASK-66: Unified 100% Component Persistence Store & Cold-Start Rehydration Engine.
- */class UnifiedComponentPersistenceStore {
+ */
+
+
+
+class UnifiedComponentPersistenceStore {
   sql;
 
   constructor(sql) {
@@ -22,7 +26,8 @@ var _models = require("../models.js"); /**
     "CREATE TABLE IF NOT EXISTS persisted_saga_steps (step_id TEXT PRIMARY KEY, task_id TEXT, payload_json TEXT)",
     "CREATE TABLE IF NOT EXISTS persisted_approval_tickets (ticket_id TEXT PRIMARY KEY, payload_json TEXT)",
     "CREATE TABLE IF NOT EXISTS persisted_finops_ledgers (tenant_id TEXT PRIMARY KEY, payload_json TEXT)",
-    "CREATE TABLE IF NOT EXISTS persisted_mcp_tools (tool_name TEXT PRIMARY KEY, payload_json TEXT)"];
+    "CREATE TABLE IF NOT EXISTS persisted_mcp_tools (tool_name TEXT PRIMARY KEY, payload_json TEXT)",
+    "CREATE TABLE IF NOT EXISTS persisted_observability (cell_id TEXT PRIMARY KEY, payload_json TEXT)"];
 
     for (const ddl of tables) {
       this.sql.exec(ddl);
@@ -33,10 +38,10 @@ var _models = require("../models.js"); /**
     let tasksSaved = 0;
     for (const task of scheduler.allTasks.values()) {
       this.sql.exec(
-      "INSERT OR REPLACE INTO persisted_tasks (task_id, payload_json) VALUES (?, ?)",
-      task.task_id,
-      JSON.stringify(task));
-
+        "INSERT OR REPLACE INTO persisted_tasks (task_id, payload_json) VALUES (?, ?)",
+        task.task_id,
+        JSON.stringify(task)
+      );
       tasksSaved += 1;
     }
     return { tasksSaved, leasesSaved: tasksSaved };
@@ -70,6 +75,69 @@ var _models = require("../models.js"); /**
     return restored;
   }
 
+  /**
+   * Persists the bounded ring spool (spooled OTLP spans + CloudEvents + drop counters + active trace
+   * contexts) so in-flight telemetry survives `celld` Isolate hibernation or a node crash.
+   */
+  persistObservabilityState(
+  coordinator,
+  cellId)
+  {
+    const spooler = coordinator.spooler;
+    const payload = {
+      cellId,
+      spooledSpans: spooler.spooledSpans,
+      spooledCloudEvents: spooler.spooledCloudEvents,
+      droppedSpansCount: spooler.droppedSpansCount,
+      droppedCloudEventsCount: spooler.droppedCloudEventsCount,
+      activeTaskTraceMap: Array.from(coordinator.tracePropagator.activeTaskTraceMap.entries()),
+      savedAtMs: Date.now()
+    };
+    this.sql.exec(
+      "INSERT OR REPLACE INTO persisted_observability (cell_id, payload_json) VALUES (?, ?)",
+      cellId,
+      JSON.stringify(payload)
+    );
+    return {
+      spansSaved: spooler.spooledSpans.length,
+      cloudEventsSaved: spooler.spooledCloudEvents.length
+    };
+  }
+
+  /**
+   * Rehydrates a fresh `FaultTolerantObservabilityCoordinator` from its persisted spool. Returns `false`
+   * when the cell has no persisted observability state yet.
+   */
+  rehydrateObservabilityState(
+  coordinator,
+  cellId)
+  {
+    const row = this.sql.
+    exec(
+      "SELECT * FROM persisted_observability WHERE cell_id = ?",
+      cellId
+    ).
+    one();
+    if (!row || row.payload_json === undefined) {
+      return false;
+    }
+    const payload = JSON.parse(String(row.payload_json));
+
+
+
+
+
+
+    coordinator.spooler.spooledSpans = payload.spooledSpans ?? [];
+    coordinator.spooler.spooledCloudEvents = payload.spooledCloudEvents ?? [];
+    coordinator.spooler.droppedSpansCount = payload.droppedSpansCount ?? 0;
+    coordinator.spooler.droppedCloudEventsCount = payload.droppedCloudEventsCount ?? 0;
+    for (const [taskId, ctx] of payload.activeTaskTraceMap ?? []) {
+      coordinator.tracePropagator.activeTaskTraceMap.set(taskId, ctx);
+    }
+    return true;
+  }
+
   saveComponentRecord(
   table,
 
@@ -83,10 +151,10 @@ var _models = require("../models.js"); /**
   payload)
   {
     this.sql.exec(
-    `INSERT OR REPLACE INTO ${table} (${pkCol}, payload_json) VALUES (?, ?)`,
-    pkVal,
-    JSON.stringify(payload));
-
+      `INSERT OR REPLACE INTO ${table} (${pkCol}, payload_json) VALUES (?, ?)`,
+      pkVal,
+      JSON.stringify(payload)
+    );
   }
 
   loadComponentRecords(table) {

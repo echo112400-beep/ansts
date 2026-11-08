@@ -2,7 +2,7 @@
 
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var crypto = _interopRequireWildcard(require("node:crypto"));var cache;function _interopRequireWildcard(e, t) {if (!t && e && e.__esModule) return e;var r,c,a = Object.defineProperty,n = { __proto__: null, default: e };if (Object(e) !== e) return n;if (cache || "function" != typeof WeakMap || (cache = new WeakMap()), cache) {if (cache.has(e)) return cache.get(e);cache.set(e, n);}for (c in e) "default" !== c && {}.hasOwnProperty.call(e, c) && ((r = a && Object.getOwnPropertyDescriptor(e, c)) && (r.get || r.set) ? a(n, c, r) : n[c] = e[c]);return n;} /**
  * @fileoverview M16 TASK-75: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
  * `runsc`/`kata` OCI Runtime Selector, `celld-fence` nftables Private-Range Blocker & Bucket Layer Cache.
  */
@@ -33,7 +33,7 @@ var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequir
 
 
 
-const INSTANCE_TYPE_SPECS = {
+const INSTANCE_TYPE_SPECS = exports.INSTANCE_TYPE_SPECS = {
   lite: { cpuCores: 0.0625, memoryMb: 256 },
   dev: { cpuCores: 0.0625, memoryMb: 256 },
   basic: { cpuCores: 0.25, memoryMb: 1024 },
@@ -42,7 +42,7 @@ const INSTANCE_TYPE_SPECS = {
   "standard-2": { cpuCores: 1.0, memoryMb: 6144 },
   "standard-3": { cpuCores: 2.0, memoryMb: 8192 },
   "standard-4": { cpuCores: 4.0, memoryMb: 12288 }
-};exports.INSTANCE_TYPE_SPECS = INSTANCE_TYPE_SPECS;
+};
 
 class OperationInterruptedError extends Error {
   cellId;
@@ -158,8 +158,8 @@ class CelldNativeContainerSandboxManager {
     let handle = this.handles.get(cellId);
     if (!handle) {
       const runningCount = Array.from(this.handles.values()).filter(
-      (h) => h.config.class_name === config.class_name && h.running).
-      length;
+        (h) => h.config.class_name === config.class_name && h.running
+      ).length;
       const cap = this.maxInstancesByClass.get(config.class_name) ?? config.max_instances ?? 64;
       if (runningCount >= cap) {
         throw new Error(`container_start_failed: fleet running count (${runningCount}) reached max_instances (${cap})`);

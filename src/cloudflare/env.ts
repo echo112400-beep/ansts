@@ -355,7 +355,12 @@ export class InMemoryR2Bucket implements R2BucketLike {
       etag: obj.etag,
       size: obj.bytes.byteLength,
       customMetadata: obj.customMetadata,
-      arrayBuffer: async () => obj.bytes.buffer.slice(obj.bytes.byteOffset, obj.bytes.byteOffset + obj.bytes.byteLength),
+      arrayBuffer: async () => {
+        // Copy into an owned ArrayBuffer: `Uint8Array.buffer` is `ArrayBufferLike` (may be shared).
+        const copy = new ArrayBuffer(obj.bytes.byteLength);
+        new Uint8Array(copy).set(obj.bytes);
+        return copy;
+      },
       text: async () => new TextDecoder().decode(obj.bytes),
     };
   }
