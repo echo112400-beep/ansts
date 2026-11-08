@@ -54,3 +54,7 @@ export * from "./cli/anstsctl.js";
 export * from "./dashboard/server.js";
 export * from "./cloudflare/celld_container_bridge.js";
 export * from "./cloudflare/hot_cell_overload_guard.js";
+export * from "./checkpoint/layerfs_store_engine.js";
+export * from "./checkpoint/layerfs_remote_sync.js";
+export * from "./runtime/layerfs_workspace_driver.js";
+export * from "./dag/layerfs_branch_coordinator.js";

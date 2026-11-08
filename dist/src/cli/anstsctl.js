@@ -4,7 +4,8 @@
 
 var _scheduler = require("../scheduler.js");
 var _models = require("../models.js");
-var _manual_scale_controller = require("../cluster/manual_scale_controller.js"); /**
+var _manual_scale_controller = require("../cluster/manual_scale_controller.js");
+var _layerfs_workspace_driver = require("../runtime/layerfs_workspace_driver.js"); /**
  * @fileoverview M12 TASK-46 & M16 TASK-82: `anstsctl` Operational CLI
  * (Submit, Status, Scale-Out, `diagnose` Fleet Lease Probe & `gc-audit` Safe Epoch GC Dry-Run).
  */
@@ -28,6 +29,7 @@ var _manual_scale_controller = require("../cluster/manual_scale_controller.js");
 class AnstsClusterRuntime {
   scheduler = new _scheduler.CoreScheduler5D();
   fleetController = new _manual_scale_controller.ManualFleetScaleController();
+  layerfsDriver = new _layerfs_workspace_driver.LayerFsWorkspaceDriver();
   peerProbes = [];
   epochCandidates = [];
 }exports.AnstsClusterRuntime = AnstsClusterRuntime;
@@ -108,6 +110,15 @@ function runCli(argv, runtime = new AnstsClusterRuntime()) {
         reclaimableBytes,
         deletableScopes: deletableEpochs.map((e) => `${e.cellScope}@epoch-${e.epochId}`)
       })
+    };
+  }
+  if (cmd === "blame") {
+    const branchOrCommit = rest[0] ?? "main";
+    const filePath = rest[1] ?? "package.json";
+    const blameLines = runtime.layerfsDriver.blameFile(branchOrCommit, filePath);
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({ branchOrCommit, filePath, lines: blameLines })
     };
   }
   return { exitCode: 1, stdout: JSON.stringify({ error: `Unknown command: ${cmd ?? ""}` }) };

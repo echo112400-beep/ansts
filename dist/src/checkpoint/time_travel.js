@@ -11,7 +11,19 @@ var _models = require("../models.js"); /**
 
 
 
+
+
 class DeterministicTimeTravelReplayer {
+  /**
+   * M17 TASK-86: Zero-Copy Recursive Commit Fork (`O(1)` metadata fork for MCTS/RL & Time-Travel Debugging).
+   */
+  forkLayerFsCommitZeroCopy(
+  driver,
+  sourceCommitId,
+  newBranchName)
+  {
+    return driver.forkBranch(sourceCommitId, newBranchName);
+  }
   forkTaskAtTurn(
   originalTask,
   walEntries,

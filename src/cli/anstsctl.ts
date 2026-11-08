@@ -5,6 +5,7 @@
 import { CoreScheduler5D } from "../scheduler.js";
 import { TaskPriority, TaskSpec } from "../models.js";
 import { ManualFleetScaleController } from "../cluster/manual_scale_controller.js";
+import { LayerFsWorkspaceDriver } from "../runtime/layerfs_workspace_driver.js";
 
 export interface FleetPeerProbeInput {
   nodeId: string;
@@ -28,6 +29,7 @@ export interface CellEpochGcCandidate {
 export class AnstsClusterRuntime {
   public readonly scheduler = new CoreScheduler5D();
   public readonly fleetController = new ManualFleetScaleController();
+  public readonly layerfsDriver = new LayerFsWorkspaceDriver();
   public peerProbes: FleetPeerProbeInput[] = [];
   public epochCandidates: CellEpochGcCandidate[] = [];
 }
@@ -108,6 +110,15 @@ export function runCli(argv: string[], runtime = new AnstsClusterRuntime()): { e
         reclaimableBytes,
         deletableScopes: deletableEpochs.map((e) => `${e.cellScope}@epoch-${e.epochId}`),
       }),
+    };
+  }
+  if (cmd === "blame") {
+    const branchOrCommit = rest[0] ?? "main";
+    const filePath = rest[1] ?? "package.json";
+    const blameLines = runtime.layerfsDriver.blameFile(branchOrCommit, filePath);
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({ branchOrCommit, filePath, lines: blameLines }),
     };
   }
   return { exitCode: 1, stdout: JSON.stringify({ error: `Unknown command: ${cmd ?? ""}` }) };

@@ -11,7 +11,19 @@ export interface ForkedTaskBranch {
   inheritedFiles: string[];
 }
 
+import { LayerFsWorkspaceDriver } from "../runtime/layerfs_workspace_driver.js";
+
 export class DeterministicTimeTravelReplayer {
+  /**
+   * M17 TASK-86: Zero-Copy Recursive Commit Fork (`O(1)` metadata fork for MCTS/RL & Time-Travel Debugging).
+   */
+  public forkLayerFsCommitZeroCopy(
+    driver: LayerFsWorkspaceDriver,
+    sourceCommitId: string,
+    newBranchName: string
+  ): { branchName: string; headCommitId: string; copiedFilesCount: 0 } {
+    return driver.forkBranch(sourceCommitId, newBranchName);
+  }
   public forkTaskAtTurn(
     originalTask: TaskSpec,
     walEntries: WalDeltaEntry[],
