@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'ansts-dev-cluster'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets:
+          - 'ansts-gateway-01:8080'
+          - 'ansts-gateway-02:8080'
+          - 'celld-brain-01:8081'
+          - 'celld-brain-02:8082'
+          - 'celld-brain-03:8083'
+          - 'body-daemon-01:9501'
+          - 'body-daemon-02:9502'
