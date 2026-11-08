@@ -120,6 +120,9 @@ export class MultiNodeClusterDaemonServer {
     });
     this.canaryController = new CanaryRolloutController("v2.5.0", "v2.5.1-canary");
     this.consoleBff = new ConsoleBffController(this.tunnelRouter, this.geoRouter, this.streamPublisher, this.mesh, this.canaryController);
+    // The dev server is not a production roster. Tests and local compose read this seeded table.
+    // Production cells stay empty unless ANSTS_CONSOLE_SEED_DEMO=1.
+    this.consoleBff.ensureDefaultConsoleSeedData();
   }
 
   public async start(): Promise<number> {
