@@ -3,6 +3,9 @@
   "version": "2.0.0",
   "description": "Agent-Native Sandbox Task Scheduler (ANSTS v2.0) — TypeScript Microservices with denoland/celld & Cloudflare Workers Support",
   "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "main": "dist/src/index.js",
   "types": "src/index.ts",
   "scripts": {
