@@ -97,3 +97,15 @@
 | **FIX-05** | `src/queue_manager.ts`<br>`tests/m16_celld_v063_optimizations.test.ts` | `popNext()` 使用 `if (queuedTasks.size <= 64)` 双分支取巧绕过堆动态重算。 | 彻底移除 `<= 64` 分支特判，重构为**按租户分桶的二叉最大堆 + 跨租户动态 DRF/Aging 锦标赛选择算法**：同一租户内部共享相同 DRF 惩罚因此堆序恒定，跨租户仅需比对各租户堆顶的实时动态得分，实现 2 任务至 10,000+ 任务全规模统一 `O(log N)` 精确调度。 |
 | **FIX-06** | `tests/google_engineering_all_tasks_audit.test.ts` | 第 2~7 项子测试仅检查 `typeof Ansts.Xxx === "function"`。 | 全部升级为跨模块真实端到端行为测试（覆盖网关入站 → 5D 调度 → Harness 推理与幂等工具调用、沙箱池与 Cgroup/WAL、Cloudflare Worker 路由、三态熔断器状态转换、裸金属节点排空与 LayerFS 无损重构）。 |
 | **FIX-07** | `src/cloudflare/env.ts`<br>`tests/m15_celld_facets_dynamic_workers.test.ts` | `InMemoryCellSqlStorage` 仅支持单条件 `WHERE` 且不支持事务回滚。 | 升级支持复合 `WHERE col1 = ? AND col2 = ?`、`ORDER BY col ASC|DESC` 以及 `BEGIN` / `COMMIT` / `ROLLBACK` 事务状态快照回滚验证。 |
+
+## 9. 核心契约符号与 Git 历史对账修复记录（`FenceToken` / `StaleFenceError` / `TurnWalFrame` / `VirtualHashSlotRingManager`）
+
+针对符号引用与 Git 历史核查发现的 **4 个核心契约类与 3 个 RPC 方法在容器重置重写期间被简化覆盖** 的问题，已在源码、导出桶与契约测试套件中 100% 恢复并固化（总测试数提升至 **16 个套件 / 79 项测试**）：
+
+| 恢复与对齐的符号名称 | 所在源码文件 | 契约能力实现与自动化测试 (`tests/design_deliverable_consistency.test.ts`) |
+| :--- | :--- | :--- |
+| **`FenceToken`** | `src/models.ts` | 双元组单调递增栅栏令牌 `(epoch: number, turnSeq: number, taskId: string)`，实现 `nextEpoch()`、`nextTurn()`、`compareTo()`、`isStrictlyOlderThan()` 与对齐 `proto/ansts_rpc.proto` (`FenceTokenProto`) 的 `toProto()`。 |
+| **`StaleFenceError`** | `src/lease_coordinator.ts` | 结构化 `409 Conflict` 领域异常类（携带 `statusCode = 409`、`taskId`、`attemptedFence`、`currentHighestFence`），在 `LeaseCoordinator.assertValidFence()`、`NodeDaemon.writeTurnCheckpoint()` 与 `TurnWalEngine.appendTurnDelta()` 中拦截过期栅栏写操作。 |
+| **`TurnWalFrame`** | `src/models.ts` & `src/checkpoint/wal_engine.ts` | 回合级 WAL 帧实体类，内置 IEEE 802.3 多项式（`0xedb88320`）`computeCrc32Hex()` 与 `verifyIntegrity()` 帧完整性校验，嵌入 `TurnWalEngine` 的每条 `WalDeltaEntry.frame`。 |
+| **`VirtualHashSlotRingManager`** | `src/cluster/manual_scale_controller.ts` | 1024 虚拟槽位 + 16 虚拟节点/物理节点的一致性哈希环管理器，直接集成至 `ManualFleetScaleController` 的 `scaleOutNode()` 与 `cordonAndDrainNode()`，实现无 K8s 裸金属节点扩缩容时的确定性槽位再平衡。 |
+| **`submitTaskRpc` / `scheduleTickRpc` / `rehydrateSchedulerFromSql`** | `src/cloudflare/scheduler_cell.ts` | 对齐 [`denoland/celld` Durable Objects 规范](https://github.com/denoland/celld/blob/main/docs/services/durable-objects.md) 的零序列化原生 `js_rpc` 入口，支持透传调用方 `AbortSignal` 取消。 |
