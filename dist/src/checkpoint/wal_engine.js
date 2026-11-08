@@ -31,6 +31,71 @@ class TurnWalEngine {
 
   constructor(walDir = "/tmp/ansts_turnwal") {this.walDir = walDir;
     fs.mkdirSync(this.walDir, { recursive: true });
+    this.hydrateFramesFromDisk();
+  }
+
+  /**
+   * Loads frames already persisted in `walDir` so a restarted gateway can still replay them
+   * (`listTaskFrames` / `resumeAndCatchUpFromWal`) instead of reporting an empty WAL.
+   */
+  hydrateFramesFromDisk() {
+    let entries;
+    try {
+      entries = fs.readdirSync(this.walDir);
+    } catch {
+      return;
+    }
+    const frames = [];
+    for (const entry of entries) {
+      if (!entry.endsWith(".wal")) continue;
+      try {
+        const raw = fs.readFileSync(path.join(this.walDir, entry), "utf8");
+        const parsed = JSON.parse(raw);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        frames.push(
+          new _models.TurnWalFrame({
+            frameId: parsed.frameId,
+            taskId: parsed.taskId,
+            turnIndex: parsed.turnIndex,
+            fence: new _models.FenceToken(parsed.fence.epoch, parsed.fence.turn_seq, parsed.fence.task_id),
+            changedFiles: parsed.changedFiles ?? [],
+            sqliteWalPages: parsed.sqliteWalPages ?? 0,
+            crc32Hex: parsed.crc32Hex,
+            state: parsed.state,
+            routedModel: parsed.routedModel,
+            tokensUsed: parsed.tokensUsed,
+            workspaceMerkleHash: parsed.workspaceMerkleHash,
+            diffSnapshot: parsed.diffSnapshot,
+            createdAtMs: parsed.createdAtMs
+          })
+        );
+      } catch {
+
+        // A partially written or corrupt frame is skipped; it must not block the rest of the WAL.
+      }}
+    frames.sort((a, b) => a.fence.turnSeq - b.fence.turnSeq || a.createdAtMs - b.createdAtMs);
+    for (const frame of frames) {
+      const existing = this.framesByTask.get(frame.taskId) ?? [];
+      const alreadyIndexed = existing.some(
+        (f) => f.frameId === frame.frameId || f.fence.turnSeq === frame.fence.turnSeq
+      );
+      if (alreadyIndexed) continue;
+      existing.push(frame);
+      this.framesByTask.set(frame.taskId, existing);
+    }
   }
 
   appendTurnDelta(params)
@@ -98,7 +163,15 @@ class TurnWalEngine {
 
   recordFrame(frame) {
     const frames = this.framesByTask.get(frame.taskId) ?? [];
-    frames.push(frame);
+    const existingIndex = frames.findIndex((f) => f.fence.turnSeq === frame.fence.turnSeq);
+    if (existingIndex >= 0) {
+      // One WAL frame per turn: a replayed/persisted frame replaces the indexed one instead of
+      // appending a duplicate that catch-up replay would emit twice.
+      frames[existingIndex] = frame;
+    } else {
+      frames.push(frame);
+      frames.sort((a, b) => a.fence.turnSeq - b.fence.turnSeq);
+    }
     this.framesByTask.set(frame.taskId, frames);
   }
 
@@ -137,6 +210,9 @@ class TurnWalEngine {
     const alreadyPresent = fs.existsSync(filePath) || existingEtag !== undefined;
     if (alreadyPresent && (ifNoneMatchEtag === undefined || ifNoneMatchEtag === existingEtag)) {
       this.idempotentSkipObjectKeys.push(objectKey);
+      // The frame is already durable, but it still belongs in the in-memory index or catch-up replay
+      // would silently drop it.
+      this.recordFrame(frame);
       return objectKey;
     }
 

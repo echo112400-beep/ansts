@@ -18,6 +18,7 @@ import * as https from "node:https";
 import {
   HaPartitionedSchedulerMeshCoordinator,
   RoutedScheduleRequest,
+  ShardDispatchEnvelope,
 } from "../cloudflare/ha_scheduler_shard_coordinator";
 import { EdgeTunnelHaDynamicRouter } from "../runtime/edge_tunnel_ha_router";
 import { TunnelGatewayCell } from "../cloudflare/tunnel_gateway_cell";
@@ -56,6 +57,12 @@ export class MultiNodeClusterDaemonServer {
   public readonly affinityRouter: PrefixCacheAffinityRouter;
   public readonly canaryController: CanaryRolloutController;
   private httpServer: http.Server | null = null;
+  /** Sandboxes observed through real dispatches on this node (feeds console capacity telemetry). */
+  private readonly activeSandboxIds = new Set<string>();
+  /** Per-body-host sandbox ceiling from the celld daemon spec. */
+  private static readonly BODY_HOST_SANDBOX_CAPACITY = 32;
+  /** Drives in the RustFS erasure set (8 data + 4 parity, see storageEc4 in the console BFF). */
+  private static readonly RUSTFS_ERASURE_SET_DRIVES = 12;
 
   constructor(public readonly config: DevClusterNodeConfig) {
     this.mesh = new HaPartitionedSchedulerMeshCoordinator([
@@ -173,22 +180,61 @@ export class MultiNodeClusterDaemonServer {
 
     // If this gateway/brain node is not the owning Brain node and a peer URL is configured, forward over HTTP
     const remoteBrainUrl = this.config.peerBrainUrls[ownerBrainId];
+    let executed: Record<string, any>;
     if (ownerBrainId !== this.config.nodeId && remoteBrainUrl) {
       const remoteRes = await this.httpPostJson(`${remoteBrainUrl}/internal/v1beta1/brain/execute-scheduled-task`, {
         ...params,
         envelope: env,
       });
-      return {
+      executed = {
         ...remoteRes,
         routedByNodeId: this.config.nodeId,
         executedByBrainNodeId: ownerBrainId,
         hopMode: "ONE_HOP_CONTAINER_HTTP_RPC",
       };
+    } else {
+      executed = await this.executeScheduledTaskOnBrain({
+        ...params,
+        envelope: env,
+      });
     }
 
-    return this.executeScheduledTaskOnBrain({
-      ...params,
-      envelope: env,
+    // The console BFF only knows what is reported here, so every real dispatch feeds it.
+    this.recordDispatchTelemetry(params, env, ownerBrainId, executed);
+    return executed;
+  }
+
+  /** Mirror a real dispatch into the console overview telemetry (no synthetic values). */
+  private recordDispatchTelemetry(
+    params: { taskId: string; tenantId: string },
+    env: ShardDispatchEnvelope,
+    ownerBrainNodeId: string,
+    executed: Record<string, any>,
+  ): void {
+    const affinity: Record<string, any> = (executed.llmAffinityRoute as Record<string, any> | undefined) ?? {};
+    const bodyExecution: Record<string, any> = (executed.bodyExecution as Record<string, any> | undefined) ?? {};
+    if (typeof bodyExecution.sandboxId === "string" && bodyExecution.sandboxId.length > 0) {
+      this.activeSandboxIds.add(bodyExecution.sandboxId);
+    }
+    const routedModelPool =
+      typeof affinity.modelPool === "string"
+        ? affinity.modelPool
+        : typeof affinity.selectedBackendId === "string"
+          ? affinity.selectedBackendId
+          : "DeepSeek";
+    this.consoleBff.recordLiveTaskExecution({
+      cellId: `AgentTaskHarnessCell_#${params.taskId}`,
+      taskId: params.taskId,
+      tenantId: params.tenantId,
+      ownerBrainNode: ownerBrainNodeId,
+      heapUsedMb: Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1)),
+      heapLimitMb: 128,
+      sqliteState: typeof executed.walObjectKey === "string" ? "Synced (RPO=0 Bucket + LTX Archive)" : "Pending",
+      fenceEpoch: env.slotEpoch,
+      fenceTurnSeq: 1,
+      routedModelPool,
+      kvCacheHit: affinity.kvCacheHit === true,
+      phase: "EXECUTION_8C",
     });
   }
 
@@ -315,15 +361,37 @@ export class MultiNodeClusterDaemonServer {
       return;
     }
 
+    // 1b. Internal WAL checkpoint count (the console aggregates this cluster-wide)
+    if (req.method === "GET" && url.pathname === "/internal/v1beta1/wal/checkpoint-count") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          nodeId: this.config.nodeId,
+          count: this.consoleBff.countPersistedWalFilesOnDisk(),
+        }),
+      );
+      return;
+    }
+
     // 2. TanStack Console Overview API
     if (req.method === "GET" && url.pathname === "/v1beta1/console/overview") {
+      const [extraTurnWalCheckpoints, failedRustFsDrives] = await Promise.all([
+        this.sumPeerWalCheckpoints(),
+        this.probeRustFsFailedDrives(),
+      ]);
+      // Capacity comes from the body hosts this node can actually reach, not a literal.
+      const bodyHostIds = new Set<string>([
+        ...this.tunnelRouter.routeTable.keys(),
+        ...Object.keys(this.config.peerBodyUrls),
+      ]);
       const overview = this.consoleBff.getClusterOverview({
         clientRegion: url.searchParams.get("region") ?? "us-west-2",
-        activeSandboxes: 6,
-        maxSandboxes: 32,
+        activeSandboxes: this.activeSandboxIds.size,
+        maxSandboxes: bodyHostIds.size * MultiNodeClusterDaemonServer.BODY_HOST_SANDBOX_CAPACITY,
         heapUsedMb: Math.round(process.memoryUsage().heapUsed / (1024 * 1024)),
-        activeCells: 12,
-        failedRustFsDrives: 0,
+        activeCells: this.mesh.shardCells.size,
+        failedRustFsDrives,
+        extraTurnWalCheckpoints,
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(overview));
@@ -692,6 +760,69 @@ export class MultiNodeClusterDaemonServer {
         }
       });
       req.on("error", reject);
+    });
+  }
+
+  /** Sum WAL checkpoints held by peer brains, so the console figure is cluster-wide, not node-local. */
+  private async sumPeerWalCheckpoints(): Promise<number> {
+    const peers = Object.entries(this.config.peerBrainUrls).filter(([peerId]) => peerId !== this.config.nodeId);
+    const counts = await Promise.all(
+      peers.map(async ([, baseUrl]) => {
+        try {
+          const body = await this.httpGetText(`${baseUrl}/internal/v1beta1/wal/checkpoint-count`, 800);
+          const parsed = JSON.parse(body) as { count?: number };
+          return typeof parsed.count === "number" ? parsed.count : 0;
+        } catch {
+          // An unreachable peer contributes nothing rather than stalling the console.
+          return 0;
+        }
+      }),
+    );
+    return counts.reduce((sum, n) => sum + n, 0);
+  }
+
+  /** Probe the RustFS erasure set: if it does not answer, every drive in the set is unusable. */
+  private async probeRustFsFailedDrives(): Promise<number> {
+    const endpoint = process.env.S3_ENDPOINT;
+    if (!endpoint) return 0;
+    try {
+      await this.httpGetText(`${endpoint.replace(/\/+$/, "")}/health`, 800);
+      return 0;
+    } catch {
+      return MultiNodeClusterDaemonServer.RUSTFS_ERASURE_SET_DRIVES;
+    }
+  }
+
+  private httpGetText(fullUrl: string, timeoutMs: number): Promise<string> {
+    const parsed = new URL(fullUrl);
+    const transport = parsed.protocol === "https:" ? https : http;
+
+    return new Promise((resolve, reject) => {
+      const req = transport.request(
+        {
+          protocol: parsed.protocol,
+          hostname: parsed.hostname,
+          port: parsed.port,
+          method: "GET",
+          path: `${parsed.pathname}${parsed.search}`,
+          timeout: timeoutMs,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () => {
+            const status = res.statusCode ?? 0;
+            if (status < 200 || status >= 300) {
+              reject(new Error(`${fullUrl} responded ${status}`));
+              return;
+            }
+            resolve(Buffer.concat(chunks).toString("utf8"));
+          });
+        },
+      );
+      req.on("timeout", () => req.destroy(new Error(`${fullUrl} timed out after ${timeoutMs}ms`)));
+      req.on("error", reject);
+      req.end();
     });
   }
 

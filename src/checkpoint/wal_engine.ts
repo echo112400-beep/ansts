@@ -4,7 +4,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { CheckpointRecord, FenceToken, TurnWalFrame } from "../models.js";
+import { CheckpointRecord, FenceToken, TaskState, TurnWalFrame } from "../models.js";
 import { StaleFenceError } from "../lease_coordinator.js";
 
 export interface WalDeltaEntry {
@@ -31,6 +31,71 @@ export class TurnWalEngine {
 
   constructor(public readonly walDir: string = "/tmp/ansts_turnwal") {
     fs.mkdirSync(this.walDir, { recursive: true });
+    this.hydrateFramesFromDisk();
+  }
+
+  /**
+   * Loads frames already persisted in `walDir` so a restarted gateway can still replay them
+   * (`listTaskFrames` / `resumeAndCatchUpFromWal`) instead of reporting an empty WAL.
+   */
+  private hydrateFramesFromDisk(): void {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(this.walDir);
+    } catch {
+      return;
+    }
+    const frames: TurnWalFrame[] = [];
+    for (const entry of entries) {
+      if (!entry.endsWith(".wal")) continue;
+      try {
+        const raw = fs.readFileSync(path.join(this.walDir, entry), "utf8");
+        const parsed = JSON.parse(raw) as {
+          frameId: string;
+          taskId: string;
+          turnIndex: number;
+          fence: { epoch: number; turn_seq: number; task_id: string };
+          changedFiles: string[];
+          sqliteWalPages: number;
+          crc32Hex: string;
+          state: TaskState;
+          routedModel: string;
+          tokensUsed: number;
+          workspaceMerkleHash: string;
+          diffSnapshot: string;
+          createdAtMs: number;
+        };
+        frames.push(
+          new TurnWalFrame({
+            frameId: parsed.frameId,
+            taskId: parsed.taskId,
+            turnIndex: parsed.turnIndex,
+            fence: new FenceToken(parsed.fence.epoch, parsed.fence.turn_seq, parsed.fence.task_id),
+            changedFiles: parsed.changedFiles ?? [],
+            sqliteWalPages: parsed.sqliteWalPages ?? 0,
+            crc32Hex: parsed.crc32Hex,
+            state: parsed.state,
+            routedModel: parsed.routedModel,
+            tokensUsed: parsed.tokensUsed,
+            workspaceMerkleHash: parsed.workspaceMerkleHash,
+            diffSnapshot: parsed.diffSnapshot,
+            createdAtMs: parsed.createdAtMs,
+          }),
+        );
+      } catch {
+        // A partially written or corrupt frame is skipped; it must not block the rest of the WAL.
+      }
+    }
+    frames.sort((a, b) => a.fence.turnSeq - b.fence.turnSeq || a.createdAtMs - b.createdAtMs);
+    for (const frame of frames) {
+      const existing = this.framesByTask.get(frame.taskId) ?? [];
+      const alreadyIndexed = existing.some(
+        (f) => f.frameId === frame.frameId || f.fence.turnSeq === frame.fence.turnSeq,
+      );
+      if (alreadyIndexed) continue;
+      existing.push(frame);
+      this.framesByTask.set(frame.taskId, existing);
+    }
   }
 
   public appendTurnDelta(params: {
@@ -98,7 +163,15 @@ export class TurnWalEngine {
 
   private recordFrame(frame: TurnWalFrame): void {
     const frames = this.framesByTask.get(frame.taskId) ?? [];
-    frames.push(frame);
+    const existingIndex = frames.findIndex((f) => f.fence.turnSeq === frame.fence.turnSeq);
+    if (existingIndex >= 0) {
+      // One WAL frame per turn: a replayed/persisted frame replaces the indexed one instead of
+      // appending a duplicate that catch-up replay would emit twice.
+      frames[existingIndex] = frame;
+    } else {
+      frames.push(frame);
+      frames.sort((a, b) => a.fence.turnSeq - b.fence.turnSeq);
+    }
     this.framesByTask.set(frame.taskId, frames);
   }
 
@@ -137,6 +210,9 @@ export class TurnWalEngine {
     const alreadyPresent = fs.existsSync(filePath) || existingEtag !== undefined;
     if (alreadyPresent && (ifNoneMatchEtag === undefined || ifNoneMatchEtag === existingEtag)) {
       this.idempotentSkipObjectKeys.push(objectKey);
+      // The frame is already durable, but it still belongs in the in-memory index or catch-up replay
+      // would silently drop it.
+      this.recordFrame(frame);
       return objectKey;
     }
 

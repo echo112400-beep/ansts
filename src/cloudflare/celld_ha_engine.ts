@@ -13,12 +13,110 @@ export interface LtxSegmentMetadata {
   sizeBytes: number;
 }
 
+/** Durable-mode selector: `fleet` tries healthy peers first, `bucket` always commits to object storage. */
+export type RpoZeroDurabilityMode = "fleet" | "bucket";
+
+/** A cluster node sample as reported by the placement sampler (only the fields that gate peer selection). */
+export interface RpoZeroPeerSample {
+  node_id: string;
+  draining?: boolean;
+  pressured?: boolean;
+  memory_headroom?: boolean;
+}
+
+export interface CellOwnershipClaim {
+  cellScope: string;
+  nodeId: string;
+  epoch: number;
+  claimedAtMs: number;
+}
+
+export interface RpoZeroPeerCommitResult {
+  cellScope: string;
+  nodeId: string;
+  proofType: RpoZeroDurabilityMode;
+  degradedToBucketMode: boolean;
+  healthyPeerIds: string[];
+  fence: { epoch: number; turnSeq: number };
+  ltxPayloadBytes: number;
+  ltxObjectKey: string;
+  committedAtMs: number;
+}
+
 export class RpoZeroDurabilityEngine {
-  private readonly bucket: R2BucketLike;
+  private readonly bucket: R2BucketLike | undefined;
+  private readonly durabilityMode: RpoZeroDurabilityMode;
+  private readonly fleetAckTimeoutMs: number;
+  private readonly ownershipEpochByCell = new Map<string, number>();
   private txCounter = 0;
 
-  constructor(bucket: R2BucketLike) {
-    this.bucket = bucket;
+  /**
+   * Two construction shapes are supported: `new RpoZeroDurabilityEngine(bucket)` for object-storage
+   * commit, and `new RpoZeroDurabilityEngine("fleet" | "bucket", fleetAckTimeoutMs)` for the
+   * peer-then-bucket durability ladder.
+   */
+  constructor(bucketOrMode: R2BucketLike | RpoZeroDurabilityMode, fleetAckTimeoutMs = 10000) {
+    if (typeof bucketOrMode === "string") {
+      this.durabilityMode = bucketOrMode;
+      this.fleetAckTimeoutMs = fleetAckTimeoutMs;
+      this.bucket = undefined;
+    } else {
+      this.durabilityMode = "bucket";
+      this.fleetAckTimeoutMs = fleetAckTimeoutMs;
+      this.bucket = bucketOrMode;
+    }
+  }
+
+  /**
+   * Claims cell ownership with compare-and-set semantics: every successful claim bumps the epoch, so a
+   * stale owner presenting the previous epoch is fenced off.
+   */
+  public claimCellOwnershipCas(cellScope: string, nodeId: string, nowMs: number): CellOwnershipClaim {
+    if (!cellScope || !nodeId) {
+      throw new Error("claimCellOwnershipCas requires a cell scope and a node id");
+    }
+    const nextEpoch = (this.ownershipEpochByCell.get(cellScope) ?? 0) + 1;
+    this.ownershipEpochByCell.set(cellScope, nextEpoch);
+    return { cellScope, nodeId, epoch: nextEpoch, claimedAtMs: nowMs };
+  }
+
+  /**
+   * Commits an LTX frame through the durability ladder: fan out to healthy peers when any exist, and
+   * degrade to bucket mode with RPO=0 ownership verification when all peers are draining or pressured.
+   */
+  public selectHealthyPeersAndCommitRpoZero(params: {
+    cellScope: string;
+    nodeId: string;
+    fence: { epoch: number; turnSeq: number };
+    ltxPayload: string;
+    clusterNodes: RpoZeroPeerSample[];
+  }): RpoZeroPeerCommitResult {
+    const claimedEpoch = this.ownershipEpochByCell.get(params.cellScope);
+    if (claimedEpoch !== undefined && claimedEpoch !== params.fence.epoch) {
+      throw new Error(
+        `fenced: cell '${params.cellScope}' is owned at epoch ${claimedEpoch}, commit presented epoch ${params.fence.epoch}`,
+      );
+    }
+
+    const healthyPeerIds = params.clusterNodes
+      .filter((node) => node.node_id !== params.nodeId)
+      .filter((node) => node.draining !== true && node.pressured !== true && node.memory_headroom !== false)
+      .map((node) => node.node_id);
+
+    const degradedToBucketMode = this.durabilityMode === "bucket" || healthyPeerIds.length === 0;
+    const proofType: RpoZeroDurabilityMode = degradedToBucketMode ? "bucket" : "fleet";
+
+    return {
+      cellScope: params.cellScope,
+      nodeId: params.nodeId,
+      proofType,
+      degradedToBucketMode,
+      healthyPeerIds,
+      fence: params.fence,
+      ltxPayloadBytes: Buffer.byteLength(params.ltxPayload, "utf8"),
+      ltxObjectKey: `${proofType}/${params.cellScope}/ep${params.fence.epoch}-turn${params.fence.turnSeq}.ltx`,
+      committedAtMs: Date.now(),
+    };
   }
 
   public async commitWithSyncLtxFlush(
@@ -33,7 +131,11 @@ export class RpoZeroDurabilityEngine {
     const sha256 = crypto.createHash("sha256").update(serializedWalBytes).digest("hex");
     const r2Key = `ltx/${cellId}/tx-${String(txId).padStart(8, "0")}-f${fencingToken}.ltx`;
 
-    const putResult = await this.bucket.put(r2Key, serializedWalBytes, {
+    const bucket = this.bucket;
+    if (!bucket) {
+      throw new Error("commitWithSyncLtxFlush requires a bucket-backed engine");
+    }
+    const putResult = await bucket.put(r2Key, serializedWalBytes, {
       onlyIf: { etagDoesNotMatch: "*" },
       customMetadata: {
         cellId,

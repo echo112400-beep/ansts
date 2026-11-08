@@ -31,6 +31,33 @@ import { DistributedOrphanGcSweeper } from "../storage/distributed_gc_sweeper";
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
+
+/** Resolve the shipped version from the nearest package.json (repo root in dev, /app in a container). */
+function resolvePackageVersion(): string {
+  const starts: string[] = [];
+  if (typeof __dirname === "string") starts.push(__dirname);
+  starts.push(process.cwd());
+  for (const start of starts) {
+    let dir = start;
+    for (let i = 0; i < 6; i += 1) {
+      const candidate = path.join(dir, "package.json");
+      if (fs.existsSync(candidate)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(candidate, "utf-8")) as { version?: string };
+          if (typeof pkg.version === "string" && pkg.version.length > 0) return `v${pkg.version}`;
+        } catch {
+          // Malformed package.json: keep walking upwards.
+        }
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  return "v0.0.0";
+}
+const ANSTS_PACKAGE_VERSION = resolvePackageVersion();
 import { ShadowTrafficReplayLab } from "./shadow_eval_lab";
 import { CapacitySlaEnforcer } from "../cluster/capacity_sla_enforcer";
 import { MultiRegionGeoRouter } from "../cluster/geo_routing";
@@ -148,7 +175,10 @@ export class ConsoleBffController {
     public readonly canaryController?: CanaryRolloutController,
   ) {
     this.ebpfBridge = new EbpfLsmRingBufferBridge(this.securityGuard);
-    this.ensureDefaultConsoleSeedData();
+    // Demo seeds are opt-in: a real deployment fills the roster from actual registrations.
+    if (process.env.ANSTS_CONSOLE_SEED_DEMO === "1") {
+      this.ensureDefaultConsoleSeedData();
+    }
   }
 
   public recordLiveTaskExecution(entry: LiveHarnessCellTelemetry): void {
@@ -344,6 +374,8 @@ export class ConsoleBffController {
     heapUsedMb: number;
     activeCells: number;
     failedRustFsDrives?: number;
+    /** WAL checkpoints held by other nodes, summed by the caller so the count is cluster-wide. */
+    extraTurnWalCheckpoints?: number;
   }) {
     const startCasHr = process.hrtime.bigint();
     const geoRoute = this.geoRouter.routeRequest(params.clientRegion);
@@ -404,7 +436,7 @@ export class ConsoleBffController {
     }
 
     return {
-      version: "v2.6.0",
+      version: ANSTS_PACKAGE_VERSION,
       clusterHealthy: brainVerdict.allowed && rustFsVerdict.rpoZeroGuaranteed,
       rpoZeroGuaranteed: rustFsVerdict.rpoZeroGuaranteed,
       selectedRegion: geoRoute.selectedRegion,
@@ -414,7 +446,7 @@ export class ConsoleBffController {
       pendingHitlApprovalsCount: pendingHitlCount,
       globalUptimePct: brainVerdict.allowed && rustFsVerdict.rpoZeroGuaranteed ? 100.0 : 99.5,
       averageMtlsRttMs: this.measureLiveTunnelRttMs(),
-      turnWalCheckpointsCount: this.countPersistedWalFilesOnDisk(),
+      turnWalCheckpointsCount: this.countPersistedWalFilesOnDisk() + (params.extraTurnWalCheckpoints ?? 0),
       sandboxes: {
         active: params.activeSandboxes,
         limit: params.maxSandboxes,
