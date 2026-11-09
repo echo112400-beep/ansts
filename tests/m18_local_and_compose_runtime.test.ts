@@ -118,5 +118,48 @@ describe("M18 Local Host & Docker Compose Unified Service Runtime Suite", () => 
 
     const runLocal = fs.readFileSync(path.join(process.cwd(), "scripts/run-local.sh"), "utf-8");
     assert.ok(runLocal.includes("exec node dist/src/server_main.js"));
+
+    const devClusterCompose = fs.readFileSync(
+      path.join(process.cwd(), "deploy/dev-cluster/docker-compose.dev-cluster.yml"),
+      "utf-8"
+    );
+    assert.ok(devClusterCompose.includes("celld-brain-01:"));
+    assert.ok(devClusterCompose.includes("body-daemon-01:"));
+    assert.ok(devClusterCompose.includes("ansts-gateway-01:"));
+    assert.ok(devClusterCompose.includes("tanstack-console:"));
+    assert.ok(devClusterCompose.includes('"http://celld-brain-02:8082"'));
+  });
+
+  it("5. Verifies v2.5 dev-cluster Dual-Homed Tunnel Registration, Distributed Task Dispatch & TanStack Console BFF endpoints", async () => {
+    const server = new AnstsLocalAndComposeServer({ host: "127.0.0.1", workerNodeCount: 2 });
+    const { apiPort } = await server.start(0, 0);
+    try {
+      const tunRes = await fetch(`http://127.0.0.1:${apiPort}/internal/v1beta1/tunnel/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ hostId: "body-host-01", gatewayId: "celld-gw-01", role: "PRIMARY", epoch: 1 }),
+      });
+      assert.equal(tunRes.status, 200);
+
+      const dispRes = await fetch(`http://127.0.0.1:${apiPort}/v1beta1/tasks/dispatch`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          tenantId: "tenant-alpha",
+          taskId: "task-distributed-001",
+          promptText: "verify distributed celld dispatch",
+          targetBodyHostId: "body-host-01",
+        }),
+      });
+      assert.equal(dispRes.status, 202);
+
+      const ovRes = await fetch(`http://127.0.0.1:${apiPort}/v1beta1/console/overview?region=us-west-2`);
+      assert.equal(ovRes.status, 200);
+
+      const shRes = await fetch(`http://127.0.0.1:${apiPort}/v1beta1/console/shards`);
+      assert.equal(shRes.status, 200);
+    } finally {
+      await server.stop();
+    }
   });
 });

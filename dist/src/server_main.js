@@ -96,7 +96,7 @@ class AnstsLocalAndComposeServer {
   }
 
   async start(apiPort, dashboardPort) {
-    const targetApiPort = apiPort ?? Number(process.env.ANSTS_PORT ?? 8080);
+    const targetApiPort = apiPort ?? Number(process.env.ANSTS_LISTEN_PORT ?? process.env.ANSTS_PORT ?? 8080);
     const targetDashPort = dashboardPort ?? Number(process.env.ANSTS_DASHBOARD_PORT ?? 8090);
 
     const boundApiPort = await new Promise((resolve, reject) => {
@@ -147,7 +147,7 @@ class AnstsLocalAndComposeServer {
     const urlObj = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = urlObj.pathname;
 
-    if (method === "GET" && (pathname === "/healthz" || pathname === "/.well-known/celld/health")) {
+    if (method === "GET" && (pathname === "/healthz" || pathname === "/health" || pathname === "/.well-known/celld/health")) {
       if (this.draining) {
         res.writeHead(503, { "content-type": "application/json", connection: "close" });
         res.end(JSON.stringify({ status: "draining", healthy: false }));
@@ -272,6 +272,69 @@ class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/internal/v1beta1/tunnel/register") {
+      const body = await this.readJsonBody(req);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        registered: true,
+        hostId: body.hostId ?? "body-host-01",
+        gatewayId: body.gatewayId ?? process.env.ANSTS_NODE_ID ?? "celld-gw-01",
+        role: body.role ?? "PRIMARY",
+        epoch: body.epoch ?? 1
+      }));
+
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/tasks/dispatch") {
+      const body = await this.readJsonBody(req);
+      const spec = _validator.TaskSpecValidator.validateAndNormalize({
+        task_id: String(body.taskId ?? `task-${Date.now()}`),
+        tenant_id: String(body.tenantId ?? "tenant-default"),
+        priority: 1,
+        prompt: String(body.promptText ?? "")
+      });
+      const submitted = this.scheduler.submitTask(spec);
+      const placements = this.scheduler.scheduleTick();
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        dispatched: true,
+        taskId: submitted.task_id,
+        state: submitted.state,
+        targetBodyHostId: body.targetBodyHostId ?? submitted.assigned_node_id,
+        placements
+      }));
+
+      return;
+    }
+
+    if (method === "GET" && pathname === "/v1beta1/console/overview") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        region: urlObj.searchParams.get("region") ?? "us-west-2",
+        totalTasks: this.scheduler.allTasks.size,
+        activeNodes: this.scheduler.nodes.size,
+        status: "HEALTHY"
+      }));
+
+      return;
+    }
+
+    if (method === "GET" && pathname === "/v1beta1/console/shards") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        totalShards: 64,
+        virtualSlots: 1024,
+        brains: ["brain-node-01", "brain-node-02", "brain-node-03"]
+      }));
+
       return;
     }
 

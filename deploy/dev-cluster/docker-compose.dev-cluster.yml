@@ -1,0 +1,283 @@
+name: ansts-v25-dev-cluster
+
+x-ansts-common-env: &ansts-common-env
+  ANSTS_RUNTIME_PROFILE: "development"
+  CELLD_BUCKET: "s3://ansts-fleet"
+  S3_ENDPOINT: "http://rustfs:9000"
+  AWS_ACCESS_KEY_ID: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+  AWS_SECRET_ACCESS_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
+  AWS_REGION: "us-east-1"
+  CELLD_DURABILITY: "fleet"
+  ANSTS_PEER_BRAIN_URLS: '{"brain-node-01":"http://celld-brain-01:8081","brain-node-02":"http://celld-brain-02:8082","brain-node-03":"http://celld-brain-03:8083"}'
+  ANSTS_PEER_BODY_URLS: '{"body-host-01":"http://body-daemon-01:9501","body-host-02":"http://body-daemon-02:9502"}'
+
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: ansts-dev-rustfs
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - rustfs_dev_data:/data
+    environment:
+      RUSTFS_VOLUMES: "/data"
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
+    command: ["/data"]
+    networks:
+      - ansts_mesh_net
+
+  celld-brain-01:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dev
+    container_name: ansts-celld-brain-01
+    ports:
+      - "18082:8081"
+    volumes:
+      - brain_01_data:/var/lib/ansts/brain-node-01
+    environment:
+      <<: *ansts-common-env
+      ANSTS_NODE_ID: "brain-node-01"
+      ANSTS_NODE_ROLE: "brain"
+      ANSTS_LISTEN_PORT: "8081"
+      ANSTS_STORAGE_DIR: "/var/lib/ansts/brain-node-01"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/state"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ansts_mesh_net
+
+  celld-brain-02:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dev
+    container_name: ansts-celld-brain-02
+    ports:
+      - "18083:8082"
+    volumes:
+      - brain_02_data:/var/lib/ansts/brain-node-02
+    environment:
+      <<: *ansts-common-env
+      ANSTS_NODE_ID: "brain-node-02"
+      ANSTS_NODE_ROLE: "brain"
+      ANSTS_LISTEN_PORT: "8082"
+      ANSTS_STORAGE_DIR: "/var/lib/ansts/brain-node-02"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/state"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ansts_mesh_net
+
+  celld-brain-03:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dev
+    container_name: ansts-celld-brain-03
+    ports:
+      - "18084:8083"
+    volumes:
+      - brain_03_data:/var/lib/ansts/brain-node-03
+    environment:
+      <<: *ansts-common-env
+      ANSTS_NODE_ID: "brain-node-03"
+      ANSTS_NODE_ROLE: "brain"
+      ANSTS_LISTEN_PORT: "8083"
+      ANSTS_STORAGE_DIR: "/var/lib/ansts/brain-node-03"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8083/state"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ansts_mesh_net
+
+  body-daemon-01:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dev
+    container_name: ansts-body-daemon-01
+    privileged: true
+    ports:
+      - "19501:9501"
+    volumes:
+      - body_01_data:/var/lib/ansts/body-host-01
+    environment:
+      <<: *ansts-common-env
+      ANSTS_NODE_ID: "body-host-01"
+      ANSTS_NODE_ROLE: "body"
+      ANSTS_LISTEN_PORT: "9501"
+      ANSTS_STORAGE_DIR: "/var/lib/ansts/body-host-01"
+      ANSTS_PRIMARY_GATEWAY_URL: "http://ansts-gateway-01:8080"
+      ANSTS_SECONDARY_GATEWAY_URL: "http://ansts-gateway-02:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9501/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ansts_mesh_net
+
+  body-daemon-02:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dev
+    container_name: ansts-body-daemon-02
+    privileged: true
+    ports:
+      - "19502:9502"
+    volumes:
+      - body_02_data:/var/lib/ansts/body-host-02
+    environment:
+      <<: *ansts-common-env
+      ANSTS_NODE_ID: "body-host-02"
+      ANSTS_NODE_ROLE: "body"
+      ANSTS_LISTEN_PORT: "9502"
+      ANSTS_STORAGE_DIR: "/var/lib/ansts/body-host-02"
+      ANSTS_PRIMARY_GATEWAY_URL: "http://ansts-gateway-02:8080"
+      ANSTS_SECONDARY_GATEWAY_URL: "http://ansts-gateway-01:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9502/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ansts_mesh_net
+
+  ansts-gateway-01:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dev
+    container_name: ansts-gateway-01
+    depends_on:
+      celld-brain-01:
+        condition: service_healthy
+      celld-brain-02:
+        condition: service_healthy
+      celld-brain-03:
+        condition: service_healthy
+      body-daemon-01:
+        condition: service_healthy
+      body-daemon-02:
+        condition: service_healthy
+    ports:
+      - "18080:8080"
+    environment:
+      <<: *ansts-common-env
+      ANSTS_NODE_ID: "celld-gw-01"
+      ANSTS_NODE_ROLE: "gateway"
+      ANSTS_LISTEN_PORT: "8080"
+      ANSTS_STORAGE_DIR: "/tmp/ansts/celld-gw-01"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ansts_mesh_net
+
+  ansts-gateway-02:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.dev
+    container_name: ansts-gateway-02
+    depends_on:
+      celld-brain-01:
+        condition: service_healthy
+      celld-brain-02:
+        condition: service_healthy
+      celld-brain-03:
+        condition: service_healthy
+      body-daemon-01:
+        condition: service_healthy
+      body-daemon-02:
+        condition: service_healthy
+    ports:
+      - "18081:8080"
+    environment:
+      <<: *ansts-common-env
+      ANSTS_NODE_ID: "celld-gw-02"
+      ANSTS_NODE_ROLE: "gateway"
+      ANSTS_LISTEN_PORT: "8080"
+      ANSTS_STORAGE_DIR: "/tmp/ansts/celld-gw-02"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ansts_mesh_net
+
+  tanstack-console:
+    image: nginx:1.27-alpine
+    container_name: ansts-tanstack-console
+    depends_on:
+      ansts-gateway-01:
+        condition: service_healthy
+      ansts-gateway-02:
+        condition: service_healthy
+    ports:
+      - "8088:80"
+    volumes:
+      - ../../docs:/usr/share/nginx/html:ro
+      - ./nginx-tanstack-console.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ansts_mesh_net
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: ansts-dev-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    networks:
+      - ansts_mesh_net
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: ansts-dev-grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../observability/grafana-dashboard.json:/var/lib/grafana/dashboards/ansts.json:ro
+    networks:
+      - ansts_mesh_net
+
+networks:
+  ansts_mesh_net:
+    driver: bridge
+
+volumes:
+  rustfs_dev_data:
+  brain_01_data:
+  brain_02_data:
+  brain_03_data:
+  body_01_data:
+  body_02_data:
+  prometheus_data:
+  grafana_data:

@@ -147,6 +147,7 @@ function runLint() {
 
   const composeFiles = [
     path.join(ROOT_DIR, "docker-compose.yml"),
+    path.join(ROOT_DIR, "deploy", "dev-cluster", "docker-compose.dev-cluster.yml"),
     path.join(ROOT_DIR, "deploy", "rustfs-celld", "docker-compose.rustfs-celld.yml"),
     path.join(ROOT_DIR, "deploy", "rustfs-celld", "docker-compose.rustfs-ha.yml"),
   ];
