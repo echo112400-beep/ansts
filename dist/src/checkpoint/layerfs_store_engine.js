@@ -213,4 +213,21 @@ class LayerFsContentStoreEngine {
       dedupAndCompressionRatio: ratio
     };
   }
+
+  listAllObjectIds() {
+    return Array.from(this.objects.keys());
+  }
+
+  getObjectBaseId(objectId) {
+    return this.objects.get(objectId)?.baseObjectId;
+  }
+
+  deleteObjectById(objectId) {
+    const obj = this.objects.get(objectId);
+    if (!obj) return 0;
+    const freed = obj.compressedBytes;
+    this.storedCompressedBytes = Math.max(0, this.storedCompressedBytes - freed);
+    this.objects.delete(objectId);
+    return freed;
+  }
 }exports.LayerFsContentStoreEngine = LayerFsContentStoreEngine;

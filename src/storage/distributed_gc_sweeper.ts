@@ -1,6 +1,10 @@
 /**
  * @fileoverview Distributed Mark-and-Sweep CAS Object Store Garbage Collector.
+ * Connected to `LayerFsWorkspaceDriver` & `LayerFsContentStoreEngine` to sweep unreferenced blocks
+ * from deleted/aborted branches while preserving all active commit & delta base objects.
  */
+import { LayerFsWorkspaceDriver } from "../runtime/layerfs_workspace_driver.js";
+
 export class DistributedCasGcSweeper {
   public sweepUnreferencedBlobs(params: {
     allBlobIds: string[];
@@ -17,5 +21,28 @@ export class DistributedCasGcSweeper {
       else sweptBlobIds.push(id);
     }
     return { retainedBlobIds, sweptBlobIds };
+  }
+
+  /**
+   * Performs a live mark-and-sweep GC pass directly against a `LayerFsWorkspaceDriver`,
+   * preserving all objects reachable from active branch commit chains (including DELTA base objects)
+   * and physically deleting unreferenced orphan objects from `storeEngine`.
+   */
+  public sweepLayerFsWorkspaceStore(driver: LayerFsWorkspaceDriver): {
+    retainedBlobIds: string[];
+    sweptBlobIds: string[];
+    reclaimedBytes: number;
+  } {
+    const allBlobIds = driver.storeEngine.listAllObjectIds();
+    const activeCommitRoots = driver.collectReachableBranchObjects();
+    const { retainedBlobIds, sweptBlobIds } = this.sweepUnreferencedBlobs({
+      allBlobIds,
+      activeCommitRoots,
+    });
+    let reclaimedBytes = 0;
+    for (const orphanId of sweptBlobIds) {
+      reclaimedBytes += driver.storeEngine.deleteObjectById(orphanId);
+    }
+    return { retainedBlobIds, sweptBlobIds, reclaimedBytes };
   }
 }

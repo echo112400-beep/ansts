@@ -5,6 +5,14 @@ class TopologyCasCoordinator {
   generation = 0;
   members = [];
 
+  getGeneration() {
+    return this.generation;
+  }
+
+  getMembers() {
+    return [...this.members];
+  }
+
   updateTopologyCas(expectedGeneration, nextMembers)
 
 
@@ -12,6 +20,12 @@ class TopologyCasCoordinator {
     if (expectedGeneration !== this.generation) {
       throw new Error(`Topology CAS conflict: expected gen=${expectedGeneration}, actual=${this.generation}`);
     }
+    this.generation += 1;
+    this.members = [...nextMembers];
+    return { generation: this.generation, members: [...this.members] };
+  }
+
+  forceSyncMembers(nextMembers) {
     this.generation += 1;
     this.members = [...nextMembers];
     return { generation: this.generation, members: [...this.members] };

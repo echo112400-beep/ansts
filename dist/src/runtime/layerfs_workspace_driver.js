@@ -477,4 +477,32 @@ class LayerFsWorkspaceDriver {
       return false;
     }
   }
+
+  deleteBranch(branchName) {
+    if (branchName === "main") {
+      throw new Error("Cannot delete default branch 'main'");
+    }
+    return this.branchHeads.delete(branchName);
+  }
+
+  collectReachableBranchObjects() {
+    const result = new Map();
+    for (const [branchName, headCommitId] of this.branchHeads.entries()) {
+      const objIds = new Set();
+      let cur = this.commits.get(headCommitId);
+      while (cur) {
+        for (const entry of cur.filesTree.values()) {
+          objIds.add(entry.objectId);
+          let baseId = this.storeEngine.getObjectBaseId(entry.objectId);
+          while (baseId) {
+            objIds.add(baseId);
+            baseId = this.storeEngine.getObjectBaseId(baseId);
+          }
+        }
+        cur = cur.parentCommitId ? this.commits.get(cur.parentCommitId) : undefined;
+      }
+      result.set(branchName, Array.from(objIds));
+    }
+    return result;
+  }
 }exports.LayerFsWorkspaceDriver = LayerFsWorkspaceDriver;

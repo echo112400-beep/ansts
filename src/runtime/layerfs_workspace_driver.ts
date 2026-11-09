@@ -477,4 +477,32 @@ export class LayerFsWorkspaceDriver {
       return false;
     }
   }
+
+  public deleteBranch(branchName: string): boolean {
+    if (branchName === "main") {
+      throw new Error("Cannot delete default branch 'main'");
+    }
+    return this.branchHeads.delete(branchName);
+  }
+
+  public collectReachableBranchObjects(): Map<string, string[]> {
+    const result = new Map<string, string[]>();
+    for (const [branchName, headCommitId] of this.branchHeads.entries()) {
+      const objIds = new Set<string>();
+      let cur = this.commits.get(headCommitId);
+      while (cur) {
+        for (const entry of cur.filesTree.values()) {
+          objIds.add(entry.objectId);
+          let baseId = this.storeEngine.getObjectBaseId(entry.objectId);
+          while (baseId) {
+            objIds.add(baseId);
+            baseId = this.storeEngine.getObjectBaseId(baseId);
+          }
+        }
+        cur = cur.parentCommitId ? this.commits.get(cur.parentCommitId) : undefined;
+      }
+      result.set(branchName, Array.from(objIds));
+    }
+    return result;
+  }
 }

@@ -23,7 +23,11 @@ var _saga_gateway = require("./saga_gateway.js");
 var _ha_scheduler_shard_coordinator = require("./cloudflare/ha_scheduler_shard_coordinator.js");
 var _scheduler_v25_persistence = require("./cloudflare/scheduler_v25_persistence.js");
 var _edge_tunnel_ha_router = require("./runtime/edge_tunnel_ha_router.js");
-var _env = require("./cloudflare/env.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var _env = require("./cloudflare/env.js");
+var _blackboard_and_git_arbiter = require("./a2a/blackboard_and_git_arbiter.js");
+var _deadlock_detector = require("./a2a/deadlock_detector.js");
+var _parallel_cow_bisect = require("./a2a/parallel_cow_bisect.js");
+var _distributed_gc_sweeper = require("./storage/distributed_gc_sweeper.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M18 & v2.5 Unified Standalone, Docker Compose & Multi-Node Cluster Service Entrypoint (`src/server_main.ts`).
  * Hardened with:
  * - [P0] Durable Disk-Backed SQL Storage (`DurableDiskCellSqlStorage`) + Cold-Start Rehydration (`RPO=0`) & RustFS S3 LTX Sync
@@ -75,9 +79,14 @@ class AnstsLocalAndComposeServer {
   shardCoordinator;
   v25Store;
   tunnelRouter;
+  blackboard;
+  deadlockDetector;
+  bisectCoordinator;
+  gcSweeper;
   dashboardServer;
   apiServer = null;
   tickTimer = null;
+  tunnelPollTimer = null;
   host;
   tickIntervalMs;
   draining = false;
@@ -116,6 +125,10 @@ class AnstsLocalAndComposeServer {
     }const sqlFilePath = path.join(this.storageDir, "v25_scheduler.sql.json");
     this.v25Store = new _scheduler_v25_persistence.SchedulerV25SingleWritePathStore(new _env.DurableDiskCellSqlStorage(sqlFilePath));
     this.tunnelRouter = new _edge_tunnel_ha_router.EdgeTunnelHaRouter();
+    this.blackboard = new _blackboard_and_git_arbiter.SharedBlackboardAndGitArbiter();
+    this.deadlockDetector = new _deadlock_detector.A2aWaitForGraphDeadlockDetector();
+    this.bisectCoordinator = new _parallel_cow_bisect.ParallelCowGitBisectCoordinator();
+    this.gcSweeper = new _distributed_gc_sweeper.DistributedCasGcSweeper();
 
     const brainNodes =
     Object.keys(this.peerBrainUrls).length > 0 ?
@@ -210,6 +223,11 @@ class AnstsLocalAndComposeServer {
     // If this node is a `body` daemon and gateway URLs are configured, proactively register dual-homed reverse tunnels
     if (this.nodeRole === "body") {
       await this.registerOutboundReverseTunnels();
+      this.tunnelPollTimer = setInterval(() => {
+        if (!this.draining) {
+          this.pollAndExecuteOutboundTunnelCommands().catch(() => {});
+        }
+      }, 40);
     }
 
     this.tickTimer = setInterval(() => {
@@ -248,6 +266,68 @@ class AnstsLocalAndComposeServer {
       } catch {
 
         // ignore if gateway not yet up
+      }}
+  }
+
+
+  async pollAndExecuteOutboundTunnelCommands() {
+    const gatewayUrls = [this.primaryGatewayUrl, this.secondaryGatewayUrl].filter(
+    (u) => Boolean(u && u.trim()));
+
+    for (const gwUrl of gatewayUrls) {
+      try {
+        const baseUrl = gwUrl.replace(/\/$/, "");
+        const pollResp = await fetch(
+        `${baseUrl}/internal/v1beta1/tunnel/poll?hostId=${encodeURIComponent(this.nodeId)}`);
+
+        if (!pollResp.ok) continue;
+        const { commands } = await pollResp.json();
+
+
+        for (const cmd of commands ?? []) {
+          const taskId = String(cmd.payload.taskId ?? `task-${Date.now()}`);
+          const branchName = String(cmd.payload.branchName ?? `task-${taskId}`);
+          if (this.s3Endpoint) {
+            await this.layerfs.pullBranchFromRemoteS3(branchName, this.s3Endpoint);
+          }
+          try {
+            this.layerfs.getBranchHeadCommit(branchName);
+          } catch {
+            this.layerfs.forkBranch("main", branchName);
+          }
+          const execRes = this.layerfs.executeEphemeralBashWorkspace({
+            branchName,
+            agentId: String(cmd.payload.tenantId ?? "tunnel-agent"),
+            stepId: `tunnel-exec-${taskId}`,
+            command: `printf "%s\\n" ${JSON.stringify(String(cmd.payload.promptText ?? "ok"))} > .ansts_tunnel_trace.txt`
+          });
+          let s3Synced = false;
+          if (this.s3Endpoint) {
+            s3Synced = await this.layerfs.pushBranchToRemoteS3(branchName, this.s3Endpoint);
+          }
+          await fetch(`${baseUrl}/internal/v1beta1/tunnel/ack`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              commandId: cmd.commandId,
+              result: {
+                executedByBodyId: this.nodeId,
+                taskId,
+                branchName,
+                commitHash: execRes.commitId,
+                commitId: execRes.commitId,
+                committedNewSnapshot: execRes.committedNewSnapshot,
+                mountLatencyMs: execRes.mountLatencyMs,
+                s3Synced,
+                deliveredViaReverseTunnel: true,
+                status: "COMPLETED"
+              }
+            })
+          });
+        }
+      } catch {
+
+        // ignore transient gateway poll error
       }}
   }
 
@@ -475,6 +555,16 @@ class AnstsLocalAndComposeServer {
     // Internal Brain RPC endpoint (`POST /internal/v1beta1/brain/schedule`) - Strict Single-Write-Path
     if (method === "POST" && pathname === "/internal/v1beta1/brain/schedule") {
       const body = await this.readJsonBody(req);
+      let recoveredFromFailedBrainCount = 0;
+      if (body.failoverFromBrainId && this.s3Endpoint) {
+        recoveredFromFailedBrainCount = await this.v25Store.restoreLtxSnapshotFromS3(
+        this.s3Endpoint,
+        String(body.failoverFromBrainId));
+
+        for (const t of this.v25Store.listPersistedTasks()) {
+          this.scheduler.allTasks.set(t.task_id, t);
+        }
+      }
       const taskId = String(body.taskId ?? `task-${Date.now()}`);
       const tenantId = String(body.tenantId ?? "tenant-default");
       const slotInfo = this.shardCoordinator.resolveBrainForTask(tenantId, taskId);
@@ -519,6 +609,7 @@ class AnstsLocalAndComposeServer {
       res.end(
       JSON.stringify({
         scheduledByBrainId: this.nodeId,
+        recoveredFromFailedBrainCount,
         slot: slotInfo.slotIndex,
         taskId: finalTask.task_id,
         state: finalTask.state,
@@ -605,6 +696,26 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+
+    if (method === "GET" && pathname === "/internal/v1beta1/tunnel/poll") {
+      const hostId = urlObj.searchParams.get("hostId") ?? "body-host-01";
+      const gatewayId = urlObj.searchParams.get("gatewayId") ?? undefined;
+      const commands = this.tunnelRouter.tunnelCell.pollPendingCommands(hostId, gatewayId);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ hostId, commands }));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/internal/v1beta1/tunnel/ack") {
+      const body = await this.readJsonBody(req);
+      const commandId = String(body.commandId ?? "");
+      const result = body.result ?? {};
+      const acked = this.tunnelRouter.tunnelCell.acknowledgeCommand(commandId, result);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ acknowledged: acked, commandId }));
+      return;
+    }
+
     if (method === "POST" && pathname === "/internal/v1beta1/tunnel/health") {
       const body = await this.readJsonBody(req);
       const hostId = String(body.hostId ?? "body-host-01");
@@ -628,8 +739,9 @@ class AnstsLocalAndComposeServer {
       const targetBodyHostId = String(body.targetBodyHostId ?? "body-host-01");
       this.metrics.incCounter("ansts_tasks_dispatched_total", 1);
 
-      // Forward to live peer Brain shard owner if configured in ANSTS_PEER_BRAIN_URLS
+      // Forward to live peer Brain shard owner; if unreachable, automatically evict & failover to surviving Brain shard!
       let remoteBrainResult = null;
+      let failoverEvent = null;
       const brainBaseUrl = this.peerBrainUrls[ownerBrainId];
       if (brainBaseUrl) {
         try {
@@ -648,9 +760,38 @@ class AnstsLocalAndComposeServer {
             remoteBrainResult = await resp.json();
           }
         } catch {
+          // Primary Brain shard is unreachable! Evict from 256-slot ring and failover to surviving Brain
+          const eviction = this.shardCoordinator.evictUnhealthyBrainShardNode(ownerBrainId);
+          const nextResolution = this.shardCoordinator.resolveBrainForTask(tenantId, taskId);
+          const nextBrainId = nextResolution.brainNodeId;
+          if (nextBrainId && this.peerBrainUrls[nextBrainId]) {
+            try {
+              const failResp = await fetch(`${this.peerBrainUrls[nextBrainId]}/internal/v1beta1/brain/schedule`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  taskId,
+                  tenantId,
+                  promptText,
+                  targetBodyHostId,
+                  slot: nextResolution.slotIndex,
+                  failoverFromBrainId: ownerBrainId
+                })
+              });
+              if (failResp.ok) {
+                remoteBrainResult = await failResp.json();
+                failoverEvent = {
+                  evictedBrainNodeId: ownerBrainId,
+                  newOwnerBrainNodeId: nextBrainId,
+                  newTopologyGeneration: eviction.newTopologyGeneration
+                };
+              }
+            } catch {
 
-          // fallback to local schedule if peer brain is unreachable
-        }}
+              // ignore if all brains unreachable
+            }}
+        }
+      }
 
       // Fallback to local schedule only when no peerBrainUrls are configured/reachable
       let localState = "LEASED";
@@ -671,10 +812,10 @@ class AnstsLocalAndComposeServer {
       }
 
       let remoteBodyResult = null;
-      const bodyBaseUrl = this.peerBodyUrls[targetBodyHostId];
-      if (bodyBaseUrl) {
+      const useReverseTunnel = body.dispatchMode === "reverse_tunnel" || !this.peerBodyUrls[targetBodyHostId];
+      if (!useReverseTunnel && this.peerBodyUrls[targetBodyHostId]) {
         try {
-          const resp = await fetch(`${bodyBaseUrl}/internal/v1beta1/body/execute`, {
+          const resp = await fetch(`${this.peerBodyUrls[targetBodyHostId]}/internal/v1beta1/body/execute`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ taskId, tenantId, promptText })
@@ -684,7 +825,23 @@ class AnstsLocalAndComposeServer {
           }
         } catch {
 
-          // fallback if peer body is unreachable
+          // fallback to reverse tunnel below
+        }}
+      if (!remoteBodyResult) {
+        try {
+          const tunnelDispatch = await this.tunnelRouter.dispatchOverReverseTunnel(
+          targetBodyHostId,
+          { taskId, tenantId, promptText },
+          3000);
+
+          remoteBodyResult = {
+            ...tunnelDispatch.executionResult,
+            routedViaGatewayId: tunnelDispatch.routedViaGatewayId,
+            tunnelRole: tunnelDispatch.role
+          };
+        } catch {
+
+          // ignore if no reverse tunnel active
         }}
 
       res.writeHead(202, { "content-type": "application/json" });
@@ -696,6 +853,7 @@ class AnstsLocalAndComposeServer {
         tenantId,
         shardSlot: slotResolution.slotIndex,
         routedBrainNodeId: remoteBrainResult?.scheduledByBrainId ?? ownerBrainId,
+        brainFailover: failoverEvent,
         deduplicated: remoteBrainResult?.deduplicated ?? false,
         fencingToken: remoteBrainResult?.fencingToken ?? localFencingToken,
         state: remoteBrainResult?.state ?? localState,
@@ -767,6 +925,85 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+
+    // [M35] Delete LayerFS Branch (`DELETE /v1/layerfs/branches/:branch`)
+    if (method === "DELETE" && pathname.startsWith("/v1/layerfs/branches/")) {
+      const branchName = decodeURIComponent(pathname.slice("/v1/layerfs/branches/".length));
+      const deleted = this.layerfs.deleteBranch(branchName);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ deleted, branchName }));
+      return;
+    }
+
+    // [M35] Distributed CAS Garbage Collection (`POST /v1beta1/storage/gc`)
+    if (method === "POST" && pathname === "/v1beta1/storage/gc") {
+      const gcResult = this.gcSweeper.sweepLayerFsWorkspaceStore(this.layerfs);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        nodeId: this.nodeId,
+        ...gcResult,
+        remainingStats: this.layerfs.storeEngine.getStorageStats()
+      }));
+
+      return;
+    }
+
+    // [M35] A2A Shared Blackboard, Git Patch Arbiter & Wait-For-Graph Deadlock Detector (`POST /v1beta1/a2a/blackboard`)
+    if (method === "POST" && pathname === "/v1beta1/a2a/blackboard") {
+      const body = await this.readJsonBody(req);
+      const action = String(body.action ?? "get");
+      if (action === "putCas") {
+        try {
+          const out = this.blackboard.putCas(
+          String(body.key ?? "default"),
+          body.value,
+          Number(body.expectedVersion ?? 0),
+          String(body.authorAgentId ?? "agent-01"));
+
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(out));
+        } catch (err) {
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "CAS_CONFLICT", message: err.message }));
+        }
+        return;
+      }
+      if (action === "arbitratePatches") {
+        const patches = body.patches ?? [];
+        const out = this.blackboard.arbitrateGitPatchTouches(patches);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(out));
+        return;
+      }
+      if (action === "addWaitEdge") {
+        this.deadlockDetector.addWaitEdge(String(body.waiterAgentId), String(body.holderAgentId));
+        const cycle = this.deadlockDetector.detectCycle();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(cycle));
+        return;
+      }
+      const entry = this.blackboard.get(String(body.key ?? "default"));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ entry: entry ?? null }));
+      return;
+    }
+
+    // [M35] A2A Parallel CoW Git Bisect over HTTP (`POST /v1beta1/a2a/bisect`)
+    if (method === "POST" && pathname === "/v1beta1/a2a/bisect") {
+      const body = await this.readJsonBody(req);
+      const commits = body.commits ?? [];
+      const testShellCommand = String(body.testShellCommand ?? "true");
+      const out = this.bisectCoordinator.executeLiveLayerFsBisect({
+        driver: this.layerfs,
+        commits,
+        testShellCommand
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(out));
+      return;
+    }
+
     if (method === "POST" && pathname === "/shutdown") {
       this.draining = true;
       res.writeHead(200, { "content-type": "application/json" });
@@ -794,6 +1031,10 @@ class AnstsLocalAndComposeServer {
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
+    }
+    if (this.tunnelPollTimer) {
+      clearInterval(this.tunnelPollTimer);
+      this.tunnelPollTimer = null;
     }
     await this.dashboardServer.close();
     if (this.apiServer) {
