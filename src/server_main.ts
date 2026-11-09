@@ -37,6 +37,12 @@ import { CapacitySlaEnforcer } from "./cluster/capacity_sla_enforcer.js";
 import { PriorityLoadShedder } from "./cluster/priority_load_shedder.js";
 import { CanaryRolloutController } from "./cluster/canary_rollout_controller.js";
 import { PredictiveSandboxPrewarmer } from "./runtime/predictive_prewarmer.js";
+import { GeoSovereigntyAndLatencyRouter } from "./cluster/geo_routing.js";
+import { CrossRegionAsyncReplicator } from "./cluster/cross_region_replicator.js";
+import { AutomatedChaosDrillRunner } from "./cluster/chaos_drill_runner.js";
+import { NetworkChaosFaultInjectionProxy } from "./runtime/network_chaos_proxy.js";
+import { SandboxPreflightReadinessGate } from "./runtime/preflight_gate.js";
+import { CoWSandboxBranchForker } from "./runtime/sandbox_branch_forker.js";
 
 export interface AnstsServiceRuntimeOptions {
   host?: string;
@@ -101,6 +107,12 @@ export class AnstsLocalAndComposeServer {
   public readonly loadShedder: PriorityLoadShedder;
   public readonly canaryController: CanaryRolloutController;
   public readonly prewarmer: PredictiveSandboxPrewarmer;
+  public readonly geoRouter: GeoSovereigntyAndLatencyRouter;
+  public readonly crossRegionReplicator: CrossRegionAsyncReplicator;
+  public readonly chaosDrillRunner: AutomatedChaosDrillRunner;
+  public readonly chaosProxy: NetworkChaosFaultInjectionProxy;
+  public readonly preflightGate: SandboxPreflightReadinessGate;
+  public readonly branchForker: CoWSandboxBranchForker;
   public readonly dashboardServer: DashboardBackendServer;
   private apiServer: http.Server | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -156,6 +168,16 @@ export class AnstsLocalAndComposeServer {
     this.loadShedder = new PriorityLoadShedder();
     this.canaryController = new CanaryRolloutController();
     this.prewarmer = new PredictiveSandboxPrewarmer();
+    this.geoRouter = new GeoSovereigntyAndLatencyRouter();
+    this.geoRouter.registerGeoRegion({ regionId: "eu-central-1", jurisdiction: "GDPR_EU", latencyMs: 18, capacityAvailable: true });
+    this.geoRouter.registerGeoRegion({ regionId: "eu-west-1", jurisdiction: "GDPR_EU", latencyMs: 26, capacityAvailable: true });
+    this.geoRouter.registerGeoRegion({ regionId: "us-west-2", jurisdiction: "US_FED", latencyMs: 12, capacityAvailable: true });
+    this.geoRouter.registerGeoRegion({ regionId: "ap-southeast-1", jurisdiction: "APAC_SG", latencyMs: 31, capacityAvailable: true });
+    this.crossRegionReplicator = new CrossRegionAsyncReplicator();
+    this.chaosDrillRunner = new AutomatedChaosDrillRunner();
+    this.chaosProxy = new NetworkChaosFaultInjectionProxy();
+    this.preflightGate = new SandboxPreflightReadinessGate();
+    this.branchForker = new CoWSandboxBranchForker(this.layerfs);
 
     const brainNodes =
       Object.keys(this.peerBrainUrls).length > 0
@@ -1164,6 +1186,85 @@ export class AnstsLocalAndComposeServer {
           priorityAdmission,
         })
       );
+      return;
+    }
+
+
+    // [M37] Geo-Sovereignty Routing & Cross-Region S3 LTX Replication (`POST /v1beta1/cluster/geo-route`)
+    if (method === "POST" && pathname === "/v1beta1/cluster/geo-route") {
+      const body = await this.readJsonBody(req);
+      if (body.action === "setRegionAvailability") {
+        const updated = this.geoRouter.setRegionAvailability(
+          String(body.regionId ?? "eu-central-1"),
+          Boolean(body.capacityAvailable ?? true),
+          body.latencyMs !== undefined ? Number(body.latencyMs) : undefined
+        );
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ updated, regions: this.geoRouter.listRegions() }));
+        return;
+      }
+      const jurisdiction = (body.jurisdiction ?? "GDPR_EU") as "GDPR_EU" | "US_FED" | "APAC_SG";
+      try {
+        const selectedRegion = this.geoRouter.routeByJurisdiction(jurisdiction);
+        let replication: Record<string, unknown> | null = null;
+        if (body.replicateObjectKey) {
+          if (this.s3Endpoint) {
+            replication = await this.crossRegionReplicator.replicateToRemoteS3Region({
+              s3Endpoint: this.s3Endpoint,
+              sourceRegion: selectedRegion.regionId,
+              targetRegion: String(body.drTargetRegion ?? "eu-west-1"),
+              objectKey: String(body.replicateObjectKey),
+              payload: (body.payload as Record<string, unknown>) ?? { jurisdiction },
+            });
+          } else {
+            replication = this.crossRegionReplicator.replicateLtxObject(
+              String(body.drTargetRegion ?? "eu-west-1"),
+              String(body.replicateObjectKey)
+            );
+          }
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ selectedRegion, replication }));
+      } catch (err) {
+        res.writeHead(451, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "DATA_SOVEREIGNTY_LOCK",
+            jurisdiction,
+            message: (err as Error).message,
+          })
+        );
+      }
+      return;
+    }
+
+    // [M37] Live Chaos Drill & Host Preflight Readiness Gate (`POST /v1beta1/cluster/chaos-drill`)
+    if (method === "POST" && pathname === "/v1beta1/cluster/chaos-drill") {
+      const body = await this.readJsonBody(req);
+      const preflight = this.preflightGate.probeLiveHostReadiness(Number(body.minDiskGb ?? 1));
+      const drill = this.chaosDrillRunner.executeLivePartitionAndFencingDrill({
+        chaosProxy: this.chaosProxy,
+        targetHost: String(body.targetHost ?? "body-host-01"),
+        oldNodeFencingToken: Number(body.oldNodeFencingToken ?? 3),
+        newNodeFencingToken: Number(body.newNodeFencingToken ?? 4),
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nodeId: this.nodeId, preflight, drill }));
+      return;
+    }
+
+    // [M37] Deterministic Execution Replay Envelope & Parallel CoW Sandbox Branch Forker (`POST /v1beta1/runtime/deterministic-fork`)
+    if (method === "POST" && pathname === "/v1beta1/runtime/deterministic-fork") {
+      const body = await this.readJsonBody(req);
+      const sourceBranch = String(body.sourceBranch ?? "main");
+      const branches =
+        (body.branches as Array<{ branchName: string; command: string; seed?: number }>) ?? [];
+      const results = this.branchForker.executeDeterministicSpeculativeBranches({
+        sourceBranch,
+        branches,
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nodeId: this.nodeId, sourceBranch, results }));
       return;
     }
 

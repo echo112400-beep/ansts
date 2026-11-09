@@ -36,7 +36,13 @@ var _mtls_tunnel_bridge = require("./runtime/mtls_tunnel_bridge.js");
 var _capacity_sla_enforcer = require("./cluster/capacity_sla_enforcer.js");
 var _priority_load_shedder = require("./cluster/priority_load_shedder.js");
 var _canary_rollout_controller = require("./cluster/canary_rollout_controller.js");
-var _predictive_prewarmer = require("./runtime/predictive_prewarmer.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var _predictive_prewarmer = require("./runtime/predictive_prewarmer.js");
+var _geo_routing = require("./cluster/geo_routing.js");
+var _cross_region_replicator = require("./cluster/cross_region_replicator.js");
+var _chaos_drill_runner = require("./cluster/chaos_drill_runner.js");
+var _network_chaos_proxy = require("./runtime/network_chaos_proxy.js");
+var _preflight_gate = require("./runtime/preflight_gate.js");
+var _sandbox_branch_forker = require("./runtime/sandbox_branch_forker.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M18 & v2.5 Unified Standalone, Docker Compose & Multi-Node Cluster Service Entrypoint (`src/server_main.ts`).
  * Hardened with:
  * - [P0] Durable Disk-Backed SQL Storage (`DurableDiskCellSqlStorage`) + Cold-Start Rehydration (`RPO=0`) & RustFS S3 LTX Sync
@@ -101,6 +107,12 @@ class AnstsLocalAndComposeServer {
   loadShedder;
   canaryController;
   prewarmer;
+  geoRouter;
+  crossRegionReplicator;
+  chaosDrillRunner;
+  chaosProxy;
+  preflightGate;
+  branchForker;
   dashboardServer;
   apiServer = null;
   tickTimer = null;
@@ -156,6 +168,16 @@ class AnstsLocalAndComposeServer {
     this.loadShedder = new _priority_load_shedder.PriorityLoadShedder();
     this.canaryController = new _canary_rollout_controller.CanaryRolloutController();
     this.prewarmer = new _predictive_prewarmer.PredictiveSandboxPrewarmer();
+    this.geoRouter = new _geo_routing.GeoSovereigntyAndLatencyRouter();
+    this.geoRouter.registerGeoRegion({ regionId: "eu-central-1", jurisdiction: "GDPR_EU", latencyMs: 18, capacityAvailable: true });
+    this.geoRouter.registerGeoRegion({ regionId: "eu-west-1", jurisdiction: "GDPR_EU", latencyMs: 26, capacityAvailable: true });
+    this.geoRouter.registerGeoRegion({ regionId: "us-west-2", jurisdiction: "US_FED", latencyMs: 12, capacityAvailable: true });
+    this.geoRouter.registerGeoRegion({ regionId: "ap-southeast-1", jurisdiction: "APAC_SG", latencyMs: 31, capacityAvailable: true });
+    this.crossRegionReplicator = new _cross_region_replicator.CrossRegionAsyncReplicator();
+    this.chaosDrillRunner = new _chaos_drill_runner.AutomatedChaosDrillRunner();
+    this.chaosProxy = new _network_chaos_proxy.NetworkChaosFaultInjectionProxy();
+    this.preflightGate = new _preflight_gate.SandboxPreflightReadinessGate();
+    this.branchForker = new _sandbox_branch_forker.CoWSandboxBranchForker(this.layerfs);
 
     const brainNodes =
     Object.keys(this.peerBrainUrls).length > 0 ?
@@ -1164,6 +1186,85 @@ class AnstsLocalAndComposeServer {
         priorityAdmission
       }));
 
+      return;
+    }
+
+
+    // [M37] Geo-Sovereignty Routing & Cross-Region S3 LTX Replication (`POST /v1beta1/cluster/geo-route`)
+    if (method === "POST" && pathname === "/v1beta1/cluster/geo-route") {
+      const body = await this.readJsonBody(req);
+      if (body.action === "setRegionAvailability") {
+        const updated = this.geoRouter.setRegionAvailability(
+        String(body.regionId ?? "eu-central-1"),
+        Boolean(body.capacityAvailable ?? true),
+        body.latencyMs !== undefined ? Number(body.latencyMs) : undefined);
+
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ updated, regions: this.geoRouter.listRegions() }));
+        return;
+      }
+      const jurisdiction = body.jurisdiction ?? "GDPR_EU";
+      try {
+        const selectedRegion = this.geoRouter.routeByJurisdiction(jurisdiction);
+        let replication = null;
+        if (body.replicateObjectKey) {
+          if (this.s3Endpoint) {
+            replication = await this.crossRegionReplicator.replicateToRemoteS3Region({
+              s3Endpoint: this.s3Endpoint,
+              sourceRegion: selectedRegion.regionId,
+              targetRegion: String(body.drTargetRegion ?? "eu-west-1"),
+              objectKey: String(body.replicateObjectKey),
+              payload: body.payload ?? { jurisdiction }
+            });
+          } else {
+            replication = this.crossRegionReplicator.replicateLtxObject(
+            String(body.drTargetRegion ?? "eu-west-1"),
+            String(body.replicateObjectKey));
+
+          }
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ selectedRegion, replication }));
+      } catch (err) {
+        res.writeHead(451, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "DATA_SOVEREIGNTY_LOCK",
+          jurisdiction,
+          message: err.message
+        }));
+
+      }
+      return;
+    }
+
+    // [M37] Live Chaos Drill & Host Preflight Readiness Gate (`POST /v1beta1/cluster/chaos-drill`)
+    if (method === "POST" && pathname === "/v1beta1/cluster/chaos-drill") {
+      const body = await this.readJsonBody(req);
+      const preflight = this.preflightGate.probeLiveHostReadiness(Number(body.minDiskGb ?? 1));
+      const drill = this.chaosDrillRunner.executeLivePartitionAndFencingDrill({
+        chaosProxy: this.chaosProxy,
+        targetHost: String(body.targetHost ?? "body-host-01"),
+        oldNodeFencingToken: Number(body.oldNodeFencingToken ?? 3),
+        newNodeFencingToken: Number(body.newNodeFencingToken ?? 4)
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nodeId: this.nodeId, preflight, drill }));
+      return;
+    }
+
+    // [M37] Deterministic Execution Replay Envelope & Parallel CoW Sandbox Branch Forker (`POST /v1beta1/runtime/deterministic-fork`)
+    if (method === "POST" && pathname === "/v1beta1/runtime/deterministic-fork") {
+      const body = await this.readJsonBody(req);
+      const sourceBranch = String(body.sourceBranch ?? "main");
+      const branches =
+      body.branches ?? [];
+      const results = this.branchForker.executeDeterministicSpeculativeBranches({
+        sourceBranch,
+        branches
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ nodeId: this.nodeId, sourceBranch, results }));
       return;
     }
 

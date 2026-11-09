@@ -1,5 +1,5 @@
 /**
- * @fileoverview v2.3 Geo-Sovereignty (GDPR/CCPA/PIPL) & Latency-Weighted Anycast Router.
+ * @fileoverview v2.3 & M37 Geo-Sovereignty (GDPR/CCPA/PIPL) & Latency-Weighted Anycast Router.
  */
 export interface GeoRegionNode {
   regionId: string;
@@ -12,7 +12,24 @@ export class GeoSovereigntyAndLatencyRouter {
   private readonly regions: GeoRegionNode[] = [];
 
   public registerGeoRegion(node: GeoRegionNode): void {
-    this.regions.push(node);
+    const existingIdx = this.regions.findIndex((r) => r.regionId === node.regionId);
+    if (existingIdx >= 0) {
+      this.regions[existingIdx] = { ...node };
+    } else {
+      this.regions.push({ ...node });
+    }
+  }
+
+  public setRegionAvailability(regionId: string, capacityAvailable: boolean, latencyMs?: number): boolean {
+    const found = this.regions.find((r) => r.regionId === regionId);
+    if (!found) return false;
+    found.capacityAvailable = capacityAvailable;
+    if (latencyMs !== undefined) found.latencyMs = latencyMs;
+    return true;
+  }
+
+  public listRegions(): GeoRegionNode[] {
+    return this.regions.map((r) => ({ ...r }));
   }
 
   public routeByJurisdiction(requiredJurisdiction: "GDPR_EU" | "US_FED" | "APAC_SG"): GeoRegionNode {
