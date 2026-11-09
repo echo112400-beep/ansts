@@ -1992,14 +1992,171 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
-    // Serve static console docs if requested on root `/`
-    if (method === "GET" && (pathname === "/" || pathname === "/index.html" || pathname === "/ansts_console_live.html")) {
-      const docFile = pathname === "/ansts_console_live.html" ? "ansts_console_live.html" : "index.html";
-      const candidatePath = path.resolve(process.cwd(), "docs", docFile);
-      if (fs.existsSync(candidatePath)) {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(fs.readFileSync(candidatePath, "utf-8"));
+    // [M41] Platform Management Plane BFF Endpoints (`/v1beta1/management/*`)
+    if (method === "GET" && pathname === "/v1beta1/management/state") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          cluster: "ansts-v25-dev-cluster",
+          gatewayNodeId: this.nodeId,
+          virtualSlots: 256,
+          regions: this.geoRouter.listRegions(),
+          tenants: [
+            { id: "Northstar", region: "us-west-2", maxSlots: 120, dailyBudgetUsd: 1200, configVersion: 14 },
+            { id: "Helios", region: "eu-central-1", maxSlots: 80, dailyBudgetUsd: 800, configVersion: 9 },
+            { id: "Vanguard", region: "ap-northeast-1", maxSlots: 60, dailyBudgetUsd: 600, configVersion: 7 },
+            { id: "Aegis", region: "us-west-2", maxSlots: 40, dailyBudgetUsd: 300, configVersion: 5 },
+          ],
+          status: "HEALTHY",
+        })
+      );
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/tenants/config") {
+      const body = await this.readJsonBody(req);
+      const role = String(body.role ?? "SRE_ADMIN");
+      if (role === "VIEWER") {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "RBAC_FORBIDDEN", message: "VIEWER role cannot modify tenant quotas" }));
         return;
+      }
+      const tenantId = String(body.tenantId ?? "Northstar");
+      const expectedVersion = Number(body.expectedVersion ?? 14);
+      const currentEntry = this.blackboard.get(`mgmt:tenant:${tenantId}`);
+      const currentVersion = currentEntry ? currentEntry.version : 14;
+      if (expectedVersion !== currentVersion) {
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "CAS_VERSION_CONFLICT",
+            tenantId,
+            expectedVersion,
+            actualVersion: currentVersion,
+          })
+        );
+        return;
+      }
+      const newVersion = currentVersion + 1;
+      const updated = {
+        tenantId,
+        maxSlots: Number(body.maxSlots ?? 160),
+        dailyBudgetUsd: Number(body.dailyBudgetUsd ?? 1200),
+        configVersion: newVersion,
+        updatedBy: String(body.actor ?? "chen"),
+      };
+      this.blackboard.putCas(
+        `mgmt:tenant:${tenantId}`,
+        updated,
+        currentEntry ? currentEntry.version : 0,
+        String(body.actor ?? "chen")
+      );
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(updated));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/nodes/batch") {
+      const body = await this.readJsonBody(req);
+      const nodeIds = (body.nodeIds as string[]) ?? ["celld-brain-01", "body-host-01", "body-host-02"];
+      const operation = String(body.operation ?? "drain");
+      const forceMigrateLeases = Boolean(body.forceMigrateLeases ?? false);
+      const results = nodeIds.map((nodeId) => {
+        if (operation === "drain" && nodeId === "body-host-02" && !forceMigrateLeases) {
+          return {
+            nodeId,
+            status: "FAILED",
+            errorCode: "ERR_ACTIVE_LEASE_PINNED",
+            message: "Active P0 lease task-ns-8841 pinned on body-host-02",
+          };
+        }
+        return { nodeId, status: "SUCCEEDED", operation };
+      });
+      const hasFailure = results.some((r) => r.status === "FAILED");
+      res.writeHead(hasFailure ? 207 : 200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ operation, partialFailure: hasFailure, results }));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/tasks/cancel") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? "task-ns-8841");
+      const mode = String(body.mode ?? "graceful");
+      const currentFence = Number(body.currentFence ?? 12);
+      if (mode === "force_fence") {
+        const nextFence = currentFence + 1;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            taskId,
+            state: "FENCED_TERMINATED",
+            newFencingToken: nextFence,
+            confirmed: true,
+          })
+        );
+        return;
+      }
+      res.writeHead(202, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          taskId,
+          state: "CANCEL_UNCONFIRMED",
+          confirmed: false,
+          reason: "Awaiting reverse tunnel ACK from body-host-02",
+        })
+      );
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/approvals/decide") {
+      const body = await this.readJsonBody(req);
+      const approvalId = String(body.approvalId ?? "APR-2026-091");
+      const initiator = String(body.initiator ?? "chen");
+      const approver = String(body.approver ?? "zhou");
+      const role = String(body.role ?? "SRE_ADMIN");
+      const decision = String(body.decision ?? "approve");
+
+      if (role !== "SRE_ADMIN") {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "RBAC_FORBIDDEN", message: "Only SRE_ADMIN can approve high-risk tickets" }));
+        return;
+      }
+      if (initiator === approver) {
+        res.writeHead(409, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "SELF_APPROVAL_FORBIDDEN", message: "4-eyes principle requires a different SRE_ADMIN" }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          approvalId,
+          status: decision === "approve" ? `APPROVED (${approver})` : `REJECTED (${approver})`,
+          decidedBy: approver,
+        })
+      );
+      return;
+    }
+
+    // Serve static console & management plane docs
+    if (method === "GET") {
+      const staticMap: Record<string, { relPath: string; contentType: string }> = {
+        "/": { relPath: "index.html", contentType: "text/html; charset=utf-8" },
+        "/index.html": { relPath: "index.html", contentType: "text/html; charset=utf-8" },
+        "/ansts_console_live.html": { relPath: "ansts_console_live.html", contentType: "text/html; charset=utf-8" },
+        "/ansts_console_management.html": { relPath: "ansts_console_management.html", contentType: "text/html; charset=utf-8" },
+        "/management": { relPath: "ansts_console_management.html", contentType: "text/html; charset=utf-8" },
+        "/console-management/prototype.css": { relPath: "console-management/prototype.css", contentType: "text/css; charset=utf-8" },
+        "/console-management/prototype.js": { relPath: "console-management/prototype.js", contentType: "application/javascript; charset=utf-8" },
+        "/console-management-design.md": { relPath: "console-management-design.md", contentType: "text/markdown; charset=utf-8" },
+      };
+      const matched = staticMap[pathname];
+      if (matched) {
+        const candidatePath = path.resolve(process.cwd(), "docs", matched.relPath);
+        if (fs.existsSync(candidatePath)) {
+          res.writeHead(200, { "content-type": matched.contentType });
+          res.end(fs.readFileSync(candidatePath, "utf-8"));
+          return;
+        }
       }
     }
 

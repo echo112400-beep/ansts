@@ -179,10 +179,20 @@ async function bootAll() {
       }
 
       const cleanPath = urlPath.split("?")[0];
-      const docName = cleanPath === "/ansts_console_live.html" ? "ansts_console_live.html" : "index.html";
-      const filePath = path.join(ROOT_DIR, "docs", docName);
+      const staticRoutes = {
+        "/": { rel: "index.html", type: "text/html; charset=utf-8" },
+        "/index.html": { rel: "index.html", type: "text/html; charset=utf-8" },
+        "/ansts_console_live.html": { rel: "ansts_console_live.html", type: "text/html; charset=utf-8" },
+        "/ansts_console_management.html": { rel: "ansts_console_management.html", type: "text/html; charset=utf-8" },
+        "/management": { rel: "ansts_console_management.html", type: "text/html; charset=utf-8" },
+        "/console-management/prototype.css": { rel: "console-management/prototype.css", type: "text/css; charset=utf-8" },
+        "/console-management/prototype.js": { rel: "console-management/prototype.js", type: "application/javascript; charset=utf-8" },
+        "/console-management-design.md": { rel: "console-management-design.md", type: "text/markdown; charset=utf-8" },
+      };
+      const entry = staticRoutes[cleanPath] || staticRoutes["/"];
+      const filePath = path.join(ROOT_DIR, "docs", entry.rel);
       if (fs.existsSync(filePath)) {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.writeHead(200, { "content-type": entry.type });
         res.end(fs.readFileSync(filePath, "utf-8"));
         return;
       }
