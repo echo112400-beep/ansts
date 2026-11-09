@@ -1,6 +1,8 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.MockDurableObjectState = exports.InMemoryR2Bucket = exports.InMemoryQueueProducer = exports.InMemoryKvNamespace = exports.InMemoryCellSqlStorage = void 0; /**
- * @fileoverview M7 TASK-25: Cloudflare Workers & denoland/celld Unified Runtime Bindings & SQL/KV/R2 Mock Layer.
- */
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.MockDurableObjectState = exports.InMemoryR2Bucket = exports.InMemoryQueueProducer = exports.InMemoryKvNamespace = exports.InMemoryCellSqlStorage = exports.DurableDiskCellSqlStorage = void 0;var fs = _interopRequireWildcard(require("node:fs"));
+var path = _interopRequireWildcard(require("node:path"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;}
+
+
+
 
 
 
@@ -131,6 +133,54 @@
 class InMemoryCellSqlStorage {
   tables = new Map();
   txSnapshot = null;
+  storageFilePath;
+
+  constructor(storageFilePath) {
+    this.storageFilePath = storageFilePath ?? null;
+    if (this.storageFilePath) {
+      this.rehydrateFromDisk();
+    }
+  }
+
+  rehydrateFromDisk() {
+    if (!this.storageFilePath || !fs.existsSync(this.storageFilePath)) return;
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.storageFilePath, "utf-8"));
+
+
+      if (raw.tables) {
+        for (const [tblName, rowsObj] of Object.entries(raw.tables)) {
+          const rowMap = new Map();
+          for (const [pk, r] of Object.entries(rowsObj)) {
+            rowMap.set(pk, r);
+          }
+          this.tables.set(tblName, rowMap);
+        }
+      }
+    } catch {
+
+      // ignore corrupted or partial file
+    }}
+
+  flushToDisk() {
+    if (!this.storageFilePath || this.txSnapshot) return;
+    try {
+      fs.mkdirSync(path.dirname(this.storageFilePath), { recursive: true });
+      const serialized = {};
+      for (const [tblName, rowMap] of this.tables.entries()) {
+        const rowsObj = {};
+        for (const [pk, r] of rowMap.entries()) {
+          rowsObj[pk] = r;
+        }
+        serialized[tblName] = rowsObj;
+      }
+      const tmpPath = this.storageFilePath + ".tmp";
+      fs.writeFileSync(tmpPath, JSON.stringify({ updatedAtMs: Date.now(), tables: serialized }));
+      fs.renameSync(tmpPath, this.storageFilePath);
+    } catch {
+
+      // ignore on read-only fs
+    }}
 
   exec(query, ...bindings) {
     const q = query.trim().replace(/\s+/g, " ");
@@ -150,6 +200,7 @@ class InMemoryCellSqlStorage {
 
     if (upper === "COMMIT" || upper === "COMMIT TRANSACTION") {
       this.txSnapshot = null;
+      this.flushToDisk();
       return { toArray: () => [], one: () => null };
     }
 
@@ -188,6 +239,7 @@ class InMemoryCellSqlStorage {
         });
         const pk = String(bindings[0] ?? `${tbl.size + 1}`);
         tbl.set(pk, row);
+        this.flushToDisk();
       }
       return { toArray: () => [], one: () => null };
     }
@@ -208,6 +260,7 @@ class InMemoryCellSqlStorage {
           });
         }
       }
+      this.flushToDisk();
       return { toArray: () => [], one: () => null };
     }
 
@@ -382,3 +435,9 @@ class InMemoryQueueProducer {
     this.sentMessages.push({ body, delaySeconds: options?.delaySeconds });
   }
 }exports.InMemoryQueueProducer = InMemoryQueueProducer;
+
+class DurableDiskCellSqlStorage extends InMemoryCellSqlStorage {
+  constructor(storageFilePath) {
+    super(storageFilePath);
+  }
+}exports.DurableDiskCellSqlStorage = DurableDiskCellSqlStorage;

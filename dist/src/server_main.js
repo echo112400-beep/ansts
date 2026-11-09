@@ -25,11 +25,14 @@ var _scheduler_v25_persistence = require("./cloudflare/scheduler_v25_persistence
 var _edge_tunnel_ha_router = require("./runtime/edge_tunnel_ha_router.js");
 var _env = require("./cloudflare/env.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M18 & v2.5 Unified Standalone, Docker Compose & Multi-Node Cluster Service Entrypoint (`src/server_main.ts`).
- * Supports single-stack mode (`:8080` API + `:8090` Dashboard) and `feat/celld-v25` Multi-Node Cluster mode
- * (`gateway`, `brain`, `body`) with cross-node HTTP RPC forwarding (`gateway -> brain -> body`),
- * Dual-Homed Reverse Tunnel registration (`EdgeTunnelHaRouter`), 256-slot `HaSchedulerShardCoordinator`,
- * `SchedulerV25SingleWritePathStore`, LayerFS Dual-Path Workspace Store, and Prometheus `/metrics`.
+ * Hardened with:
+ * - [P0] Durable Disk-Backed SQL Storage (`DurableDiskCellSqlStorage`) + Cold-Start Rehydration (`RPO=0`) & RustFS S3 LTX Sync
+ * - [P0] Strict Single-Write-Path (`SchedulerV25SingleWritePathStore` before in-memory index) & Stateless Gateway Fan-Out
+ * - [P1] Cross-Node LayerFS Snapshot Sync (`Body-01 <-> RustFS (:9000) <-> Body-02`) & Auto Dual-Homed Reverse Tunnel Registration
  */
+
+
+
 
 
 
@@ -56,6 +59,9 @@ class AnstsLocalAndComposeServer {
   nodeId;
   nodeRole;
   storageDir;
+  s3Endpoint;
+  primaryGatewayUrl;
+  secondaryGatewayUrl;
   peerBrainUrls;
   peerBodyUrls;
   scheduler;
@@ -81,7 +87,13 @@ class AnstsLocalAndComposeServer {
     this.nodeId = options.nodeId ?? process.env.ANSTS_NODE_ID ?? "ansts-dev-node-01";
     this.nodeRole =
     (options.nodeRole ?? process.env.ANSTS_NODE_ROLE) || "gateway";
-    this.storageDir = options.storageDir ?? process.env.ANSTS_STORAGE_DIR ?? `/tmp/ansts/${this.nodeId}`;
+    this.storageDir =
+    options.storageDir ??
+    process.env.ANSTS_STORAGE_DIR ??
+    `/tmp/ansts/${this.nodeId}-${process.pid}`;
+    this.s3Endpoint = options.s3Endpoint ?? process.env.S3_ENDPOINT ?? null;
+    this.primaryGatewayUrl = options.primaryGatewayUrl ?? process.env.ANSTS_PRIMARY_GATEWAY_URL ?? null;
+    this.secondaryGatewayUrl = options.secondaryGatewayUrl ?? process.env.ANSTS_SECONDARY_GATEWAY_URL ?? null;
     this.peerBrainUrls = options.peerBrainUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BRAIN_URLS);
     this.peerBodyUrls = options.peerBodyUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BODY_URLS);
 
@@ -94,7 +106,15 @@ class AnstsLocalAndComposeServer {
     this.fleetController = new _manual_scale_controller.ManualFleetScaleController();
     this.router = new _cognitive_router.CognitiveRouter();
     this.sagaGateway = new _saga_gateway.SagaToolGateway();
-    this.v25Store = new _scheduler_v25_persistence.SchedulerV25SingleWritePathStore(new _env.InMemoryCellSqlStorage());
+
+    // Ensure storageDir exists and bind DurableDiskCellSqlStorage for RPO=0 persistence
+    try {
+      fs.mkdirSync(this.storageDir, { recursive: true });
+    } catch {
+
+      // ignore if read-only in restricted environments
+    }const sqlFilePath = path.join(this.storageDir, "v25_scheduler.sql.json");
+    this.v25Store = new _scheduler_v25_persistence.SchedulerV25SingleWritePathStore(new _env.DurableDiskCellSqlStorage(sqlFilePath));
     this.tunnelRouter = new _edge_tunnel_ha_router.EdgeTunnelHaRouter();
 
     const brainNodes =
@@ -106,13 +126,6 @@ class AnstsLocalAndComposeServer {
       this.shardCoordinator.registerBrainShardNode(bId);
     }
 
-    // Ensure storageDir exists for state persistence metadata
-    try {
-      fs.mkdirSync(this.storageDir, { recursive: true });
-    } catch {
-
-      // ignore if read-only in restricted environments
-    }
     // Register default LLM endpoints & Saga tools
     this.router.registerEndpoint(
     new _models.LlmEndpointMetrics({
@@ -165,6 +178,11 @@ class AnstsLocalAndComposeServer {
       }
     }
 
+    // Rehydrate in-memory scheduler index from durable v25Store on cold start
+    for (const persistedTask of this.v25Store.listPersistedTasks()) {
+      this.scheduler.allTasks.set(persistedTask.task_id, persistedTask);
+    }
+
     const bridge = new _server.DashboardBridgeService(this.scheduler, this.fleetController);
     this.dashboardServer = new _server.DashboardBackendServer(bridge, this.host);
   }
@@ -189,6 +207,11 @@ class AnstsLocalAndComposeServer {
 
     const boundDashPort = await this.dashboardServer.listen(targetDashPort);
 
+    // If this node is a `body` daemon and gateway URLs are configured, proactively register dual-homed reverse tunnels
+    if (this.nodeRole === "body") {
+      await this.registerOutboundReverseTunnels();
+    }
+
     this.tickTimer = setInterval(() => {
       if (!this.draining) {
         this.scheduler.reconcileOrphanedLeases();
@@ -199,6 +222,33 @@ class AnstsLocalAndComposeServer {
     }, this.tickIntervalMs);
 
     return { apiPort: boundApiPort, dashboardPort: boundDashPort };
+  }
+
+  async registerOutboundReverseTunnels() {
+    const targets = [];
+    if (this.primaryGatewayUrl) {
+      targets.push({ url: this.primaryGatewayUrl, role: "PRIMARY", gwId: "celld-gw-01" });
+    }
+    if (this.secondaryGatewayUrl) {
+      targets.push({ url: this.secondaryGatewayUrl, role: "SECONDARY", gwId: "celld-gw-02" });
+    }
+    for (const t of targets) {
+      try {
+        await fetch(`${t.url.replace(/\/$/, "")}/internal/v1beta1/tunnel/register`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            hostId: this.nodeId,
+            gatewayId: t.gwId,
+            role: t.role,
+            connGeneration: 1,
+            epoch: 1
+          })
+        });
+      } catch {
+
+        // ignore if gateway not yet up
+      }}
   }
 
   async readJsonBody(req) {
@@ -299,17 +349,38 @@ class AnstsLocalAndComposeServer {
           res.end(JSON.stringify({ error: "TOO_MANY_REQUESTS", reason: decision.reason }));
           return;
         }
-        const submitted = this.scheduler.submitTask(spec);
-        const placements = this.scheduler.scheduleTick();
-        this.metrics.incCounter("ansts_tasks_submitted_total", 1);
+        // Strict Single-Write-Path: check existing persisted task first, then schedule and commit atomically
+        const existingPersisted = this.v25Store.getPersistedTask(spec.task_id);
+        if (!existingPersisted) {
+          const submitted = this.scheduler.submitTask(spec);
+          const placements = this.scheduler.scheduleTick();
+          this.v25Store.commitTaskSingleWritePath(submitted, submitted.assigned_node_id);
+          if (this.s3Endpoint) {
+            await this.v25Store.flushLtxSnapshotToS3(this.s3Endpoint, this.nodeId);
+          }
+          this.metrics.incCounter("ansts_tasks_submitted_total", 1);
+          res.writeHead(202, { "content-type": "application/json" });
+          res.end(
+          JSON.stringify({
+            task_id: submitted.task_id,
+            state: submitted.state,
+            assigned_node_id: submitted.assigned_node_id ?? null,
+            lease_fencing_token: submitted.lease_fencing_token,
+            placements
+          }));
+
+          return;
+        }
+        const preCommitted = this.v25Store.commitTaskSingleWritePath(spec);
         res.writeHead(202, { "content-type": "application/json" });
         res.end(
         JSON.stringify({
-          task_id: submitted.task_id,
-          state: submitted.state,
-          assigned_node_id: submitted.assigned_node_id ?? null,
-          lease_fencing_token: submitted.lease_fencing_token,
-          placements
+          task_id: preCommitted.task.task_id,
+          state: preCommitted.task.state,
+          assigned_node_id: preCommitted.task.assigned_node_id ?? null,
+          lease_fencing_token: preCommitted.fencingToken,
+          deduplicated: true,
+          placements: []
         }));
 
       } catch (err) {
@@ -325,14 +396,28 @@ class AnstsLocalAndComposeServer {
 
     if (method === "GET" && pathname.startsWith("/v1/tasks/")) {
       const taskId = decodeURIComponent(pathname.slice("/v1/tasks/".length));
-      const task = this.scheduler.allTasks.get(taskId);
-      if (!task) {
-        res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "TASK_NOT_FOUND", task_id: taskId }));
+      const localTask = this.scheduler.allTasks.get(taskId) ?? this.v25Store.getPersistedTask(taskId);
+      if (localTask) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(localTask));
         return;
       }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(task));
+      // Stateless Gateway Fan-out across peerBrainUrls if not cached locally
+      for (const brainUrl of Object.values(this.peerBrainUrls)) {
+        try {
+          const resp = await fetch(`${brainUrl}/internal/v1beta1/brain/tasks/${encodeURIComponent(taskId)}`);
+          if (resp.ok) {
+            const remoteTask = await resp.json();
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(remoteTask));
+            return;
+          }
+        } catch {
+
+          // continue probing remaining brain shards
+        }}
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "TASK_NOT_FOUND", task_id: taskId }));
       return;
     }
 
@@ -341,6 +426,9 @@ class AnstsLocalAndComposeServer {
       const branchName = String(body.branch ?? "main");
       const command = String(body.command ?? "echo layerfs-ok");
       const stepId = String(body.step_id ?? `step-${Date.now()}`);
+      if (this.s3Endpoint) {
+        await this.layerfs.pullBranchFromRemoteS3(branchName, this.s3Endpoint);
+      }
       if (branchName !== "main") {
         try {
           this.layerfs.getBranchHeadCommit(branchName);
@@ -354,12 +442,37 @@ class AnstsLocalAndComposeServer {
         stepId,
         command
       });
+      let s3Synced = false;
+      if (this.s3Endpoint) {
+        s3Synced = await this.layerfs.pushBranchToRemoteS3(branchName, this.s3Endpoint);
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ...result, executedByNodeId: this.nodeId, nodeRole: this.nodeRole }));
+      res.end(JSON.stringify({ ...result, executedByNodeId: this.nodeId, nodeRole: this.nodeRole, s3Synced }));
       return;
     }
 
-    // Internal Brain RPC endpoint (`POST /internal/v1beta1/brain/schedule`)
+    // Internal Brain Task Query endpoints (`GET /internal/v1beta1/brain/tasks` & `/:id`)
+    if (method === "GET" && pathname === "/internal/v1beta1/brain/tasks") {
+      const tasks = this.v25Store.listPersistedTasks();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ brainNodeId: this.nodeId, totalTasks: tasks.length, tasks }));
+      return;
+    }
+
+    if (method === "GET" && pathname.startsWith("/internal/v1beta1/brain/tasks/")) {
+      const taskId = decodeURIComponent(pathname.slice("/internal/v1beta1/brain/tasks/".length));
+      const task = this.v25Store.getPersistedTask(taskId) ?? this.scheduler.allTasks.get(taskId);
+      if (!task) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "TASK_NOT_FOUND", task_id: taskId }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(task));
+      return;
+    }
+
+    // Internal Brain RPC endpoint (`POST /internal/v1beta1/brain/schedule`) - Strict Single-Write-Path
     if (method === "POST" && pathname === "/internal/v1beta1/brain/schedule") {
       const body = await this.readJsonBody(req);
       const taskId = String(body.taskId ?? `task-${Date.now()}`);
@@ -369,22 +482,49 @@ class AnstsLocalAndComposeServer {
         task_id: taskId,
         tenant_id: tenantId,
         priority: 1,
-        prompt: String(body.promptText ?? "")
+        prompt: String(body.promptText ?? ""),
+        idempotency_key: body.idempotencyKey ? String(body.idempotencyKey) : `idem:${tenantId}:${taskId}`
       });
-      const submitted = this.scheduler.submitTask(spec);
-      const placements = this.scheduler.scheduleTick();
-      const persisted = this.v25Store.commitTaskSingleWritePath(submitted);
+
+      // Step 1: Check / Commit in durable v25Store first (Single-Write-Path)
+      const firstCommit = this.v25Store.commitTaskSingleWritePath(spec);
+      let placements = [];
+      let finalTask = firstCommit.task;
+
+      if (!firstCommit.deduplicated) {
+        const submitted = this.scheduler.submitTask(spec);
+        placements = this.scheduler.scheduleTick();
+        const targetHost = String(body.targetBodyHostId ?? submitted.assigned_node_id ?? "body-host-01");
+        submitted.assigned_node_id = targetHost;
+        // Persist updated state & assigned node into durable SQL table
+        this.v25Store.sql.exec(
+        "INSERT OR REPLACE INTO v25_scheduler_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, idem_key, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        submitted.task_id,
+        submitted.tenant_id,
+        submitted.priority,
+        submitted.state,
+        submitted.lease_fencing_token,
+        targetHost,
+        spec.idempotency_key,
+        JSON.stringify(submitted));
+
+        finalTask = submitted;
+        if (this.s3Endpoint) {
+          await this.v25Store.flushLtxSnapshotToS3(this.s3Endpoint, this.nodeId);
+        }
+      }
+
       this.metrics.incCounter("ansts_brain_schedules_total", 1);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
       JSON.stringify({
         scheduledByBrainId: this.nodeId,
         slot: slotInfo.slotIndex,
-        taskId: submitted.task_id,
-        state: submitted.state,
-        deduplicated: persisted.deduplicated,
-        fencingToken: submitted.lease_fencing_token,
-        assignedBodyHostId: String(body.targetBodyHostId ?? submitted.assigned_node_id ?? "body-host-01"),
+        taskId: finalTask.task_id,
+        state: finalTask.state,
+        deduplicated: firstCommit.deduplicated,
+        fencingToken: finalTask.lease_fencing_token,
+        assignedBodyHostId: String(body.targetBodyHostId ?? finalTask.assigned_node_id ?? "body-host-01"),
         placements
       }));
 
@@ -395,7 +535,10 @@ class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/internal/v1beta1/body/execute") {
       const body = await this.readJsonBody(req);
       const taskId = String(body.taskId ?? `task-${Date.now()}`);
-      const branchName = `task-${taskId}`;
+      const branchName = String(body.branchName ?? `task-${taskId}`);
+      if (this.s3Endpoint) {
+        await this.layerfs.pullBranchFromRemoteS3(branchName, this.s3Endpoint);
+      }
       try {
         this.layerfs.getBranchHeadCommit(branchName);
       } catch {
@@ -407,6 +550,10 @@ class AnstsLocalAndComposeServer {
         stepId: `exec-${taskId}`,
         command: `printf '%s\\n' ${JSON.stringify(String(body.promptText ?? "ok"))} > .ansts_task_trace.txt`
       });
+      let s3Synced = false;
+      if (this.s3Endpoint) {
+        s3Synced = await this.layerfs.pushBranchToRemoteS3(branchName, this.s3Endpoint);
+      }
       this.metrics.incCounter("ansts_body_executions_total", 1);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -418,13 +565,14 @@ class AnstsLocalAndComposeServer {
         commitId: execResult.commitId,
         committedNewSnapshot: execResult.committedNewSnapshot,
         mountLatencyMs: execResult.mountLatencyMs,
+        s3Synced,
         status: "COMPLETED"
       }));
 
       return;
     }
 
-    // Dual-Homed Reverse Tunnel registration (`POST /internal/v1beta1/tunnel/register`)
+    // Dual-Homed Reverse Tunnel registration & health mark (`POST /internal/v1beta1/tunnel/register` & `/health`)
     if (method === "POST" && pathname === "/internal/v1beta1/tunnel/register") {
       const body = await this.readJsonBody(req);
       const hostId = String(body.hostId ?? "body-host-01");
@@ -457,6 +605,18 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    if (method === "POST" && pathname === "/internal/v1beta1/tunnel/health") {
+      const body = await this.readJsonBody(req);
+      const hostId = String(body.hostId ?? "body-host-01");
+      const gatewayId = String(body.gatewayId ?? this.nodeId);
+      const healthy = Boolean(body.healthy ?? true);
+      this.tunnelRouter.tunnelCell.markGatewayHealth(hostId, gatewayId, healthy);
+      const activeBinding = this.tunnelRouter.tunnelCell.selectActiveTunnel(hostId);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ hostId, activeGatewayId: activeBinding.gatewayId, activeRole: activeBinding.role }));
+      return;
+    }
+
     // Distributed Task Dispatch (`POST /v1beta1/tasks/dispatch`)
     if (method === "POST" && pathname === "/v1beta1/tasks/dispatch") {
       const body = await this.readJsonBody(req);
@@ -465,19 +625,10 @@ class AnstsLocalAndComposeServer {
       const promptText = String(body.promptText ?? "");
       const slotResolution = this.shardCoordinator.resolveBrainForTask(tenantId, taskId);
       const ownerBrainId = slotResolution.brainNodeId ?? "brain-node-01";
-
-      const spec = _validator.TaskSpecValidator.validateAndNormalize({
-        task_id: taskId,
-        tenant_id: tenantId,
-        priority: 1,
-        prompt: promptText
-      });
-      const submitted = this.scheduler.submitTask(spec);
-      const placements = this.scheduler.scheduleTick();
-      const targetBodyHostId = String(body.targetBodyHostId ?? submitted.assigned_node_id ?? "body-host-01");
+      const targetBodyHostId = String(body.targetBodyHostId ?? "body-host-01");
       this.metrics.incCounter("ansts_tasks_dispatched_total", 1);
 
-      // Forward to live peer Brain & Body nodes if configured in ANSTS_PEER_BRAIN_URLS / ANSTS_PEER_BODY_URLS
+      // Forward to live peer Brain shard owner if configured in ANSTS_PEER_BRAIN_URLS
       let remoteBrainResult = null;
       const brainBaseUrl = this.peerBrainUrls[ownerBrainId];
       if (brainBaseUrl) {
@@ -501,6 +652,24 @@ class AnstsLocalAndComposeServer {
           // fallback to local schedule if peer brain is unreachable
         }}
 
+      // Fallback to local schedule only when no peerBrainUrls are configured/reachable
+      let localState = "LEASED";
+      let localFencingToken = 1;
+      let localPlacements = [[taskId, targetBodyHostId, 1]];
+      if (!remoteBrainResult) {
+        const spec = _validator.TaskSpecValidator.validateAndNormalize({
+          task_id: taskId,
+          tenant_id: tenantId,
+          priority: 1,
+          prompt: promptText
+        });
+        const submitted = this.scheduler.submitTask(spec);
+        localPlacements = this.scheduler.scheduleTick();
+        this.v25Store.commitTaskSingleWritePath(submitted, targetBodyHostId);
+        localState = submitted.state;
+        localFencingToken = submitted.lease_fencing_token;
+      }
+
       let remoteBodyResult = null;
       const bodyBaseUrl = this.peerBodyUrls[targetBodyHostId];
       if (bodyBaseUrl) {
@@ -523,27 +692,52 @@ class AnstsLocalAndComposeServer {
       JSON.stringify({
         dispatched: true,
         gatewayNodeId: this.nodeId,
-        taskId: submitted.task_id,
+        taskId,
         tenantId,
         shardSlot: slotResolution.slotIndex,
         routedBrainNodeId: remoteBrainResult?.scheduledByBrainId ?? ownerBrainId,
-        fencingToken: remoteBrainResult?.fencingToken ?? submitted.lease_fencing_token,
-        state: submitted.state,
+        deduplicated: remoteBrainResult?.deduplicated ?? false,
+        fencingToken: remoteBrainResult?.fencingToken ?? localFencingToken,
+        state: remoteBrainResult?.state ?? localState,
         targetBodyHostId,
         bodyExecution: remoteBodyResult,
-        placements
+        placements: remoteBrainResult?.placements ?? localPlacements
       }));
 
       return;
     }
 
     if (method === "GET" && pathname === "/v1beta1/console/overview") {
+      // Stateless fan-out across all peerBrainUrls so both Gateway-01 and Gateway-02 return identical global counts
+      const globalTaskIds = new Set(this.scheduler.allTasks.keys());
+      for (const t of this.v25Store.listPersistedTasks()) {
+        globalTaskIds.add(t.task_id);
+      }
+      const brainEntries = Object.entries(this.peerBrainUrls);
+      if (brainEntries.length > 0) {
+        await Promise.all(
+        brainEntries.map(async ([, bUrl]) => {
+          try {
+            const resp = await fetch(`${bUrl}/internal/v1beta1/brain/tasks`);
+            if (resp.ok) {
+              const data = await resp.json();
+              for (const t of data.tasks ?? []) {
+                globalTaskIds.add(t.task_id);
+              }
+            }
+          } catch {
+
+            // ignore unreachable brain
+          }}));
+
+      }
+
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
       JSON.stringify({
         region: urlObj.searchParams.get("region") ?? "us-west-2",
         gatewayNodeId: this.nodeId,
-        totalTasks: this.scheduler.allTasks.size,
+        totalTasks: globalTaskIds.size,
         activeNodes: this.scheduler.nodes.size,
         configuredBrains: Object.keys(this.peerBrainUrls),
         configuredBodies: Object.keys(this.peerBodyUrls),

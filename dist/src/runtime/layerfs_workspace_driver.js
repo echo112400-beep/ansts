@@ -181,10 +181,18 @@ class LayerFsWorkspaceDriver {
     const mountDir = fs.mkdtempSync(path.join(os.tmpdir(), `layerfs-ws-${params.branchName}-`));
     let stdout = "";
     try {
+      const baselineStats = new Map();
       for (const [relPath, fileEntry] of parentCommit.filesTree.entries()) {
         const fullPath = path.join(mountDir, relPath);
         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
         fs.writeFileSync(fullPath, fileEntry.content, { encoding: "utf-8", mode: fileEntry.mode });
+        try {
+          fs.utimesSync(fullPath, 1700000000, 1700000000);
+        } catch {
+
+          // ignore if utimes unsupported
+        }const st = fs.statSync(fullPath);
+        baselineStats.set(relPath, { size: st.size, mode: st.mode & 0o777 });
       }
       const mountLatencyMs = Math.max(0.01, Number((performance.now() - tMountStart).toFixed(3)));
       const nodeModulesPreMounted = fs.existsSync(path.join(mountDir, "node_modules/react/index.js"));
@@ -209,9 +217,15 @@ class LayerFsWorkspaceDriver {
             scanDir(full);
           } else if (entry.isFile()) {
             const rel = path.relative(mountDir, full).split(path.sep).join("/");
-            const content = fs.readFileSync(full, "utf-8");
-            const mode = fs.statSync(full).mode & 0o777;
+            const st = fs.statSync(full);
+            const mode = st.mode & 0o777;
+            const baseSt = baselineStats.get(rel);
             const prev = parentCommit.filesTree.get(rel);
+            // Fast-path: skip reading file bytes if mtime (1700000000s), size, and mode are unchanged
+            if (prev && baseSt && Math.floor(st.mtimeMs / 1000) === 1700000000 && st.size === baseSt.size && mode === baseSt.mode) {
+              continue;
+            }
+            const content = fs.readFileSync(full, "utf-8");
             if (!prev || prev.content !== content || prev.mode !== mode) {
               discoveredMutations.push({ filePath: rel, content, mode });
             }
@@ -361,5 +375,106 @@ class LayerFsWorkspaceDriver {
       text,
       stepId: blames[idx] ?? file.lastStepId
     }));
+  }
+
+  exportBranchBundle(branchName)
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    const headRecord = this.getBranchHeadCommit(branchName);
+    const chain = [];
+    let cur = headRecord;
+    while (cur) {
+      chain.unshift(cur);
+      cur = cur.parentCommitId ? this.commits.get(cur.parentCommitId) : undefined;
+    }
+    return {
+      branchName,
+      headCommitId: headRecord.commitId,
+      commits: chain.map((c) => ({
+        commitId: c.commitId,
+        parentCommitId: c.parentCommitId,
+        branchName: c.branchName,
+        agentId: c.agentId,
+        stepId: c.stepId,
+        toolCategory: c.toolCategory,
+        files: Array.from(c.filesTree.entries()),
+        blame: Array.from(c.lineBlameMap.entries()),
+        mountLatencyMs: c.mountLatencyMs
+      }))
+    };
+  }
+
+  importBranchBundle(bundle) {
+    for (const c of bundle.commits) {
+      const filesTree = new Map(c.files);
+      const lineBlameMap = new Map(c.blame);
+      for (const [relPath, entry] of filesTree.entries()) {
+        this.storeEngine.putFileObject(relPath, entry.content, undefined, entry.mode);
+      }
+      const record = {
+        commitId: c.commitId,
+        parentCommitId: c.parentCommitId,
+        branchName: c.branchName,
+        agentId: c.agentId,
+        stepId: c.stepId,
+        toolCategory: c.toolCategory,
+        filesTree,
+        lineBlameMap,
+        includesIgnoredDependencies: true,
+        mountLatencyMs: c.mountLatencyMs
+      };
+      this.commits.set(c.commitId, record);
+      const num = Number(c.commitId.replace(/^C/, ""));
+      if (!Number.isNaN(num) && num > this.commitSeq) {
+        this.commitSeq = num;
+      }
+    }
+    this.branchHeads.set(bundle.branchName, bundle.headCommitId);
+  }
+
+  async pushBranchToRemoteS3(branchName, s3Endpoint) {
+    try {
+      const bundle = this.exportBranchBundle(branchName);
+      const resp = await fetch(
+      `${s3Endpoint.replace(/\/$/, "")}/ansts-fleet/layerfs/branches/${encodeURIComponent(branchName)}.json`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(bundle)
+      });
+
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  async pullBranchFromRemoteS3(branchName, s3Endpoint) {
+    try {
+      const resp = await fetch(
+      `${s3Endpoint.replace(/\/$/, "")}/ansts-fleet/layerfs/branches/${encodeURIComponent(branchName)}.json`);
+
+      if (!resp.ok) return false;
+      const bundle = await resp.json();
+      if (bundle && Array.isArray(bundle.commits)) {
+        this.importBranchBundle(bundle);
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
   }
 }exports.LayerFsWorkspaceDriver = LayerFsWorkspaceDriver;

@@ -102,6 +102,7 @@ async function bootAll() {
       peerBrainUrls: PEER_BRAIN_URLS,
       peerBodyUrls: PEER_BODY_URLS,
       storageDir: `/tmp/ansts/${b.nodeId}`,
+      s3Endpoint: "http://127.0.0.1:9000",
     });
     await srv.start(b.port, 0);
     anstsNodes.push({ containerName: b.containerName, nodeId: b.nodeId, role: "brain", port: b.port, server: srv });
@@ -120,6 +121,9 @@ async function bootAll() {
       peerBrainUrls: PEER_BRAIN_URLS,
       peerBodyUrls: PEER_BODY_URLS,
       storageDir: `/tmp/ansts/${bd.nodeId}`,
+      s3Endpoint: "http://127.0.0.1:9000",
+      primaryGatewayUrl: "http://127.0.0.1:18080",
+      secondaryGatewayUrl: "http://127.0.0.1:18081",
     });
     await srv.start(bd.port, 0);
     anstsNodes.push({ containerName: bd.containerName, nodeId: bd.nodeId, role: "body", port: bd.port, server: srv });

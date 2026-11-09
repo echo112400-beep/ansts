@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 /**
  * @fileoverview M7 TASK-25: Cloudflare Workers & denoland/celld Unified Runtime Bindings & SQL/KV/R2 Mock Layer.
  */
@@ -131,6 +133,54 @@ export interface CloudflareCelldEnv {
 export class InMemoryCellSqlStorage implements SqlStorageLike {
   private tables: Map<string, Map<string, Record<string, unknown>>> = new Map();
   private txSnapshot: Map<string, Map<string, Record<string, unknown>>> | null = null;
+  public readonly storageFilePath: string | null;
+
+  constructor(storageFilePath?: string) {
+    this.storageFilePath = storageFilePath ?? null;
+    if (this.storageFilePath) {
+      this.rehydrateFromDisk();
+    }
+  }
+
+  private rehydrateFromDisk(): void {
+    if (!this.storageFilePath || !fs.existsSync(this.storageFilePath)) return;
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.storageFilePath, "utf-8")) as {
+        tables?: Record<string, Record<string, Record<string, unknown>>>;
+      };
+      if (raw.tables) {
+        for (const [tblName, rowsObj] of Object.entries(raw.tables)) {
+          const rowMap = new Map<string, Record<string, unknown>>();
+          for (const [pk, r] of Object.entries(rowsObj)) {
+            rowMap.set(pk, r);
+          }
+          this.tables.set(tblName, rowMap);
+        }
+      }
+    } catch {
+      // ignore corrupted or partial file
+    }
+  }
+
+  private flushToDisk(): void {
+    if (!this.storageFilePath || this.txSnapshot) return;
+    try {
+      fs.mkdirSync(path.dirname(this.storageFilePath), { recursive: true });
+      const serialized: Record<string, Record<string, Record<string, unknown>>> = {};
+      for (const [tblName, rowMap] of this.tables.entries()) {
+        const rowsObj: Record<string, Record<string, unknown>> = {};
+        for (const [pk, r] of rowMap.entries()) {
+          rowsObj[pk] = r;
+        }
+        serialized[tblName] = rowsObj;
+      }
+      const tmpPath = this.storageFilePath + ".tmp";
+      fs.writeFileSync(tmpPath, JSON.stringify({ updatedAtMs: Date.now(), tables: serialized }));
+      fs.renameSync(tmpPath, this.storageFilePath);
+    } catch {
+      // ignore on read-only fs
+    }
+  }
 
   public exec<T = Record<string, unknown>>(query: string, ...bindings: unknown[]): SqlCursorLike<T> {
     const q = query.trim().replace(/\s+/g, " ");
@@ -150,6 +200,7 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
 
     if (upper === "COMMIT" || upper === "COMMIT TRANSACTION") {
       this.txSnapshot = null;
+      this.flushToDisk();
       return { toArray: () => [], one: () => null };
     }
 
@@ -188,6 +239,7 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
         });
         const pk = String(bindings[0] ?? `${tbl.size + 1}`);
         tbl.set(pk, row);
+        this.flushToDisk();
       }
       return { toArray: () => [], one: () => null };
     }
@@ -208,6 +260,7 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
           });
         }
       }
+      this.flushToDisk();
       return { toArray: () => [], one: () => null };
     }
 
@@ -380,5 +433,11 @@ export class InMemoryQueueProducer<T = unknown> implements QueueProducerLike<T> 
   public readonly sentMessages: Array<{ body: T; delaySeconds?: number }> = [];
   public async send(body: T, options?: { delaySeconds?: number }): Promise<void> {
     this.sentMessages.push({ body, delaySeconds: options?.delaySeconds });
+  }
+}
+
+export class DurableDiskCellSqlStorage extends InMemoryCellSqlStorage {
+  constructor(storageFilePath: string) {
+    super(storageFilePath);
   }
 }
