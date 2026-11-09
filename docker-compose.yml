@@ -1,0 +1,77 @@
+name: ansts-v2-stack
+
+services:
+  ansts-control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ansts-control-plane
+    restart: unless-stopped
+    ports:
+      - "${ANSTS_PORT:-8080}:8080"
+      - "${ANSTS_DASHBOARD_PORT:-8090}:8090"
+    environment:
+      ANSTS_HOST: "0.0.0.0"
+      ANSTS_PORT: "8080"
+      ANSTS_DASHBOARD_PORT: "8090"
+      ANSTS_WORKER_NODES: "3"
+      CELLD_BUCKET: "s3://ansts-fleet"
+      S3_ENDPOINT: "http://rustfs:9000"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+      AWS_SECRET_ACCESS_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
+    volumes:
+      - ansts-layerfs-store:/tmp/layerfs-store
+    networks:
+      - ansts-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  ansts-worker-node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ansts-worker-node-1
+    restart: unless-stopped
+    environment:
+      ANSTS_HOST: "0.0.0.0"
+      ANSTS_PORT: "8081"
+      ANSTS_DASHBOARD_PORT: "8091"
+      ANSTS_WORKER_NODES: "2"
+      CELLD_NODE: "ansts-worker-node-1"
+      CELLD_BUCKET: "s3://ansts-fleet"
+      S3_ENDPOINT: "http://rustfs:9000"
+    volumes:
+      - ansts-layerfs-store:/tmp/layerfs-store
+    networks:
+      - ansts-net
+    depends_on:
+      ansts-control-plane:
+        condition: service_healthy
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: ansts-rustfs
+    profiles: ["with-rustfs"]
+    user: "10001:10001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
+    volumes:
+      - rustfs-data:/data
+    networks:
+      - ansts-net
+
+volumes:
+  ansts-layerfs-store:
+  rustfs-data:
+
+networks:
+  ansts-net:
+    driver: bridge

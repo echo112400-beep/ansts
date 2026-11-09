@@ -102,6 +102,7 @@ export class ApiGatewayServer {
   public async close(): Promise<void> {
     if (!this.server) return;
     return new Promise((resolve) => {
+      (this.server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
       this.server!.close(() => {
         this.server = null;
         resolve();

@@ -25,6 +25,10 @@ describe("Design-to-Deliverable Consistency Audit", () => {
   it("1. Verifies all 58 TypeScript source modules, deployment scripts, proto, SQL migrations, and Wrangler configs exist", () => {
     const requiredFiles = [
       "package.json",
+      "Dockerfile",
+      "docker-compose.yml",
+      "scripts/run-local.sh",
+      "src/server_main.ts",
       "tsconfig.json",
       "wrangler.json",
       "wrangler.toml",

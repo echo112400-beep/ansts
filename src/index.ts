@@ -58,3 +58,4 @@ export * from "./checkpoint/layerfs_store_engine.js";
 export * from "./checkpoint/layerfs_remote_sync.js";
 export * from "./runtime/layerfs_workspace_driver.js";
 export * from "./dag/layerfs_branch_coordinator.js";
+export * from "./server_main.js";

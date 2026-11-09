@@ -88,6 +88,10 @@ function compileTsToCommonJs(code, filename) {
     });
     return transformed.code;
   }
+  const prebuiltPath = path.join(ROOT_DIR, "dist", path.relative(ROOT_DIR, filename).replace(/\.ts$/, ".js"));
+  if (fs.existsSync(prebuiltPath)) {
+    return fs.readFileSync(prebuiltPath, "utf8");
+  }
   throw new Error(
     "Neither 'typescript' nor '@babel/core' was found. Please run 'npm install' first."
   );
@@ -140,6 +144,27 @@ function runLint() {
     throw new Error("Missing migrations/0001_init_ansts.sql");
   }
   console.log("  [WRANGLER/CELLD OK] wrangler.json & migrations/0001_init_ansts.sql");
+
+  const composeFiles = [
+    path.join(ROOT_DIR, "docker-compose.yml"),
+    path.join(ROOT_DIR, "deploy", "rustfs-celld", "docker-compose.rustfs-celld.yml"),
+    path.join(ROOT_DIR, "deploy", "rustfs-celld", "docker-compose.rustfs-ha.yml"),
+  ];
+  for (const cf of composeFiles) {
+    if (!fs.existsSync(cf)) {
+      throw new Error(`Missing Docker Compose file: ${cf}`);
+    }
+    if (yaml) {
+      const parsedCompose = yaml.load(fs.readFileSync(cf, "utf8"));
+      if (!parsedCompose || !parsedCompose.services) {
+        throw new Error(`Invalid Docker Compose services in ${cf}`);
+      }
+    }
+  }
+  if (!fs.existsSync(path.join(ROOT_DIR, "Dockerfile"))) {
+    throw new Error("Missing root Dockerfile");
+  }
+  console.log("  [DOCKER/COMPOSE OK] Dockerfile & 3 docker-compose.yml manifests validated");
   console.log("===> [Stage 1/3: TYPESCRIPT LINT PASSED]\n");
 }
 
@@ -197,6 +222,17 @@ if (stage === "lint") {
   runBuild();
 } else if (stage === "test") {
   runTests();
+} else if (stage === "start") {
+  const serverEntry = path.join(ROOT_DIR, "dist", "src", "server_main.js");
+  if (!fs.existsSync(serverEntry)) {
+    runBuild();
+  }
+  const res = spawnSync(process.execPath, [serverEntry], {
+    cwd: ROOT_DIR,
+    stdio: "inherit",
+    env: { ...process.env, NODE_PATH: process.env.NODE_PATH },
+  });
+  process.exit(res.status ?? 0);
 } else {
   runLint();
   runBuild();

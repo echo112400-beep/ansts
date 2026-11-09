@@ -26,16 +26,18 @@ var _manual_scale_controller = require("../cluster/manual_scale_controller.js");
 
 class DashboardBackendServer {
   bridge;
+  host;
   server = null;
 
-  constructor(bridge) {
+  constructor(bridge, host = "127.0.0.1") {
     this.bridge = bridge;
+    this.host = host;
   }
 
   async listen(port = 0) {
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => {
-        if (req.url === "/api/overview") {
+        if (req.url === "/api/overview" || req.url === "/healthz") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(this.bridge.buildClusterOverview()));
           return;
@@ -44,7 +46,7 @@ class DashboardBackendServer {
         res.end("<!doctype html><html><head><title>ANSTS v2 Control Plane</title></head><body><h1>ANSTS v2 Dashboard</h1></body></html>");
       });
       this.server.on("error", reject);
-      this.server.listen(port, "127.0.0.1", () => {
+      this.server.listen(port, this.host, () => {
         const addr = this.server.address();
         resolve(typeof addr === "object" && addr ? addr.port : port);
       });
@@ -54,6 +56,7 @@ class DashboardBackendServer {
   async close() {
     if (!this.server) return;
     return new Promise((resolve) => {
+      this.server.closeAllConnections?.();
       this.server.close(() => {
         this.server = null;
         resolve();

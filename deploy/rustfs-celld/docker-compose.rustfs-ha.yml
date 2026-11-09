@@ -1,4 +1,5 @@
-version: "3.9"
+name: ansts-rustfs-ha
+
 x-rustfs-common: &rustfs-common
   image: rustfs/rustfs:latest
   user: "10001:10001"

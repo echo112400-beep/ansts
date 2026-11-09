@@ -1,4 +1,5 @@
-version: "3.9"
+name: ansts-rustfs-celld
+
 services:
   rustfs:
     image: rustfs/rustfs:latest
@@ -6,6 +7,29 @@ services:
     ports:
       - "9000:9000"
       - "9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
+    volumes:
+      - rustfs-data:/data
+
   celld-node-01:
     image: ghcr.io/denoland/celld:latest
-    command: --bucket s3://ansts-fleet --endpoint http://rustfs:9000 --listen 0.0.0.0:8080 --internal-listen 0.0.0.0:9001 --advertise http://celld-node-01:9001
+    ports:
+      - "8080:8080"
+    environment:
+      AWS_ACCESS_KEY_ID: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+      AWS_SECRET_ACCESS_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
+      AWS_REGION: "us-east-1"
+    command: >
+      --bucket s3://ansts-fleet
+      --endpoint http://rustfs:9000
+      --region us-east-1
+      --listen 0.0.0.0:8080
+      --internal-listen 0.0.0.0:8081
+      --advertise celld-node-01:8081
+    depends_on:
+      - rustfs
+
+volumes:
+  rustfs-data:

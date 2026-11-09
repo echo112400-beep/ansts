@@ -1,4 +1,4 @@
-.PHONY: all lint build test ci clean
+.PHONY: all lint build test ci start docker-up docker-down
 
 all: ci
 
@@ -14,5 +14,11 @@ test:
 ci:
 	node scripts/ci_check.mjs --stage all
 
-clean:
-	rm -rf dist
+start:
+	bash ./scripts/run-local.sh
+
+docker-up:
+	docker compose up --build -d
+
+docker-down:
+	docker compose down

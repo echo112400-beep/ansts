@@ -3,11 +3,16 @@
   "version": "2.2.0",
   "description": "Agent-Native Sandbox Task Scheduler (ANSTS v2.2) on denoland/celld, Cloudflare Workers, LayerFS, and RustFS EC:4",
   "private": true,
+  "main": "dist/src/index.js",
   "scripts": {
+    "start": "node scripts/ci_check.mjs --stage start",
+    "dev": "node scripts/ci_check.mjs --stage start",
     "lint": "node scripts/ci_check.mjs --stage lint",
     "build": "node scripts/ci_check.mjs --stage build",
     "test": "node scripts/ci_check.mjs --stage test",
-    "ci": "node scripts/ci_check.mjs --stage all"
+    "ci": "node scripts/ci_check.mjs --stage all",
+    "docker:up": "docker compose up --build -d",
+    "docker:down": "docker compose down"
   },
   "engines": {
     "node": ">=18.0.0"
