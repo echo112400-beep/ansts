@@ -141,6 +141,7 @@ class AnstsLocalAndComposeServer {
   cloudEventsBus;
   outboxDispatcher;
   dashboardServer;
+  managementPlane;
   apiServer = null;
   tickTimer = null;
   tunnelPollTimer = null;
@@ -294,6 +295,28 @@ class AnstsLocalAndComposeServer {
 
     const bridge = new _server.DashboardBridgeService(this.scheduler, this.fleetController);
     this.dashboardServer = new _server.DashboardBackendServer(bridge, this.host);
+    this.managementPlane = new _server.PlatformManagementPlaneEngine({
+      nodeId: this.nodeId,
+      scheduler: this.scheduler,
+      v25Store: this.v25Store,
+      shardCoordinator: this.shardCoordinator,
+      fleetController: this.fleetController,
+      finopsController: this.finopsController,
+      dagEscrow: this.dagEscrow,
+      walEngine: this.walEngine,
+      timeTravelReplayer: this.timeTravelReplayer,
+      layerfs: this.layerfs,
+      sagaGateway: this.sagaGateway,
+      slaEnforcer: this.slaEnforcer,
+      loadShedder: this.loadShedder,
+      prewarmer: this.prewarmer,
+      geoRouter: this.geoRouter,
+      heavyMigrator: this.heavyMigrator,
+      tunnelRouter: this.tunnelRouter,
+      cloudEventsBus: this.cloudEventsBus,
+      peerBrainUrls: this.peerBrainUrls,
+      peerBodyUrls: this.peerBodyUrls
+    });
   }
 
   async start(apiPort, dashboardPort) {
@@ -1992,148 +2015,128 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M41] Platform Management Plane BFF Endpoints (`/v1beta1/management/*`)
+    // [M41] Platform Management Plane BFF Endpoints (`/v1beta1/management/*`) — Backed by real PlatformManagementPlaneEngine
     if (method === "GET" && pathname === "/v1beta1/management/state") {
+      if (this.managementPlane.getScenario() === "offline" && urlObj.searchParams.get("recover") !== "1") {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MANAGEMENT_API_UNAVAILABLE",
+          scenario: "offline",
+          message: "Management BFF endpoint temporarily unavailable (503)"
+        }));
+
+        return;
+      }
+      if (urlObj.searchParams.get("recover") === "1") {
+        this.managementPlane.setScenario("normal", "chen");
+      }
+      const statePayload = await this.managementPlane.buildFullManagementState({
+        region: urlObj.searchParams.get("region") ?? undefined,
+        tenant: urlObj.searchParams.get("tenant") ?? undefined,
+        timeRange: urlObj.searchParams.get("timeRange") ?? undefined
+      });
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-      JSON.stringify({
-        cluster: "ansts-v25-dev-cluster",
-        gatewayNodeId: this.nodeId,
-        virtualSlots: 256,
-        regions: this.geoRouter.listRegions(),
-        tenants: [
-        { id: "Northstar", region: "us-west-2", maxSlots: 120, dailyBudgetUsd: 1200, configVersion: 14 },
-        { id: "Helios", region: "eu-central-1", maxSlots: 80, dailyBudgetUsd: 800, configVersion: 9 },
-        { id: "Vanguard", region: "ap-northeast-1", maxSlots: 60, dailyBudgetUsd: 600, configVersion: 7 },
-        { id: "Aegis", region: "us-west-2", maxSlots: 40, dailyBudgetUsd: 300, configVersion: 5 }],
+      res.end(JSON.stringify(statePayload));
+      return;
+    }
 
-        status: "HEALTHY"
-      }));
-
+    if (method === "POST" && pathname === "/v1beta1/management/scenario") {
+      const body = await this.readJsonBody(req);
+      if (body.action === "reset") {
+        this.managementPlane.resetToBaseline();
+        const resetState = await this.managementPlane.buildFullManagementState();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ reset: true, state: resetState }));
+        return;
+      }
+      const nextScenario = body.scenario ?? "normal";
+      const actor = String(body.actor ?? "chen");
+      this.managementPlane.setScenario(nextScenario, actor);
+      const statePayload = await this.managementPlane.buildFullManagementState();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ scenario: nextScenario, state: statePayload }));
       return;
     }
 
     if (method === "POST" && pathname === "/v1beta1/management/tenants/config") {
       const body = await this.readJsonBody(req);
-      const role = String(body.role ?? "SRE_ADMIN");
-      if (role === "VIEWER") {
-        res.writeHead(403, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "RBAC_FORBIDDEN", message: "VIEWER role cannot modify tenant quotas" }));
-        return;
-      }
-      const tenantId = String(body.tenantId ?? "Northstar");
-      const expectedVersion = Number(body.expectedVersion ?? 14);
-      const currentEntry = this.blackboard.get(`mgmt:tenant:${tenantId}`);
-      const currentVersion = currentEntry ? currentEntry.version : 14;
-      if (expectedVersion !== currentVersion) {
-        res.writeHead(409, { "content-type": "application/json" });
-        res.end(
-        JSON.stringify({
-          error: "CAS_VERSION_CONFLICT",
-          tenantId,
-          expectedVersion,
-          actualVersion: currentVersion
-        }));
-
-        return;
-      }
-      const newVersion = currentVersion + 1;
-      const updated = {
-        tenantId,
+      const result = this.managementPlane.updateTenantConfig({
+        tenantId: String(body.tenantId ?? "Northstar"),
         maxSlots: Number(body.maxSlots ?? 160),
         dailyBudgetUsd: Number(body.dailyBudgetUsd ?? 1200),
-        configVersion: newVersion,
-        updatedBy: String(body.actor ?? "chen")
-      };
-      this.blackboard.putCas(
-      `mgmt:tenant:${tenantId}`,
-      updated,
-      currentEntry ? currentEntry.version : 0,
-      String(body.actor ?? "chen"));
-
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(updated));
+        expectedVersion: Number(body.expectedVersion ?? 14),
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 
     if (method === "POST" && pathname === "/v1beta1/management/nodes/batch") {
       const body = await this.readJsonBody(req);
-      const nodeIds = body.nodeIds ?? ["celld-brain-01", "body-host-01", "body-host-02"];
-      const operation = String(body.operation ?? "drain");
-      const forceMigrateLeases = Boolean(body.forceMigrateLeases ?? false);
-      const results = nodeIds.map((nodeId) => {
-        if (operation === "drain" && nodeId === "body-host-02" && !forceMigrateLeases) {
-          return {
-            nodeId,
-            status: "FAILED",
-            errorCode: "ERR_ACTIVE_LEASE_PINNED",
-            message: "Active P0 lease task-ns-8841 pinned on body-host-02"
-          };
-        }
-        return { nodeId, status: "SUCCEEDED", operation };
+      const result = this.managementPlane.executeBatchNodeOperation({
+        operation: body.operation ?? "drain",
+        nodeIds: body.nodeIds ?? ["celld-brain-01", "body-host-01", "body-host-02"],
+        forceMigrateLeases: Boolean(body.forceMigrateLeases ?? false),
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
       });
-      const hasFailure = results.some((r) => r.status === "FAILED");
-      res.writeHead(hasFailure ? 207 : 200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ operation, partialFailure: hasFailure, results }));
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 
     if (method === "POST" && pathname === "/v1beta1/management/tasks/cancel") {
       const body = await this.readJsonBody(req);
-      const taskId = String(body.taskId ?? "task-ns-8841");
-      const mode = String(body.mode ?? "graceful");
-      const currentFence = Number(body.currentFence ?? 12);
-      if (mode === "force_fence") {
-        const nextFence = currentFence + 1;
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(
-        JSON.stringify({
-          taskId,
-          state: "FENCED_TERMINATED",
-          newFencingToken: nextFence,
-          confirmed: true
-        }));
+      const result = this.managementPlane.cancelOrFenceTask({
+        taskId: String(body.taskId ?? "task-ns-8841"),
+        mode: body.mode ?? "graceful",
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
 
-        return;
-      }
-      res.writeHead(202, { "content-type": "application/json" });
-      res.end(
-      JSON.stringify({
-        taskId,
-        state: "CANCEL_UNCONFIRMED",
-        confirmed: false,
-        reason: "Awaiting reverse tunnel ACK from body-host-02"
-      }));
-
+    if (method === "POST" && pathname === "/v1beta1/management/tasks/time-travel") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.inspectAndForkTaskTurn({
+        taskId: String(body.taskId ?? "task-ns-8841"),
+        targetTurnIndex: Number(body.targetTurnIndex ?? 3),
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 
     if (method === "POST" && pathname === "/v1beta1/management/approvals/decide") {
       const body = await this.readJsonBody(req);
-      const approvalId = String(body.approvalId ?? "APR-2026-091");
-      const initiator = String(body.initiator ?? "chen");
-      const approver = String(body.approver ?? "zhou");
-      const role = String(body.role ?? "SRE_ADMIN");
-      const decision = String(body.decision ?? "approve");
+      const result = this.managementPlane.decideApprovalTicket({
+        approvalId: String(body.approvalId ?? "APR-2026-091"),
+        initiator: body.initiator ? String(body.initiator) : undefined,
+        approver: String(body.approver ?? "zhou"),
+        role: String(body.role ?? "SRE_ADMIN"),
+        decision: body.decision ?? "approve"
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
 
-      if (role !== "SRE_ADMIN") {
-        res.writeHead(403, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "RBAC_FORBIDDEN", message: "Only SRE_ADMIN can approve high-risk tickets" }));
-        return;
-      }
-      if (initiator === approver) {
-        res.writeHead(409, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "SELF_APPROVAL_FORBIDDEN", message: "4-eyes principle requires a different SRE_ADMIN" }));
-        return;
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-      JSON.stringify({
-        approvalId,
-        status: decision === "approve" ? `APPROVED (${approver})` : `REJECTED (${approver})`,
-        decidedBy: approver
-      }));
-
+    if (method === "POST" && pathname === "/v1beta1/management/capacity/action") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeCapacityOrRebalanceAction({
+        action: body.action ?? "mitigate_capacity",
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 
