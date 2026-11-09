@@ -43,6 +43,14 @@ import { AutomatedChaosDrillRunner } from "./cluster/chaos_drill_runner.js";
 import { NetworkChaosFaultInjectionProxy } from "./runtime/network_chaos_proxy.js";
 import { SandboxPreflightReadinessGate } from "./runtime/preflight_gate.js";
 import { CoWSandboxBranchForker } from "./runtime/sandbox_branch_forker.js";
+import { FinOpsBudgetController } from "./finops/budget_controller.js";
+import { McpDynamicToolRegistry } from "./saga/mcp_registry.js";
+import { TurnWalEngine } from "./checkpoint/wal_engine.js";
+import { DeterministicTimeTravelReplayer } from "./checkpoint/time_travel.js";
+import { EphemeralHeavyExecutorMigrator } from "./runtime/live_migration.js";
+import { InMemoryR2Bucket } from "./cloudflare/env.js";
+import { TaskPriority } from "./models.js";
+import { StaleFenceError } from "./lease_coordinator.js";
 
 export interface AnstsServiceRuntimeOptions {
   host?: string;
@@ -113,6 +121,11 @@ export class AnstsLocalAndComposeServer {
   public readonly chaosProxy: NetworkChaosFaultInjectionProxy;
   public readonly preflightGate: SandboxPreflightReadinessGate;
   public readonly branchForker: CoWSandboxBranchForker;
+  public readonly finopsController: FinOpsBudgetController;
+  public readonly mcpRegistry: McpDynamicToolRegistry;
+  public readonly walEngine: TurnWalEngine;
+  public readonly timeTravelReplayer: DeterministicTimeTravelReplayer;
+  public readonly heavyMigrator: EphemeralHeavyExecutorMigrator;
   public readonly dashboardServer: DashboardBackendServer;
   private apiServer: http.Server | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -178,6 +191,11 @@ export class AnstsLocalAndComposeServer {
     this.chaosProxy = new NetworkChaosFaultInjectionProxy();
     this.preflightGate = new SandboxPreflightReadinessGate();
     this.branchForker = new CoWSandboxBranchForker(this.layerfs);
+    this.finopsController = new FinOpsBudgetController();
+    this.mcpRegistry = new McpDynamicToolRegistry();
+    this.walEngine = new TurnWalEngine();
+    this.timeTravelReplayer = new DeterministicTimeTravelReplayer();
+    this.heavyMigrator = new EphemeralHeavyExecutorMigrator(new InMemoryR2Bucket());
 
     const brainNodes =
       Object.keys(this.peerBrainUrls).length > 0
@@ -205,10 +223,18 @@ export class AnstsLocalAndComposeServer {
         ttft_ewma_ms: 150,
       })
     );
-    this.sagaGateway.registerTool("shell_exec", ToolCallEffectClass.IDEMPOTENT_WRITE, (args) => ({
-      executed: args.cmd ?? "echo ok",
-      status: "SUCCESS",
-    }));
+    this.sagaGateway.registerTool(
+      "shell_exec",
+      ToolCallEffectClass.IDEMPOTENT_WRITE,
+      (args) => ({
+        executed: args.cmd ?? "echo ok",
+        status: "SUCCESS",
+      }),
+      (args) => ({
+        rolledBackCmd: args.cmd ?? "echo ok",
+        status: "COMPENSATED",
+      })
+    );
 
     // Bootstrap worker nodes
     const configuredBodies = Object.keys(this.peerBodyUrls);
@@ -1265,6 +1291,294 @@ export class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ nodeId: this.nodeId, sourceBranch, results }));
+      return;
+    }
+
+
+    // [M38-1] Cognitive LLM Router + FinOps Budget Auto-Downgrade & 402 Gate (`POST /v1beta1/router/completions`)
+    if (method === "POST" && pathname === "/v1beta1/router/completions") {
+      const body = await this.readJsonBody(req);
+      if (body.action === "setBudgetPolicy") {
+        this.finopsController.setPolicy({
+          tenantId: String(body.tenantId ?? "tenant-default"),
+          dailyBudgetUsd: Number(body.dailyBudgetUsd ?? 10.0),
+          softDowngradeThresholdRatio: Number(body.softDowngradeThresholdRatio ?? 0.8),
+          preferredModel: String(body.preferredModel ?? "DeepSeek"),
+          fallbackEconomyModel: String(body.fallbackEconomyModel ?? "Qwen-3.8"),
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ policyUpdated: true, tenantId: body.tenantId }));
+        return;
+      }
+      const tenantId = String(body.tenantId ?? "tenant-default");
+      const budgetDecision = this.finopsController.evaluateBudgetAndModel(tenantId);
+      if (!budgetDecision.allowed) {
+        res.writeHead(402, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "FINOPS_BUDGET_EXCEEDED",
+            tenantId,
+            ...budgetDecision,
+          })
+        );
+        return;
+      }
+      const costUsd = Number(body.costUsd ?? 0.5);
+      const totalSpentUsd = this.finopsController.recordSpend(tenantId, costUsd);
+      const prefixHash = CognitiveRouter.computePrefixHash(
+        String(body.systemPrompt ?? "You are ANSTS Agent"),
+        String(body.toolsSchema ?? "default-tools")
+      );
+      const [endpoint, prefixCacheHit] = this.router.selectEndpoint(
+        prefixHash,
+        Number(body.estimatedTokens ?? 512),
+        Number(body.priority ?? TaskPriority.P1_HIGH) as TaskPriority
+      );
+      this.router.releaseEndpoint(endpoint.endpoint_id);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          tenantId,
+          selectedModel: budgetDecision.selectedModel,
+          downgraded: budgetDecision.downgraded,
+          utilizationRatio: budgetDecision.utilizationRatio,
+          totalSpentUsd,
+          endpointId: endpoint.endpoint_id,
+          prefixCacheHit,
+          prefixHash,
+        })
+      );
+      return;
+    }
+
+    // [M38-2] Dynamic MCP Tool Hub Registration (`POST /v1beta1/saga/mcp/register`)
+    if (method === "POST" && pathname === "/v1beta1/saga/mcp/register") {
+      const body = await this.readJsonBody(req);
+      const serverName = String(body.serverName ?? "mcp-github");
+      const rawTools = (body.tools as Array<Record<string, unknown>>) ?? [];
+      const descriptors = rawTools.map((t) => ({
+        toolName: String(t.toolName ?? "mcp_tool"),
+        description: String(t.description ?? "MCP dynamic tool"),
+        effectClass: (t.effectClass as ToolCallEffectClass) ?? ToolCallEffectClass.COMPENSATABLE_WRITE,
+        inputSchema: (t.inputSchema as Record<string, unknown>) ?? {},
+      }));
+      const count = this.mcpRegistry.registerMcpServerTools(
+        serverName,
+        descriptors,
+        this.sagaGateway,
+        (rpcMethod, rpcParams) => ({
+          jsonrpc: "2.0",
+          method: rpcMethod,
+          serverName,
+          invokedTool: rpcParams.name,
+          argsEcho: rpcParams.arguments,
+          status: "MCP_OK",
+        })
+      );
+      // Also attach compensation handlers for registered COMPENSATABLE_WRITE MCP tools
+      for (const d of descriptors) {
+        if (d.effectClass) {
+          this.sagaGateway.registerTool(
+            d.toolName,
+            d.effectClass,
+            (args) => ({
+              jsonrpc: "2.0",
+              serverName,
+              invokedTool: d.toolName,
+              argsEcho: args,
+              status: "MCP_OK",
+            }),
+            (args) => ({
+              compensatedTool: d.toolName,
+              argsEcho: args,
+              status: "MCP_COMPENSATED",
+            })
+          );
+        }
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ registeredCount: count, totalMcpTools: this.mcpRegistry.listTools().length }));
+      return;
+    }
+
+    // [M38-2] Saga Idempotent Tool Execution & Human Approval Staging (`POST /v1beta1/saga/execute`)
+    if (method === "POST" && pathname === "/v1beta1/saga/execute") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? "task-saga-01");
+      const turnIndex = Number(body.turnIndex ?? 1);
+      const toolName = String(body.toolName ?? "shell_exec");
+      const args = (body.args as Record<string, unknown>) ?? {};
+
+      let task = this.scheduler.allTasks.get(taskId);
+      if (!task) {
+        task = new TaskSpec({
+          task_id: taskId,
+          tenant_id: String(body.tenantId ?? "tenant-default"),
+          priority: TaskPriority.P1_HIGH,
+          prompt: "saga task",
+        });
+        this.scheduler.allTasks.set(taskId, task);
+      }
+
+      if (body.requireApproval) {
+        const staged = this.sagaGateway.stagingGate.stageEffect({
+          effectId: `eff-${taskId}-${turnIndex}`,
+          taskId,
+          turnIndex,
+          toolName,
+          args,
+        });
+        const ticket = this.sagaGateway.stagingGate.requestHumanApproval(task, toolName, args);
+        res.writeHead(202, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "PENDING_APPROVAL", stagedEffectId: staged.effectId, ticket }));
+        return;
+      }
+
+      const [output, deduplicated] = this.sagaGateway.invokeTool(taskId, turnIndex, toolName, args);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "EXECUTED", taskId, turnIndex, toolName, deduplicated, output }));
+      return;
+    }
+
+    // [M38-2] Human-in-the-Loop Approval Resolution (`POST /v1beta1/saga/approve`)
+    if (method === "POST" && pathname === "/v1beta1/saga/approve") {
+      const body = await this.readJsonBody(req);
+      const ticketId = String(body.ticketId ?? "");
+      const taskId = String(body.taskId ?? "task-saga-01");
+      const approved = Boolean(body.approved ?? true);
+      const decidedBy = String(body.decidedBy ?? "secops-reviewer");
+      let task = this.scheduler.allTasks.get(taskId);
+      if (!task) {
+        task = new TaskSpec({
+          task_id: taskId,
+          tenant_id: "tenant-default",
+          priority: TaskPriority.P1_HIGH,
+          prompt: "saga approval task",
+        });
+        this.scheduler.allTasks.set(taskId, task);
+      }
+      const ticket = this.sagaGateway.stagingGate.resolveApproval(ticketId, approved, decidedBy, task);
+      let committedEffects: Array<{ effectId: string; output: Record<string, unknown> }> = [];
+      if (approved) {
+        committedEffects = this.sagaGateway.stagingGate.commitStagedEffects(taskId, (tName, tArgs) => {
+          return this.sagaGateway.invokeTool(taskId, 1, tName, tArgs)[0];
+        });
+      } else {
+        this.sagaGateway.stagingGate.abortStagedEffects(taskId);
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ticket, taskState: task.state, committedEffects }));
+      return;
+    }
+
+    // [M38-2] Reverse-Order LIFO Saga Compensation Rollback (`POST /v1beta1/saga/rollback`)
+    if (method === "POST" && pathname === "/v1beta1/saga/rollback") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? "task-saga-01");
+      const upToTurnInclusive = Number(body.upToTurnInclusive ?? 0);
+      const rolledBackSteps = this.sagaGateway.compensator.rollbackTask(taskId, upToTurnInclusive);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          taskId,
+          rolledBackCount: rolledBackSteps.length,
+          rolledBackSteps: rolledBackSteps.map((s) => ({
+            stepId: s.stepId,
+            turnIndex: s.turnIndex,
+            toolName: s.toolName,
+            compensationResult: s.compensationResult,
+          })),
+        })
+      );
+      return;
+    }
+
+    // [M38-3] Turn WAL Append & Deterministic Time-Travel Task/LayerFS Forking (`POST /v1beta1/checkpoint/time-travel`)
+    if (method === "POST" && pathname === "/v1beta1/checkpoint/time-travel") {
+      const body = await this.readJsonBody(req);
+      const action = String(body.action ?? "appendTurnWal");
+      const taskId = String(body.taskId ?? "task-wal-01");
+
+      if (action === "appendTurnWal") {
+        try {
+          const entry = this.walEngine.appendTurnDelta({
+            taskId,
+            turnIndex: Number(body.turnIndex ?? 1),
+            fencingToken: Number(body.fencingToken ?? 1),
+            changedFiles: (body.changedFiles as string[]) ?? ["app.ts"],
+            sqliteWalPages: Number(body.sqliteWalPages ?? 4),
+            highestSubmittedFencingToken: Number(body.highestSubmittedFencingToken ?? 1),
+          });
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ appended: true, entry }));
+        } catch (err) {
+          if (err instanceof StaleFenceError || (err as Error).name === "StaleFenceError" || (err as Error).message.includes("Stale")) {
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "STALE_FENCE_TOKEN", message: err.message }));
+            return;
+          }
+          throw err;
+        }
+        return;
+      }
+
+      // action === "forkAtTurn"
+      let originalTask = this.scheduler.allTasks.get(taskId) ?? this.v25Store.getPersistedTask(taskId);
+      if (!originalTask) {
+        originalTask = new TaskSpec({
+          task_id: taskId,
+          tenant_id: String(body.tenantId ?? "tenant-default"),
+          priority: TaskPriority.P1_HIGH,
+          prompt: "original task prompt",
+        });
+        this.scheduler.allTasks.set(taskId, originalTask);
+      }
+      const walEntries = this.walEngine.getTaskWalEntries(taskId);
+      const forked = this.timeTravelReplayer.forkTaskAtTurn(
+        originalTask,
+        walEntries,
+        Number(body.targetTurnIndex ?? 1),
+        String(body.newTaskId ?? `${taskId}-fork`),
+        body.overriddenPrompt ? String(body.overriddenPrompt) : undefined
+      );
+      this.scheduler.allTasks.set(forked.forkedTask.task_id, forked.forkedTask);
+      this.v25Store.commitTaskSingleWritePath(forked.forkedTask);
+
+      let layerfsFork: Record<string, unknown> | null = null;
+      if (body.sourceCommitId) {
+        layerfsFork = this.timeTravelReplayer.forkLayerFsCommitZeroCopy(
+          this.layerfs,
+          String(body.sourceCommitId),
+          String(body.newBranchName ?? `branch-${forked.forkedTask.task_id}`)
+        );
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ forked, layerfsFork }));
+      return;
+    }
+
+    // [M38-3] Heavy Sandbox Cross-Node Live Migration (`POST /v1beta1/runtime/migrate`)
+    if (method === "POST" && pathname === "/v1beta1/runtime/migrate") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? "task-heavy-01");
+      const branchName = String(body.branchName ?? "main");
+      const payloadBytes = new TextEncoder().encode(
+        JSON.stringify(this.layerfs.exportBranchBundle(branchName))
+      );
+      const migration = await this.heavyMigrator.migrateHeavyTaskAcrossNodes({
+        taskId,
+        turnIndex: Number(body.turnIndex ?? 1),
+        sourceNodeId: String(body.sourceNodeId ?? this.nodeId),
+        targetNodeId: String(body.targetNodeId ?? "body-host-02"),
+        newFencingToken: Number(body.newFencingToken ?? 2),
+        upperdirSnapshotBytes: payloadBytes,
+      });
+      let s3Synced = false;
+      if (this.s3Endpoint) {
+        s3Synced = await this.layerfs.pushBranchToRemoteS3(branchName, this.s3Endpoint);
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ...migration, branchName, s3Synced }));
       return;
     }
 

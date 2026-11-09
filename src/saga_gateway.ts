@@ -80,7 +80,7 @@ export class SagaToolGateway {
     };
     this.executionJournal.set(idemKey, logEntry);
 
-    if (effectClass === ToolCallEffectClass.COMPENSATABLE && compensateHandler) {
+    if (compensateHandler) {
       this.compensator.recordForwardStep({
         stepId: idemKey.slice(0, 16),
         taskId,
