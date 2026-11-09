@@ -417,15 +417,26 @@ class LayerFsWorkspaceDriver {
   }
 
   importBranchBundle(bundle) {
+    const idRemap = new Map();
     for (const c of bundle.commits) {
+      let targetId = c.commitId;
+      const existing = this.commits.get(c.commitId);
+      if (existing && c.commitId !== "C0" && (existing.branchName !== c.branchName || existing.stepId !== c.stepId)) {
+        targetId = `${c.commitId}-${bundle.branchName}`;
+      }
+      idRemap.set(c.commitId, targetId);
+    }
+    for (const c of bundle.commits) {
+      const mappedCommitId = idRemap.get(c.commitId) ?? c.commitId;
+      const mappedParentId = c.parentCommitId ? idRemap.get(c.parentCommitId) ?? c.parentCommitId : null;
       const filesTree = new Map(c.files);
       const lineBlameMap = new Map(c.blame);
       for (const [relPath, entry] of filesTree.entries()) {
         this.storeEngine.putFileObject(relPath, entry.content, undefined, entry.mode);
       }
       const record = {
-        commitId: c.commitId,
-        parentCommitId: c.parentCommitId,
+        commitId: mappedCommitId,
+        parentCommitId: mappedParentId,
         branchName: c.branchName,
         agentId: c.agentId,
         stepId: c.stepId,
@@ -435,13 +446,13 @@ class LayerFsWorkspaceDriver {
         includesIgnoredDependencies: true,
         mountLatencyMs: c.mountLatencyMs
       };
-      this.commits.set(c.commitId, record);
+      this.commits.set(mappedCommitId, record);
       const num = Number(c.commitId.replace(/^C/, ""));
       if (!Number.isNaN(num) && num > this.commitSeq) {
         this.commitSeq = num;
       }
     }
-    this.branchHeads.set(bundle.branchName, bundle.headCommitId);
+    this.branchHeads.set(bundle.branchName, idRemap.get(bundle.headCommitId) ?? bundle.headCommitId);
   }
 
   async pushBranchToRemoteS3(branchName, s3Endpoint) {

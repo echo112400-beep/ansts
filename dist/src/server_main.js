@@ -27,7 +27,16 @@ var _env = require("./cloudflare/env.js");
 var _blackboard_and_git_arbiter = require("./a2a/blackboard_and_git_arbiter.js");
 var _deadlock_detector = require("./a2a/deadlock_detector.js");
 var _parallel_cow_bisect = require("./a2a/parallel_cow_bisect.js");
-var _distributed_gc_sweeper = require("./storage/distributed_gc_sweeper.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var _distributed_gc_sweeper = require("./storage/distributed_gc_sweeper.js");
+var _layerfs_branch_coordinator = require("./dag/layerfs_branch_coordinator.js");
+var _slsa_provenance_attestor = require("./runtime/slsa_provenance_attestor.js");
+var _confidential_tee_bridge = require("./runtime/confidential_tee_bridge.js");
+var _zero_trust_security_guard = require("./runtime/zero_trust_security_guard.js");
+var _mtls_tunnel_bridge = require("./runtime/mtls_tunnel_bridge.js");
+var _capacity_sla_enforcer = require("./cluster/capacity_sla_enforcer.js");
+var _priority_load_shedder = require("./cluster/priority_load_shedder.js");
+var _canary_rollout_controller = require("./cluster/canary_rollout_controller.js");
+var _predictive_prewarmer = require("./runtime/predictive_prewarmer.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M18 & v2.5 Unified Standalone, Docker Compose & Multi-Node Cluster Service Entrypoint (`src/server_main.ts`).
  * Hardened with:
  * - [P0] Durable Disk-Backed SQL Storage (`DurableDiskCellSqlStorage`) + Cold-Start Rehydration (`RPO=0`) & RustFS S3 LTX Sync
@@ -83,6 +92,15 @@ class AnstsLocalAndComposeServer {
   deadlockDetector;
   bisectCoordinator;
   gcSweeper;
+  branchCoordinator;
+  slsaAttestor;
+  teeBridge;
+  securityGuard;
+  mtlsBridge;
+  slaEnforcer;
+  loadShedder;
+  canaryController;
+  prewarmer;
   dashboardServer;
   apiServer = null;
   tickTimer = null;
@@ -129,6 +147,15 @@ class AnstsLocalAndComposeServer {
     this.deadlockDetector = new _deadlock_detector.A2aWaitForGraphDeadlockDetector();
     this.bisectCoordinator = new _parallel_cow_bisect.ParallelCowGitBisectCoordinator();
     this.gcSweeper = new _distributed_gc_sweeper.DistributedCasGcSweeper();
+    this.branchCoordinator = new _layerfs_branch_coordinator.LayerFsMultiAgentBranchCoordinator(this.layerfs);
+    this.slsaAttestor = new _slsa_provenance_attestor.SlsaProvenanceAttestor();
+    this.teeBridge = new _confidential_tee_bridge.ConfidentialTeeAttestationBridge();
+    this.securityGuard = new _zero_trust_security_guard.ZeroTrustSandboxSecurityGuard();
+    this.mtlsBridge = new _mtls_tunnel_bridge.MtlsReverseTunnelBridge();
+    this.slaEnforcer = new _capacity_sla_enforcer.CapacitySlaEnforcer();
+    this.loadShedder = new _priority_load_shedder.PriorityLoadShedder();
+    this.canaryController = new _canary_rollout_controller.CanaryRolloutController();
+    this.prewarmer = new _predictive_prewarmer.PredictiveSandboxPrewarmer();
 
     const brainNodes =
     Object.keys(this.peerBrainUrls).length > 0 ?
@@ -505,6 +532,20 @@ class AnstsLocalAndComposeServer {
       const body = await this.readJsonBody(req);
       const branchName = String(body.branch ?? "main");
       const command = String(body.command ?? "echo layerfs-ok");
+      const secDecision = this.securityGuard.evaluateAction({
+        shellCommand: command,
+        filePath: body.filePath ? String(body.filePath) : undefined
+      });
+      if (!secDecision.allowed) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "ZERO_TRUST_POLICY_VIOLATION",
+          reason: secDecision.reason ?? "BLOCKED_BY_SECURITY_GUARD"
+        }));
+
+        return;
+      }
       const stepId = String(body.step_id ?? `step-${Date.now()}`);
       if (this.s3Endpoint) {
         await this.layerfs.pullBranchFromRemoteS3(branchName, this.s3Endpoint);
@@ -1001,6 +1042,128 @@ class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(out));
+      return;
+    }
+
+
+    // [M36] Live Cross-Node Multi-Agent LayerFS 3-Way Branch Merge (`POST /v1/layerfs/merge`)
+    if (method === "POST" && pathname === "/v1/layerfs/merge") {
+      const body = await this.readJsonBody(req);
+      const sourceBranch = String(body.sourceBranch ?? "feat-agent-a");
+      const targetBranch = String(body.targetBranch ?? "main");
+      const baseCommitId = String(body.baseCommitId ?? "C0");
+      if (this.s3Endpoint) {
+        await this.layerfs.pullBranchFromRemoteS3(sourceBranch, this.s3Endpoint);
+        await this.layerfs.pullBranchFromRemoteS3(targetBranch, this.s3Endpoint);
+      }
+      try {
+        const mergeResult = this.branchCoordinator.mergeBranchIntoTarget(
+        sourceBranch,
+        targetBranch,
+        baseCommitId);
+
+        let s3Synced = false;
+        if (this.s3Endpoint) {
+          s3Synced = await this.layerfs.pushBranchToRemoteS3(targetBranch, this.s3Endpoint);
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ...mergeResult, targetBranch, s3Synced }));
+      } catch (err) {
+        if (err instanceof _layerfs_branch_coordinator.LayerFsMergeConflictError) {
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(
+          JSON.stringify({
+            error: "LAYERFS_MERGE_CONFLICT",
+            conflictingFiles: err.conflictingFiles,
+            message: err.message
+          }));
+
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
+    // [M36] Cryptographic SLSA v1.0 Provenance + TEE Attestation + SPIFFE mTLS Verification (`POST /v1beta1/security/attest`)
+    if (method === "POST" && pathname === "/v1beta1/security/attest") {
+      const body = await this.readJsonBody(req);
+      const branchOrCommit = String(body.branchOrCommit ?? "main");
+      const spiffeId = String(body.spiffeId ?? `spiffe://ansts.io/ns/fleet/sa/${this.nodeRole}`);
+      const certExpiresAtMs = Number(body.certExpiresAtMs ?? Date.now() + 3600_000);
+
+      const mtlsCheck = this.mtlsBridge.verifySpiffeCertificate(spiffeId, certExpiresAtMs);
+      if (!mtlsCheck.authenticated) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "SPIFFE_MTLS_UNAUTHENTICATED", spiffeId }));
+        return;
+      }
+
+      if (this.s3Endpoint) {
+        await this.layerfs.pullBranchFromRemoteS3(branchOrCommit, this.s3Endpoint);
+      }
+      const slsaStatement = this.slsaAttestor.attestLayerFsCommit(this.layerfs, branchOrCommit);
+      const slsaVerified = this.slsaAttestor.verifyProvenanceStatement(slsaStatement);
+      const teeQuote = this.teeBridge.generateAndVerifyAttestationQuote({
+        vmId: this.nodeId,
+        measurementDigestHex: slsaStatement.subjectDigest,
+        nonce: String(body.nonce ?? "ansts-v25-nonce")
+      });
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        nodeId: this.nodeId,
+        mtlsCheck,
+        slsaStatement,
+        slsaVerified,
+        teeQuote
+      }));
+
+      return;
+    }
+
+    // [M36] Closed-Loop Cluster Governance: SLA Enforcer, Priority Load Shedder, Canary & Prewarmer (`POST /v1beta1/cluster/governance`)
+    if (method === "POST" && pathname === "/v1beta1/cluster/governance") {
+      const body = await this.readJsonBody(req);
+      const action = String(body.action ?? "evaluateSlaAndPrewarm");
+      if (action === "evaluateCanary") {
+        const canaryRes = this.canaryController.evaluateCanaryStep({
+          errorRatePct: Number(body.errorRatePct ?? 0.1),
+          p99LatencyMs: Number(body.p99LatencyMs ?? 120),
+          maxErrorRatePct: body.maxErrorRatePct !== undefined ? Number(body.maxErrorRatePct) : undefined,
+          maxP99LatencyMs: body.maxP99LatencyMs !== undefined ? Number(body.maxP99LatencyMs) : undefined
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(canaryRes));
+        return;
+      }
+      const utilizationRatio = Number(body.utilizationRatio ?? 0.5);
+      const slaCompliance = this.slaEnforcer.evaluateSlaCompliance({
+        p0QueueWaitP99Ms: Number(body.p0QueueWaitP99Ms ?? 80),
+        warmPoolHitRatio: Number(body.warmPoolHitRatio ?? 0.94),
+        freeClusterCpuRatio: Number(body.freeClusterCpuRatio ?? 1 - utilizationRatio)
+      });
+      const prewarmPrediction = this.prewarmer.recordArrivalSampleAndPredict(
+      Number(body.observedArrivalsPerSec ?? 12.0),
+      Number(body.avgSandboxHoldSec ?? 4.0));
+
+      const priorityAdmission = {
+        P0_EMERGENCY: this.loadShedder.shouldAdmitUnderLoad(0, utilizationRatio),
+        P1_HIGH: this.loadShedder.shouldAdmitUnderLoad(1, utilizationRatio),
+        P2_STANDARD: this.loadShedder.shouldAdmitUnderLoad(2, utilizationRatio),
+        P3_BATCH: this.loadShedder.shouldAdmitUnderLoad(3, utilizationRatio)
+      };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        nodeId: this.nodeId,
+        utilizationRatio,
+        slaCompliance,
+        prewarmPrediction,
+        priorityAdmission
+      }));
+
       return;
     }
 
