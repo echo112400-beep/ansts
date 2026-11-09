@@ -123,3 +123,63 @@ export function runCli(argv: string[], runtime = new AnstsClusterRuntime()): { e
   }
   return { exitCode: 1, stdout: JSON.stringify({ error: `Unknown command: ${cmd ?? ""}` }) };
 }
+
+/**
+ * [M39] Live Remote Dev-Cluster CLI Runner (`runAnstsCtlRemote`).
+ * Connects directly to a running ANSTS Gateway / Body node over HTTP.
+ */
+export async function runAnstsCtlRemote(
+  argv: string[],
+  gatewayUrl = process.env.ANSTS_GATEWAY_URL ?? "http://127.0.0.1:18080"
+): Promise<CliCommandOutput> {
+  const baseUrl = gatewayUrl.replace(/\/$/, "");
+  const [cmd, ...rest] = argv;
+
+  if (cmd === "cluster-overview") {
+    const [ovResp, shResp] = await Promise.all([
+      fetch(`${baseUrl}/v1beta1/console/overview`),
+      fetch(`${baseUrl}/v1beta1/console/shards`),
+    ]);
+    if (!ovResp.ok || !shResp.ok) {
+      return { exitCode: 1, stdout: JSON.stringify({ error: "GATEWAY_UNREACHABLE" }) };
+    }
+    const overview = await ovResp.json();
+    const shards = await shResp.json();
+    return { exitCode: 0, stdout: JSON.stringify({ overview, shards }) };
+  }
+
+  if (cmd === "dispatch") {
+    const tenantId = rest[0] ?? "tenant-cli";
+    const taskId = rest[1] ?? `task-cli-${Date.now()}`;
+    const promptText = rest[2] ?? "cli dispatched task";
+    const resp = await fetch(`${baseUrl}/v1beta1/tasks/dispatch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tenantId, taskId, promptText }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "attest") {
+    const branchOrCommit = rest[0] ?? "main";
+    const resp = await fetch(`${baseUrl}/v1beta1/security/attest`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        branchOrCommit,
+        spiffeId: "spiffe://ansts.io/ns/fleet/sa/cli",
+      }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "gc") {
+    const resp = await fetch(`${baseUrl}/v1beta1/storage/gc`, { method: "POST" });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  return { exitCode: 1, stdout: JSON.stringify({ error: `Unknown remote command: ${cmd ?? ""}` }) };
+}

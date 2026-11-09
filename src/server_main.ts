@@ -51,6 +51,13 @@ import { EphemeralHeavyExecutorMigrator } from "./runtime/live_migration.js";
 import { InMemoryR2Bucket } from "./cloudflare/env.js";
 import { TaskPriority } from "./models.js";
 import { StaleFenceError } from "./lease_coordinator.js";
+import { AgentHarnessRunner } from "./harness/runner.js";
+import { SyntacticAndVelocityBreaker } from "./harness/velocity_breaker.js";
+import { DagEscrowCoordinator } from "./dag/escrow.js";
+import { CgroupPhaseController } from "./runtime/phase_controller.js";
+import { LinuxPsiMemoryGuard } from "./runtime/psi_guard.js";
+import { CloudEventsBus } from "./telemetry/cloudevents.js";
+import { TransactionalOutboxDispatcher } from "./telemetry/outbox_webhook.js";
 
 export interface AnstsServiceRuntimeOptions {
   host?: string;
@@ -126,6 +133,13 @@ export class AnstsLocalAndComposeServer {
   public readonly walEngine: TurnWalEngine;
   public readonly timeTravelReplayer: DeterministicTimeTravelReplayer;
   public readonly heavyMigrator: EphemeralHeavyExecutorMigrator;
+  public readonly harnessRunner: AgentHarnessRunner;
+  public readonly velocityBreaker: SyntacticAndVelocityBreaker;
+  public readonly dagEscrow: DagEscrowCoordinator;
+  public readonly phaseController: CgroupPhaseController;
+  public readonly psiGuard: LinuxPsiMemoryGuard;
+  public readonly cloudEventsBus: CloudEventsBus;
+  public readonly outboxDispatcher: TransactionalOutboxDispatcher;
   public readonly dashboardServer: DashboardBackendServer;
   private apiServer: http.Server | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -196,6 +210,13 @@ export class AnstsLocalAndComposeServer {
     this.walEngine = new TurnWalEngine();
     this.timeTravelReplayer = new DeterministicTimeTravelReplayer();
     this.heavyMigrator = new EphemeralHeavyExecutorMigrator(new InMemoryR2Bucket());
+    this.velocityBreaker = new SyntacticAndVelocityBreaker();
+    this.harnessRunner = new AgentHarnessRunner(this.router, this.sagaGateway, this.velocityBreaker);
+    this.dagEscrow = new DagEscrowCoordinator();
+    this.phaseController = new CgroupPhaseController();
+    this.psiGuard = new LinuxPsiMemoryGuard();
+    this.cloudEventsBus = new CloudEventsBus();
+    this.outboxDispatcher = new TransactionalOutboxDispatcher();
 
     const brainNodes =
       Object.keys(this.peerBrainUrls).length > 0
@@ -1579,6 +1600,235 @@ export class AnstsLocalAndComposeServer {
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ...migration, branchName, s3Synced }));
+      return;
+    }
+
+
+    // [M39-1] Multi-Turn Agent Harness Runner + Velocity Breaker + Cgroup Phase + PSI Guard (`POST /v1beta1/harness/run-turn`)
+    if (method === "POST" && pathname === "/v1beta1/harness/run-turn") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? "task-harness-01");
+      const tenantId = String(body.tenantId ?? "tenant-default");
+      const toolName = String(body.toolName ?? "shell_exec");
+      const toolArgs = (body.toolArgs as Record<string, unknown>) ?? { cmd: "echo ok" };
+      const estimatedTokens = Number(body.estimatedTokens ?? 1200);
+
+      let task = this.scheduler.allTasks.get(taskId);
+      if (!task) {
+        task = new TaskSpec({
+          task_id: taskId,
+          tenant_id: tenantId,
+          priority: TaskPriority.P1_HIGH,
+          prompt: String(body.prompt ?? "harness turn"),
+        });
+        this.scheduler.allTasks.set(taskId, task);
+      }
+
+      const thinkCgroup = this.phaseController.applyThinkPhase(taskId, task.resource_profile);
+      try {
+        const turnSummary = this.harnessRunner.executeSingleTurn(
+          task,
+          toolName,
+          toolArgs,
+          estimatedTokens
+        );
+        const actCgroup = this.phaseController.applyActPhase(taskId, task.resource_profile);
+
+        let psiDefense = null;
+        if (body.psiSample) {
+          const sample = body.psiSample as { someAvg10Pct: number; fullAvg10Pct: number; freeSwapMb: number };
+          psiDefense = this.psiGuard.evaluateAndDefend(sample, Array.from(this.scheduler.allTasks.values()));
+        }
+
+        const sseEvtId = `evt-${taskId}-t${turnSummary.turnIndex}`;
+        this.sseGateway.publish({
+          id: sseEvtId,
+          event: "turn.completed",
+          taskId,
+          turnIndex: turnSummary.turnIndex,
+          timestampMs: Date.now(),
+          data: { toolName, turnIndex: turnSummary.turnIndex, endpointId: turnSummary.endpointId },
+        });
+
+        const cloudEvent = this.cloudEventsBus.emitEvent({
+          type: "io.ansts.harness.turn.completed",
+          subject: taskId,
+          tenantId,
+          llmCostUsd: Number(body.llmCostUsd ?? 0.02),
+          sandboxCpuCoreSeconds: 1.5,
+          data: { turnIndex: turnSummary.turnIndex, toolName },
+        });
+
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            turnSummary,
+            thinkCgroup,
+            actCgroup,
+            psiDefense,
+            sseEvtId,
+            cloudEventId: cloudEvent.id,
+          })
+        );
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (msg.includes("Velocity breaker tripped")) {
+          res.writeHead(429, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "VELOCITY_BREAKER_TRIPPED",
+              taskState: task.state,
+              message: msg,
+            })
+          );
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
+    // [M39-1] Parent-Child Sub-Agent DAG Quota Escrow & Cycle Guard (`POST /v1beta1/dag/escrow`)
+    if (method === "POST" && pathname === "/v1beta1/dag/escrow") {
+      const body = await this.readJsonBody(req);
+      const action = String(body.action ?? "reserveParent");
+      const parentId = String(body.parentTaskId ?? "task-parent-01");
+      const tenantId = String(body.tenantId ?? "tenant-dag");
+
+      let parentTask = this.scheduler.allTasks.get(parentId);
+      if (!parentTask) {
+        parentTask = new TaskSpec({
+          task_id: parentId,
+          tenant_id: tenantId,
+          priority: TaskPriority.P1_HIGH,
+          prompt: "parent task",
+          expected_SubAgent_count: Number(body.expectedSubAgentCount ?? 2),
+        });
+        this.scheduler.allTasks.set(parentId, parentTask);
+      }
+
+      if (action === "reserveParent") {
+        const record = this.dagEscrow.reserveParentEscrow(
+          parentTask,
+          Number(body.maxTenantQuota ?? 10),
+          Number(body.currentTenantUsed ?? 1)
+        );
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            parentTaskId: record.parentTaskId,
+            escrowedSlots: record.escrowedSlots,
+            usedSlots: record.usedSlots,
+          })
+        );
+        return;
+      }
+
+      if (action === "registerChild") {
+        const childId = String(body.childTaskId ?? "task-child-01");
+        const deps = (body.dependencies as string[]) ?? [];
+        const childTask = new TaskSpec({
+          task_id: childId,
+          tenant_id: tenantId,
+          priority: TaskPriority.P1_HIGH,
+          prompt: "child task",
+          dependencies: deps,
+          parent_task_id: parentId,
+        });
+        try {
+          const out = this.dagEscrow.registerChildSubAgent(parentTask, childTask);
+          this.scheduler.allTasks.set(childId, childTask);
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ...out, parentState: parentTask.state, childTaskId: childId }));
+        } catch (err) {
+          if ((err as Error).message.includes("DAG cycle detected")) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "DAG_CYCLE_DETECTED", message: (err as Error).message }));
+            return;
+          }
+          throw err;
+        }
+        return;
+      }
+
+      if (action === "completeChild") {
+        const childId = String(body.childTaskId ?? "task-child-01");
+        const allChildrenDone = this.dagEscrow.completeChildSubAgent(parentTask, childId);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ allChildrenDone, parentState: parentTask.state }));
+        return;
+      }
+    }
+
+    // [M39-2] CloudEvents v1.0 Telemetry Bus & HMAC-SHA256 Transactional Outbox Webhook (`POST /v1beta1/telemetry/events`)
+    if (method === "POST" && pathname === "/v1beta1/telemetry/events") {
+      const body = await this.readJsonBody(req);
+      const tenantId = String(body.tenantId ?? "tenant-telemetry");
+      const taskId = String(body.taskId ?? "task-telemetry-01");
+      const evt = this.cloudEventsBus.emitEvent({
+        type: String(body.type ?? "io.ansts.task.completed"),
+        subject: taskId,
+        tenantId,
+        llmCostUsd: Number(body.llmCostUsd ?? 0.15),
+        sandboxCpuCoreSeconds: Number(body.sandboxCpuCoreSeconds ?? 12.5),
+        data: (body.data as Record<string, unknown>) ?? {},
+      });
+
+      let webhookDelivery: Record<string, unknown> | null = null;
+      if (body.webhookUrl) {
+        const msgId = `outbox-${evt.id}`;
+        const msg = this.outboxDispatcher.enqueueOutbox(msgId, taskId, String(body.webhookUrl), {
+          cloudEvent: evt,
+        });
+        const sig = this.outboxDispatcher.signPayload(JSON.stringify(msg.payload));
+        msg.signatureHeader = sig;
+        let delivered = false;
+        try {
+          const whResp = await fetch(String(body.webhookUrl), {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-ansts-signature": sig,
+            },
+            body: JSON.stringify(msg.payload),
+          });
+          delivered = whResp.ok;
+          msg.delivered = delivered;
+        } catch {
+          delivered = false;
+        }
+        webhookDelivery = { messageId: msgId, delivered, signatureHeader: sig };
+      }
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          cloudEvent: evt,
+          tenantFinOpsReport: this.cloudEventsBus.getTenantReport(tenantId),
+          webhookDelivery,
+        })
+      );
+      return;
+    }
+
+    // [M39-2] SSE Stream with `Last-Event-ID` Historical Replay (`GET /v1/events/stream`)
+    if (method === "GET" && pathname === "/v1/events/stream") {
+      const taskId = urlObj.searchParams.get("taskId") ?? "task-harness-01";
+      const lastEventId =
+        (req.headers["last-event-id"] as string | undefined) ??
+        urlObj.searchParams.get("lastEventId") ??
+        undefined;
+      const subId = `sub-${Date.now()}`;
+      const sub = this.sseGateway.subscribe(taskId, subId, lastEventId);
+      const chunks: Buffer[] = [];
+      sub.stream.on("data", (c: Buffer) => chunks.push(Buffer.from(c)));
+      this.sseGateway.unsubscribe(taskId, subId);
+      const ssePayload = Buffer.concat(chunks).toString("utf-8");
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      });
+      res.end(ssePayload);
       return;
     }
 
