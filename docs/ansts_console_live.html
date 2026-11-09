@@ -1,5 +1,1980 @@
-<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>ANSTS v2.5 Live Shard & Tunnel Console</title></head>
-<body><h1>ANSTS v2.5 Live Shard & Dual-Homed Tunnel Matrix</h1></body>
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ANSTS v2.5 — TanStack Distributed Control Plane Console</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace']
+          },
+          colors: {
+            slate: {
+              925: '#0b1120',
+              950: '#060a14'
+            }
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    body {
+      background-color: #060a14;
+      color: #e2e8f0;
+      font-family: 'Inter', system-ui, sans-serif;
+    }
+    .glass-card {
+      background: rgba(15, 23, 42, 0.82);
+      border: 1px solid rgba(51, 65, 85, 0.65);
+      backdrop-filter: blur(12px);
+    }
+    .slot-cell {
+      transition: transform 0.12s ease, background-color 0.2s ease;
+    }
+    .slot-cell:hover {
+      transform: scale(1.28);
+      z-index: 10;
+    }
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0b1120;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col selection:bg-indigo-500 selection:text-white">
+
+  <!-- Top Control Plane Header -->
+  <header class="sticky top-0 z-30 border-b border-slate-800/80 bg-slate-950/90 backdrop-blur-md">
+    <div class="max-w-[1600px] mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-indigo-500 via-violet-500 to-emerald-400 flex items-center justify-center shadow-lg shadow-indigo-500/20 font-mono font-bold text-slate-950 text-sm">
+          v2.5
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-base sm:text-lg font-bold tracking-tight text-white">ANSTS TanStack Control Plane Console</h1>
+            <span class="px-2 py-0.5 text-[11px] font-mono font-semibold rounded-full bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+              celld v0.6.3 + LayerFS
+            </span>
+          </div>
+          <p class="text-xs text-slate-400 font-mono">
+            Cluster: <span id="hdr-cluster-name" class="text-slate-200">ansts-v25-dev-cluster</span> · 11 Services · 256 Virtual Hash Slots · RPO=0 SQL + RustFS S3 LTX
+          </p>
+        </div>
+      </div>
+
+      <!-- TanStack Query Status & Global Controls -->
+      <div class="flex flex-wrap items-center gap-2.5">
+        <div id="bff-mode-badge" class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs font-mono text-emerald-300">
+          <span id="bff-status-dot" class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span id="bff-mode-text">TANSTACK QUERY: SYNCING...</span>
+        </div>
+
+        <div class="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs font-mono text-slate-300">
+          <span>Poll:</span>
+          <select id="query-poll-interval" onchange="changePollInterval(this.value)" class="bg-transparent text-indigo-300 focus:outline-none cursor-pointer">
+            <option value="0">Manual</option>
+            <option value="3000" selected>3.0s</option>
+            <option value="8000">8.0s</option>
+          </select>
+        </div>
+
+        <button id="btn-refetch-all" type="button" onclick="refetchAllQueries()" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-xs font-medium text-white transition flex items-center gap-1.5 shadow-sm">
+          <span>↻</span>
+          <span>Refetch BFF</span>
+        </button>
+
+        <button id="btn-open-api-log" type="button" onclick="toggleApiInspectorDrawer()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-200 border border-slate-700 transition">
+          BFF Log (<span id="bff-log-count">0</span>)
+        </button>
+      </div>
+    </div>
+
+    <!-- TanStack Router Navigation Bar -->
+    <div class="max-w-[1600px] mx-auto px-4 sm:px-6 flex items-center gap-1 overflow-x-auto border-t border-slate-900/90 pt-1">
+      <button id="nav-tab-overview" type="button" onclick="switchConsoleRoute('overview')" class="route-tab px-4 py-2.5 text-xs sm:text-sm font-medium border-b-2 border-indigo-500 text-indigo-300 whitespace-nowrap flex items-center gap-2 transition">
+        <span class="font-mono text-[11px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">1</span>
+        <span>Cluster Mesh &amp; 256-Slot Ring</span>
+      </button>
+      <button id="nav-tab-scheduler" type="button" onclick="switchConsoleRoute('scheduler')" class="route-tab px-4 py-2.5 text-xs sm:text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200 whitespace-nowrap flex items-center gap-2 transition">
+        <span class="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">2</span>
+        <span>5D Task Scheduler &amp; TanStack Table</span>
+      </button>
+      <button id="nav-tab-layerfs" type="button" onclick="switchConsoleRoute('layerfs')" class="route-tab px-4 py-2.5 text-xs sm:text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200 whitespace-nowrap flex items-center gap-2 transition">
+        <span class="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">3</span>
+        <span>LayerFS CoW &amp; 3-Way Merge Studio</span>
+      </button>
+      <button id="nav-tab-a2a" type="button" onclick="switchConsoleRoute('a2a')" class="route-tab px-4 py-2.5 text-xs sm:text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200 whitespace-nowrap flex items-center gap-2 transition">
+        <span class="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">4</span>
+        <span>A2A Blackboard, Bisect &amp; Time-Travel</span>
+      </button>
+      <button id="nav-tab-governance" type="button" onclick="switchConsoleRoute('governance')" class="route-tab px-4 py-2.5 text-xs sm:text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200 whitespace-nowrap flex items-center gap-2 transition">
+        <span class="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">5</span>
+        <span>Zero-Trust, FinOps &amp; Chaos Governance</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Workspace Container -->
+  <main class="flex-1 max-w-[1600px] w-full mx-auto px-4 sm:px-6 py-5 space-y-6">
+
+    <!-- Global KPI Strip -->
+    <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div class="glass-card rounded-xl p-4">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <span>GLOBAL SCHEDULED TASKS</span>
+          <span class="font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded">RPO=0 SQL</span>
+        </div>
+        <div class="mt-2 flex items-baseline justify-between">
+          <div id="kpi-total-tasks" class="text-2xl font-bold font-mono text-white">0</div>
+          <div id="kpi-active-brains" class="text-xs font-mono text-slate-400">3/3 Brains Active</div>
+        </div>
+        <div class="mt-2 text-[11px] text-slate-400 font-mono truncate">
+          Stateless Gateway Fan-Out: <span id="kpi-gw-node" class="text-indigo-300">celld-gw-01</span>
+        </div>
+      </div>
+
+      <div class="glass-card rounded-xl p-4">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <span>256-SLOT CONSISTENT HASH RING</span>
+          <span id="kpi-ring-gen" class="font-mono text-indigo-300 bg-indigo-500/10 px-2 py-0.5 rounded">Gen #3</span>
+        </div>
+        <div class="mt-2 flex items-baseline justify-between">
+          <div id="kpi-slot-balance" class="text-xl font-bold font-mono text-white">85 / 86 / 85</div>
+          <div class="text-xs font-mono text-emerald-400">64 Shards</div>
+        </div>
+        <div class="mt-2 text-[11px] text-slate-400 font-mono">
+          Owners: <span class="text-indigo-400">brain-01</span> · <span class="text-emerald-400">brain-02</span> · <span class="text-amber-400">brain-03</span>
+        </div>
+      </div>
+
+      <div class="glass-card rounded-xl p-4">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <span>LAYERFS COW &amp; S3 CAS STORE</span>
+          <span class="font-mono text-violet-300 bg-violet-500/10 px-2 py-0.5 rounded">s3://ansts-fleet</span>
+        </div>
+        <div class="mt-2 flex items-baseline justify-between">
+          <div id="kpi-layerfs-branches" class="text-2xl font-bold font-mono text-white">3 Branches</div>
+          <div id="kpi-layerfs-objects" class="text-xs font-mono text-violet-300">6 CAS Objects</div>
+        </div>
+        <div class="mt-2 text-[11px] text-slate-400 font-mono">
+          Zero-Copy Fork: <span class="text-emerald-400">0.08 ms</span> · RustFS Sync: <span class="text-emerald-400">ACTIVE</span>
+        </div>
+      </div>
+
+      <div class="glass-card rounded-xl p-4">
+        <div class="flex items-center justify-between text-xs text-slate-400">
+          <span>DUAL-HOMED REVERSE TUNNEL</span>
+          <span id="kpi-tunnel-role" class="font-mono text-amber-300 bg-amber-500/10 px-2 py-0.5 rounded">PRIMARY</span>
+        </div>
+        <div class="mt-2 flex items-baseline justify-between">
+          <div id="kpi-tunnel-gw" class="text-xl font-bold font-mono text-white">celld-gw-01</div>
+          <div class="text-xs font-mono text-emerald-400">mTLS SVID OK</div>
+        </div>
+        <div class="mt-2 text-[11px] text-slate-400 font-mono">
+          NAT Traversal: <span class="text-slate-200">body-host-01/02 ⇄ gw-01/02</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- VIEW 1: CLUSTER MESH & 256-SLOT HASH RING (#overview)                 -->
+    <!-- ===================================================================== -->
+    <section id="view-overview" class="space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- 256-Slot Consistent Hash Ring Panel -->
+        <div class="lg:col-span-7 glass-card rounded-xl p-5 space-y-4">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 class="text-sm font-semibold text-white flex items-center gap-2">
+                <span>256-Slot Consistent Hash Ring &amp; Automatic Brain Failover</span>
+                <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300">FNV-1a VNodes=8</span>
+              </h2>
+              <p class="text-xs text-slate-400 mt-0.5">
+                Hover any slot (`000`–`255`) to inspect its owning `celld` Brain shard and epoch fencing token.
+              </p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <button id="btn-evict-brain02" type="button" onclick="triggerBrainShardRebalance('evict', 'brain-node-02')" class="px-3 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/40 text-xs font-mono text-rose-300 transition">
+                ⚡ Evict brain-node-02
+              </button>
+              <button id="btn-restore-brain02" type="button" onclick="triggerBrainShardRebalance('register', 'brain-node-02')" class="px-3 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-xs font-mono text-emerald-300 transition">
+                ↻ Restore brain-node-02
+              </button>
+            </div>
+          </div>
+
+          <!-- Legend & Slot Inspector Bar -->
+          <div class="flex flex-wrap items-center justify-between gap-3 bg-slate-900/90 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono">
+            <div class="flex items-center gap-4">
+              <span class="flex items-center gap-1.5">
+                <span class="w-3 h-3 rounded-sm bg-indigo-500 inline-block"></span>
+                <span class="text-slate-300">brain-node-01 (<span id="legend-slots-b1">85</span>)</span>
+              </span>
+              <span class="flex items-center gap-1.5">
+                <span class="w-3 h-3 rounded-sm bg-emerald-500 inline-block"></span>
+                <span class="text-slate-300">brain-node-02 (<span id="legend-slots-b2">86</span>)</span>
+              </span>
+              <span class="flex items-center gap-1.5">
+                <span class="w-3 h-3 rounded-sm bg-amber-500 inline-block"></span>
+                <span class="text-slate-300">brain-node-03 (<span id="legend-slots-b3">85</span>)</span>
+              </span>
+            </div>
+            <div id="slot-hover-readout" class="text-indigo-300">
+              Slot #000 → Owner: brain-node-01 (Epoch 1)
+            </div>
+          </div>
+
+          <!-- 16x16 Grid for 256 Virtual Slots -->
+          <div id="hash-ring-grid" class="grid grid-cols-16 gap-1 p-2 bg-slate-950/80 rounded-lg border border-slate-800/80" style="grid-template-columns: repeat(16, minmax(0, 1fr));"></div>
+        </div>
+
+        <!-- Real-Time Telemetry Chart & Dual-Homed Reverse Tunnel Control -->
+        <div class="lg:col-span-5 glass-card rounded-xl p-5 flex flex-col justify-between space-y-4">
+          <div>
+            <div class="flex items-center justify-between">
+              <h2 class="text-sm font-semibold text-white">5D Scheduler Throughput &amp; LayerFS Mount Latency</h2>
+              <span class="text-[11px] font-mono text-emerald-400">Prometheus :9090 Live</span>
+            </div>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Tracks task scheduling rate (tasks/s) and p99 ephemeral CoW mount latency (ms).
+            </p>
+            <div class="relative h-60 mt-3">
+              <canvas id="telemetry-chart"></canvas>
+            </div>
+          </div>
+
+          <!-- Dual-Homed Reverse Tunnel Failover Switcher -->
+          <div class="bg-slate-900/90 border border-slate-800 rounded-lg p-3.5 space-y-2.5">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold text-white">Dual-Homed Outbound Reverse Tunnel HA</span>
+              <span id="tunnel-active-pill" class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300">
+                PRIMARY: celld-gw-01 (:18080)
+              </span>
+            </div>
+            <p class="text-xs text-slate-400">
+              Private `body-host-01` &amp; `body-host-02` maintain simultaneous outbound tunnels to `celld-gw-01` and `celld-gw-02`.
+            </p>
+            <div class="flex flex-wrap items-center gap-2 pt-1">
+              <button id="btn-tunnel-failover" type="button" onclick="toggleGatewayTunnelHealth(false)" class="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-xs font-mono text-amber-300 transition">
+                Simulate celld-gw-01 Outage → Failover to gw-02
+              </button>
+              <button id="btn-tunnel-recover" type="button" onclick="toggleGatewayTunnelHealth(true)" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-mono text-slate-200 transition">
+                Restore celld-gw-01 Primary
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 11-Container Dev Cluster Topology Matrix -->
+      <div class="glass-card rounded-xl p-5 space-y-4">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 class="text-sm font-semibold text-white">11-Container Multi-Node Topology (`deploy/dev-cluster/docker-compose.dev-cluster.yml`)</h2>
+            <p class="text-xs text-slate-400">
+              Live status across Edge Gateways, Sharded `celld` Brains, `LayerFS` Body Hosts, RustFS S3 CAS, Prometheus, and Grafana.
+            </p>
+          </div>
+          <span class="text-xs font-mono text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-2.5 py-1 rounded-lg">
+            11 / 11 Services Healthy
+          </span>
+        </div>
+        <div id="topology-cards-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3"></div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- VIEW 2: 5D TASK SCHEDULER & TANSTACK TABLE (#scheduler)               -->
+    <!-- ===================================================================== -->
+    <section id="view-scheduler" class="hidden space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- Dispatch Task Form -->
+        <div class="lg:col-span-4 glass-card rounded-xl p-5 space-y-4">
+          <div>
+            <h2 class="text-sm font-semibold text-white">Dispatch Distributed Task (`POST /v1beta1/tasks/dispatch`)</h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Routes via 256-slot consistent hash ring to the owning Brain shard (`RPO=0` SQL commit) and executes on the target Body LayerFS daemon.
+            </p>
+          </div>
+
+          <form id="form-dispatch-task" onsubmit="submitDispatchTaskForm(event)" class="space-y-3 text-xs">
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label for="inp-task-id" class="block text-slate-400 mb-1 font-mono">Task ID</label>
+                <input id="inp-task-id" type="text" value="task-prod-901" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-white font-mono focus:border-indigo-500 focus:outline-none" />
+              </div>
+              <div>
+                <label for="inp-tenant-id" class="block text-slate-400 mb-1 font-mono">Tenant ID</label>
+                <input id="inp-tenant-id" type="text" value="tenant-acme" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-white font-mono focus:border-indigo-500 focus:outline-none" />
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label for="inp-task-priority" class="block text-slate-400 mb-1 font-mono">Priority Class</label>
+                <select id="inp-task-priority" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-white font-mono focus:border-indigo-500 focus:outline-none">
+                  <option value="0">P0_EMERGENCY (0)</option>
+                  <option value="1" selected>P1_HIGH (1)</option>
+                  <option value="2">P2_STANDARD (2)</option>
+                  <option value="3">P3_BATCH (3)</option>
+                </select>
+              </div>
+              <div>
+                <label for="inp-body-host" class="block text-slate-400 mb-1 font-mono">Target Body Host</label>
+                <select id="inp-body-host" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-white font-mono focus:border-indigo-500 focus:outline-none">
+                  <option value="body-host-01" selected>body-host-01 (:19501)</option>
+                  <option value="body-host-02">body-host-02 (:19502)</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label for="inp-dispatch-mode" class="block text-slate-400 mb-1 font-mono">Transport Mode</label>
+              <select id="inp-dispatch-mode" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-white font-mono focus:border-indigo-500 focus:outline-none">
+                <option value="direct" selected>Direct HTTP RPC → Auto Fallback to Reverse Tunnel</option>
+                <option value="reverse_tunnel">Force Outbound Reverse Tunnel (NAT-Traversal)</option>
+              </select>
+            </div>
+
+            <div>
+              <label for="inp-task-prompt" class="block text-slate-400 mb-1 font-mono">Agent Task Prompt / Payload</label>
+              <textarea id="inp-task-prompt" rows="2" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-white font-mono focus:border-indigo-500 focus:outline-none">Verify multi-node LayerFS CoW snapshot and sync to s3://ansts-fleet</textarea>
+            </div>
+
+            <div class="flex items-center gap-2 pt-1">
+              <button id="btn-submit-task" type="submit" class="flex-1 py-2 px-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition shadow">
+                🚀 Dispatch Task to Cluster
+              </button>
+              <button id="btn-batch-seed-tasks" type="button" onclick="seedBatchSampleTasks()" class="py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-mono border border-slate-700 transition">
+                +3 Batch
+              </button>
+            </div>
+          </form>
+
+          <!-- Latest Dispatch Receipt -->
+          <div id="dispatch-receipt-box" class="bg-slate-950/90 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 space-y-1">
+            <div class="text-slate-400">LATEST DISPATCH TRACE:</div>
+            <div id="dispatch-receipt-content" class="text-emerald-300 break-all">Ready. Submit a task above to trace Gateway → Brain Slot → Body LayerFS.</div>
+          </div>
+        </div>
+
+        <!-- TanStack Table: Multi-Column Sort, Filter & Execution Trace -->
+        <div class="lg:col-span-8 glass-card rounded-xl p-5 space-y-4">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 class="text-sm font-semibold text-white">TanStack Table — GlobalPersistedTasks (`GET /v1beta1/console/tasks`)</h2>
+              <p class="text-xs text-slate-400">
+                Stateless fan-out across `brain-node-01..03` SQL stores. Click any column header to sort or click **Trace** to inspect execution.
+              </p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <input id="table-search-input" type="text" oninput="updateTableFilterSearch(this.value)" placeholder="Filter task_id / tenant / brain..." class="rounded-lg bg-slate-900 border border-slate-700 px-3 py-1.5 text-xs font-mono text-white focus:border-indigo-500 focus:outline-none" />
+              <select id="table-brain-filter" onchange="updateTableBrainFilter(this.value)" class="rounded-lg bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-xs font-mono text-slate-200 focus:outline-none">
+                <option value="ALL">All Brain Shards</option>
+                <option value="brain-node-01">brain-node-01</option>
+                <option value="brain-node-02">brain-node-02</option>
+                <option value="brain-node-03">brain-node-03</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="overflow-x-auto border border-slate-800 rounded-lg">
+            <table class="w-full text-left border-collapse text-xs font-mono">
+              <thead>
+                <tr class="bg-slate-900/95 text-slate-400 border-b border-slate-800 select-none">
+                  <th onclick="sortTaskTable('task_id')" class="py-2.5 px-3 cursor-pointer hover:text-white">Task ID ↕</th>
+                  <th onclick="sortTaskTable('tenant_id')" class="py-2.5 px-3 cursor-pointer hover:text-white">Tenant ↕</th>
+                  <th onclick="sortTaskTable('shardSlot')" class="py-2.5 px-3 cursor-pointer hover:text-white">Slot ↕</th>
+                  <th onclick="sortTaskTable('routedBrainNodeId')" class="py-2.5 px-3 cursor-pointer hover:text-white">Brain Shard ↕</th>
+                  <th onclick="sortTaskTable('lease_fencing_token')" class="py-2.5 px-3 cursor-pointer hover:text-white">Fence Token ↕</th>
+                  <th onclick="sortTaskTable('assigned_node_id')" class="py-2.5 px-3 cursor-pointer hover:text-white">Body Host ↕</th>
+                  <th onclick="sortTaskTable('state')" class="py-2.5 px-3 cursor-pointer hover:text-white">State ↕</th>
+                  <th class="py-2.5 px-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="tanstack-task-tbody" class="divide-y divide-slate-800/70 bg-slate-950/50"></tbody>
+            </table>
+          </div>
+
+          <!-- Selected Task Execution Pipeline Drawer -->
+          <div id="task-trace-panel" class="bg-slate-900/90 border border-indigo-500/30 rounded-lg p-4 space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold text-indigo-300 font-mono">SELECTED TASK END-TO-END EXECUTION PIPELINE</span>
+              <span id="trace-task-badge" class="text-[11px] font-mono px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-200">Click a row to inspect</span>
+            </div>
+            <div id="trace-pipeline-steps" class="grid grid-cols-1 sm:grid-cols-4 gap-2 text-xs font-mono pt-1"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- VIEW 3: LAYERFS COW WORKSPACE & 3-WAY MERGE STUDIO (#layerfs)         -->
+    <!-- ===================================================================== -->
+    <section id="view-layerfs" class="hidden space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- Ephemeral Bash Runner & Zero-Trust Guard -->
+        <div class="lg:col-span-5 glass-card rounded-xl p-5 space-y-4">
+          <div>
+            <h2 class="text-sm font-semibold text-white">LayerFS Ephemeral CoW Workspace (`POST /v1/layerfs/exec`)</h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Mounts branch snapshot, executes bash command with Zero-Trust guard, commits diff to content-addressable store, and syncs to `s3://ansts-fleet`.
+            </p>
+          </div>
+
+          <div class="space-y-3 text-xs font-mono">
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label for="lfs-branch-input" class="block text-slate-400 mb-1">Target Branch</label>
+                <input id="lfs-branch-input" type="text" value="feat-agent-a" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-white focus:border-indigo-500 focus:outline-none" />
+              </div>
+              <div>
+                <label for="lfs-step-input" class="block text-slate-400 mb-1">Step Provenance ID</label>
+                <input id="lfs-step-input" type="text" value="step-agent-a-101" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-white focus:border-indigo-500 focus:outline-none" />
+              </div>
+            </div>
+
+            <div>
+              <label for="lfs-cmd-input" class="block text-slate-400 mb-1">Shell Command (Checked by Zero-Trust Guard)</label>
+              <input id="lfs-cmd-input" type="text" value="printf 'export const agentPatch = 42;\n' > src_patch.ts" class="w-full rounded-lg bg-slate-900 border border-slate-700 px-3 py-2 text-emerald-300 focus:border-indigo-500 focus:outline-none" />
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <button id="btn-lfs-exec" type="button" onclick="runLayerFsCommand(false)" class="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-sans font-semibold transition">
+                ▶ Execute &amp; Commit CoW Snapshot
+              </button>
+              <button id="btn-lfs-test-zt" type="button" onclick="runLayerFsCommand(true)" class="px-3 py-2 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/40 text-rose-300 transition">
+                🛡 Test Blocked Cmd (`cat /etc/shadow`)
+              </button>
+            </div>
+          </div>
+
+          <!-- 3-Way Multi-Agent Branch Merge & CAS GC -->
+          <div class="border-t border-slate-800 pt-4 space-y-3 text-xs">
+            <h3 class="font-semibold text-white">Cross-Node 3-Way Branch Merge (`POST /v1/layerfs/merge`) &amp; CAS GC</h3>
+            <div class="grid grid-cols-3 gap-2 font-mono">
+              <div>
+                <label for="lfs-merge-src" class="block text-slate-400 mb-1 text-[11px]">Source Branch</label>
+                <input id="lfs-merge-src" type="text" value="feat-agent-a" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+              </div>
+              <div>
+                <label for="lfs-merge-dst" class="block text-slate-400 mb-1 text-[11px]">Target Branch</label>
+                <input id="lfs-merge-dst" type="text" value="main" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+              </div>
+              <div>
+                <label for="lfs-merge-base" class="block text-slate-400 mb-1 text-[11px]">Base Commit</label>
+                <input id="lfs-merge-base" type="text" value="C0" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+              </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 font-mono">
+              <button id="btn-lfs-merge" type="button" onclick="executeLayerFsThreeWayMerge()" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-sans font-medium transition">
+                ⇄ 3-Way Merge into Target
+              </button>
+              <button id="btn-lfs-gc" type="button" onclick="triggerLayerFsGarbageCollection()" class="px-3 py-1.5 rounded-lg bg-violet-500/15 hover:bg-violet-500/25 border border-violet-500/40 text-violet-300 transition">
+                🧹 Sweep Unreferenced CAS Chunks
+              </button>
+            </div>
+          </div>
+
+          <div id="lfs-exec-output" class="bg-slate-950/90 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">LayerFS output console ready.</div>
+        </div>
+
+        <!-- LayerFS Branch Tree & Line-Level Step Blame Explorer -->
+        <div class="lg:col-span-7 glass-card rounded-xl p-5 space-y-4">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 class="text-sm font-semibold text-white">LayerFS Branch Heads, B-Tree Directory Entries &amp; Line-Level Blame</h2>
+              <p class="text-xs text-slate-400">
+                Inspect zero-copy branches, SHA-256 object IDs, and line-by-line agent step attribution (`blameFile`).
+              </p>
+            </div>
+            <button id="btn-refresh-lfs" type="button" onclick="refreshLayerFsView()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-mono text-slate-200 border border-slate-700">
+              ↻ Refresh Branches
+            </button>
+          </div>
+
+          <div id="lfs-branches-grid" class="grid grid-cols-1 md:grid-cols-2 gap-3"></div>
+
+          <!-- Line-Level Blame Viewer -->
+          <div class="bg-slate-950/90 border border-slate-800 rounded-lg p-4 space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold text-indigo-300 font-mono">LINE-LEVEL STEP BLAME (`blameFile`)</span>
+              <span id="lfs-blame-target" class="text-[11px] font-mono text-slate-400">Branch: main · File: package.json</span>
+            </div>
+            <div id="lfs-blame-lines" class="space-y-1 font-mono text-xs pt-1"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- VIEW 4: A2A BLACKBOARD, COW BISECT & TIME-TRAVEL (#a2a)               -->
+    <!-- ===================================================================== -->
+    <section id="view-a2a" class="hidden space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- A2A Shared Blackboard & WFG Deadlock Detector -->
+        <div class="lg:col-span-6 glass-card rounded-xl p-5 space-y-4">
+          <div>
+            <h2 class="text-sm font-semibold text-white">A2A Shared Blackboard (`putCas`) &amp; WFG Deadlock Detector</h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Optimistic Compare-And-Swap coordination across multi-agent swarms (`409 CAS_CONFLICT` on stale version) and $O(V+E)$ cycle detection.
+            </p>
+          </div>
+
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+            <div>
+              <label for="bb-key" class="block text-slate-400 mb-1">Key</label>
+              <input id="bb-key" type="text" value="schema.migration.lock" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+            </div>
+            <div>
+              <label for="bb-author" class="block text-slate-400 mb-1">Agent ID</label>
+              <input id="bb-author" type="text" value="agent-alpha" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+            </div>
+            <div>
+              <label for="bb-ver" class="block text-slate-400 mb-1">Expected Ver</label>
+              <input id="bb-ver" type="number" value="0" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+            </div>
+            <div>
+              <label for="bb-val" class="block text-slate-400 mb-1">Value</label>
+              <input id="bb-val" type="text" value="v2.5-ready" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2 text-xs font-mono">
+            <button id="btn-bb-put" type="button" onclick="executeBlackboardCas()" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-sans font-medium transition">
+              Put CAS Entry
+            </button>
+            <button id="btn-wfg-cycle" type="button" onclick="simulateWfgDeadlockCycle()" class="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 transition">
+              🔄 Simulate WFG Deadlock Cycle (`agent-A ⇄ agent-B`)
+            </button>
+          </div>
+
+          <div id="a2a-blackboard-output" class="bg-slate-950/90 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">Blackboard &amp; WFG status ready.</div>
+        </div>
+
+        <!-- O(log N) Parallel CoW Bisect & Turn WAL Time-Travel Fork -->
+        <div class="lg:col-span-6 glass-card rounded-xl p-5 space-y-4">
+          <div>
+            <h2 class="text-sm font-semibold text-white">Parallel CoW Git Bisect (`O(log N)`) &amp; Turn WAL Time-Travel</h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Pinpoint regression commits across LayerFS snapshots and fork tasks + zero-copy workspaces at any historical turn.
+            </p>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2 text-xs font-mono">
+            <button id="btn-run-bisect" type="button" onclick="runParallelCowBisectDemo()" class="px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-sans font-medium transition">
+              🔍 Run Live LayerFS Bisect (`C0..C4`)
+            </button>
+            <button id="btn-run-timetravel" type="button" onclick="runTurnTimeTravelForkDemo()" class="px-3.5 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-sans font-medium transition">
+              ⏱ Time-Travel Fork at Turn #1
+            </button>
+            <button id="btn-run-migration" type="button" onclick="runHeavyTaskLiveMigrationDemo()" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition">
+              🚚 Migrate Heavy Sandbox (`body-01 → body-02`)
+            </button>
+          </div>
+
+          <div id="a2a-bisect-output" class="bg-slate-950/90 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">Click any action above to run live Bisect, Turn WAL Time-Travel Fork, or Heavy Sandbox Live Migration.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- VIEW 5: ZERO-TRUST SECURITY, FINOPS & CHAOS GOVERNANCE (#governance)  -->
+    <!-- ===================================================================== -->
+    <section id="view-governance" class="hidden space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- SLSA v1.0 + AMD SEV-SNP TEE + SPIFFE SVID Attestation -->
+        <div class="lg:col-span-6 glass-card rounded-xl p-5 space-y-4">
+          <div>
+            <h2 class="text-sm font-semibold text-white">SLSA v1.0 Provenance + AMD SEV-SNP TEE + SPIFFE SVID (`POST /v1beta1/security/attest`)</h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Computes cryptographic SHA-256 Merkle tree over LayerFS commit files, verifies SPIFFE mTLS identity, and signs hardware TEE quote.
+            </p>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3 text-xs font-mono">
+            <div>
+              <label for="sec-spiffe-id" class="block text-slate-400 mb-1">SPIFFE Workload ID</label>
+              <input id="sec-spiffe-id" type="text" value="spiffe://ansts.io/ns/fleet/sa/body" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+            </div>
+            <div>
+              <label for="sec-branch" class="block text-slate-400 mb-1">Target LayerFS Branch</label>
+              <input id="sec-branch" type="text" value="main" class="w-full rounded bg-slate-900 border border-slate-700 px-2.5 py-1.5 text-white" />
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2 text-xs font-mono">
+            <button id="btn-sec-attest" type="button" onclick="runSecurityAttestation()" class="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-sans font-medium transition">
+              🔐 Generate SLSA v1.0 &amp; TEE Quote
+            </button>
+            <button id="btn-geo-gdpr" type="button" onclick="runGeoSovereigntyCheck('GDPR_EU')" class="px-3 py-2 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 transition">
+              🌍 Route GDPR_EU (`eu-central-1`)
+            </button>
+          </div>
+
+          <div id="sec-attest-output" class="bg-slate-950/90 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">Ready to verify SPIFFE SVID, SLSA v1.0 Merkle Provenance, and SEV-SNP Quote.</div>
+        </div>
+
+        <!-- FinOps Cognitive Router + Automated Split-Brain Chaos Drill -->
+        <div class="lg:col-span-6 glass-card rounded-xl p-5 space-y-4">
+          <div>
+            <h2 class="text-sm font-semibold text-white">FinOps Cognitive Router (`402` Gate) &amp; Split-Brain Chaos Drill</h2>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Prefix-affinity LLM routing (`DeepSeek → Qwen-3.8` soft downgrade at 80% budget) and automated network partition fencing verification.
+            </p>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2 text-xs font-mono">
+            <button id="btn-finops-step" type="button" onclick="simulateFinOpsCompletionStep()" class="px-3.5 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-sans font-medium transition">
+              💳 Simulate LLM Spend Step (+$4.50 / $10 Budget)
+            </button>
+            <button id="btn-finops-reset" type="button" onclick="resetFinOpsPolicy()" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition">
+              Reset Budget ($10)
+            </button>
+            <button id="btn-chaos-drill" type="button" onclick="runSplitBrainChaosDrill()" class="px-3.5 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-sans font-medium transition">
+              🔥 Run Split-Brain &amp; Fencing Chaos Drill
+            </button>
+          </div>
+
+          <div id="governance-output" class="bg-slate-950/90 border border-slate-800 rounded-lg p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">Ready to test FinOps auto-downgrade / 402 gate and Split-Brain Chaos Drill.</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Slide-Over BFF Request Log Drawer -->
+  <aside id="bff-log-drawer" class="fixed right-4 bottom-4 z-40 w-full max-w-lg hidden glass-card rounded-xl border border-indigo-500/40 shadow-2xl p-4 space-y-3">
+    <div class="flex items-center justify-between">
+      <div class="text-xs font-mono font-semibold text-indigo-300">TANSTACK QUERY BFF NETWORK LOG (`/v1beta1/*`)</div>
+      <button id="btn-close-bff-log" type="button" onclick="toggleApiInspectorDrawer()" class="text-xs font-mono text-slate-400 hover:text-white px-2 py-0.5 rounded bg-slate-800">
+        Close ✕
+      </button>
+    </div>
+    <div id="bff-log-entries" class="max-h-60 overflow-y-auto space-y-1.5 font-mono text-[11px]"></div>
+  </aside>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" class="fixed bottom-4 left-4 z-50 space-y-2 pointer-events-none"></div>
+
+  <script>
+    // =========================================================================
+    // Embedded Deterministic ANSTS v2.5 Cluster Engine (Dual-Mode BFF Fallback)
+    // Ensures 100% interactive fidelity both when served by `:8088` in the live
+    // 11-container dev cluster AND when previewed inside the isolated Canvas UI.
+    // =========================================================================
+    const EmbeddedClusterState = {
+      topologyGeneration: 3,
+      evictedBrains: new Set(),
+      activePrimaryGateway: true,
+      finopsSpentUsd: 0,
+      finopsBudgetUsd: 10.0,
+      blackboard: new Map([
+        ['schema.migration.lock', { key: 'schema.migration.lock', value: 'v2.5-init', version: 1, authorAgentId: 'system' }]
+      ]),
+      tasks: [
+        {
+          task_id: 'task-boot-001',
+          tenant_id: 'tenant-core',
+          priority: 0,
+          state: 'LEASED',
+          lease_fencing_token: 1,
+          assigned_node_id: 'body-host-01',
+          shardSlot: 42,
+          routedBrainNodeId: 'brain-node-01',
+          prompt: 'Initialize 256-slot consistent hash ring & RPO=0 SQL store'
+        },
+        {
+          task_id: 'task-lfs-002',
+          tenant_id: 'tenant-acme',
+          priority: 1,
+          state: 'COMPLETED',
+          lease_fencing_token: 2,
+          assigned_node_id: 'body-host-02',
+          shardSlot: 129,
+          routedBrainNodeId: 'brain-node-02',
+          prompt: 'Sync LayerFS branch feat-agent-a to s3://ansts-fleet'
+        },
+        {
+          task_id: 'task-tun-003',
+          tenant_id: 'tenant-secops',
+          priority: 1,
+          state: 'LEASED',
+          lease_fencing_token: 1,
+          assigned_node_id: 'body-host-01',
+          shardSlot: 214,
+          routedBrainNodeId: 'brain-node-03',
+          prompt: 'Verify Dual-Homed Reverse Tunnel mTLS SVID attestation'
+        }
+      ],
+      branches: [
+        {
+          branchName: 'main',
+          headCommitId: 'C0',
+          agentId: 'system',
+          stepId: 'bootstrap-init',
+          toolCategory: 'FILE_FAST_PATH',
+          mountLatencyMs: 0.08,
+          files: [
+            { filePath: 'package.json', objectId: 'sha256:9f86d081884c7d65', lastStepId: 'bootstrap-init', sizeBytes: 58 },
+            { filePath: 'node_modules/react/index.js', objectId: 'sha256:4b227777d4dd1fc6', lastStepId: 'bootstrap-init', sizeBytes: 42 }
+          ]
+        },
+        {
+          branchName: 'feat-agent-a',
+          headCommitId: 'C1',
+          agentId: 'agent-alpha',
+          stepId: 'step-agent-a-100',
+          toolCategory: 'BASH_SANDBOX_MOUNT',
+          mountLatencyMs: 1.42,
+          files: [
+            { filePath: 'package.json', objectId: 'sha256:9f86d081884c7d65', lastStepId: 'bootstrap-init', sizeBytes: 58 },
+            { filePath: 'src/agent_a.ts', objectId: 'sha256:e3b0c44298fc1c14', lastStepId: 'step-agent-a-100', sizeBytes: 64 }
+          ]
+        },
+        {
+          branchName: 'feat-agent-b',
+          headCommitId: 'C2',
+          agentId: 'agent-beta',
+          stepId: 'step-agent-b-200',
+          toolCategory: 'FILE_FAST_PATH',
+          mountLatencyMs: 0.11,
+          files: [
+            { filePath: 'package.json', objectId: 'sha256:9f86d081884c7d65', lastStepId: 'bootstrap-init', sizeBytes: 58 },
+            { filePath: 'src/agent_b.ts', objectId: 'sha256:7f83b1657ff1fc53', lastStepId: 'step-agent-b-200', sizeBytes: 71 }
+          ]
+        }
+      ],
+      commitCounter: 2,
+      slotOwners: [],
+      bffLogs: [],
+      tableSortField: 'task_id',
+      tableSortAsc: true,
+      tableSearch: '',
+      tableBrainFilter: 'ALL'
+    };
+
+    function recomputeEmbeddedSlotOwners() {
+      const activeBrains = ['brain-node-01', 'brain-node-02', 'brain-node-03'].filter(
+        (b) => !EmbeddedClusterState.evictedBrains.has(b)
+      );
+      const owners = [];
+      for (let i = 0; i < 256; i++) {
+        owners.push(activeBrains[i % activeBrains.length] || 'brain-node-01');
+      }
+      EmbeddedClusterState.slotOwners = owners;
+      return owners;
+    }
+    recomputeEmbeddedSlotOwners();
+
+    function showToast(message, tone) {
+      const container = document.getElementById('toast-container');
+      if (!container) return;
+      const el = document.createElement('div');
+      const borderCls =
+        tone === 'error'
+          ? 'border-rose-500/50 bg-rose-950/90 text-rose-200'
+          : tone === 'warn'
+          ? 'border-amber-500/50 bg-amber-950/90 text-amber-200'
+          : 'border-emerald-500/50 bg-slate-900/95 text-emerald-300';
+      el.className = `px-3.5 py-2 rounded-lg border text-xs font-mono shadow-lg transition ${borderCls}`;
+      el.textContent = message;
+      container.appendChild(el);
+      setTimeout(() => {
+        el.remove();
+      }, 3600);
+    }
+
+    function recordBffLog(method, endpoint, status, mode, latencyMs) {
+      EmbeddedClusterState.bffLogs.unshift({
+        ts: new Date().toISOString().slice(11, 19),
+        method,
+        endpoint,
+        status,
+        mode,
+        latencyMs
+      });
+      if (EmbeddedClusterState.bffLogs.length > 30) {
+        EmbeddedClusterState.bffLogs.pop();
+      }
+      const countEl = document.getElementById('bff-log-count');
+      if (countEl) countEl.textContent = String(EmbeddedClusterState.bffLogs.length);
+      renderBffLogDrawer();
+    }
+
+    function renderBffLogDrawer() {
+      const box = document.getElementById('bff-log-entries');
+      if (!box) return;
+      box.innerHTML = EmbeddedClusterState.bffLogs
+        .map(
+          (item) => `
+          <div class="flex items-center justify-between px-2.5 py-1.5 rounded bg-slate-900/90 border border-slate-800">
+            <div class="flex items-center gap-2 truncate">
+              <span class="text-slate-500">${item.ts}</span>
+              <span class="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">${item.method}</span>
+              <span class="text-slate-200 truncate">${item.endpoint}</span>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+              <span class="${item.status >= 400 ? 'text-rose-400' : 'text-emerald-400'}">${item.status}</span>
+              <span class="text-slate-500">${item.mode} (${item.latencyMs}ms)</span>
+            </div>
+          </div>`
+        )
+        .join('');
+    }
+
+    function updateBffConnectionBadge(isLiveHttp) {
+      const badge = document.getElementById('bff-mode-badge');
+      const dot = document.getElementById('bff-status-dot');
+      const text = document.getElementById('bff-mode-text');
+      if (!badge || !dot || !text) return;
+      if (isLiveHttp) {
+        badge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs font-mono text-emerald-300';
+        dot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+        text.textContent = 'LIVE BFF CONNECTED (:8088)';
+      } else {
+        badge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-xs font-mono text-indigo-300';
+        dot.className = 'w-2 h-2 rounded-full bg-indigo-400 animate-pulse';
+        text.textContent = 'TANSTACK ENGINE (CANVAS READY)';
+      }
+    }
+
+    // Dual-Mode BFF Client: tries live HTTP origin first, seamlessly falls back to EmbeddedClusterState
+    async function callClusterBff(method, endpoint, payload) {
+      const t0 = performance.now();
+      const canTryHttp =
+        typeof window !== 'undefined' &&
+        window.location &&
+        (window.location.protocol === 'http:' || window.location.protocol === 'https:') &&
+        (window.location.port === '8088' || window.location.port === '18080' || window.location.port === '18081');
+
+      if (canTryHttp) {
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 1200);
+          const targetUrl = `${window.location.origin}${endpoint}`;
+          const resp = await fetch(targetUrl, {
+            method,
+            headers: { 'content-type': 'application/json' },
+            body: payload ? JSON.stringify(payload) : undefined,
+            signal: controller.signal
+          });
+          clearTimeout(timer);
+          const data = await resp.json();
+          const dt = Math.round(performance.now() - t0);
+          updateBffConnectionBadge(true);
+          recordBffLog(method, endpoint, resp.status, 'LIVE-HTTP', dt);
+          return { status: resp.status, data };
+        } catch (_err) {
+          // Fall through to embedded cluster engine
+        }
+      }
+
+      const simResult = simulateEmbeddedBffEndpoint(method, endpoint, payload || {});
+      const dt = Math.max(1, Math.round(performance.now() - t0));
+      updateBffConnectionBadge(false);
+      recordBffLog(method, endpoint, simResult.status, 'ENGINE', dt);
+      return simResult;
+    }
+
+    function computeSlotForString(str) {
+      let h = 2166136261;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return Math.abs(h) % 256;
+    }
+
+    function simulateEmbeddedBffEndpoint(method, endpoint, body) {
+      if (method === 'GET' && endpoint.startsWith('/v1beta1/console/topology')) {
+        const slotOwners = EmbeddedClusterState.slotOwners;
+        const slotDistribution = { 'brain-node-01': 0, 'brain-node-02': 0, 'brain-node-03': 0 };
+        for (const owner of slotOwners) {
+          slotDistribution[owner] = (slotDistribution[owner] || 0) + 1;
+        }
+        return {
+          status: 200,
+          data: {
+            cluster: 'ansts-v25-dev-cluster',
+            gatewayNodeId: EmbeddedClusterState.activePrimaryGateway ? 'celld-gw-01' : 'celld-gw-02',
+            virtualSlots: 256,
+            slotOwners,
+            slotDistribution,
+            brains: ['brain-node-01', 'brain-node-02', 'brain-node-03'].map((bId, idx) => ({
+              nodeId: bId,
+              url: `http://127.0.0.1:${18082 + idx}`,
+              ownedSlots: slotDistribution[bId] || 0,
+              status: (slotDistribution[bId] || 0) > 0 ? 'HEALTHY' : 'EVICTED'
+            })),
+            bodies: ['body-host-01', 'body-host-02'].map((bdId, idx) => ({
+              nodeId: bdId,
+              url: `http://127.0.0.1:${19501 + idx}`,
+              status: 'HEALTHY',
+              activeGatewayId: EmbeddedClusterState.activePrimaryGateway ? 'celld-gw-01' : 'celld-gw-02',
+              activeRole: EmbeddedClusterState.activePrimaryGateway ? 'PRIMARY' : 'SECONDARY'
+            })),
+            servicesCount: 11
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/console/shards/rebalance') {
+        const bId = body.brainNodeId || 'brain-node-02';
+        if (body.action === 'evict') {
+          EmbeddedClusterState.evictedBrains.add(bId);
+        } else {
+          EmbeddedClusterState.evictedBrains.delete(bId);
+        }
+        EmbeddedClusterState.topologyGeneration += 1;
+        const slotOwners = recomputeEmbeddedSlotOwners();
+        const slotDistribution = { 'brain-node-01': 0, 'brain-node-02': 0, 'brain-node-03': 0 };
+        for (const o of slotOwners) slotDistribution[o] = (slotDistribution[o] || 0) + 1;
+        return {
+          status: 200,
+          data: {
+            action: body.action,
+            brainNodeId: bId,
+            event: { newTopologyGeneration: EmbeddedClusterState.topologyGeneration },
+            slotDistribution,
+            slotOwners
+          }
+        };
+      }
+
+      if (method === 'GET' && endpoint === '/v1beta1/console/tasks') {
+        return {
+          status: 200,
+          data: {
+            totalTasks: EmbeddedClusterState.tasks.length,
+            tasks: EmbeddedClusterState.tasks.slice()
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/tasks/dispatch') {
+        const taskId = String(body.taskId || `task-${Date.now()}`);
+        const tenantId = String(body.tenantId || 'tenant-default');
+        const slot = computeSlotForString(`${tenantId}:${taskId}`);
+        const brainId = EmbeddedClusterState.slotOwners[slot] || 'brain-node-01';
+        const targetHost = String(body.targetBodyHostId || 'body-host-01');
+        const existing = EmbeddedClusterState.tasks.find((t) => t.task_id === taskId);
+        const fence = existing ? existing.lease_fencing_token : 1;
+        const newTask = {
+          task_id: taskId,
+          tenant_id: tenantId,
+          priority: Number(body.priority ?? 1),
+          state: 'COMPLETED',
+          lease_fencing_token: fence,
+          assigned_node_id: targetHost,
+          shardSlot: slot,
+          routedBrainNodeId: brainId,
+          prompt: String(body.promptText || 'Verify LayerFS snapshot')
+        };
+        if (!existing) {
+          EmbeddedClusterState.tasks.unshift(newTask);
+        }
+        return {
+          status: 202,
+          data: {
+            dispatched: true,
+            gatewayNodeId: EmbeddedClusterState.activePrimaryGateway ? 'celld-gw-01' : 'celld-gw-02',
+            taskId,
+            tenantId,
+            shardSlot: slot,
+            routedBrainNodeId: brainId,
+            deduplicated: Boolean(existing),
+            fencingToken: fence,
+            state: 'COMPLETED',
+            targetBodyHostId: targetHost,
+            bodyExecution: {
+              executedByBodyId: targetHost,
+              branchName: `task-${taskId}`,
+              commitHash: `C${++EmbeddedClusterState.commitCounter}`,
+              s3Synced: true,
+              deliveredViaReverseTunnel: body.dispatchMode === 'reverse_tunnel',
+              status: 'COMPLETED'
+            }
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/internal/v1beta1/tunnel/health') {
+        EmbeddedClusterState.activePrimaryGateway = Boolean(body.healthy);
+        return {
+          status: 200,
+          data: {
+            hostId: body.hostId || 'body-host-01',
+            activeGatewayId: EmbeddedClusterState.activePrimaryGateway ? 'celld-gw-01' : 'celld-gw-02',
+            activeRole: EmbeddedClusterState.activePrimaryGateway ? 'PRIMARY' : 'SECONDARY'
+          }
+        };
+      }
+
+      if (method === 'GET' && endpoint.startsWith('/v1beta1/console/layerfs')) {
+        return {
+          status: 200,
+          data: {
+            nodeId: 'body-host-01',
+            branches: EmbeddedClusterState.branches,
+            storageStats: {
+              totalObjects: EmbeddedClusterState.branches.reduce((acc, b) => acc + b.files.length, 2),
+              deduplicatedHits: 9,
+              btreePagesCount: EmbeddedClusterState.branches.length * 2
+            },
+            blame: [
+              { lineNumber: 1, text: '{"name":"workspace-app","dependencies":{"react":"^19.0.0"}}', stepId: 'bootstrap-init' },
+              { lineNumber: 2, text: 'export const agentPatch = 42;', stepId: 'step-agent-a-101' }
+            ]
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1/layerfs/exec') {
+        const cmd = String(body.command || '');
+        if (cmd.includes('/etc/shadow') || cmd.includes('rm -rf /')) {
+          return {
+            status: 403,
+            data: {
+              error: 'ZERO_TRUST_POLICY_VIOLATION',
+              reason: 'SENSITIVE_HOST_PATH_OR_DESTRUCTIVE_COMMAND_BLOCKED'
+            }
+          };
+        }
+        const brName = String(body.branch || 'feat-agent-a');
+        const stepId = String(body.step_id || 'step-live-101');
+        const nextCommit = `C${++EmbeddedClusterState.commitCounter}`;
+        let br = EmbeddedClusterState.branches.find((b) => b.branchName === brName);
+        if (!br) {
+          br = {
+            branchName: brName,
+            headCommitId: nextCommit,
+            agentId: 'console-operator',
+            stepId,
+            toolCategory: 'BASH_SANDBOX_MOUNT',
+            mountLatencyMs: 1.18,
+            files: []
+          };
+          EmbeddedClusterState.branches.push(br);
+        }
+        br.headCommitId = nextCommit;
+        br.stepId = stepId;
+        br.files.push({
+          filePath: 'src_patch.ts',
+          objectId: `sha256:${Math.random().toString(16).slice(2, 18)}`,
+          lastStepId: stepId,
+          sizeBytes: cmd.length
+        });
+        return {
+          status: 200,
+          data: {
+            branchName: brName,
+            commitId: nextCommit,
+            committedNewSnapshot: true,
+            mountLatencyMs: 1.18,
+            s3Synced: true,
+            executedByNodeId: 'body-host-01'
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1/layerfs/merge') {
+        const nextCommit = `C${++EmbeddedClusterState.commitCounter}-merge`;
+        const mainBr = EmbeddedClusterState.branches.find((b) => b.branchName === (body.targetBranch || 'main'));
+        if (mainBr) {
+          mainBr.headCommitId = nextCommit;
+          mainBr.stepId = `3way-merge-${body.sourceBranch || 'feat-agent-a'}`;
+        }
+        return {
+          status: 200,
+          data: {
+            mergedCommitId: nextCommit,
+            sourceBranch: body.sourceBranch || 'feat-agent-a',
+            targetBranch: body.targetBranch || 'main',
+            autoResolvedFiles: ['src_patch.ts'],
+            s3Synced: true
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/storage/gc') {
+        return {
+          status: 200,
+          data: {
+            nodeId: 'body-host-01',
+            sweptObjectsCount: 3,
+            retainedObjectsCount: 5,
+            reclaimedBytes: 12480
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/a2a/blackboard') {
+        if (body.action === 'putCas') {
+          const cur = EmbeddedClusterState.blackboard.get(body.key);
+          const curVer = cur ? cur.version : 0;
+          if (Number(body.expectedVersion) !== curVer) {
+            return {
+              status: 409,
+              data: {
+                error: 'CAS_CONFLICT',
+                message: `Key '${body.key}' expected version ${body.expectedVersion}, actual ${curVer}`
+              }
+            };
+          }
+          const nextEntry = {
+            key: body.key,
+            value: body.value,
+            version: curVer + 1,
+            authorAgentId: body.authorAgentId
+          };
+          EmbeddedClusterState.blackboard.set(body.key, nextEntry);
+          return { status: 200, data: nextEntry };
+        }
+        if (body.action === 'addWaitEdge') {
+          return {
+            status: 200,
+            data: {
+              hasCycle: true,
+              cyclePath: ['agent-alpha', 'agent-beta', 'agent-alpha'],
+              recommendedVictimAgentId: 'agent-beta'
+            }
+          };
+        }
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/a2a/bisect') {
+        return {
+          status: 200,
+          data: {
+            firstBadCommitId: 'C2',
+            testedCommitsOrder: ['C2', 'C1'],
+            stepsTaken: 2,
+            theoreticalMaxSteps: 3
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/checkpoint/time-travel') {
+        const newBranch = `branch-fork-turn1`;
+        return {
+          status: 200,
+          data: {
+            forked: {
+              forkedTask: {
+                task_id: body.newTaskId || 'task-wal-01-fork',
+                restoredTurnIndex: 1,
+                lease_fencing_token: 2
+              }
+            },
+            layerfsFork: {
+              branchName: newBranch,
+              headCommitId: 'C0',
+              copiedFilesCount: 0
+            }
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/runtime/migrate') {
+        return {
+          status: 200,
+          data: {
+            migrated: true,
+            taskId: body.taskId || 'task-heavy-01',
+            sourceNodeId: 'body-host-01',
+            targetNodeId: 'body-host-02',
+            newFencingToken: 2,
+            r2SnapshotKey: 'snapshots/task-heavy-01/turn-1.tar.zst',
+            s3Synced: true
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/security/attest') {
+        return {
+          status: 200,
+          data: {
+            nodeId: 'body-host-01',
+            mtlsCheck: { authenticated: true, spiffeId: body.spiffeId, trustDomain: 'ansts.io' },
+            slsaVerified: true,
+            slsaStatement: {
+              predicateType: 'https://slsa.dev/provenance/v1',
+              subjectDigest: 'sha256:8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4'
+            },
+            teeQuote: {
+              provider: 'AMD_SEV_SNP',
+              verified: true,
+              signatureHex: '9c8b7a6f5e4d3c2b1a09f8e7d6c5b4a3'
+            }
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/cluster/geo-route') {
+        return {
+          status: 200,
+          data: {
+            selectedRegion: { regionId: 'eu-central-1', jurisdiction: body.jurisdiction, latencyMs: 18 },
+            replication: { replicated: true, sourceRegion: 'eu-central-1', targetRegion: 'eu-west-1' }
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/router/completions') {
+        if (body.action === 'setBudgetPolicy') {
+          EmbeddedClusterState.finopsSpentUsd = 0;
+          EmbeddedClusterState.finopsBudgetUsd = Number(body.dailyBudgetUsd || 10);
+          return { status: 200, data: { policyUpdated: true, dailyBudgetUsd: EmbeddedClusterState.finopsBudgetUsd } };
+        }
+        if (EmbeddedClusterState.finopsSpentUsd >= EmbeddedClusterState.finopsBudgetUsd) {
+          return {
+            status: 402,
+            data: {
+              error: 'FINOPS_BUDGET_EXCEEDED',
+              utilizationRatio: EmbeddedClusterState.finopsSpentUsd / EmbeddedClusterState.finopsBudgetUsd,
+              message: 'Hard daily FinOps budget reached (HTTP 402 Payment Required)'
+            }
+          };
+        }
+        EmbeddedClusterState.finopsSpentUsd += Number(body.costUsd || 4.5);
+        const ratio = EmbeddedClusterState.finopsSpentUsd / EmbeddedClusterState.finopsBudgetUsd;
+        const downgraded = ratio >= 0.8;
+        return {
+          status: 200,
+          data: {
+            tenantId: body.tenantId || 'tenant-finops',
+            selectedModel: downgraded ? 'Qwen-3.8 (Auto-Downgraded)' : 'DeepSeek-R1 (Primary)',
+            downgraded,
+            utilizationRatio: Number(ratio.toFixed(2)),
+            totalSpentUsd: Number(EmbeddedClusterState.finopsSpentUsd.toFixed(2)),
+            prefixCacheHit: true
+          }
+        };
+      }
+
+      if (method === 'POST' && endpoint === '/v1beta1/cluster/chaos-drill') {
+        return {
+          status: 200,
+          data: {
+            nodeId: 'celld-gw-01',
+            preflight: { ready: true, checks: { diskSpaceOk: true, layerfsMountable: true } },
+            drill: {
+              partitionInjected: true,
+              staleOldNodeWriteRejected: true,
+              newNodeTakeoverSucceeded: true,
+              oldNodeFencingToken: 3,
+              newNodeFencingToken: 4
+            }
+          }
+        };
+      }
+
+      return { status: 200, data: { ok: true } };
+    }
+
+    // =========================================================================
+    // View Navigation (TanStack Router State Machine)
+    // =========================================================================
+    const CONSOLE_ROUTES = ['overview', 'scheduler', 'layerfs', 'a2a', 'governance'];
+
+    function switchConsoleRoute(routeKey) {
+      if (!CONSOLE_ROUTES.includes(routeKey)) routeKey = 'overview';
+      for (const r of CONSOLE_ROUTES) {
+        const sec = document.getElementById(`view-${r}`);
+        const tab = document.getElementById(`nav-tab-${r}`);
+        if (sec) {
+          if (r === routeKey) sec.classList.remove('hidden');
+          else sec.classList.add('hidden');
+        }
+        if (tab) {
+          if (r === routeKey) {
+            tab.className = 'route-tab px-4 py-2.5 text-xs sm:text-sm font-medium border-b-2 border-indigo-500 text-indigo-300 whitespace-nowrap flex items-center gap-2 transition';
+          } else {
+            tab.className = 'route-tab px-4 py-2.5 text-xs sm:text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200 whitespace-nowrap flex items-center gap-2 transition';
+          }
+        }
+      }
+      try {
+        window.history.replaceState(null, '', `#${routeKey}`);
+      } catch (_e) {
+        // ignore inside sandboxed iframe
+      }
+    }
+
+    // =========================================================================
+    // View 1 Rendering: 256-Slot Hash Ring, Topology Cards & Chart.js
+    // =========================================================================
+    function renderHashRingGrid(slotOwners) {
+      const grid = document.getElementById('hash-ring-grid');
+      if (!grid) return;
+      const counts = { 'brain-node-01': 0, 'brain-node-02': 0, 'brain-node-03': 0 };
+      const htmlParts = [];
+      for (let idx = 0; idx < 256; idx++) {
+        const owner = slotOwners[idx] || 'brain-node-01';
+        counts[owner] = (counts[owner] || 0) + 1;
+        const colorCls =
+          owner === 'brain-node-01'
+            ? 'bg-indigo-500/80 hover:bg-indigo-400'
+            : owner === 'brain-node-02'
+            ? 'bg-emerald-500/80 hover:bg-emerald-400'
+            : 'bg-amber-500/80 hover:bg-amber-400';
+        htmlParts.push(
+          `<div onmouseenter="inspectHashSlot(${idx}, '${owner}')" class="slot-cell h-3.5 rounded-[2px] cursor-pointer ${colorCls}" title="Slot #${idx} → ${owner}"></div>`
+        );
+      }
+      grid.innerHTML = htmlParts.join('');
+      const b1 = document.getElementById('legend-slots-b1');
+      const b2 = document.getElementById('legend-slots-b2');
+      const b3 = document.getElementById('legend-slots-b3');
+      const bal = document.getElementById('kpi-slot-balance');
+      const activeBrainsEl = document.getElementById('kpi-active-brains');
+      if (b1) b1.textContent = String(counts['brain-node-01'] || 0);
+      if (b2) b2.textContent = String(counts['brain-node-02'] || 0);
+      if (b3) b3.textContent = String(counts['brain-node-03'] || 0);
+      if (bal) {
+        bal.textContent = `${counts['brain-node-01'] || 0} / ${counts['brain-node-02'] || 0} / ${counts['brain-node-03'] || 0}`;
+      }
+      const liveBrains = Object.values(counts).filter((c) => c > 0).length;
+      if (activeBrainsEl) activeBrainsEl.textContent = `${liveBrains}/3 Brains Active`;
+    }
+
+    function inspectHashSlot(slotIndex, ownerNodeId) {
+      const el = document.getElementById('slot-hover-readout');
+      if (!el) return;
+      const padded = String(slotIndex).padStart(3, '0');
+      el.textContent = `Slot #${padded} → Owner: ${ownerNodeId} (Gen #${EmbeddedClusterState.topologyGeneration})`;
+    }
+
+    async function triggerBrainShardRebalance(action, brainNodeId) {
+      const res = await callClusterBff('POST', '/v1beta1/console/shards/rebalance', {
+        action,
+        brainNodeId
+      });
+      if (res.data && Array.isArray(res.data.slotOwners)) {
+        EmbeddedClusterState.slotOwners = res.data.slotOwners;
+        renderHashRingGrid(res.data.slotOwners);
+      }
+      const genEl = document.getElementById('kpi-ring-gen');
+      if (genEl) genEl.textContent = `Gen #${EmbeddedClusterState.topologyGeneration}`;
+      await refreshTopologyAndTasks();
+      showToast(
+        action === 'evict'
+          ? `Evicted ${brainNodeId}: 256 slots rebalanced across surviving Brains`
+          : `Restored ${brainNodeId} into 256-slot consistent hash ring`,
+        action === 'evict' ? 'warn' : 'ok'
+      );
+    }
+
+    async function toggleGatewayTunnelHealth(healthy) {
+      const res = await callClusterBff('POST', '/internal/v1beta1/tunnel/health', {
+        hostId: 'body-host-01',
+        gatewayId: 'celld-gw-01',
+        healthy
+      });
+      const activeGw = res.data.activeGatewayId || (healthy ? 'celld-gw-01' : 'celld-gw-02');
+      const activeRole = res.data.activeRole || (healthy ? 'PRIMARY' : 'SECONDARY');
+      const pill = document.getElementById('tunnel-active-pill');
+      const kpiGw = document.getElementById('kpi-tunnel-gw');
+      const kpiRole = document.getElementById('kpi-tunnel-role');
+      if (pill) {
+        pill.textContent = `${activeRole}: ${activeGw} (${activeGw === 'celld-gw-01' ? ':18080' : ':18081'})`;
+        pill.className = healthy
+          ? 'text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300'
+          : 'text-[11px] font-mono px-2 py-0.5 rounded bg-amber-500/20 text-amber-300';
+      }
+      if (kpiGw) kpiGw.textContent = activeGw;
+      if (kpiRole) kpiRole.textContent = activeRole;
+      showToast(`Reverse Tunnel routed via ${activeGw} (${activeRole})`, healthy ? 'ok' : 'warn');
+    }
+
+    function renderTopologyServiceCards(topoData) {
+      const grid = document.getElementById('topology-cards-grid');
+      if (!grid) return;
+      const bDist = (topoData && topoData.slotDistribution) || {};
+      const services = [
+        { name: 'ansts-gateway-01', role: 'Edge Gateway (Primary)', port: ':18080', detail: 'Stateless Fan-Out + Reverse Tunnel Hub', healthy: EmbeddedClusterState.activePrimaryGateway },
+        { name: 'ansts-gateway-02', role: 'Edge Gateway (Secondary)', port: ':18081', detail: 'HA Failover Ingress + SSE Stream', healthy: true },
+        { name: 'ansts-celld-brain-01', role: 'Brain Shard Node #1', port: ':18082', detail: `Owned Slots: ${bDist['brain-node-01'] ?? 85}/256 · RPO=0 SQL`, healthy: (bDist['brain-node-01'] ?? 85) > 0 },
+        { name: 'ansts-celld-brain-02', role: 'Brain Shard Node #2', port: ':18083', detail: `Owned Slots: ${bDist['brain-node-02'] ?? 86}/256 · RPO=0 SQL`, healthy: (bDist['brain-node-02'] ?? 86) > 0 },
+        { name: 'ansts-celld-brain-03', role: 'Brain Shard Node #3', port: ':18084', detail: `Owned Slots: ${bDist['brain-node-03'] ?? 85}/256 · RPO=0 SQL`, healthy: (bDist['brain-node-03'] ?? 85) > 0 },
+        { name: 'ansts-body-daemon-01', role: 'Body LayerFS Host #1', port: ':19501', detail: 'CoW Overlay + Outbound mTLS Tunnel', healthy: true },
+        { name: 'ansts-body-daemon-02', role: 'Body LayerFS Host #2', port: ':19502', detail: 'CoW Overlay + Outbound mTLS Tunnel', healthy: true },
+        { name: 'ansts-dev-rustfs', role: 'S3 LTX & CAS Object Store', port: ':9000/:9001', detail: 'Bucket: s3://ansts-fleet (Cross-Node Sync)', healthy: true },
+        { name: 'ansts-tanstack-console', role: 'TanStack Console BFF UI', port: ':8088', detail: 'Dual-Gateway Round-Robin Proxy', healthy: true },
+        { name: 'ansts-dev-prometheus', role: 'Metrics Scraper', port: ':9090', detail: '7 Active Scrape Targets (15s interval)', healthy: true },
+        { name: 'ansts-dev-grafana', role: 'Observability Dashboards', port: ':3000', detail: '5D Scheduler & LayerFS Telemetry', healthy: true }
+      ];
+      grid.innerHTML = services
+        .map(
+          (s) => `
+          <div class="rounded-lg bg-slate-900/90 border ${s.healthy ? 'border-slate-800' : 'border-rose-500/50'} p-3 flex flex-col justify-between">
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-mono text-xs font-semibold text-white truncate">${s.name}</span>
+              <span class="px-2 py-0.5 text-[10px] font-mono rounded ${s.healthy ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/20 text-rose-300'}">
+                ${s.healthy ? 'HEALTHY' : 'EVICTED/DEGRADED'}
+              </span>
+            </div>
+            <div class="text-[11px] text-slate-400 mt-1">${s.role} · <span class="font-mono text-indigo-300">${s.port}</span></div>
+            <div class="text-[11px] font-mono text-slate-300 mt-2 pt-1.5 border-t border-slate-800/80 truncate">${s.detail}</div>
+          </div>`
+        )
+        .join('');
+    }
+
+    let telemetryChartInstance = null;
+    function initTelemetryChart() {
+      const canvas = document.getElementById('telemetry-chart');
+      if (!canvas || typeof Chart === 'undefined') return;
+      const ctx = canvas.getContext('2d');
+      telemetryChartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: ['T-25s', 'T-20s', 'T-15s', 'T-10s', 'T-5s', 'Now'],
+          datasets: [
+            {
+              label: 'Scheduled Tasks / sec',
+              data: [42, 48, 53, 51, 59, 64],
+              borderColor: '#6366f1',
+              backgroundColor: 'rgba(99, 102, 241, 0.15)',
+              fill: true,
+              tension: 0.35
+            },
+            {
+              label: 'LayerFS CoW Mount p99 (ms)',
+              data: [1.4, 1.2, 1.3, 1.1, 1.2, 1.1],
+              borderColor: '#10b981',
+              backgroundColor: 'rgba(16, 185, 129, 0.1)',
+              fill: false,
+              tension: 0.35
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              labels: { color: '#cbd5e1', font: { family: 'JetBrains Mono', size: 11 } }
+            }
+          },
+          scales: {
+            x: { ticks: { color: '#64748b' }, grid: { color: 'rgba(51,65,85,0.25)' } },
+            y: { ticks: { color: '#64748b' }, grid: { color: 'rgba(51,65,85,0.25)' } }
+          }
+        }
+      });
+    }
+
+    // =========================================================================
+    // View 2: 5D Task Scheduler & TanStack Table Operations
+    // =========================================================================
+    async function submitDispatchTaskForm(evt) {
+      if (evt) evt.preventDefault();
+      const taskId = document.getElementById('inp-task-id').value.trim() || `task-${Date.now()}`;
+      const tenantId = document.getElementById('inp-tenant-id').value.trim() || 'tenant-acme';
+      const priority = Number(document.getElementById('inp-task-priority').value || 1);
+      const targetBodyHostId = document.getElementById('inp-body-host').value || 'body-host-01';
+      const dispatchMode = document.getElementById('inp-dispatch-mode').value || 'direct';
+      const promptText = document.getElementById('inp-task-prompt').value.trim() || 'Verify snapshot';
+
+      const res = await callClusterBff('POST', '/v1beta1/tasks/dispatch', {
+        taskId,
+        tenantId,
+        priority,
+        targetBodyHostId,
+        dispatchMode,
+        promptText
+      });
+
+      const d = res.data || {};
+      const receiptEl = document.getElementById('dispatch-receipt-content');
+      if (receiptEl) {
+        receiptEl.textContent =
+          `[202 Accepted] Task=${d.taskId} → Slot=#${d.shardSlot} → Brain=${d.routedBrainNodeId} (Fence=${d.fencingToken}, Dedup=${Boolean(d.deduplicated)}) → Body=${d.targetBodyHostId} (Commit=${d.bodyExecution?.commitHash || 'C1'}, S3=${Boolean(d.bodyExecution?.s3Synced)})`;
+      }
+      // Advance default task ID suffix for convenience
+      const nextNum = Math.floor(100 + Math.random() * 899);
+      document.getElementById('inp-task-id').value = `task-prod-${nextNum}`;
+
+      await refreshTopologyAndTasks();
+      inspectTaskPipelineTrace(taskId);
+      showToast(`Dispatched ${taskId} → Slot #${d.shardSlot} (${d.routedBrainNodeId})`, 'ok');
+    }
+
+    async function seedBatchSampleTasks() {
+      const samples = [
+        { taskId: `task-ai-${Math.floor(100 + Math.random() * 900)}`, tenantId: 'tenant-openai', targetBodyHostId: 'body-host-01', dispatchMode: 'direct', promptText: 'Run multi-agent SWE patch verification' },
+        { taskId: `task-nat-${Math.floor(100 + Math.random() * 900)}`, tenantId: 'tenant-edge', targetBodyHostId: 'body-host-02', dispatchMode: 'reverse_tunnel', promptText: 'Execute private VPC sandbox build via Reverse Tunnel' },
+        { taskId: `task-fin-${Math.floor(100 + Math.random() * 900)}`, tenantId: 'tenant-quant', targetBodyHostId: 'body-host-01', dispatchMode: 'direct', promptText: 'Verify RPO=0 SQL checkpoint & RustFS LTX upload' }
+      ];
+      for (const s of samples) {
+        await callClusterBff('POST', '/v1beta1/tasks/dispatch', s);
+      }
+      await refreshTopologyAndTasks();
+      showToast('Dispatched 3 distributed tasks across Brain shards & Body hosts', 'ok');
+    }
+
+    function sortTaskTable(field) {
+      if (EmbeddedClusterState.tableSortField === field) {
+        EmbeddedClusterState.tableSortAsc = !EmbeddedClusterState.tableSortAsc;
+      } else {
+        EmbeddedClusterState.tableSortField = field;
+        EmbeddedClusterState.tableSortAsc = true;
+      }
+      renderTanStackTaskTable();
+    }
+
+    function updateTableFilterSearch(val) {
+      EmbeddedClusterState.tableSearch = (val || '').toLowerCase();
+      renderTanStackTaskTable();
+    }
+
+    function updateTableBrainFilter(val) {
+      EmbeddedClusterState.tableBrainFilter = val || 'ALL';
+      renderTanStackTaskTable();
+    }
+
+    function renderTanStackTaskTable() {
+      const tbody = document.getElementById('tanstack-task-tbody');
+      if (!tbody) return;
+      const q = EmbeddedClusterState.tableSearch;
+      const bf = EmbeddedClusterState.tableBrainFilter;
+
+      const filtered = EmbeddedClusterState.tasks.filter((t) => {
+        if (bf !== 'ALL' && t.routedBrainNodeId !== bf) return false;
+        if (!q) return true;
+        return (
+          String(t.task_id).toLowerCase().includes(q) ||
+          String(t.tenant_id).toLowerCase().includes(q) ||
+          String(t.routedBrainNodeId).toLowerCase().includes(q) ||
+          String(t.assigned_node_id).toLowerCase().includes(q)
+        );
+      });
+
+      const field = EmbeddedClusterState.tableSortField;
+      const dir = EmbeddedClusterState.tableSortAsc ? 1 : -1;
+      filtered.sort((a, b) => {
+        const va = a[field] ?? '';
+        const vb = b[field] ?? '';
+        if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir;
+        return String(va).localeCompare(String(vb)) * dir;
+      });
+
+      tbody.innerHTML = filtered
+        .map(
+          (t) => `
+          <tr class="hover:bg-slate-900/90 transition">
+            <td class="py-2.5 px-3 font-semibold text-indigo-300">${t.task_id}</td>
+            <td class="py-2.5 px-3 text-slate-300">${t.tenant_id}</td>
+            <td class="py-2.5 px-3 text-amber-300">#${t.shardSlot ?? 0}</td>
+            <td class="py-2.5 px-3">
+              <span class="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300">${t.routedBrainNodeId || 'brain-node-01'}</span>
+            </td>
+            <td class="py-2.5 px-3 text-emerald-300">epoch:${t.lease_fencing_token ?? 1}</td>
+            <td class="py-2.5 px-3 text-slate-300">${t.assigned_node_id || 'body-host-01'}</td>
+            <td class="py-2.5 px-3">
+              <span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300">${t.state || 'LEASED'}</span>
+            </td>
+            <td class="py-2.5 px-3 text-right">
+              <button type="button" onclick="inspectTaskPipelineTrace('${t.task_id}')" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-indigo-600 text-slate-200 hover:text-white transition">
+                Trace →
+              </button>
+            </td>
+          </tr>`
+        )
+        .join('');
+    }
+
+    function inspectTaskPipelineTrace(taskId) {
+      const task = EmbeddedClusterState.tasks.find((t) => t.task_id === taskId) || EmbeddedClusterState.tasks[0];
+      if (!task) return;
+      const badge = document.getElementById('trace-task-badge');
+      const stepsEl = document.getElementById('trace-pipeline-steps');
+      if (badge) badge.textContent = `${task.task_id} (Slot #${task.shardSlot ?? 0})`;
+      if (!stepsEl) return;
+      const steps = [
+        { step: '1. Edge Gateway Ingress', detail: `celld-gw-01 hashed ${task.tenant_id}:${task.task_id} → Slot #${task.shardSlot ?? 0}` },
+        { step: '2. Brain RPO=0 SQL Commit', detail: `${task.routedBrainNodeId} persisted fencing_token=${task.lease_fencing_token}` },
+        { step: '3. Body LayerFS CoW Mount', detail: `${task.assigned_node_id} mounted branch task-${task.task_id} (1.1ms)` },
+        { step: '4. RustFS S3 LTX Sync', detail: `Synced LTX WAL & CAS bundle to s3://ansts-fleet` }
+      ];
+      stepsEl.innerHTML = steps
+        .map(
+          (s) => `
+          <div class="rounded bg-slate-950/90 border border-slate-800 p-2.5">
+            <div class="text-indigo-300 font-semibold">${s.step}</div>
+            <div class="text-slate-400 text-[11px] mt-1">${s.detail}</div>
+          </div>`
+        )
+        .join('');
+    }
+
+    // =========================================================================
+    // View 3: LayerFS CoW Workspace, 3-Way Merge, Blame & GC
+    // =========================================================================
+    async function runLayerFsCommand(forceBlockedTest) {
+      const branch = document.getElementById('lfs-branch-input').value.trim() || 'feat-agent-a';
+      const stepId = document.getElementById('lfs-step-input').value.trim() || `step-${Date.now()}`;
+      const cmdInput = document.getElementById('lfs-cmd-input');
+      const command = forceBlockedTest ? 'cat /etc/shadow' : cmdInput.value.trim();
+
+      const res = await callClusterBff('POST', '/v1/layerfs/exec', {
+        branch,
+        step_id: stepId,
+        agent_id: 'tanstack-console-agent',
+        command
+      });
+
+      const outBox = document.getElementById('lfs-exec-output');
+      if (outBox) {
+        outBox.textContent = JSON.stringify(res.data, null, 2);
+      }
+      if (res.status === 403) {
+        showToast('Zero-Trust Guard blocked sensitive command (HTTP 403)', 'error');
+      } else {
+        showToast(`Committed CoW snapshot ${res.data.commitId} on branch ${branch}`, 'ok');
+      }
+      await refreshLayerFsView();
+    }
+
+    async function executeLayerFsThreeWayMerge() {
+      const sourceBranch = document.getElementById('lfs-merge-src').value.trim() || 'feat-agent-a';
+      const targetBranch = document.getElementById('lfs-merge-dst').value.trim() || 'main';
+      const baseCommitId = document.getElementById('lfs-merge-base').value.trim() || 'C0';
+
+      const res = await callClusterBff('POST', '/v1/layerfs/merge', {
+        sourceBranch,
+        targetBranch,
+        baseCommitId
+      });
+      const outBox = document.getElementById('lfs-exec-output');
+      if (outBox) {
+        outBox.textContent = JSON.stringify(res.data, null, 2);
+      }
+      showToast(`3-Way Merged ${sourceBranch} → ${targetBranch} (${res.data.mergedCommitId})`, 'ok');
+      await refreshLayerFsView();
+    }
+
+    async function triggerLayerFsGarbageCollection() {
+      const res = await callClusterBff('POST', '/v1beta1/storage/gc', {});
+      const outBox = document.getElementById('lfs-exec-output');
+      if (outBox) {
+        outBox.textContent = JSON.stringify(res.data, null, 2);
+      }
+      showToast('Completed Distributed CAS Mark-and-Sweep GC', 'ok');
+      await refreshLayerFsView();
+    }
+
+    async function refreshLayerFsView() {
+      const res = await callClusterBff('GET', '/v1beta1/console/layerfs?branch=main&file=package.json');
+      const branches = (res.data && res.data.branches) || EmbeddedClusterState.branches;
+      const stats = (res.data && res.data.storageStats) || { totalObjects: 6 };
+
+      const kpiBr = document.getElementById('kpi-layerfs-branches');
+      const kpiObj = document.getElementById('kpi-layerfs-objects');
+      if (kpiBr) kpiBr.textContent = `${branches.length} Branches`;
+      if (kpiObj) kpiObj.textContent = `${stats.totalObjects || 6} CAS Objects`;
+
+      const grid = document.getElementById('lfs-branches-grid');
+      if (grid) {
+        grid.innerHTML = branches
+          .map(
+            (b) => `
+            <div class="rounded-lg bg-slate-900/90 border border-slate-800 p-3 space-y-2 font-mono text-xs">
+              <div class="flex items-center justify-between">
+                <span class="font-semibold text-indigo-300">⎇ ${b.branchName}</span>
+                <span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300">HEAD: ${b.headCommitId}</span>
+              </div>
+              <div class="text-[11px] text-slate-400">
+                Last Step: <span class="text-slate-200">${b.stepId}</span> · Mode: ${b.toolCategory}
+              </div>
+              <div class="space-y-1 pt-1 border-t border-slate-800/80">
+                ${(b.files || [])
+                  .slice(0, 4)
+                  .map(
+                    (f) => `
+                    <div class="flex items-center justify-between text-[11px]">
+                      <span class="text-slate-300 truncate">${f.filePath}</span>
+                      <span class="text-slate-500">${String(f.objectId).slice(0, 15)}…</span>
+                    </div>`
+                  )
+                  .join('')}
+              </div>
+            </div>`
+          )
+          .join('');
+      }
+
+      const blameLines = (res.data && res.data.blame && res.data.blame.length > 0)
+        ? res.data.blame
+        : [
+            { lineNumber: 1, text: '{"name":"workspace-app","dependencies":{"react":"^19.0.0"}}', stepId: 'bootstrap-init' },
+            { lineNumber: 2, text: 'export const agentPatch = 42;', stepId: 'step-agent-a-101' }
+          ];
+      const blameBox = document.getElementById('lfs-blame-lines');
+      if (blameBox) {
+        blameBox.innerHTML = blameLines
+          .map(
+            (l) => `
+            <div class="flex items-center gap-3 px-2.5 py-1 rounded bg-slate-900 border border-slate-800/80">
+              <span class="text-slate-500 w-6">#${l.lineNumber}</span>
+              <span class="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 text-[11px] shrink-0">${l.stepId}</span>
+              <span class="text-emerald-300 truncate">${l.text}</span>
+            </div>`
+          )
+          .join('');
+      }
+    }
+
+    // =========================================================================
+    // View 4: A2A Blackboard, WFG Deadlock, CoW Bisect & Turn Time-Travel
+    // =========================================================================
+    async function executeBlackboardCas() {
+      const key = document.getElementById('bb-key').value.trim() || 'schema.migration.lock';
+      const authorAgentId = document.getElementById('bb-author').value.trim() || 'agent-alpha';
+      const expectedVersion = Number(document.getElementById('bb-ver').value || 0);
+      const value = document.getElementById('bb-val').value.trim() || 'v2.5-ready';
+
+      const res = await callClusterBff('POST', '/v1beta1/a2a/blackboard', {
+        action: 'putCas',
+        key,
+        authorAgentId,
+        expectedVersion,
+        value
+      });
+      const out = document.getElementById('a2a-blackboard-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      if (res.status === 409) {
+        showToast('HTTP 409 CAS_CONFLICT: version mismatch detected!', 'warn');
+      } else {
+        document.getElementById('bb-ver').value = String(res.data.version || expectedVersion + 1);
+        showToast(`Blackboard CAS updated to version ${res.data.version}`, 'ok');
+      }
+    }
+
+    async function simulateWfgDeadlockCycle() {
+      await callClusterBff('POST', '/v1beta1/a2a/blackboard', {
+        action: 'addWaitEdge',
+        waiterAgentId: 'agent-alpha',
+        holderAgentId: 'agent-beta'
+      });
+      const res = await callClusterBff('POST', '/v1beta1/a2a/blackboard', {
+        action: 'addWaitEdge',
+        waiterAgentId: 'agent-beta',
+        holderAgentId: 'agent-alpha'
+      });
+      const out = document.getElementById('a2a-blackboard-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      showToast('WFG Cycle detected: agent-alpha ⇄ agent-beta', 'warn');
+    }
+
+    async function runParallelCowBisectDemo() {
+      const res = await callClusterBff('POST', '/v1beta1/a2a/bisect', {
+        commits: ['C0', 'C1', 'C2', 'C3'],
+        testShellCommand: 'test ! -f .regression_bug'
+      });
+      const out = document.getElementById('a2a-bisect-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      showToast('Completed O(log N) Parallel CoW Bisect', 'ok');
+    }
+
+    async function runTurnTimeTravelForkDemo() {
+      await callClusterBff('POST', '/v1beta1/checkpoint/time-travel', {
+        action: 'appendTurnWal',
+        taskId: 'task-wal-demo',
+        turnIndex: 1,
+        fencingToken: 1,
+        changedFiles: ['src/index.ts']
+      });
+      const res = await callClusterBff('POST', '/v1beta1/checkpoint/time-travel', {
+        action: 'forkAtTurn',
+        taskId: 'task-wal-demo',
+        targetTurnIndex: 1,
+        newTaskId: `task-wal-fork-${Math.floor(10 + Math.random() * 89)}`,
+        sourceCommitId: 'C0',
+        newBranchName: `branch-timetravel-t1`
+      });
+      const out = document.getElementById('a2a-bisect-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      showToast('Forked Task & Zero-Copy LayerFS Branch at Turn #1', 'ok');
+    }
+
+    async function runHeavyTaskLiveMigrationDemo() {
+      const res = await callClusterBff('POST', '/v1beta1/runtime/migrate', {
+        taskId: 'task-heavy-gpu-01',
+        turnIndex: 2,
+        sourceNodeId: 'body-host-01',
+        targetNodeId: 'body-host-02',
+        newFencingToken: 3,
+        branchName: 'main'
+      });
+      const out = document.getElementById('a2a-bisect-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      showToast('Migrated Heavy Sandbox body-host-01 → body-host-02', 'ok');
+    }
+
+    // =========================================================================
+    // View 5: Zero-Trust Attestation, FinOps Router & Split-Brain Chaos Drill
+    // =========================================================================
+    async function runSecurityAttestation() {
+      const spiffeId = document.getElementById('sec-spiffe-id').value.trim();
+      const branchOrCommit = document.getElementById('sec-branch').value.trim() || 'main';
+      const res = await callClusterBff('POST', '/v1beta1/security/attest', {
+        spiffeId,
+        branchOrCommit,
+        nonce: `nonce-${Date.now()}`
+      });
+      const out = document.getElementById('sec-attest-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      if (res.status === 401) {
+        showToast('SPIFFE SVID rejected (HTTP 401)', 'error');
+      } else {
+        showToast('Verified SLSA v1.0 Merkle Provenance + AMD SEV-SNP Quote', 'ok');
+      }
+    }
+
+    async function runGeoSovereigntyCheck(jurisdiction) {
+      const res = await callClusterBff('POST', '/v1beta1/cluster/geo-route', {
+        jurisdiction,
+        replicateObjectKey: 'ltx/gdpr-checkpoint-01.ltx',
+        drTargetRegion: 'eu-west-1'
+      });
+      const out = document.getElementById('sec-attest-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      showToast(`Routed ${jurisdiction} workload with cross-region DR LTX sync`, 'ok');
+    }
+
+    async function simulateFinOpsCompletionStep() {
+      const res = await callClusterBff('POST', '/v1beta1/router/completions', {
+        tenantId: 'tenant-finops-demo',
+        costUsd: 4.5,
+        estimatedTokens: 2048
+      });
+      const out = document.getElementById('governance-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      if (res.status === 402) {
+        showToast('HTTP 402 Payment Required: Hard FinOps budget limit reached!', 'error');
+      } else if (res.data.downgraded) {
+        showToast('Soft threshold (>80%) crossed: Auto-downgraded to Qwen-3.8', 'warn');
+      } else {
+        showToast(`Routed to ${res.data.selectedModel} (Prefix Cache Hit)`, 'ok');
+      }
+    }
+
+    async function resetFinOpsPolicy() {
+      const res = await callClusterBff('POST', '/v1beta1/router/completions', {
+        action: 'setBudgetPolicy',
+        tenantId: 'tenant-finops-demo',
+        dailyBudgetUsd: 10.0,
+        softDowngradeThresholdRatio: 0.8
+      });
+      const out = document.getElementById('governance-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      showToast('Reset tenant FinOps budget policy ($10.00/day)', 'ok');
+    }
+
+    async function runSplitBrainChaosDrill() {
+      const res = await callClusterBff('POST', '/v1beta1/cluster/chaos-drill', {
+        targetHost: 'body-host-01',
+        oldNodeFencingToken: 3,
+        newNodeFencingToken: 4,
+        minDiskGb: 1
+      });
+      const out = document.getElementById('governance-output');
+      if (out) out.textContent = JSON.stringify(res.data, null, 2);
+      showToast('Chaos Drill Passed: Zombie write fenced (Token 3 < 4)', 'ok');
+    }
+
+    // =========================================================================
+    // Global TanStack Query Refetch & Polling Lifecycle
+    // =========================================================================
+    async function refreshTopologyAndTasks() {
+      const topoRes = await callClusterBff('GET', '/v1beta1/console/topology');
+      if (topoRes.data) {
+        if (Array.isArray(topoRes.data.slotOwners) && topoRes.data.slotOwners.length === 256) {
+          EmbeddedClusterState.slotOwners = topoRes.data.slotOwners;
+        }
+        renderHashRingGrid(EmbeddedClusterState.slotOwners);
+        renderTopologyServiceCards(topoRes.data);
+        const gwEl = document.getElementById('kpi-gw-node');
+        if (gwEl && topoRes.data.gatewayNodeId) gwEl.textContent = topoRes.data.gatewayNodeId;
+      }
+
+      const tasksRes = await callClusterBff('GET', '/v1beta1/console/tasks');
+      if (tasksRes.data && Array.isArray(tasksRes.data.tasks) && tasksRes.data.tasks.length > 0) {
+        EmbeddedClusterState.tasks = tasksRes.data.tasks;
+      }
+      const totalEl = document.getElementById('kpi-total-tasks');
+      if (totalEl) totalEl.textContent = String(EmbeddedClusterState.tasks.length);
+      renderTanStackTaskTable();
+    }
+
+    async function refetchAllQueries() {
+      await refreshTopologyAndTasks();
+      await refreshLayerFsView();
+      if (telemetryChartInstance) {
+        const ds0 = telemetryChartInstance.data.datasets[0].data;
+        ds0.shift();
+        ds0.push(Math.floor(52 + Math.random() * 18));
+        telemetryChartInstance.update('none');
+      }
+    }
+
+    let pollTimerId = null;
+    function changePollInterval(msStr) {
+      if (pollTimerId) {
+        clearInterval(pollTimerId);
+        pollTimerId = null;
+      }
+      const ms = Number(msStr || 0);
+      if (ms > 0) {
+        pollTimerId = setInterval(() => {
+          refetchAllQueries();
+        }, ms);
+      }
+    }
+
+    function toggleApiInspectorDrawer() {
+      const drawer = document.getElementById('bff-log-drawer');
+      if (!drawer) return;
+      drawer.classList.toggle('hidden');
+    }
+
+    // Keyboard shortcuts 1..5 for instant view switching
+    window.addEventListener('keydown', (e) => {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target && e.target.tagName) || '')) return;
+      if (e.key >= '1' && e.key <= '5') {
+        const idx = Number(e.key) - 1;
+        switchConsoleRoute(CONSOLE_ROUTES[idx]);
+      }
+    });
+
+    window.addEventListener('DOMContentLoaded', async () => {
+      initTelemetryChart();
+      await refetchAllQueries();
+      inspectTaskPipelineTrace(EmbeddedClusterState.tasks[0]?.task_id || 'task-boot-001');
+      changePollInterval('3000');
+    });
+  </script>
+</body>
 </html>

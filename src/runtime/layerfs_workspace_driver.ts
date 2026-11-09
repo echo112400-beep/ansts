@@ -496,6 +496,46 @@ export class LayerFsWorkspaceDriver {
     return this.branchHeads.delete(branchName);
   }
 
+  public listBranchesSummary(): Array<{
+    branchName: string;
+    headCommitId: string;
+    agentId: string;
+    stepId: string;
+    toolCategory: LayerFsToolCategory;
+    mountLatencyMs: number;
+    files: Array<{ filePath: string; objectId: string; lastStepId: string; sizeBytes: number }>;
+  }> {
+    const out: Array<{
+      branchName: string;
+      headCommitId: string;
+      agentId: string;
+      stepId: string;
+      toolCategory: LayerFsToolCategory;
+      mountLatencyMs: number;
+      files: Array<{ filePath: string; objectId: string; lastStepId: string; sizeBytes: number }>;
+    }> = [];
+    for (const [branchName, headId] of this.branchHeads.entries()) {
+      const c = this.commits.get(headId);
+      if (!c) continue;
+      const files = Array.from(c.filesTree.entries()).map(([filePath, entry]) => ({
+        filePath,
+        objectId: entry.objectId,
+        lastStepId: entry.lastStepId,
+        sizeBytes: Buffer.byteLength(entry.content, "utf-8"),
+      }));
+      out.push({
+        branchName,
+        headCommitId: headId,
+        agentId: c.agentId,
+        stepId: c.stepId,
+        toolCategory: c.toolCategory,
+        mountLatencyMs: c.mountLatencyMs,
+        files,
+      });
+    }
+    return out;
+  }
+
   public collectReachableBranchObjects(): Map<string, string[]> {
     const result = new Map<string, string[]>();
     for (const [branchName, headCommitId] of this.branchHeads.entries()) {

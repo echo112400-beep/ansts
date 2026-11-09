@@ -154,7 +154,7 @@ async function bootAll() {
     8088,
     async (req, res) => {
       const urlPath = req.url ?? "/";
-      if (urlPath.startsWith("/v1beta1/") || urlPath.startsWith("/internal/v1beta1/")) {
+      if (urlPath.startsWith("/v1/") || urlPath.startsWith("/v1beta1/") || urlPath.startsWith("/internal/v1beta1/")) {
         const targetPort = gatewayUpstreamPorts[rrCounter++ % gatewayUpstreamPorts.length];
         try {
           const chunks = [];

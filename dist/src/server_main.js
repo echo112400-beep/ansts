@@ -1035,6 +1035,159 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M40] TanStack Console BFF: Live 11-Service Topology & 256-Slot Ring Map (`GET /v1beta1/console/topology`)
+    if (method === "GET" && pathname === "/v1beta1/console/topology") {
+      const slotOwners = Array.from({ length: 256 }, (_, idx) =>
+      this.shardCoordinator.ring.getOwnerNodeForSlot(idx) ?? "brain-node-01");
+
+      const slotDistribution = {};
+      for (const owner of slotOwners) {
+        slotDistribution[owner] = (slotDistribution[owner] ?? 0) + 1;
+      }
+      const brainKeys =
+      Object.keys(this.peerBrainUrls).length > 0 ?
+      Object.keys(this.peerBrainUrls) :
+      ["brain-node-01", "brain-node-02", "brain-node-03"];
+      const bodyKeys =
+      Object.keys(this.peerBodyUrls).length > 0 ?
+      Object.keys(this.peerBodyUrls) :
+      ["body-host-01", "body-host-02"];
+
+      const brains = brainKeys.map((bId, idx) => ({
+        nodeId: bId,
+        url: this.peerBrainUrls[bId] ?? `http://127.0.0.1:${18082 + idx}`,
+        ownedSlots: slotDistribution[bId] ?? 0,
+        status: (slotDistribution[bId] ?? 0) > 0 ? "HEALTHY" : "EVICTED"
+      }));
+
+      const bodies = bodyKeys.map((bdId, idx) => {
+        let activeGatewayId = "celld-gw-01";
+        let activeRole = "PRIMARY";
+        try {
+          const active = this.tunnelRouter.tunnelCell.selectActiveTunnel(bdId);
+          activeGatewayId = active.gatewayId;
+          activeRole = active.role;
+        } catch {
+
+          // default primary tunnel
+        }return {
+          nodeId: bdId,
+          url: this.peerBodyUrls[bdId] ?? `http://127.0.0.1:${19501 + idx}`,
+          status: "HEALTHY",
+          activeGatewayId,
+          activeRole
+        };
+      });
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        cluster: "ansts-v25-dev-cluster",
+        gatewayNodeId: this.nodeId,
+        virtualSlots: 256,
+        slotOwners,
+        slotDistribution,
+        brains,
+        bodies,
+        servicesCount: 11
+      }));
+
+      return;
+    }
+
+    // [M40] TanStack Console BFF: Interactive Brain Shard Eviction & Rebalance (`POST /v1beta1/console/shards/rebalance`)
+    if (method === "POST" && pathname === "/v1beta1/console/shards/rebalance") {
+      const body = await this.readJsonBody(req);
+      const action = String(body.action ?? "evict");
+      const brainNodeId = String(body.brainNodeId ?? "brain-node-02");
+      let event = {};
+      if (action === "evict") {
+        event = this.shardCoordinator.evictUnhealthyBrainShardNode(brainNodeId);
+      } else {
+        const epoch = this.shardCoordinator.registerBrainShardNode(brainNodeId);
+        event = { registeredNodeId: brainNodeId, epoch };
+      }
+      const slotOwners = Array.from({ length: 256 }, (_, idx) =>
+      this.shardCoordinator.ring.getOwnerNodeForSlot(idx) ?? "brain-node-01");
+
+      const slotDistribution = {};
+      for (const owner of slotOwners) {
+        slotDistribution[owner] = (slotDistribution[owner] ?? 0) + 1;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ action, brainNodeId, event, slotDistribution, slotOwners }));
+      return;
+    }
+
+    // [M40] TanStack Console BFF: Global Stateless Task Table Fan-Out (`GET /v1beta1/console/tasks`)
+    if (method === "GET" && pathname === "/v1beta1/console/tasks") {
+      const taskMap = new Map();
+      for (const [id, t] of this.scheduler.allTasks.entries()) {
+        taskMap.set(id, t);
+      }
+      for (const t of this.v25Store.listPersistedTasks()) {
+        taskMap.set(t.task_id, t);
+      }
+      const brainEntries = Object.entries(this.peerBrainUrls);
+      if (brainEntries.length > 0) {
+        await Promise.all(
+        brainEntries.map(async ([, bUrl]) => {
+          try {
+            const resp = await fetch(`${bUrl}/internal/v1beta1/brain/tasks`);
+            if (resp.ok) {
+              const data = await resp.json();
+              for (const t of data.tasks ?? []) {
+                taskMap.set(t.task_id, t);
+              }
+            }
+          } catch {
+
+            // ignore unreachable brain
+          }}));
+
+      }
+      const tasks = Array.from(taskMap.values()).map((t) => {
+        const resSlot = this.shardCoordinator.resolveBrainForTask(t.tenant_id, t.task_id);
+        return {
+          task_id: t.task_id,
+          tenant_id: t.tenant_id,
+          priority: t.priority,
+          state: t.state,
+          lease_fencing_token: t.lease_fencing_token,
+          assigned_node_id: t.assigned_node_id ?? "body-host-01",
+          shardSlot: resSlot.slotIndex,
+          routedBrainNodeId: resSlot.brainNodeId ?? "brain-node-01",
+          prompt: t.prompt
+        };
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ totalTasks: tasks.length, tasks }));
+      return;
+    }
+
+    // [M40] TanStack Console BFF: LayerFS Branch & Line-Blame Explorer (`GET /v1beta1/console/layerfs`)
+    if (method === "GET" && pathname === "/v1beta1/console/layerfs") {
+      const branch = urlObj.searchParams.get("branch");
+      const file = urlObj.searchParams.get("file");
+      let blame = null;
+      if (branch && file) {
+        try {
+          blame = this.layerfs.blameFile(branch, file);
+        } catch {
+          blame = [];
+        }
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        nodeId: this.nodeId,
+        branches: this.layerfs.listBranchesSummary(),
+        storageStats: this.layerfs.storeEngine.getStorageStats(),
+        blame
+      }));
+
+      return;
+    }
 
     // [M35] Delete LayerFS Branch (`DELETE /v1/layerfs/branches/:branch`)
     if (method === "DELETE" && pathname.startsWith("/v1/layerfs/branches/")) {

@@ -496,6 +496,46 @@ class LayerFsWorkspaceDriver {
     return this.branchHeads.delete(branchName);
   }
 
+  listBranchesSummary()
+
+
+
+
+
+
+
+  {
+    const out =
+
+
+
+
+
+
+
+    [];
+    for (const [branchName, headId] of this.branchHeads.entries()) {
+      const c = this.commits.get(headId);
+      if (!c) continue;
+      const files = Array.from(c.filesTree.entries()).map(([filePath, entry]) => ({
+        filePath,
+        objectId: entry.objectId,
+        lastStepId: entry.lastStepId,
+        sizeBytes: Buffer.byteLength(entry.content, "utf-8")
+      }));
+      out.push({
+        branchName,
+        headCommitId: headId,
+        agentId: c.agentId,
+        stepId: c.stepId,
+        toolCategory: c.toolCategory,
+        mountLatencyMs: c.mountLatencyMs,
+        files
+      });
+    }
+    return out;
+  }
+
   collectReachableBranchObjects() {
     const result = new Map();
     for (const [branchName, headCommitId] of this.branchHeads.entries()) {
