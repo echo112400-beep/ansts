@@ -5,14 +5,15 @@
   "private": true,
   "main": "dist/src/index.js",
   "scripts": {
-    "start": "node scripts/ci_check.mjs --stage start",
-    "dev": "node scripts/ci_check.mjs --stage start",
+    "start": "node dist/src/server_main.js",
+    "dev": "node dist/src/server_main.js",
     "lint": "node scripts/ci_check.mjs --stage lint",
     "build": "node scripts/ci_check.mjs --stage build",
     "test": "node scripts/ci_check.mjs --stage test",
     "ci": "node scripts/ci_check.mjs --stage all",
     "docker:up": "docker compose up --build -d",
-    "docker:down": "docker compose down"
+    "docker:down": "docker compose down",
+    "prestart": "node scripts/ci_check.mjs --stage build-if-missing"
   },
   "engines": {
     "node": ">=18.0.0"

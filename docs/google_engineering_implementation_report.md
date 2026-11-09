@@ -109,3 +109,12 @@
 | **`TurnWalFrame`** | `src/models.ts` & `src/checkpoint/wal_engine.ts` | 回合级 WAL 帧实体类，内置 IEEE 802.3 多项式（`0xedb88320`）`computeCrc32Hex()` 与 `verifyIntegrity()` 帧完整性校验，嵌入 `TurnWalEngine` 的每条 `WalDeltaEntry.frame`。 |
 | **`VirtualHashSlotRingManager`** | `src/cluster/manual_scale_controller.ts` | 1024 虚拟槽位 + 16 虚拟节点/物理节点的一致性哈希环管理器，直接集成至 `ManualFleetScaleController` 的 `scaleOutNode()` 与 `cordonAndDrainNode()`，实现无 K8s 裸金属节点扩缩容时的确定性槽位再平衡。 |
 | **`submitTaskRpc` / `scheduleTickRpc` / `rehydrateSchedulerFromSql`** | `src/cloudflare/scheduler_cell.ts` | 对齐 [`denoland/celld` Durable Objects 规范](https://github.com/denoland/celld/blob/main/docs/services/durable-objects.md) 的零序列化原生 `js_rpc` 入口，支持透传调用方 `AbortSignal` 取消。 |
+
+## 10. Milestone 18 — 本机直跑（`npm start` / `run-local.sh`）与 `docker compose` 一键运行验证
+
+已完成统一本机与容器服务入口 `src/server_main.ts`（`AnstsLocalAndComposeServer`）、根目录 `Dockerfile`、根目录 `docker-compose.yml` 与 `scripts/run-local.sh` 的构建与端到端实测（全仓 **17 个测试套件 / 83 项测试 100% 通过**，总耗时 `~3.4s`）：
+
+| 运行模式 | 启动命令 | 暴露端口与核心服务端点 |
+| :--- | :--- | :--- |
+| **本机直接运行（Local Host）** | `npm start` 或 `bash ./scripts/run-local.sh` | • `:8080`：API 网关（`POST /v1/tasks`、`GET /v1/tasks/:id`）、LayerFS 执行端点（`POST /v1/layerfs/exec`）、Prometheus 指标（`GET /metrics`）、[`denoland/celld` 兼容探针](https://github.com/denoland/celld/blob/main/docs/README.md)（`GET /healthz`、`GET /.well-known/celld/health`、`GET /state`、`POST /shutdown?handoff=preserve`）<br>• `:8090`：控制面 Web 看板（`GET /`、`GET /api/overview`） |
+| **Docker Compose 一键编排** | `docker compose up --build -d`<br>（或带 RustFS 对象存储：`docker compose --profile with-rustfs up --build -d`） | 自动构建并启动 `ansts-control-plane`（`:8080` / `:8090`）与 `ansts-worker-node-1` 工作节点容器，共享 `ansts-layerfs-store` 持久化卷与 `ansts-net` 桥接网络，内置容器级 `HEALTHCHECK`。 |

@@ -222,6 +222,11 @@ if (stage === "lint") {
   runBuild();
 } else if (stage === "test") {
   runTests();
+} else if (stage === "build-if-missing") {
+  const serverEntry = path.join(ROOT_DIR, "dist", "src", "server_main.js");
+  if (!fs.existsSync(serverEntry)) {
+    runBuild();
+  }
 } else if (stage === "start") {
   const serverEntry = path.join(ROOT_DIR, "dist", "src", "server_main.js");
   if (!fs.existsSync(serverEntry)) {
