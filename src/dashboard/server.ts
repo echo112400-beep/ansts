@@ -168,6 +168,7 @@ export interface ManagementPlaneDeps {
   cloudEventsBus: CloudEventsBus;
   peerBrainUrls: Record<string, string>;
   peerBodyUrls: Record<string, string>;
+  s3Endpoint?: string | null;
 }
 
 export class PlatformManagementPlaneEngine {
@@ -1280,6 +1281,230 @@ export class PlatformManagementPlaneEngine {
     return {
       status: 200,
       body: { policyApplied: true, fallbackModel: "Qwen-3.8" },
+    };
+  }
+
+  public async pushManagementStateToS3(): Promise<boolean> {
+    this.ensureInitialized();
+    const s3 = this.deps.s3Endpoint;
+    if (!s3) return false;
+    try {
+      const sql = this.deps.v25Store.sql;
+      const payload = {
+        updatedByNodeId: this.deps.nodeId,
+        updatedAtMs: Date.now(),
+        scenario: this.scenario,
+        loadSheddingActive: this.loadSheddingActive,
+        verificationRetried: this.verificationRetried,
+        lastSyncUtc: this.lastSyncUtc,
+        lastBatchReport: this.lastBatchReport,
+        tenants: sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_tenants").toArray(),
+        approvals: sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_approvals").toArray(),
+        audits: sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_audit_logs").toArray(),
+        nodeOverrides: sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_node_overrides").toArray(),
+        tasks: sql.exec<Record<string, unknown>>("SELECT * FROM v25_scheduler_tasks").toArray(),
+      };
+      const resp = await fetch(`${s3.replace(/\/$/, "")}/ansts-fleet/management/cluster_state.json`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  public async pullManagementStateFromS3(): Promise<boolean> {
+    this.ensureInitialized();
+    const s3 = this.deps.s3Endpoint;
+    if (!s3) return false;
+    try {
+      const resp = await fetch(`${s3.replace(/\/$/, "")}/ansts-fleet/management/cluster_state.json`);
+      if (!resp.ok) return false;
+      const payload = (await resp.json()) as Record<string, unknown>;
+      if (!payload || !Array.isArray(payload.tenants)) return false;
+
+      const sql = this.deps.v25Store.sql;
+      if (payload.scenario) this.scenario = payload.scenario as ManagementScenarioId;
+      if (payload.loadSheddingActive !== undefined) this.loadSheddingActive = Boolean(payload.loadSheddingActive);
+      if (payload.verificationRetried !== undefined) this.verificationRetried = Boolean(payload.verificationRetried);
+      if (payload.lastSyncUtc) this.lastSyncUtc = String(payload.lastSyncUtc);
+      if (payload.lastBatchReport !== undefined) {
+        this.lastBatchReport = payload.lastBatchReport as typeof this.lastBatchReport;
+      }
+
+      for (const r of payload.tenants as Array<Record<string, unknown>>) {
+        sql.exec(
+          "INSERT OR REPLACE INTO v25_mgmt_tenants (tenant_id, region, tier, max_slots, escrow_reserved, daily_budget_usd, spent_usd, model_policy, config_version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          r.tenant_id,
+          r.region,
+          r.tier,
+          r.max_slots,
+          r.escrow_reserved,
+          r.daily_budget_usd,
+          r.spent_usd,
+          r.model_policy,
+          r.config_version,
+          r.updated_by,
+          r.updated_at
+        );
+      }
+      for (const a of (payload.approvals as Array<Record<string, unknown>>) ?? []) {
+        sql.exec(
+          "INSERT OR REPLACE INTO v25_mgmt_approvals (approval_id, type, target, region, tenant, initiator, status, risk, created_at, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          a.approval_id,
+          a.type,
+          a.target,
+          a.region,
+          a.tenant,
+          a.initiator,
+          a.status,
+          a.risk,
+          a.created_at,
+          a.decided_by ?? ""
+        );
+      }
+      for (const l of (payload.audits as Array<Record<string, unknown>>) ?? []) {
+        sql.exec(
+          "INSERT OR REPLACE INTO v25_mgmt_audit_logs (audit_id, ts, actor, role, action, scope, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          l.audit_id,
+          l.ts,
+          l.actor,
+          l.role,
+          l.action,
+          l.scope,
+          l.outcome
+        );
+      }
+      for (const n of (payload.nodeOverrides as Array<Record<string, unknown>>) ?? []) {
+        sql.exec(
+          "INSERT OR REPLACE INTO v25_mgmt_node_overrides (node_id, region, role_label, status, cpu_pct, psi_pct) VALUES (?, ?, ?, ?, ?, ?)",
+          n.node_id,
+          n.region,
+          n.role_label,
+          n.status,
+          n.cpu_pct,
+          n.psi_pct
+        );
+      }
+      for (const t of (payload.tasks as Array<Record<string, unknown>>) ?? []) {
+        sql.exec(
+          "INSERT OR REPLACE INTO v25_scheduler_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, idem_key, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          t.task_id,
+          t.tenant_id,
+          t.priority,
+          t.state,
+          t.fencing_token,
+          t.assigned_node_id ?? "",
+          t.idem_key,
+          t.spec_json
+        );
+        const restored = this.deps.v25Store.getPersistedTask(String(t.task_id));
+        if (restored) {
+          this.deps.scheduler.allTasks.set(restored.task_id, restored);
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public getTaskTurnsDetail(taskId: string): {
+    taskId: string;
+    branchName: string;
+    turns: Array<{
+      turnIndex: number;
+      walSeq: number;
+      fencingToken: number;
+      crc32Hex: string;
+      integrityVerified: boolean;
+      changedFiles: string[];
+      sqliteWalPages: number;
+      commitId: string;
+      ltxStatus: "VERIFIED" | "LTX_SEGMENT_MISSING";
+    }>;
+  } {
+    this.ensureInitialized();
+    const walEntries = this.deps.walEngine.getTaskWalEntries(taskId);
+    const branchName =
+      taskId === "task-ns-8841"
+        ? "feat-ns-auth"
+        : taskId === "task-ns-8842"
+        ? "fix-ns-ledger"
+        : taskId === "task-hl-3019"
+        ? "gdpr-audit-eu"
+        : `task-${taskId}`;
+    const turns = walEntries.map((e) => {
+      const missing = this.scenario === "history-missing" && e.turnIndex >= 4;
+      return {
+        turnIndex: e.turnIndex,
+        walSeq: e.walSeq,
+        fencingToken: e.fencingToken,
+        crc32Hex: e.frame.crc32Hex,
+        integrityVerified: !missing && e.frame.verifyIntegrity(),
+        changedFiles: e.frame.changedFiles,
+        sqliteWalPages: e.frame.sqliteWalPages,
+        commitId: `C${Math.max(0, e.turnIndex - 1)}`,
+        ltxStatus: (missing ? "LTX_SEGMENT_MISSING" : "VERIFIED") as "VERIFIED" | "LTX_SEGMENT_MISSING",
+      };
+    });
+    return { taskId, branchName, turns };
+  }
+
+  public createApprovalTicket(params: {
+    type: string;
+    target: string;
+    region: string;
+    tenant: string;
+    initiator: string;
+    role: string;
+    risk?: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权发起高危变更申请单" },
+      };
+    }
+    const approvalId = `APR-2026-${Math.floor(100 + Math.random() * 899)}`;
+    const createdAt = `${new Date().toISOString().slice(11, 16)} UTC`;
+    const risk = params.risk ?? (params.type.includes("SAGA") ? "CRITICAL" : "HIGH");
+    this.deps.v25Store.sql.exec(
+      "INSERT OR REPLACE INTO v25_mgmt_approvals (approval_id, type, target, region, tenant, initiator, status, risk, created_at, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      approvalId,
+      params.type,
+      params.target,
+      params.region,
+      params.tenant,
+      params.initiator,
+      "PENDING_SECOND_ADMIN",
+      risk,
+      createdAt,
+      ""
+    );
+    this.appendAudit(
+      params.initiator,
+      params.role,
+      `提交高危变更申请单 ${approvalId} (${params.type}: ${params.target})`,
+      `${params.region} / ${params.tenant}`,
+      "PENDING_SECOND_ADMIN"
+    );
+    return {
+      status: 201,
+      body: {
+        approvalId,
+        type: params.type,
+        target: params.target,
+        region: params.region,
+        tenant: params.tenant,
+        initiator: params.initiator,
+        status: "PENDING_SECOND_ADMIN",
+        risk,
+        createdAt,
+      },
     };
   }
 }

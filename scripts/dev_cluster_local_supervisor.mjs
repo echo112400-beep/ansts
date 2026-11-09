@@ -142,6 +142,7 @@ async function bootAll() {
       peerBrainUrls: PEER_BRAIN_URLS,
       peerBodyUrls: PEER_BODY_URLS,
       storageDir: `/tmp/ansts/${gw.nodeId}`,
+      s3Endpoint: "http://127.0.0.1:9000",
     });
     await srv.start(gw.port, 0);
     anstsNodes.push({ containerName: gw.containerName, nodeId: gw.nodeId, role: "gateway", port: gw.port, server: srv });

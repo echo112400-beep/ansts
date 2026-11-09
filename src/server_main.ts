@@ -316,6 +316,7 @@ export class AnstsLocalAndComposeServer {
       cloudEventsBus: this.cloudEventsBus,
       peerBrainUrls: this.peerBrainUrls,
       peerBodyUrls: this.peerBodyUrls,
+      s3Endpoint: this.s3Endpoint,
     });
   }
 
@@ -2015,7 +2016,11 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M41] Platform Management Plane BFF Endpoints (`/v1beta1/management/*`) — Backed by real PlatformManagementPlaneEngine
+    // [M41 & M42] Platform Management Plane BFF Endpoints (`/v1beta1/management/*`) — Backed by real PlatformManagementPlaneEngine + Cross-Gateway S3 Sync
+    if (pathname.startsWith("/v1beta1/management/")) {
+      await this.managementPlane.pullManagementStateFromS3();
+    }
+
     if (method === "GET" && pathname === "/v1beta1/management/state") {
       if (this.managementPlane.getScenario() === "offline" && urlObj.searchParams.get("recover") !== "1") {
         res.writeHead(503, { "content-type": "application/json" });
@@ -2030,6 +2035,7 @@ export class AnstsLocalAndComposeServer {
       }
       if (urlObj.searchParams.get("recover") === "1") {
         this.managementPlane.setScenario("normal", "chen");
+        await this.managementPlane.pushManagementStateToS3();
       }
       const statePayload = await this.managementPlane.buildFullManagementState({
         region: urlObj.searchParams.get("region") ?? undefined,
@@ -2041,10 +2047,21 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    if (method === "GET" && pathname.startsWith("/v1beta1/management/tasks/") && pathname.endsWith("/turns")) {
+      const taskId = decodeURIComponent(
+        pathname.slice("/v1beta1/management/tasks/".length, pathname.length - "/turns".length)
+      );
+      const detail = this.managementPlane.getTaskTurnsDetail(taskId);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(detail));
+      return;
+    }
+
     if (method === "POST" && pathname === "/v1beta1/management/scenario") {
       const body = await this.readJsonBody(req);
       if (body.action === "reset") {
         this.managementPlane.resetToBaseline();
+        await this.managementPlane.pushManagementStateToS3();
         const resetState = await this.managementPlane.buildFullManagementState();
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ reset: true, state: resetState }));
@@ -2053,6 +2070,7 @@ export class AnstsLocalAndComposeServer {
       const nextScenario = (body.scenario ?? "normal") as ManagementScenarioId;
       const actor = String(body.actor ?? "chen");
       this.managementPlane.setScenario(nextScenario, actor);
+      await this.managementPlane.pushManagementStateToS3();
       const statePayload = await this.managementPlane.buildFullManagementState();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ scenario: nextScenario, state: statePayload }));
@@ -2069,6 +2087,9 @@ export class AnstsLocalAndComposeServer {
         actor: String(body.actor ?? "chen"),
         role: String(body.role ?? "SRE_ADMIN"),
       });
+      if (result.status === 200) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
       return;
@@ -2083,6 +2104,7 @@ export class AnstsLocalAndComposeServer {
         actor: String(body.actor ?? "chen"),
         role: String(body.role ?? "SRE_ADMIN"),
       });
+      await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
       return;
@@ -2096,6 +2118,7 @@ export class AnstsLocalAndComposeServer {
         actor: String(body.actor ?? "chen"),
         role: String(body.role ?? "SRE_ADMIN"),
       });
+      await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
       return;
@@ -2109,6 +2132,28 @@ export class AnstsLocalAndComposeServer {
         actor: String(body.actor ?? "chen"),
         role: String(body.role ?? "SRE_ADMIN"),
       });
+      if (result.status === 200) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/approvals/create") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.createApprovalTicket({
+        type: String(body.type ?? "QUOTA_EMERGENCY_BOOST"),
+        target: String(body.target ?? "Northstar (120 → 180 并发槽)"),
+        region: String(body.region ?? "us-west-2"),
+        tenant: String(body.tenant ?? "Northstar"),
+        initiator: String(body.initiator ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+        risk: body.risk ? String(body.risk) : undefined,
+      });
+      if (result.status === 201) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
       return;
@@ -2123,6 +2168,9 @@ export class AnstsLocalAndComposeServer {
         role: String(body.role ?? "SRE_ADMIN"),
         decision: (body.decision ?? "approve") as "approve" | "reject",
       });
+      if (result.status === 200) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
       return;
@@ -2135,6 +2183,7 @@ export class AnstsLocalAndComposeServer {
         actor: String(body.actor ?? "chen"),
         role: String(body.role ?? "SRE_ADMIN"),
       });
+      await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
       return;

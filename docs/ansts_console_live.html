@@ -1277,6 +1277,42 @@ dialog#dialog::backdrop {
       if (state.scenario === 'history-missing') state.scenario = 'normal';
       return { ok: true, status: 200, data: { forkedTaskId: newTaskId, layerfsBranch: `branch-${newTaskId}` }, fromLiveBackend: false };
     }
+    if (method === 'GET' && endpointPath.startsWith('/v1beta1/management/tasks/') && endpointPath.endsWith('/turns')) {
+      const taskId = decodeURIComponent(endpointPath.slice('/v1beta1/management/tasks/'.length, endpointPath.length - '/turns'.length));
+      const isMissing = state.scenario === 'history-missing';
+      const turns = [1, 2, 3, 4, 5].map((idx) => ({
+        turnIndex: idx,
+        walSeq: idx,
+        fencingToken: 12,
+        crc32Hex: 'a8f40' + idx + 'c9',
+        integrityVerified: !(isMissing && idx >= 4),
+        changedFiles: ['src/' + taskId + '-turn' + idx + '.ts'],
+        sqliteWalPages: 4 + idx,
+        commitId: 'C' + (idx - 1),
+        ltxStatus: isMissing && idx >= 4 ? 'LTX_SEGMENT_MISSING' : 'VERIFIED'
+      }));
+      return { ok: true, status: 200, data: { taskId, branchName: 'branch-' + taskId, turns }, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/approvals/create') {
+      if (body.role === 'VIEWER') {
+        return { ok: false, status: 403, data: { error: 'RBAC_FORBIDDEN', message: 'VIEWER 角色无权发起高危变更申请单' }, fromLiveBackend: false };
+      }
+      const approvalId = 'APR-2026-' + Math.floor(100 + Math.random() * 899);
+      const created = {
+        id: approvalId,
+        approvalId,
+        type: body.type || 'QUOTA_EMERGENCY_BOOST',
+        target: body.target || 'Northstar (120 → 180 并发槽)',
+        region: body.region || 'us-west-2',
+        tenant: body.tenant || 'Northstar',
+        initiator: body.initiator || 'chen',
+        status: 'PENDING_SECOND_ADMIN',
+        risk: body.risk || 'HIGH',
+        createdAt: '09:34 UTC'
+      };
+      state.approvals.unshift(created);
+      return { ok: true, status: 201, data: created, fromLiveBackend: false };
+    }
     if (method === 'POST' && endpointPath === '/v1beta1/management/approvals/decide') {
       const item = state.approvals.find((a) => a.id === body.approvalId);
       const initiator = body.initiator || (item ? item.initiator : 'chen');
@@ -1934,6 +1970,7 @@ dialog#dialog::backdrop {
             <p class="panel-subtitle">后端强制校验：仅 <code>SRE_ADMIN</code> 可审批（否则返回 403），且发起人与审批人不得为同一人（否则返回 409 SELF_APPROVAL_FORBIDDEN）。当前身份：<strong>${p.name}</strong></p>
           </div>
           <div class="btn-row">
+            <button type="button" class="small primary" data-action="open-create-approval-dialog" ${p.role === 'VIEWER' || state.scenario === 'offline' ? 'disabled' : ''}>+ 提交高危变更审批单 (/v1beta1/management/approvals/create)</button>
             <button type="button" class="small" data-action="open-identity-dialog">切换陈/周身份完成双人复核</button>
           </div>
         </div>
@@ -2260,35 +2297,36 @@ dialog#dialog::backdrop {
     );
   }
 
-  function openTurnHistoryDialog(taskId) {
+  async function openTurnHistoryDialog(taskId) {
     const task = state.tasks.find((t) => t.id === taskId) || state.tasks[0];
-    const isMissing = state.scenario === 'history-missing';
+    const turnsRes = await callBackendApi('GET', '/v1beta1/management/tasks/' + encodeURIComponent(task.id) + '/turns');
+    const turnsList = (turnsRes.data && Array.isArray(turnsRes.data.turns) && turnsRes.data.turns.length > 0)
+      ? turnsRes.data.turns
+      : [
+          { turnIndex: 1, commitId: 'C0', crc32Hex: '9a01b2c3', sqliteWalPages: 5, changedFiles: ['src/init.ts'], ltxStatus: 'VERIFIED' },
+          { turnIndex: 2, commitId: 'C1', crc32Hex: '4d12e8f0', sqliteWalPages: 6, changedFiles: ['src/auth.ts'], ltxStatus: 'VERIFIED' },
+          { turnIndex: 3, commitId: 'C2', crc32Hex: '7c89a112', sqliteWalPages: 7, changedFiles: ['src/ledger.ts'], ltxStatus: 'VERIFIED' }
+        ];
 
     openDialog(
-      `任务回合历史与零拷贝 Time-Travel 分叉 · ${task.id}`,
-      `
-        <div>目标任务：<strong class="mono">${task.id}</strong> · LayerFS 分支：<code class="mono">${task.branch}</code></div>
-        <div class="table-wrap">
-          <table class="data-table">
-            <thead>
-              <tr><th>回合</th><th>LayerFS Commit</th><th>LTX 归档状态</th><th>说明</th></tr>
-            </thead>
-            <tbody>
-              <tr><td class="mono">Turn #1–#2</td><td class="mono">C0 / C1</td><td><span class="status-pill ok">S3 LTX 完整</span></td><td class="muted">CRC32 校验通过</td></tr>
-              <tr><td class="mono"><strong>Turn #3</strong></td><td class="mono"><strong>C2 (推荐恢复点)</strong></td><td><span class="status-pill ok">S3 LTX 完整</span></td><td><span class="status-pill ok">最近完整校验点</span></td></tr>
-              <tr><td class="mono">Turn #4–#5</td><td class="mono">C3 / C4</td><td><span class="status-pill ${isMissing ? 'danger' : 'ok'}">${isMissing ? 'LTX_SEGMENT_MISSING' : 'S3 LTX 完整'}</span></td><td class="muted">${isMissing ? '后端将拦截 422' : '可安全检出'}</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="form-field">
-          <label for="dlg-fork-turn">选择 Time-Travel 零拷贝分叉回合 (POST /v1beta1/management/tasks/time-travel)</label>
-          <select id="dlg-fork-turn">
-            <option value="3" selected>Turn #3 (Commit C2 · 最近完整校验点)</option>
-            <option value="2">Turn #2 (Commit C1)</option>
-            <option value="4">${isMissing ? 'Turn #4 (缺失段 · 触发后端 422 完整性拦截)' : 'Turn #4 (Commit C3)'}</option>
-          </select>
-        </div>
-      `,
+      '任务回合 WAL 帧 CRC32 校验与零拷贝分叉 · ' + task.id + ' (GET /v1beta1/management/tasks/' + task.id + '/turns)',
+      '<div>目标任务：<strong class="mono">' + task.id + '</strong> · LayerFS 分支：<code class="mono">' + task.branch + '</code></div>' +
+      '<div class="table-wrap"><table class="data-table"><thead><tr><th>回合</th><th>Commit</th><th>CRC32 帧校验</th><th>WAL 页数 / 变更文件</th><th>S3 LTX 状态</th></tr></thead><tbody>' +
+      turnsList.map((tr) =>
+        '<tr><td class="mono"><strong>Turn #' + tr.turnIndex + '</strong></td>' +
+        '<td class="mono">' + tr.commitId + '</td>' +
+        '<td class="mono"><code>0x' + tr.crc32Hex + '</code></td>' +
+        '<td class="mono">' + tr.sqliteWalPages + ' pages · ' + (tr.changedFiles || []).join(', ') + '</td>' +
+        '<td><span class="status-pill ' + (tr.ltxStatus === 'VERIFIED' ? 'ok' : 'danger') + '">' + tr.ltxStatus + '</span></td></tr>'
+      ).join('') +
+      '</tbody></table></div>' +
+      '<div class="form-field"><label for="dlg-fork-turn">选择 Time-Travel 零拷贝分叉回合 (POST /v1beta1/management/tasks/time-travel)</label>' +
+      '<select id="dlg-fork-turn">' +
+      turnsList.map((tr) =>
+        '<option value="' + tr.turnIndex + '" ' + (tr.turnIndex === 3 ? 'selected' : '') + '>' +
+        'Turn #' + tr.turnIndex + ' (' + tr.commitId + ' · CRC32=0x' + tr.crc32Hex + ' · ' + tr.ltxStatus + ')</option>'
+      ).join('') +
+      '</select></div>',
       '调用后端派生新任务与 LayerFS 分支',
       async () => {
         const errEl = document.getElementById('dialog-error');
@@ -2307,7 +2345,51 @@ dialog#dialog::backdrop {
         }
         closeDialog();
         await fetchBackendState();
-        showToast(`后端已零拷贝派生新任务 ${res.data.forkedTaskId} (分支 ${res.data.layerfsBranch})`);
+        showToast('后端已零拷贝派生新任务 ' + res.data.forkedTaskId + ' (分支 ' + res.data.layerfsBranch + ')');
+      }
+    );
+  }
+
+  function openCreateApprovalDialog() {
+    const p = getPrincipal();
+    openDialog(
+      '提交高危变更申请单 (POST /v1beta1/management/approvals/create)',
+      '<div class="form-field"><label for="dlg-apr-type">高危变更类型</label><select id="dlg-apr-type">' +
+      '<option value="QUOTA_EMERGENCY_BOOST" selected>QUOTA_EMERGENCY_BOOST (租户紧急提额)</option>' +
+      '<option value="SAGA_HIGH_RISK_TOOL">SAGA_HIGH_RISK_TOOL (高风险 Saga 外部工具执行)</option>' +
+      '<option value="BRAIN_SHARD_DRAIN">BRAIN_SHARD_DRAIN (核心调度分片维护迁移)</option>' +
+      '</select></div>' +
+      '<div class="form-field"><label for="dlg-apr-target">变更目标与内容描述</label>' +
+      '<input id="dlg-apr-target" type="text" value="Northstar (120 → 180 并发沙箱槽位)" /></div>' +
+      '<div class="form-field"><label for="dlg-apr-tenant">目标租户</label><select id="dlg-apr-tenant">' +
+      '<option value="Northstar" selected>Northstar (us-west-2)</option>' +
+      '<option value="Helios">Helios (eu-central-1)</option>' +
+      '<option value="Vanguard">Vanguard (ap-northeast-1)</option>' +
+      '</select></div>' +
+      '<div class="muted">当前发起人：<strong>' + p.name + ' (' + p.id + ')</strong>。提交后需切换至另一位 <code>SRE_ADMIN</code> 复核批准方可生效。</div>',
+      '提交后端审批单',
+      async () => {
+        const errEl = document.getElementById('dialog-error');
+        const type = document.getElementById('dlg-apr-type').value;
+        const target = document.getElementById('dlg-apr-target').value.trim();
+        const tenant = document.getElementById('dlg-apr-tenant').value;
+        const region = tenant === 'Helios' ? 'eu-central-1' : tenant === 'Vanguard' ? 'ap-northeast-1' : 'us-west-2';
+
+        const res = await callBackendApi('POST', '/v1beta1/management/approvals/create', {
+          type,
+          target,
+          region,
+          tenant,
+          initiator: p.id,
+          role: p.role
+        });
+        if (!res.ok) {
+          errEl.textContent = res.data.message || '提交失败';
+          return;
+        }
+        closeDialog();
+        await fetchBackendState();
+        showToast('已创建高危变更审批单 ' + res.data.approvalId + '，请切换另一管理员复核');
       }
     );
   }
@@ -2542,7 +2624,11 @@ dialog#dialog::backdrop {
       return;
     }
     if (action === 'open-turn-history-dialog') {
-      openTurnHistoryDialog(target.getAttribute('data-task') || 'task-ns-8841');
+      await openTurnHistoryDialog(target.getAttribute('data-task') || 'task-ns-8841');
+      return;
+    }
+    if (action === 'open-create-approval-dialog') {
+      openCreateApprovalDialog();
       return;
     }
     if (action === 'open-rebalance-verification') {

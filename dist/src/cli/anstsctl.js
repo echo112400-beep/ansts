@@ -175,6 +175,60 @@ gatewayUrl = process.env.ANSTS_GATEWAY_URL ?? "http://127.0.0.1:18080")
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-state") {
+    const region = rest[0] ?? "all";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/state?region=${encodeURIComponent(region)}`);
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-quota") {
+    const tenantId = rest[0] ?? "Northstar";
+    const maxSlots = Number(rest[1] ?? 160);
+    const dailyBudgetUsd = Number(rest[2] ?? 1500);
+    const expectedVersion = Number(rest[3] ?? 14);
+    const actor = rest[4] ?? "chen";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/tenants/config`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tenantId, maxSlots, dailyBudgetUsd, expectedVersion, actor, role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-drain") {
+    const nodeId = rest[0] ?? "body-host-02";
+    const forceMigrateLeases = rest.includes("--force-migrate");
+    const resp = await fetch(`${baseUrl}/v1beta1/management/nodes/batch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation: "drain", nodeIds: [nodeId], forceMigrateLeases, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.status === 200 ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-approve") {
+    const approvalId = rest[0] ?? "APR-2026-091";
+    const approver = rest[1] ?? "zhou";
+    const decision = rest[2] ?? "approve";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/approvals/decide`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approvalId, approver, decision, role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-turns") {
+    const taskId = rest[0] ?? "task-ns-8841";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/tasks/${encodeURIComponent(taskId)}/turns`);
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "gc") {
     const resp = await fetch(`${baseUrl}/v1beta1/storage/gc`, { method: "POST" });
     const data = await resp.json();
