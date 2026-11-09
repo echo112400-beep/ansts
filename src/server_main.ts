@@ -1,10 +1,13 @@
 /**
- * @fileoverview M18 Unified Standalone & Docker Compose Service Entrypoint (`src/server_main.ts`).
- * Starts the ANSTS v2.2 Control Plane HTTP Gateway (`:8080`), Operational Web Dashboard (`:8090`),
- * Pre-warmed NodeDaemon Worker Pool, LayerFS Dual-Path Workspace Store, Prometheus `/metrics`,
- * and `denoland/celld` compatible `/healthz`, `/.well-known/celld/health`, and `/state` endpoints.
+ * @fileoverview M18 & v2.5 Unified Standalone, Docker Compose & Multi-Node Cluster Service Entrypoint (`src/server_main.ts`).
+ * Supports single-stack mode (`:8080` API + `:8090` Dashboard) and `feat/celld-v25` Multi-Node Cluster mode
+ * (`gateway`, `brain`, `body`) with cross-node HTTP RPC forwarding (`gateway -> brain -> body`),
+ * Dual-Homed Reverse Tunnel registration (`EdgeTunnelHaRouter`), 256-slot `HaSchedulerShardCoordinator`,
+ * `SchedulerV25SingleWritePathStore`, LayerFS Dual-Path Workspace Store, and Prometheus `/metrics`.
  */
 import * as http from "node:http";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { CoreScheduler5D } from "./scheduler.js";
 import { NodeDaemon } from "./node_daemon.js";
 import { TaskSpecValidator, TaskSpecValidationError } from "./gateway/validator.js";
@@ -17,6 +20,10 @@ import { ManualFleetScaleController } from "./cluster/manual_scale_controller.js
 import { CognitiveRouter } from "./cognitive_router.js";
 import { LlmEndpointMetrics, ToolCallEffectClass } from "./models.js";
 import { SagaToolGateway } from "./saga_gateway.js";
+import { HaSchedulerShardCoordinator } from "./cloudflare/ha_scheduler_shard_coordinator.js";
+import { SchedulerV25SingleWritePathStore } from "./cloudflare/scheduler_v25_persistence.js";
+import { EdgeTunnelHaRouter } from "./runtime/edge_tunnel_ha_router.js";
+import { InMemoryCellSqlStorage } from "./cloudflare/env.js";
 
 export interface AnstsServiceRuntimeOptions {
   host?: string;
@@ -24,9 +31,33 @@ export interface AnstsServiceRuntimeOptions {
   dashboardPort?: number;
   workerNodeCount?: number;
   tickIntervalMs?: number;
+  nodeId?: string;
+  nodeRole?: "brain" | "body" | "gateway";
+  peerBrainUrls?: Record<string, string>;
+  peerBodyUrls?: Record<string, string>;
+  storageDir?: string;
+}
+
+function parseJsonEnvMap(raw: string | undefined): Record<string, string> {
+  if (!raw || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === "string") out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
 }
 
 export class AnstsLocalAndComposeServer {
+  public readonly nodeId: string;
+  public readonly nodeRole: "brain" | "body" | "gateway";
+  public readonly storageDir: string;
+  public readonly peerBrainUrls: Record<string, string>;
+  public readonly peerBodyUrls: Record<string, string>;
   public readonly scheduler: CoreScheduler5D;
   public readonly backpressure: IngressBackpressureController;
   public readonly sseGateway: SseEventStreamGateway;
@@ -35,6 +66,9 @@ export class AnstsLocalAndComposeServer {
   public readonly fleetController: ManualFleetScaleController;
   public readonly router: CognitiveRouter;
   public readonly sagaGateway: SagaToolGateway;
+  public readonly shardCoordinator: HaSchedulerShardCoordinator;
+  public readonly v25Store: SchedulerV25SingleWritePathStore;
+  public readonly tunnelRouter: EdgeTunnelHaRouter;
   public readonly dashboardServer: DashboardBackendServer;
   private apiServer: http.Server | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -44,6 +78,13 @@ export class AnstsLocalAndComposeServer {
 
   constructor(options: AnstsServiceRuntimeOptions = {}) {
     this.host = options.host ?? process.env.ANSTS_HOST ?? "0.0.0.0";
+    this.nodeId = options.nodeId ?? process.env.ANSTS_NODE_ID ?? "ansts-dev-node-01";
+    this.nodeRole =
+      (options.nodeRole ?? (process.env.ANSTS_NODE_ROLE as "brain" | "body" | "gateway")) || "gateway";
+    this.storageDir = options.storageDir ?? process.env.ANSTS_STORAGE_DIR ?? `/tmp/ansts/${this.nodeId}`;
+    this.peerBrainUrls = options.peerBrainUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BRAIN_URLS);
+    this.peerBodyUrls = options.peerBodyUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BODY_URLS);
+
     this.tickIntervalMs = options.tickIntervalMs ?? Number(process.env.ANSTS_TICK_INTERVAL_MS ?? 1000);
     this.scheduler = new CoreScheduler5D(15.0);
     this.backpressure = new IngressBackpressureController();
@@ -53,6 +94,24 @@ export class AnstsLocalAndComposeServer {
     this.fleetController = new ManualFleetScaleController();
     this.router = new CognitiveRouter();
     this.sagaGateway = new SagaToolGateway();
+    this.v25Store = new SchedulerV25SingleWritePathStore(new InMemoryCellSqlStorage());
+    this.tunnelRouter = new EdgeTunnelHaRouter();
+
+    const brainNodes =
+      Object.keys(this.peerBrainUrls).length > 0
+        ? Object.keys(this.peerBrainUrls)
+        : ["brain-node-01", "brain-node-02", "brain-node-03"];
+    this.shardCoordinator = new HaSchedulerShardCoordinator(256, 8);
+    for (const bId of brainNodes) {
+      this.shardCoordinator.registerBrainShardNode(bId);
+    }
+
+    // Ensure storageDir exists for state persistence metadata
+    try {
+      fs.mkdirSync(this.storageDir, { recursive: true });
+    } catch {
+      // ignore if read-only in restricted environments
+    }
 
     // Register default LLM endpoints & Saga tools
     this.router.registerEndpoint(
@@ -76,19 +135,34 @@ export class AnstsLocalAndComposeServer {
       status: "SUCCESS",
     }));
 
-    // Bootstrap local/container worker nodes
-    const workerCount = options.workerNodeCount ?? Number(process.env.ANSTS_WORKER_NODES ?? 3);
-    for (let i = 1; i <= workerCount; i++) {
-      const nodeId = `ansts-worker-${String(i).padStart(2, "0")}`;
-      const daemon = new NodeDaemon(nodeId, 32, 65536, 8);
-      this.scheduler.registerOrUpdateNode(daemon.emitHeartbeat(0));
-      this.fleetController.registerBareMetalNode({
-        nodeId,
-        ipAddress: `10.240.0.${10 + i}`,
-        role: "worker",
-        systemdUnit: "ansts-node-daemon.service",
-        runningCells: [`AnstsSchedulerCell:shard-${i}`],
+    // Bootstrap worker nodes
+    const configuredBodies = Object.keys(this.peerBodyUrls);
+    if (configuredBodies.length > 0) {
+      configuredBodies.forEach((bodyId, idx) => {
+        const daemon = new NodeDaemon(bodyId, 32, 65536, 8);
+        this.scheduler.registerOrUpdateNode(daemon.emitHeartbeat(0));
+        this.fleetController.registerBareMetalNode({
+          nodeId: bodyId,
+          ipAddress: `10.240.0.${20 + idx}`,
+          role: "worker",
+          systemdUnit: "ansts-body-daemon.service",
+          runningCells: [`BodySandboxHost:${bodyId}`],
+        });
       });
+    } else {
+      const workerCount = options.workerNodeCount ?? Number(process.env.ANSTS_WORKER_NODES ?? 3);
+      for (let i = 1; i <= workerCount; i++) {
+        const nodeId = `ansts-worker-${String(i).padStart(2, "0")}`;
+        const daemon = new NodeDaemon(nodeId, 32, 65536, 8);
+        this.scheduler.registerOrUpdateNode(daemon.emitHeartbeat(0));
+        this.fleetController.registerBareMetalNode({
+          nodeId,
+          ipAddress: `10.240.0.${10 + i}`,
+          role: "worker",
+          systemdUnit: "ansts-node-daemon.service",
+          runningCells: [`AnstsSchedulerCell:shard-${i}`],
+        });
+      }
     }
 
     const bridge = new DashboardBridgeService(this.scheduler, this.fleetController);
@@ -97,7 +171,7 @@ export class AnstsLocalAndComposeServer {
 
   public async start(apiPort?: number, dashboardPort?: number): Promise<{ apiPort: number; dashboardPort: number }> {
     const targetApiPort = apiPort ?? Number(process.env.ANSTS_LISTEN_PORT ?? process.env.ANSTS_PORT ?? 8080);
-    const targetDashPort = dashboardPort ?? Number(process.env.ANSTS_DASHBOARD_PORT ?? 8090);
+    const targetDashPort = dashboardPort ?? Number(process.env.ANSTS_DASHBOARD_PORT ?? 0);
 
     const boundApiPort = await new Promise<number>((resolve, reject) => {
       this.apiServer = http.createServer((req, res) => {
@@ -147,10 +221,16 @@ export class AnstsLocalAndComposeServer {
     const urlObj = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = urlObj.pathname;
 
-    if (method === "GET" && (pathname === "/healthz" || pathname === "/health" || pathname === "/.well-known/celld/health")) {
+    if (
+      method === "GET" &&
+      (pathname === "/healthz" ||
+        pathname === "/health" ||
+        pathname === "/readyz" ||
+        pathname === "/.well-known/celld/health")
+    ) {
       if (this.draining) {
         res.writeHead(503, { "content-type": "application/json", connection: "close" });
-        res.end(JSON.stringify({ status: "draining", healthy: false }));
+        res.end(JSON.stringify({ status: "draining", healthy: false, nodeId: this.nodeId, nodeRole: this.nodeRole }));
         return;
       }
       res.writeHead(200, { "content-type": "application/json" });
@@ -158,6 +238,8 @@ export class AnstsLocalAndComposeServer {
         JSON.stringify({
           status: "ok",
           healthy: true,
+          nodeId: this.nodeId,
+          nodeRole: this.nodeRole,
           queuedTasks: this.scheduler.queueManager.totalQueued(),
           totalTasks: this.scheduler.allTasks.size,
           activeNodes: this.scheduler.nodes.size,
@@ -171,6 +253,8 @@ export class AnstsLocalAndComposeServer {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
+          nodeId: this.nodeId,
+          nodeRole: this.nodeRole,
           node_load: {
             capacity_waiting: 0,
             activation_waiting: 0,
@@ -271,42 +355,182 @@ export class AnstsLocalAndComposeServer {
         command,
       });
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(result));
+      res.end(JSON.stringify({ ...result, executedByNodeId: this.nodeId, nodeRole: this.nodeRole }));
       return;
     }
 
-    if (method === "POST" && pathname === "/internal/v1beta1/tunnel/register") {
+    // Internal Brain RPC endpoint (`POST /internal/v1beta1/brain/schedule`)
+    if (method === "POST" && pathname === "/internal/v1beta1/brain/schedule") {
       const body = await this.readJsonBody(req);
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          registered: true,
-          hostId: body.hostId ?? "body-host-01",
-          gatewayId: body.gatewayId ?? (process.env.ANSTS_NODE_ID ?? "celld-gw-01"),
-          role: body.role ?? "PRIMARY",
-          epoch: body.epoch ?? 1,
-        })
-      );
-      return;
-    }
-
-    if (method === "POST" && pathname === "/v1beta1/tasks/dispatch") {
-      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? `task-${Date.now()}`);
+      const tenantId = String(body.tenantId ?? "tenant-default");
+      const slotInfo = this.shardCoordinator.resolveBrainForTask(tenantId, taskId);
       const spec = TaskSpecValidator.validateAndNormalize({
-        task_id: String(body.taskId ?? `task-${Date.now()}`),
-        tenant_id: String(body.tenantId ?? "tenant-default"),
+        task_id: taskId,
+        tenant_id: tenantId,
         priority: 1,
         prompt: String(body.promptText ?? ""),
       });
       const submitted = this.scheduler.submitTask(spec);
       const placements = this.scheduler.scheduleTick();
+      const persisted = this.v25Store.commitTaskSingleWritePath(submitted);
+      this.metrics.incCounter("ansts_brain_schedules_total", 1);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          scheduledByBrainId: this.nodeId,
+          slot: slotInfo.slotIndex,
+          taskId: submitted.task_id,
+          state: submitted.state,
+          deduplicated: persisted.deduplicated,
+          fencingToken: submitted.lease_fencing_token,
+          assignedBodyHostId: String(body.targetBodyHostId ?? submitted.assigned_node_id ?? "body-host-01"),
+          placements,
+        })
+      );
+      return;
+    }
+
+    // Internal Body RPC endpoint (`POST /internal/v1beta1/body/execute`)
+    if (method === "POST" && pathname === "/internal/v1beta1/body/execute") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? `task-${Date.now()}`);
+      const branchName = `task-${taskId}`;
+      try {
+        this.layerfs.getBranchHeadCommit(branchName);
+      } catch {
+        this.layerfs.forkBranch("main", branchName);
+      }
+      const execResult = this.layerfs.executeEphemeralBashWorkspace({
+        branchName,
+        agentId: String(body.tenantId ?? "distributed-agent"),
+        stepId: `exec-${taskId}`,
+        command: `printf '%s\\n' ${JSON.stringify(String(body.promptText ?? "ok"))} > .ansts_task_trace.txt`,
+      });
+      this.metrics.incCounter("ansts_body_executions_total", 1);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          executedByBodyId: this.nodeId,
+          taskId,
+          branchName,
+          commitHash: execResult.commitId,
+          commitId: execResult.commitId,
+          committedNewSnapshot: execResult.committedNewSnapshot,
+          mountLatencyMs: execResult.mountLatencyMs,
+          status: "COMPLETED",
+        })
+      );
+      return;
+    }
+
+    // Dual-Homed Reverse Tunnel registration (`POST /internal/v1beta1/tunnel/register`)
+    if (method === "POST" && pathname === "/internal/v1beta1/tunnel/register") {
+      const body = await this.readJsonBody(req);
+      const hostId = String(body.hostId ?? "body-host-01");
+      const gatewayId = String(body.gatewayId ?? this.nodeId);
+      const role = (body.role === "SECONDARY" ? "SECONDARY" : "PRIMARY") as "PRIMARY" | "SECONDARY";
+      const connGeneration = Number(body.connGeneration ?? 1);
+      const epoch = Number(body.epoch ?? 1);
+
+      this.tunnelRouter.tunnelCell.registerTunnel({
+        hostId,
+        gatewayId,
+        role,
+        connGeneration,
+        epoch,
+      });
+
+      const activeBinding = this.tunnelRouter.tunnelCell.selectActiveTunnel(hostId);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          registered: true,
+          hostId,
+          gatewayId,
+          role,
+          connGeneration,
+          epoch,
+          activeGatewayId: activeBinding.gatewayId,
+        })
+      );
+      return;
+    }
+
+    // Distributed Task Dispatch (`POST /v1beta1/tasks/dispatch`)
+    if (method === "POST" && pathname === "/v1beta1/tasks/dispatch") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? `task-${Date.now()}`);
+      const tenantId = String(body.tenantId ?? "tenant-default");
+      const promptText = String(body.promptText ?? "");
+      const slotResolution = this.shardCoordinator.resolveBrainForTask(tenantId, taskId);
+      const ownerBrainId = slotResolution.brainNodeId ?? "brain-node-01";
+
+      const spec = TaskSpecValidator.validateAndNormalize({
+        task_id: taskId,
+        tenant_id: tenantId,
+        priority: 1,
+        prompt: promptText,
+      });
+      const submitted = this.scheduler.submitTask(spec);
+      const placements = this.scheduler.scheduleTick();
+      const targetBodyHostId = String(body.targetBodyHostId ?? submitted.assigned_node_id ?? "body-host-01");
+      this.metrics.incCounter("ansts_tasks_dispatched_total", 1);
+
+      // Forward to live peer Brain & Body nodes if configured in ANSTS_PEER_BRAIN_URLS / ANSTS_PEER_BODY_URLS
+      let remoteBrainResult: Record<string, unknown> | null = null;
+      const brainBaseUrl = this.peerBrainUrls[ownerBrainId];
+      if (brainBaseUrl) {
+        try {
+          const resp = await fetch(`${brainBaseUrl}/internal/v1beta1/brain/schedule`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              taskId,
+              tenantId,
+              promptText,
+              targetBodyHostId,
+              slot: slotResolution.slotIndex,
+            }),
+          });
+          if (resp.ok) {
+            remoteBrainResult = (await resp.json()) as Record<string, unknown>;
+          }
+        } catch {
+          // fallback to local schedule if peer brain is unreachable
+        }
+      }
+
+      let remoteBodyResult: Record<string, unknown> | null = null;
+      const bodyBaseUrl = this.peerBodyUrls[targetBodyHostId];
+      if (bodyBaseUrl) {
+        try {
+          const resp = await fetch(`${bodyBaseUrl}/internal/v1beta1/body/execute`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ taskId, tenantId, promptText }),
+          });
+          if (resp.ok) {
+            remoteBodyResult = (await resp.json()) as Record<string, unknown>;
+          }
+        } catch {
+          // fallback if peer body is unreachable
+        }
+      }
+
       res.writeHead(202, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           dispatched: true,
+          gatewayNodeId: this.nodeId,
           taskId: submitted.task_id,
+          tenantId,
+          shardSlot: slotResolution.slotIndex,
+          routedBrainNodeId: remoteBrainResult?.scheduledByBrainId ?? ownerBrainId,
+          fencingToken: remoteBrainResult?.fencingToken ?? submitted.lease_fencing_token,
           state: submitted.state,
-          targetBodyHostId: body.targetBodyHostId ?? submitted.assigned_node_id,
+          targetBodyHostId,
+          bodyExecution: remoteBodyResult,
           placements,
         })
       );
@@ -318,8 +542,11 @@ export class AnstsLocalAndComposeServer {
       res.end(
         JSON.stringify({
           region: urlObj.searchParams.get("region") ?? "us-west-2",
+          gatewayNodeId: this.nodeId,
           totalTasks: this.scheduler.allTasks.size,
           activeNodes: this.scheduler.nodes.size,
+          configuredBrains: Object.keys(this.peerBrainUrls),
+          configuredBodies: Object.keys(this.peerBodyUrls),
           status: "HEALTHY",
         })
       );
@@ -331,8 +558,16 @@ export class AnstsLocalAndComposeServer {
       res.end(
         JSON.stringify({
           totalShards: 64,
-          virtualSlots: 1024,
-          brains: ["brain-node-01", "brain-node-02", "brain-node-03"],
+          virtualSlots: 256,
+          brains:
+            Object.keys(this.peerBrainUrls).length > 0
+              ? Object.keys(this.peerBrainUrls)
+              : ["brain-node-01", "brain-node-02", "brain-node-03"],
+          sampleSlotOwners: {
+            slot0: this.shardCoordinator.ring.getOwnerNodeForSlot(0),
+            slot85: this.shardCoordinator.ring.getOwnerNodeForSlot(85),
+            slot170: this.shardCoordinator.ring.getOwnerNodeForSlot(170),
+          },
         })
       );
       return;
@@ -343,6 +578,17 @@ export class AnstsLocalAndComposeServer {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "draining_started", handoff: urlObj.searchParams.get("handoff") ?? "release" }));
       return;
+    }
+
+    // Serve static console docs if requested on root `/`
+    if (method === "GET" && (pathname === "/" || pathname === "/index.html" || pathname === "/ansts_console_live.html")) {
+      const docFile = pathname === "/ansts_console_live.html" ? "ansts_console_live.html" : "index.html";
+      const candidatePath = path.resolve(process.cwd(), "docs", docFile);
+      if (fs.existsSync(candidatePath)) {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(fs.readFileSync(candidatePath, "utf-8"));
+        return;
+      }
     }
 
     res.writeHead(404, { "content-type": "application/json" });
@@ -380,7 +626,9 @@ if (isMainModule) {
   server.start().then(({ apiPort, dashboardPort }) => {
     console.log(
       JSON.stringify({
-        service: "ANSTS v2.2 Control Plane & LayerFS Runtime",
+        service: "ANSTS v2.5 Control Plane & LayerFS Runtime",
+        nodeId: server.nodeId,
+        nodeRole: server.nodeRole,
         status: "LISTENING",
         apiGatewayUrl: `http://127.0.0.1:${apiPort}`,
         healthzUrl: `http://127.0.0.1:${apiPort}/healthz`,

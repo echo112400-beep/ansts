@@ -1,14 +1,14 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.SchedulerV25SingleWritePathStore = void 0;
 
 
-
+var _env = require("./env.js");
 var _models = require("../models.js"); /**
  * @fileoverview v2.5 Single-Write-Path Scheduler Persistence & Queue Deduplication Store (`b566a53`).
  */class SchedulerV25SingleWritePathStore {
   sql;
   seenIdempotencyKeys = new Set();
 
-  constructor(sql) {
+  constructor(sql = new _env.InMemoryCellSqlStorage()) {
     this.sql = sql;
     this.sql.exec(
     "CREATE TABLE IF NOT EXISTS v25_scheduler_tasks (task_id TEXT PRIMARY KEY, tenant_id TEXT, priority INTEGER, state TEXT, fencing_token INTEGER, idem_key TEXT, spec_json TEXT)");

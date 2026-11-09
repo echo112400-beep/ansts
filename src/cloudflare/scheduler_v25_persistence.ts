@@ -1,14 +1,14 @@
 /**
  * @fileoverview v2.5 Single-Write-Path Scheduler Persistence & Queue Deduplication Store (`b566a53`).
  */
-import { SqlStorageLike } from "./env.js";
+import { InMemoryCellSqlStorage, SqlStorageLike } from "./env.js";
 import { TaskPriority, TaskSpec, TaskState } from "../models.js";
 
 export class SchedulerV25SingleWritePathStore {
   private readonly sql: SqlStorageLike;
   private readonly seenIdempotencyKeys: Set<string> = new Set();
 
-  constructor(sql: SqlStorageLike) {
+  constructor(sql: SqlStorageLike = new InMemoryCellSqlStorage()) {
     this.sql = sql;
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS v25_scheduler_tasks (task_id TEXT PRIMARY KEY, tenant_id TEXT, priority INTEGER, state TEXT, fencing_token INTEGER, idem_key TEXT, spec_json TEXT)"

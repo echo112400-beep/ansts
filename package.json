@@ -13,7 +13,10 @@
     "ci": "node scripts/ci_check.mjs --stage all",
     "docker:up": "docker compose up --build -d",
     "docker:down": "docker compose down",
-    "prestart": "node scripts/ci_check.mjs --stage build-if-missing"
+    "prestart": "node scripts/ci_check.mjs --stage build-if-missing",
+    "dev:cluster:up": "cat deploy/dev-cluster/dev-cluster-up.sh | bash",
+    "dev:cluster:down": "cat deploy/dev-cluster/dev-cluster-down.sh | bash",
+    "start:local": "cat scripts/run-local.sh | bash"
   },
   "engines": {
     "node": ">=18.0.0"
