@@ -264,6 +264,18 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-sandbox") {
+    const action = rest[0] ?? "allocate_and_mount";
+    const taskId = rest[1] ?? "task-ns-8841";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/runtime/sandbox`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, taskId, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-mcp") {
     const action = rest[0] ?? "invoke_mcp_tool";
     const toolName = rest[1] ?? "mcp_pg_migration_apply";

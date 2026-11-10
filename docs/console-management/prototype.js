@@ -125,6 +125,11 @@
         ],
         lastSagaRollbackReport: null
       },
+      runtimeSandboxState: {
+        warmPoolStats: { warmCount: 8, activeCount: 1 },
+        teePublicKeyDerHex: '302a300506032b6570032100a8f19c...',
+        spiffeCaPublicKeyDerHex: '302a300506032b65700321007d44e2...'
+      },
       gcSweepReport: null,
       taskFilterSearch: '',
       taskFilterState: 'ALL',
@@ -244,6 +249,7 @@
       if (d.canary) state.canary = d.canary;
       if (d.a2aState) state.a2aState = d.a2aState;
       if (d.mcpState) state.mcpState = d.mcpState;
+      if (d.runtimeSandboxState) state.runtimeSandboxState = d.runtimeSandboxState;
       if (d.layerfsStats) state.layerfsStats = d.layerfsStats;
       if (d.gcSweepReport !== undefined) state.gcSweepReport = d.gcSweepReport;
       if (d.slotDistribution) state.slotDistribution = d.slotDistribution;
@@ -556,6 +562,52 @@
         state.canary = { state: nextW >= 100 ? 'PROMOTED' : 'CANARY_ACTIVE', trafficWeightPct: nextW };
       }
       return { ok: true, status: 200, data: state.canary, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/runtime/sandbox') {
+      if (body.action === 'allocate_and_mount') {
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            taskId: body.taskId || 'task-ns-8841',
+            microVm: { vmId: 'fc-vm-celld-gw-01-1', state: 'ALLOCATED', bootLatencyMs: 65 },
+            multiplexer: { sandboxNumber: 1, activeWorkspacesOnSandbox: 1 },
+            cgroupLimits: { cpuMaxContent: '400000 100000', memoryHighBytes: '3649044480', memoryMaxBytes: '4294967296' },
+            overlayUpperSnapshot: { changedFiles: ['sandbox_mount.meta'], sha256: '8f9a1c4b2e77d0194481a92c1108e73a90c11b2a33d4e5f60123456789abcdef', byteLength: 148 },
+            rightSizedProfile: { think_cpu_cores: 0.25, act_cpu_cores: 3.52, act_memory_mb: 3125, disk_mb: 10240 }
+          },
+          fromLiveBackend: false
+        };
+      }
+      if (body.action === 'vsock_exec_and_io') {
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            vmId: 'fc-vm-task-ns-8841',
+            writeResult: { status: 'OK', filePath: 'agent_artifact.txt', bytesWritten: 34, sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' },
+            execResult: { exitCode: 0, rawStdout: 'verified-by-vsock-task-ns-8841' }
+          },
+          fromLiveBackend: false
+        };
+      }
+      if (body.action === 'issue_and_verify_mtls_tee') {
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            spiffeVerification: { authenticated: true, cryptographicallyVerified: true, nodeRole: 'body-worker' },
+            teeAttestation: { verified: true, asymmetricVerified: true, teePlatform: 'AMD_SEV_SNP' }
+          },
+          fromLiveBackend: false
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        data: { cellId: 'AnstsHarnessCell:task-ns-8841', previousNodeId: 'celld-brain-01', newNodeId: 'celld-brain-03', newEpochFencingToken: 2 },
+        fromLiveBackend: false
+      };
     }
     if (method === 'POST' && endpointPath === '/v1beta1/management/mcp') {
       if (!state.mcpState) state.mcpState = createBaselineState().mcpState;
@@ -1477,6 +1529,10 @@
             <button type="button" class="small" data-action="runtime-celld-facets">DO Sub-Actor Facets &amp; 32-Shard KV (/v1beta1/celld/facets)</button>
             <button type="button" class="small" data-action="runtime-ltx-compaction">L0→L1 LTX 压缩与 UFFD 恢复 (/v1beta1/celld/ltx-compaction)</button>
             <button type="button" class="small" data-action="runtime-layerfs-d9">LayerFS Rule D9 存储同步 (/v1beta1/layerfs/store-sync)</button>
+            <button type="button" class="small primary" data-action="runtime-sandbox-op" data-op="allocate_and_mount">Cgroup v2 + OverlayFS + MicroVM 挂载 (/v1beta1/management/runtime/sandbox)</button>
+            <button type="button" class="small" data-action="runtime-sandbox-op" data-op="vsock_exec_and_io">Vsock 真实文件 I/O 与子进程执行</button>
+            <button type="button" class="small" data-action="runtime-sandbox-op" data-op="issue_and_verify_mtls_tee">Ed25519 SPIFFE SVID &amp; SEV-SNP 验签</button>
+            <button type="button" class="small" data-action="runtime-sandbox-op" data-op="migrate_celld_actor">CelldAdmin 跨节点热迁移 DO Cell</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>
@@ -2251,6 +2307,20 @@
           '</tbody></table></div>';
       }
       showToast('已加载分支 ' + (res.data.branchName || '') + ' 的 LayerFS 行级代码溯源');
+      return;
+    }
+    if (action === 'runtime-sandbox-op') {
+      const op = target.getAttribute('data-op') || 'allocate_and_mount';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/runtime/sandbox', {
+        action: op,
+        taskId: 'task-ns-8841',
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast('已完成底层沙箱与内核运行时操作 [' + op + ']');
       return;
     }
     if (action === 'mcp-action') {

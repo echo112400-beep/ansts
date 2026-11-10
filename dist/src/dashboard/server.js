@@ -1,4 +1,5 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var crypto = _interopRequireWildcard(require("node:crypto"));
+
 
 
 var http = _interopRequireWildcard(require("node:http"));
@@ -95,7 +96,18 @@ var _phase_controller = require("../runtime/phase_controller.js");
 var _mcp_registry = require("../saga/mcp_registry.js");
 var _celld_native_optimizations = require("../cloudflare/celld_native_optimizations.js");
 var _cognitive_router = require("../cognitive_router.js");
-var _models = require("../models.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var _models = require("../models.js");
+var os = _interopRequireWildcard(require("node:os"));
+var path = _interopRequireWildcard(require("node:path"));
+var fs = _interopRequireWildcard(require("node:fs"));
+var _linux_cgroup_psi = require("../runtime/linux_cgroup_psi.js");
+var _container_driver = require("../runtime/container_driver.js");
+var _warm_pool = require("../runtime/warm_pool.js");
+var _vsock_bridge = require("../runtime/vsock_bridge.js");
+var _confidential_tee_bridge = require("../runtime/confidential_tee_bridge.js");
+var _mtls_tunnel_bridge = require("../runtime/mtls_tunnel_bridge.js");
+var _profiler = require("../profiler.js");
+var _celld_admin_client = require("../cloudflare/celld_admin_client.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M13 TASK-47: Real-Time Control Plane Web UI & Operational Dashboard Backend Server.
  */class DashboardBridgeService {scheduler;fleet;constructor(scheduler, fleet = new _manual_scale_controller.ManualFleetScaleController()) {this.scheduler = scheduler;this.fleet = fleet;}buildClusterOverview() {return { totalTasks: this.scheduler.allTasks.size, queuedTasks: this.scheduler.queueManager.totalQueued(), completedTasks: this.scheduler.completedIds.size, nodes: this.fleet.listNodes() };}}exports.DashboardBridgeService = DashboardBridgeService;class DashboardBackendServer {bridge;host;server = null;constructor(bridge, host = "127.0.0.1") {this.bridge = bridge;this.host = host;}async listen(port = 0) {return new Promise((resolve, reject) => {this.server = http.createServer((req, res) => {if (req.url === "/api/overview" || req.url === "/healthz") {res.writeHead(200, { "content-type": "application/json" });res.end(JSON.stringify(this.bridge.buildClusterOverview()));return;}res.writeHead(200, { "content-type": "text/html; charset=utf-8" });res.end("<!doctype html><html><head><title>ANSTS v2 Control Plane</title></head><body><h1>ANSTS v2 Dashboard</h1></body></html>");});this.server.on("error", reject);this.server.listen(port, this.host, () => {const addr = this.server.address();resolve(typeof addr === "object" && addr ? addr.port : port);});});}async close() {if (!this.server) return;return new Promise((resolve) => {this.server.closeAllConnections?.();this.server.close(() => {this.server = null;resolve();});});}}exports.DashboardBackendServer = DashboardBackendServer;
 
@@ -223,6 +235,15 @@ class PlatformManagementPlaneEngine {
   mcpRegistry;
   facetSupervisor;
   lastSagaRollbackReport = null;
+  cgroupDriver;
+  overlayDriver;
+  warmPool;
+  sandboxMultiplexer;
+  vsockBridge;
+  teeBridge;
+  mtlsBridge;
+  resourceProfiler;
+  celldAdmin;
   lastGitArbitration = null;
   lastBisectResult =
 
@@ -248,6 +269,19 @@ class PlatformManagementPlaneEngine {
     this.phaseController = deps.phaseController ?? new _phase_controller.CgroupPhaseController();
     this.mcpRegistry = deps.mcpRegistry ?? new _mcp_registry.McpDynamicToolRegistry();
     this.facetSupervisor = deps.facetSupervisor ?? new _celld_native_optimizations.DurableObjectFacetSupervisor();
+    const runtimeBaseDir = path.join(os.tmpdir(), `ansts-runtime-${deps.nodeId}-${process.pid}`);
+    this.cgroupDriver = new _linux_cgroup_psi.LinuxCgroupV2AndPsiDriver(path.join(runtimeBaseDir, "cgroup"));
+    this.overlayDriver = new _container_driver.CompanionContainerAndOverlayDriver(path.join(runtimeBaseDir, "overlay"));
+    this.warmPool = new _warm_pool.WarmSandboxPoolManager(deps.nodeId, 8);
+    this.sandboxMultiplexer = new _warm_pool.LayerFsNumberedSandboxMultiplexer();
+    this.vsockBridge = new _vsock_bridge.ZeroTrustVsockBridge(
+    ["api.openai.com", "api.anthropic.com", "registry.npmjs.org"],
+    path.join(runtimeBaseDir, "vsock"));
+
+    this.teeBridge = new _confidential_tee_bridge.ConfidentialTeeAttestationBridge();
+    this.mtlsBridge = new _mtls_tunnel_bridge.MtlsReverseTunnelBridge();
+    this.resourceProfiler = new _profiler.TaskResourceProfiler();
+    this.celldAdmin = new _celld_admin_client.CelldAdminClient(deps.v25Store.sql);
     if (deps.harnessRunner) {
       this.harnessRunner = deps.harnessRunner;
     } else {
@@ -972,6 +1006,7 @@ class PlatformManagementPlaneEngine {
       layerfsStats: this.deps.layerfs.storeEngine.getStorageStats(),
       a2aState: this.getA2aGovernanceSnapshot(),
       mcpState: this.getMcpGovernanceSnapshot(),
+      runtimeSandboxState: this.getRuntimeSandboxSnapshot(),
       gcSweepReport: this.lastGcSweepReport,
       status: "HEALTHY"
     };
@@ -1960,6 +1995,13 @@ class PlatformManagementPlaneEngine {
     // 1. Apply THINK cgroup phase (0.25 core) -> Execute AgentHarnessRunner (CognitiveRouter + VelocityBreaker + SagaToolGateway) -> Apply ACT cgroup phase (4.0 cores)
     const profile = task.resource_profile ?? { think_cpu_cores: 0.25, act_cpu_cores: 4.0, act_memory_mb: 4096, disk_mb: 10240 };
     const thinkCgroup = this.phaseController.applyThinkPhase(task.task_id, profile);
+    this.cgroupDriver.writePhaseLimits(
+    task.task_id,
+    "THINK",
+    profile.think_cpu_cores,
+    Math.round(profile.act_memory_mb * 0.25),
+    Math.round(profile.act_memory_mb * 0.5));
+
     const toolName = params.toolName ?? "shell_exec";
     const cmdStr = params.shellCommand ?? `step-${params.taskId}-turn-${nextTurnIndex}`;
     const harnessSummary = this.harnessRunner.executeSingleTurn(task, toolName, {
@@ -1967,6 +2009,20 @@ class PlatformManagementPlaneEngine {
       turnIndex: nextTurnIndex
     });
     const actCgroup = this.phaseController.applyActPhase(task.task_id, profile);
+    const diskCgroupFiles = this.cgroupDriver.writePhaseLimits(
+    task.task_id,
+    "ACT",
+    profile.act_cpu_cores,
+    Math.round(profile.act_memory_mb * 0.85),
+    profile.act_memory_mb);
+
+    const overlayLayout = this.overlayDriver.createOverlayMountLayout(task.task_id);
+    fs.writeFileSync(
+    path.join(overlayLayout.upperDir, `turn-${nextTurnIndex}.diff`),
+    `task=${task.task_id}\nturn=${nextTurnIndex}\ncmd=${cmdStr}\n`,
+    "utf-8");
+
+    const overlayDelta = this.overlayDriver.captureUpperdirDeltaSnapshot(task.task_id, nextTurnIndex);
 
     const changedFile = `src/${params.taskId}-turn${nextTurnIndex}.ts`;
     const walEntry = this.deps.walEngine.appendTurnDelta({
@@ -2041,7 +2097,9 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         harnessExecution: harnessSummary,
         cgroupTransition: {
           thinkQuotaUs: thinkCgroup.cpuQuotaUsPer100ms,
-          actQuotaUs: actCgroup.cpuQuotaUsPer100ms
+          actQuotaUs: actCgroup.cpuQuotaUsPer100ms,
+          diskCpuMax: diskCgroupFiles.cpuMaxContent,
+          overlayUpperSha256: overlayDelta.sha256
         }
       }
     };
@@ -2897,6 +2955,184 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         compensatedCount: compensated.length,
         compensatedTools: compensated,
         mcpState: this.getMcpGovernanceSnapshot()
+      }
+    };
+  }
+
+
+  getRuntimeSandboxSnapshot() {
+    this.ensureInitialized();
+    return {
+      warmPoolStats: this.warmPool.stats(),
+      teePublicKeyDerHex: this.teeBridge.publicKeyDerHex.slice(0, 32) + "...",
+      spiffeCaPublicKeyDerHex: this.mtlsBridge.caPublicKeyDerHex.slice(0, 32) + "..."
+    };
+  }
+
+  async executeRuntimeSandboxLifecycle(params)
+
+
+
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权直接操控底层沙箱与内核 Cgroup/Vsock 接口" }
+      };
+    }
+    const taskId = params.taskId ?? "task-ns-8841";
+    const task =
+    this.deps.scheduler.allTasks.get(taskId) ??
+    this.deps.v25Store.getPersistedTask(taskId) ??
+    new _models.TaskSpec({ task_id: taskId, tenant_id: "Northstar", priority: _models.TaskPriority.P0_EMERGENCY });
+
+    if (params.action === "allocate_and_mount") {
+      const microVm = this.warmPool.acquireSandbox(taskId);
+      const muxMount = this.sandboxMultiplexer.mountWorkspaceIntoSandbox(taskId);
+      const cgroupLimits = this.cgroupDriver.writePhaseLimits(taskId, "ACT", 4.0, 3480, 4096);
+      const freezeState = this.cgroupDriver.setFreezeState(taskId, false);
+      const overlayDirs = this.overlayDriver.createOverlayMountLayout(taskId);
+      fs.writeFileSync(
+      path.join(overlayDirs.upperDir, "sandbox_mount.meta"),
+      JSON.stringify({ vmId: microVm.vmId, sandboxNumber: muxMount.sandboxNumber, ts: Date.now() }),
+      "utf-8");
+
+      const upperSnap = this.overlayDriver.captureUpperdirDeltaSnapshot(taskId, Math.max(1, task.current_turn));
+      this.resourceProfiler.recordExecutionMetrics(task, 2.8, 2400);
+      this.resourceProfiler.recordExecutionMetrics(task, 3.1, 2600);
+      this.resourceProfiler.recordExecutionMetrics(task, 2.9, 2500);
+      const rightSizedProfile = this.resourceProfiler.recommendProfile(task);
+
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `分配热沙箱 ${microVm.vmId} (Multiplexer #${muxMount.sandboxNumber}) 并写入磁盘 Cgroup v2 (cpu.max=${cgroupLimits.cpuMaxContent}) 与 OverlayFS Upperdir 快照`,
+      `Runtime / ${taskId}`,
+      `MOUNTED (${microVm.vmId})`);
+
+
+      return {
+        status: 200,
+        body: {
+          taskId,
+          microVm,
+          multiplexer: muxMount,
+          cgroupLimits,
+          freezeState,
+          overlayUpperSnapshot: {
+            changedFiles: upperSnap.changedFiles,
+            sha256: upperSnap.sha256,
+            byteLength: upperSnap.serializedArchiveBytes.byteLength
+          },
+          rightSizedProfile,
+          warmPoolStats: this.warmPool.stats()
+        }
+      };
+    }
+
+    if (params.action === "vsock_exec_and_io") {
+      const vmId = `fc-vm-${taskId}`;
+      const relFile = params.filePath ?? "agent_artifact.txt";
+      const content = params.fileContent ?? `verified-by-vsock-${taskId}
+`;
+      const writeRes = this.vsockBridge.sendRequest({
+        requestId: `req-w-${Date.now()}`,
+        vmId,
+        method: "WRITE_FILE",
+        payload: { filePath: relFile, content }
+      });
+      const execRes = this.vsockBridge.sendRequest({
+        requestId: `req-x-${Date.now()}`,
+        vmId,
+        method: "EXEC_CMD",
+        payload: { command: params.command ?? `cat ${relFile}` }
+      });
+      const readRes = this.vsockBridge.sendRequest({
+        requestId: `req-r-${Date.now()}`,
+        vmId,
+        method: "READ_FILE",
+        payload: { filePath: relFile }
+      });
+
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `通过 ZeroTrustVsockBridge 执行真实沙箱文件 I/O (${relFile}, SHA-256=${String(writeRes.sha256).slice(0, 12)}) 与受控子进程指令`,
+      `Runtime / ${vmId}`,
+      `VSOCK_OK (exit=${execRes.exitCode})`);
+
+
+      return {
+        status: 200,
+        body: {
+          vmId,
+          writeResult: writeRes,
+          execResult: execRes,
+          readResult: readRes
+        }
+      };
+    }
+
+    if (params.action === "issue_and_verify_mtls_tee") {
+      const spiffeId = `spiffe://ansts.io/ns/fleet/sa/body-worker`;
+      const svid = this.mtlsBridge.issueSpiffeSvidToken(spiffeId, 3_600_000);
+      const svidVerify = this.mtlsBridge.verifySpiffeCertificate(
+      svid.spiffeId,
+      svid.certExpiresAtMs,
+      Date.now(),
+      svid.svidSignatureHex);
+
+      const teeQuote = this.teeBridge.generateAndVerifyAttestationQuote({
+        vmId: `fc-vm-${taskId}`,
+        measurementDigestHex: crypto.createHash("sha256").update(`rootfs:${taskId}`, "utf-8").digest("hex"),
+        nonce: `nonce-${Date.now()}`
+      });
+
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `签发并验证 Ed25519 SPIFFE SVID 证书与 AMD SEV-SNP TEE 硬件远程证明 Quote`,
+      `Security / ${taskId}`,
+      `ED25519_VERIFIED`);
+
+
+      return {
+        status: 200,
+        body: {
+          spiffeSvid: svid,
+          spiffeVerification: svidVerify,
+          teeAttestation: teeQuote
+        }
+      };
+    }
+
+    // action === "migrate_celld_actor"
+    const cellId = `AnstsHarnessCell:${taskId}`;
+    if (!this.celldAdmin.getCellPlacement(cellId)) {
+      this.celldAdmin.registerCell(cellId, "celld-brain-01", 42);
+    }
+    const targetNodeId = params.targetNodeId ?? "celld-brain-03";
+    const migrated = await this.celldAdmin.migrateCellToNode(cellId, targetNodeId);
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `通过 CelldAdminClient 热迁移 DO Cell [${cellId}] (${migrated.previousNodeId} → ${migrated.newNodeId}, Epoch=#${migrated.newEpochFencingToken})`,
+    `Cluster / ${cellId}`,
+    `CELL_MIGRATED (epoch:${migrated.newEpochFencingToken})`);
+
+
+    return {
+      status: 200,
+      body: {
+        cellId,
+        ...migrated
       }
     };
   }

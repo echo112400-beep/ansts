@@ -2337,6 +2337,31 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M47-3] Physical Linux Cgroup v2, OverlayFS Upperdir, Vsock RPC, Ed25519 SPIFFE/TEE & CelldAdmin Cell Migration (`POST /v1beta1/management/runtime/sandbox`)
+    if (method === "POST" && pathname === "/v1beta1/management/runtime/sandbox") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeRuntimeSandboxLifecycle({
+        action: (body.action ?? "allocate_and_mount") as
+          | "allocate_and_mount"
+          | "vsock_exec_and_io"
+          | "issue_and_verify_mtls_tee"
+          | "migrate_celld_actor",
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        command: body.command ? String(body.command) : undefined,
+        filePath: body.filePath ? String(body.filePath) : undefined,
+        fileContent: body.fileContent ? String(body.fileContent) : undefined,
+        targetNodeId: body.targetNodeId ? String(body.targetNodeId) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M46-3] Dynamic MCP Tool Registry & Saga LIFO Rollback (`POST /v1beta1/management/mcp`)
     if (method === "POST" && pathname === "/v1beta1/management/mcp") {
       const body = await this.readJsonBody(req);
