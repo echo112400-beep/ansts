@@ -264,6 +264,52 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-a2a") {
+    const action = rest[0] ?? "put_blackboard_cas";
+    const key = rest[1] ?? "arch/zero-trust-policy";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/a2a`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, key, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-migrate") {
+    const taskId = rest[0] ?? "task-ns-8841";
+    const targetNodeId = rest[1] ?? "body-host-03";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/tasks/migrate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ taskId, targetNodeId, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-gc-sweep") {
+    const action = rest[0] ?? "sweep_cas";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/storage/gc-sweep`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-diagnose") {
+    const expectedProtocol = rest[0] ?? "v0.6.3";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/diagnostics/probe`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedProtocol, enqueueWebhookTest: true, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "gc") {
     const resp = await fetch(`${baseUrl}/v1beta1/storage/gc`, { method: "POST" });
     const data = await resp.json();

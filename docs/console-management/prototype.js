@@ -109,6 +109,17 @@
         breaches: []
       },
       canary: { state: 'CANARY_ACTIVE', trafficWeightPct: 5 },
+      a2aState: {
+        blackboardEntries: [
+          { key: 'arch/zero-trust-policy', value: { mTLS: 'STRICT', spiffeTrustDomain: 'ansts.io' }, version: 1, authorAgentId: 'agent-northstar' },
+          { key: 'ledger/shard-cursor', value: { shardRange: '0..127', checkpointTurn: 5 }, version: 1, authorAgentId: 'agent-helios' }
+        ],
+        deadlock: { hasDeadlock: false, cyclePath: [] },
+        lastGitArbitration: null,
+        lastBisectResult: null
+      },
+      layerfsStats: { totalObjects: 18, fullObjects: 6, deltaObjects: 12, totalLogicalBytes: 49152, totalCompressedBytes: 18432 },
+      gcSweepReport: null,
       taskFilterSearch: '',
       taskFilterState: 'ALL',
       auditFilterQuery: '',
@@ -225,6 +236,9 @@
       state.verificationRetried = Boolean(d.verificationRetried);
       if (d.sla) state.sla = d.sla;
       if (d.canary) state.canary = d.canary;
+      if (d.a2aState) state.a2aState = d.a2aState;
+      if (d.layerfsStats) state.layerfsStats = d.layerfsStats;
+      if (d.gcSweepReport !== undefined) state.gcSweepReport = d.gcSweepReport;
       if (d.slotDistribution) state.slotDistribution = d.slotDistribution;
       state.batchReport = d.batchReport || null;
       state.nodes = d.nodes || state.nodes;
@@ -535,6 +549,95 @@
         state.canary = { state: nextW >= 100 ? 'PROMOTED' : 'CANARY_ACTIVE', trafficWeightPct: nextW };
       }
       return { ok: true, status: 200, data: state.canary, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/a2a') {
+      if (!state.a2aState) state.a2aState = createBaselineState().a2aState;
+      if (body.action === 'put_blackboard_cas') {
+        const k = body.key || 'arch/zero-trust-policy';
+        const existing = state.a2aState.blackboardEntries.find((e) => e.key === k);
+        const curV = existing ? existing.version : 0;
+        const expV = body.expectedVersion !== undefined ? Number(body.expectedVersion) : curV;
+        if (expV !== curV) {
+          return { ok: false, status: 409, data: { error: 'A2A_BLACKBOARD_CAS_CONFLICT', key: k, expectedVersion: expV, actualVersion: curV, message: 'A2A 黑板 CAS 冲突' }, fromLiveBackend: false };
+        }
+        const nextEntry = { key: k, value: body.value || { mTLS: 'STRICT', updatedBy: body.actor || 'chen', rev: curV + 1 }, version: curV + 1, authorAgentId: 'agent-' + (body.actor || 'chen') };
+        if (existing) Object.assign(existing, nextEntry);
+        else state.a2aState.blackboardEntries.push(nextEntry);
+        return { ok: true, status: 200, data: { committed: true, entry: nextEntry, a2aState: state.a2aState }, fromLiveBackend: false };
+      }
+      if (body.action === 'arbitrate_git_patches') {
+        const arb = { acceptedAgentIds: ['agent-ns-auth-p0', 'agent-hl-ledger-p1'], conflictedAgentIds: ['agent-ns-refactor-p2'] };
+        state.a2aState.lastGitArbitration = arb;
+        return { ok: true, status: 200, data: { ...arb, a2aState: state.a2aState }, fromLiveBackend: false };
+      }
+      if (body.action === 'inject_deadlock_cycle') {
+        state.a2aState.deadlock = { hasDeadlock: true, cyclePath: ['agent-ns-worker-1', 'agent-ns-worker-2', 'agent-ns-worker-3', 'agent-ns-worker-1'] };
+        return { ok: true, status: 200, data: { ...state.a2aState.deadlock, a2aState: state.a2aState }, fromLiveBackend: false };
+      }
+      if (body.action === 'break_deadlock') {
+        state.a2aState.deadlock = { hasDeadlock: false, cyclePath: [] };
+        return { ok: true, status: 200, data: { victimAgentId: 'agent-ns-worker-3', ...state.a2aState.deadlock, a2aState: state.a2aState }, fromLiveBackend: false };
+      }
+      const bisect = { firstBadCommit: 'C2', probesExecuted: 2, probedCommits: [{ commitId: 'C1', passed: true, branchName: 'bisect-probe-C1-0' }, { commitId: 'C2', passed: false, branchName: 'bisect-probe-C2-1' }] };
+      state.a2aState.lastBisectResult = bisect;
+      return { ok: true, status: 200, data: { ...bisect, a2aState: state.a2aState }, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/tasks/migrate') {
+      const tk = state.tasks.find((x) => x.id === body.taskId) || state.tasks[0];
+      const srcNode = tk.body;
+      const dstNode = body.targetNodeId || (srcNode === 'body-host-02' ? 'body-host-03' : 'body-host-02');
+      tk.body = dstNode;
+      tk.fence += 1;
+      const snapKey = 'migrations/' + tk.id + '/turn-' + tk.turn + '-f' + tk.fence + '.tar.zst';
+      return { ok: true, status: 200, data: { taskId: tk.id, sourceNodeId: srcNode, targetNodeId: dstNode, newFencingToken: tk.fence, snapshotKey: snapKey, sourceFrozen: true, targetRestored: true, migrationDurationMs: 118 }, fromLiveBackend: false };
+    }
+    if (method === 'GET' && endpointPath.startsWith('/v1beta1/management/layerfs/blame')) {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          taskId: 'task-ns-8841',
+          branchName: 'feat-ns-auth',
+          headCommitId: 'C2',
+          filePath: 'src/task-ns-8841.ts',
+          lines: [
+            { lineNumber: 1, commitId: 'C1', agentId: 'agent-northstar', stepId: 'step-task-ns-8841-t1', content: 'export const taskId = "task-ns-8841";' },
+            { lineNumber: 2, commitId: 'C2', agentId: 'chen', stepId: 'step-task-ns-8841-t2', content: 'export const zeroTrustVerified = true;' }
+          ]
+        },
+        fromLiveBackend: false
+      };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/storage/gc-sweep') {
+      if (body.action === 'seed_orphans') {
+        state.layerfsStats.totalObjects += 3;
+        state.layerfsStats.fullObjects += 3;
+        return { ok: true, status: 200, data: { seededOrphanBlobIds: ['obj-orphan-1', 'obj-orphan-2', 'obj-orphan-3'], storageStats: state.layerfsStats }, fromLiveBackend: false };
+      }
+      if (body.action === 'sweep_cas') {
+        state.gcSweepReport = { retainedCount: state.layerfsStats.totalObjects - 3, sweptCount: 3, reclaimedBytes: 912, sweptBlobIds: ['obj-orphan-1', 'obj-orphan-2', 'obj-orphan-3'] };
+        state.layerfsStats.totalObjects = Math.max(6, state.layerfsStats.totalObjects - 3);
+        return { ok: true, status: 200, data: { ...state.gcSweepReport, storageStats: state.layerfsStats }, fromLiveBackend: false };
+      }
+      return { ok: true, status: 200, data: { dryRun: true, graceSecs: 3600, deletableEpochCount: 2, reclaimableBytes: 40960, deletableScopes: ['AnstsSchedulerCell:shard-01@epoch-10', 'AnstsSchedulerCell:shard-02@epoch-11'] }, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/diagnostics/probe') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          expectedProtocol: 'v0.6.3',
+          rollingUpgradeSafe: state.scenario !== 'offline' && state.scenario !== 'partial',
+          expiredLeases: [],
+          unreachablePeers: [],
+          protocolMismatches: [],
+          totalRestoring: 0,
+          traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+          prometheusMetrics: '# TYPE ansts_cluster_nodes_total gauge\nansts_cluster_nodes_total ' + state.nodes.length + '\n# TYPE ansts_active_tasks_total gauge\nansts_active_tasks_total ' + state.tasks.length + '\n# TYPE ansts_rolling_upgrade_safe gauge\nansts_rolling_upgrade_safe 1\n',
+          webhookOutbox: { deliveredCount: 1, deadLetterCount: 0, hmacHeaderSample: 't=1794303000,v1=9f86d081884c7d659a2feaa0c55ad015' }
+        },
+        fromLiveBackend: false
+      };
     }
     if (method === 'POST' && endpointPath === '/v1beta1/management/capacity/action') {
       state.loadSheddingActive = true;
@@ -1001,6 +1104,7 @@
             <p class="panel-subtitle">真实调用 <code>POST /v1beta1/management/nodes/batch</code> 执行节点隔离 (Cordon)、维护排水 (Drain) 与 256 哈希槽迁移。</p>
           </div>
           <div class="btn-row">
+            <button type="button" data-action="run-fleet-diagnostics">滚动升级与 Prometheus 诊断 (/v1beta1/management/diagnostics/probe)</button>
             <button type="button" data-action="run-batch-node-op" data-op="prewarm" ${!perm.ok ? 'disabled' : ''}>批量预热沙箱池</button>
             <button type="button" data-action="open-scale-node-dialog" ${!perm.ok ? 'disabled' : ''}>+ 扩容裸金属/容器节点 (/v1beta1/management/nodes/scale)</button>
             <button type="button" class="primary" data-action="run-batch-node-op" data-op="drain" ${!perm.ok ? 'disabled' : ''}>批量执行节点维护排水</button>
@@ -1186,7 +1290,8 @@
                     <td>
                       <div class="btn-row">
                         <button type="button" class="small primary" data-action="step-task-turn" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>+推进回合</button>
-                        <button type="button" class="small" data-action="open-turn-history-dialog" data-task="${t.id}">回合历史 / 分叉</button>
+                        <button type="button" class="small" data-action="migrate-task-node" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''} title="调用 EphemeralHeavyExecutorMigrator 跨节点热迁移并推进 Fencing Token">热迁移节点</button>
+                        <button type="button" class="small" data-action="open-turn-history-dialog" data-task="${t.id}">回合历史 / 分叉 / Blame</button>
                         <button type="button" class="small" data-action="graceful-stop-task" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>
                           请求停止
                         </button>
@@ -1353,6 +1458,67 @@
             <button type="button" class="small" data-action="runtime-layerfs-d9">LayerFS Rule D9 存储同步 (/v1beta1/layerfs/store-sync)</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">A2A 多智能体协同治理、WFG 死锁检测与并行 CoW 二分排障 (POST /v1beta1/management/a2a)</h2>
+              <p class="panel-subtitle">对接 <code>SharedBlackboardAndGitArbiter</code>、<code>A2aWaitForGraphDeadlockDetector</code> 与 <code>ParallelCowGitBisectCoordinator</code>。</p>
+            </div>
+            <div class="btn-row">
+              <span class="status-pill ${state.a2aState?.deadlock?.hasDeadlock ? 'danger' : 'ok'}">
+                ${state.a2aState?.deadlock?.hasDeadlock ? 'WFG 环形死锁: ' + (state.a2aState.deadlock.cyclePath || []).join('→') : 'WFG 无死锁 (0 Cycles)'}
+              </span>
+            </div>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="a2a-action" data-op="put_blackboard_cas">+ 黑板 CAS 更新</button>
+            <button type="button" class="small" data-action="a2a-action" data-op="arbitrate_git_patches">Git 补丁冲突仲裁</button>
+            <button type="button" class="small danger" data-action="a2a-action" data-op="inject_deadlock_cycle">注入 WFG 环形死锁</button>
+            <button type="button" class="small primary" data-action="a2a-action" data-op="break_deadlock">抢占解除死锁</button>
+            <button type="button" class="small" data-action="a2a-action" data-op="run_cow_bisect">零拷贝 CoW 二分排障</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr><th>黑板键 (Blackboard Key)</th><th>CAS 版本</th><th>写入智能体</th><th>当前协同载荷</th></tr>
+              </thead>
+              <tbody>
+                ${(state.a2aState?.blackboardEntries || []).map((entry) => `
+                  <tr>
+                    <td class="mono"><strong>${entry.key}</strong></td>
+                    <td><span class="status-pill ok">v${entry.version}</span></td>
+                    <td class="mono">${entry.authorAgentId}</td>
+                    <td class="mono">${JSON.stringify(entry.value)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">分布式 CAS 两阶段垃圾回收与 celld Epoch 安全审计 (POST /v1beta1/management/storage/gc-sweep)</h2>
+              <p class="panel-subtitle">对接 <code>DistributedCasGcSweeper</code> 物理回收孤儿块并保留活跃 Delta 基线，支持 <code>anstsctl gc-audit</code> 演练。</p>
+            </div>
+            <div class="btn-row">
+              <span class="status-pill ok">CAS 对象: ${state.layerfsStats?.totalObjects ?? 18} (Full ${state.layerfsStats?.fullObjects ?? 6} / Delta ${state.layerfsStats?.deltaObjects ?? 12})</span>
+            </div>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small" data-action="storage-gc-action" data-op="seed_orphans">1. 生成孤儿 CAS 数据块</button>
+            <button type="button" class="small primary" data-action="storage-gc-action" data-op="sweep_cas">2. 执行 Mark-and-Sweep 物理回收</button>
+            <button type="button" class="small" data-action="storage-gc-action" data-op="epoch_gc_audit">3. celld Epoch GC 安全审计 (Dry-Run)</button>
+          </div>
+          <div class="muted" style="padding:6px 0;">
+            逻辑总容量: <strong class="mono">${state.layerfsStats?.totalLogicalBytes ?? 49152} Bytes</strong> · 压缩后物理占用: <strong class="mono">${state.layerfsStats?.totalCompressedBytes ?? 18432} Bytes</strong>
+            ${state.gcSweepReport ? ` · 最近 GC 回收: <strong class="mono">${state.gcSweepReport.sweptCount} 个孤儿块 (${state.gcSweepReport.reclaimedBytes} Bytes)</strong>` : ''}
+          </div>
         </div>
       </div>
     `;
@@ -1617,7 +1783,12 @@
         '<option value="' + tr.turnIndex + '" ' + (tr.turnIndex === 3 ? 'selected' : '') + '>' +
         'Turn #' + tr.turnIndex + ' (' + tr.commitId + ' · CRC32=0x' + tr.crc32Hex + ' · ' + tr.ltxStatus + ')</option>'
       ).join('') +
-      '</select></div>',
+      '</select></div>' +
+      '<div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;">' +
+      '<span class="muted">支持对当前任务分支执行 LayerFS CoW 行级代码溯源 (GET /v1beta1/management/layerfs/blame)</span>' +
+      '<button type="button" class="small" data-action="inspect-layerfs-blame" data-task="' + task.id + '">查看 LayerFS 行级代码溯源 (Blame)</button>' +
+      '</div>' +
+      '<div id="dlg-blame-output" style="margin-top:6px;"></div>',
       '调用后端派生新任务与 LayerFS 分支',
       async () => {
         const errEl = document.getElementById('dialog-error');
@@ -1996,6 +2167,85 @@
       });
       await fetchBackendState();
       showToast('租户 ' + tenantId + ' DAG 子任务预留槽已增至 ' + res.data.escrowReserved + ' 槽');
+      return;
+    }
+    if (action === 'migrate-task-node') {
+      const taskId = target.getAttribute('data-task') || 'task-ns-8841';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/tasks/migrate', {
+        taskId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data.message || '跨节点迁移被拒绝');
+        return;
+      }
+      await fetchBackendState();
+      showToast('已热迁移任务 ' + taskId + ': ' + res.data.sourceNodeId + ' → ' + res.data.targetNodeId + ' (新令牌 epoch:' + res.data.newFencingToken + ')');
+      return;
+    }
+    if (action === 'inspect-layerfs-blame') {
+      const taskId = target.getAttribute('data-task') || 'task-ns-8841';
+      const res = await callBackendApi('GET', '/v1beta1/management/layerfs/blame?taskId=' + encodeURIComponent(taskId));
+      const box = document.getElementById('dlg-blame-output');
+      if (box && res.data && Array.isArray(res.data.lines)) {
+        box.innerHTML =
+          '<div class="table-wrap"><table class="data-table"><thead><tr><th>行号</th><th>Commit</th><th>作者 Agent</th><th>Step ID</th><th>代码内容 (' + (res.data.filePath || '') + ')</th></tr></thead><tbody>' +
+          res.data.lines.map((ln) =>
+            '<tr><td class="mono">L' + ln.lineNumber + '</td><td class="mono">' + ln.commitId + '</td><td class="mono">' + ln.agentId + '</td><td class="mono">' + ln.stepId + '</td><td class="mono"><code>' + ln.content + '</code></td></tr>'
+          ).join('') +
+          '</tbody></table></div>';
+      }
+      showToast('已加载分支 ' + (res.data.branchName || '') + ' 的 LayerFS 行级代码溯源');
+      return;
+    }
+    if (action === 'a2a-action') {
+      const op = target.getAttribute('data-op') || 'put_blackboard_cas';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/a2a', {
+        action: op,
+        key: 'arch/zero-trust-policy',
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast('已完成 A2A 协同操作 [' + op + ']');
+      return;
+    }
+    if (action === 'storage-gc-action') {
+      const op = target.getAttribute('data-op') || 'sweep_cas';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/storage/gc-sweep', {
+        action: op,
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast('已完成分布式存储 GC 操作 [' + op + ']');
+      return;
+    }
+    if (action === 'run-fleet-diagnostics') {
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/diagnostics/probe', {
+        expectedProtocol: 'v0.6.3',
+        enqueueWebhookTest: true,
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      openDialog(
+        '集群滚动升级安全探针 & Prometheus / Outbox 诊断 (POST /v1beta1/management/diagnostics/probe)',
+        '<div><strong>滚动升级安全判定：</strong> <span class="status-pill ' + (d.rollingUpgradeSafe ? 'ok' : 'danger') + '">' + (d.rollingUpgradeSafe ? 'SAFE_TO_UPGRADE (全节点协议 v0.6.3 一致)' : 'UPGRADE_BLOCKED') + '</span></div>' +
+        '<div class="muted">W3C Traceparent: <code class="mono">' + (d.traceparent || '') + '</code> · Webhook HMAC: <code class="mono">' + (d.webhookOutbox?.hmacHeaderSample || 'OK') + '</code></div>' +
+        '<div class="form-field"><label>实时导出的 Prometheus 指标文本 (/metrics)</label>' +
+        '<pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:8px;border-radius:5px;font-size:11px;max-height:180px;overflow:auto;">' + (d.prometheusMetrics || '') + '</pre></div>',
+        '完成诊断复核',
+        () => closeDialog()
+      );
+      await fetchBackendState();
       return;
     }
     if (action === 'step-task-turn') {

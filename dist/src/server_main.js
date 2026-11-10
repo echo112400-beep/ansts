@@ -333,6 +333,12 @@ class AnstsLocalAndComposeServer {
       tunnelRouter: this.tunnelRouter,
       cloudEventsBus: this.cloudEventsBus,
       sseGateway: this.sseGateway,
+      blackboard: this.blackboard,
+      deadlockDetector: this.deadlockDetector,
+      bisectCoordinator: this.bisectCoordinator,
+      gcSweeper: this.gcSweeper,
+      metrics: this.metrics,
+      outboxDispatcher: this.outboxDispatcher,
       peerBrainUrls: this.peerBrainUrls,
       peerBodyUrls: this.peerBodyUrls,
       s3Endpoint: this.s3Endpoint
@@ -2303,6 +2309,93 @@ class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // [M45-1] Multi-Agent A2A Governance Engine (`POST /v1beta1/management/a2a`)
+    if (method === "POST" && pathname === "/v1beta1/management/a2a") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeA2aGovernanceAction({
+        action: body.action ?? "put_blackboard_cas",
+
+
+
+
+
+        key: body.key ? String(body.key) : undefined,
+        value: body.value,
+        expectedVersion: body.expectedVersion !== undefined ? Number(body.expectedVersion) : undefined,
+        authorAgentId: body.authorAgentId ? String(body.authorAgentId) : undefined,
+        patches: Array.isArray(body.patches) ? body.patches : undefined,
+        victimAgentId: body.victimAgentId ? String(body.victimAgentId) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M45-2] Live Heavy Task Cross-Node CRIU/Upperdir Migration (`POST /v1beta1/management/tasks/migrate`)
+    if (method === "POST" && pathname === "/v1beta1/management/tasks/migrate") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.migrateTaskAcrossBodyNodes({
+        taskId: String(body.taskId ?? "task-ns-8841"),
+        targetNodeId: body.targetNodeId ? String(body.targetNodeId) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M45-2] LayerFS File Line-Level Blame Inspector (`GET /v1beta1/management/layerfs/blame`)
+    if (method === "GET" && pathname === "/v1beta1/management/layerfs/blame") {
+      const result = this.managementPlane.inspectLayerFsFileBlame({
+        taskId: urlObj.searchParams.get("taskId") ?? undefined,
+        branchOrCommit: urlObj.searchParams.get("branch") ?? undefined,
+        filePath: urlObj.searchParams.get("filePath") ?? undefined
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M45-3] Distributed CAS Mark-and-Sweep GC & celld Epoch GC Audit (`POST /v1beta1/management/storage/gc-sweep`)
+    if (method === "POST" && pathname === "/v1beta1/management/storage/gc-sweep") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeStorageGcAndEpochAudit({
+        action: body.action ?? "sweep_cas",
+        graceSecs: body.graceSecs !== undefined ? Number(body.graceSecs) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M45-4] Rolling-Upgrade Fleet Diagnostics Probe (`POST /v1beta1/management/diagnostics/probe`)
+    if (method === "POST" && pathname === "/v1beta1/management/diagnostics/probe") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.runFleetRollingUpgradeDiagnostics({
+        expectedProtocol: body.expectedProtocol ? String(body.expectedProtocol) : undefined,
+        enqueueWebhookTest: Boolean(body.enqueueWebhookTest ?? true),
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 

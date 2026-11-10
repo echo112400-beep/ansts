@@ -84,6 +84,12 @@ import { EphemeralHeavyExecutorMigrator } from "../runtime/live_migration.js";
 import { EdgeTunnelHaRouter } from "../runtime/edge_tunnel_ha_router.js";
 import { CloudEventsBus } from "../telemetry/cloudevents.js";
 import { SseEventStreamGateway } from "../gateway/sse_stream.js";
+import { SharedBlackboardAndGitArbiter } from "../a2a/blackboard_and_git_arbiter.js";
+import { A2aWaitForGraphDeadlockDetector } from "../a2a/deadlock_detector.js";
+import { ParallelCowGitBisectCoordinator } from "../a2a/parallel_cow_bisect.js";
+import { DistributedCasGcSweeper } from "../storage/distributed_gc_sweeper.js";
+import { OtelAndPrometheusExporter } from "../telemetry/otel_prometheus.js";
+import { TransactionalOutboxDispatcher } from "../telemetry/outbox_webhook.js";
 import { TaskPriority, TaskSpec, TaskState } from "../models.js";
 
 export type ManagementScenarioId =
@@ -173,6 +179,12 @@ export interface ManagementPlaneDeps {
   tunnelRouter: EdgeTunnelHaRouter;
   cloudEventsBus: CloudEventsBus;
   sseGateway?: SseEventStreamGateway;
+  blackboard?: SharedBlackboardAndGitArbiter;
+  deadlockDetector?: A2aWaitForGraphDeadlockDetector;
+  bisectCoordinator?: ParallelCowGitBisectCoordinator;
+  gcSweeper?: DistributedCasGcSweeper;
+  metrics?: OtelAndPrometheusExporter;
+  outboxDispatcher?: TransactionalOutboxDispatcher;
   peerBrainUrls: Record<string, string>;
   peerBodyUrls: Record<string, string>;
   s3Endpoint?: string | null;
@@ -190,10 +202,34 @@ export class PlatformManagementPlaneEngine {
     results: Array<{ nodeId: string; status: string; errorCode?: string; message?: string }>;
   } | null = null;
 
+  private readonly blackboard: SharedBlackboardAndGitArbiter;
+  private readonly deadlockDetector: A2aWaitForGraphDeadlockDetector;
+  private readonly bisectCoordinator: ParallelCowGitBisectCoordinator;
+  private readonly gcSweeper: DistributedCasGcSweeper;
+  private readonly metrics: OtelAndPrometheusExporter;
+  private readonly outboxDispatcher: TransactionalOutboxDispatcher;
+  private lastGitArbitration: { acceptedAgentIds: string[]; conflictedAgentIds: string[] } | null = null;
+  private lastBisectResult: {
+    firstBadCommit: string | null;
+    probesExecuted: number;
+    probedCommits: Array<{ commitId: string; passed: boolean; branchName: string }>;
+  } | null = null;
+  private lastGcSweepReport: {
+    retainedCount: number;
+    sweptCount: number;
+    reclaimedBytes: number;
+    sweptBlobIds: string[];
+  } | null = null;
   private initialized = false;
 
   constructor(deps: ManagementPlaneDeps) {
     this.deps = deps;
+    this.blackboard = deps.blackboard ?? new SharedBlackboardAndGitArbiter();
+    this.deadlockDetector = deps.deadlockDetector ?? new A2aWaitForGraphDeadlockDetector();
+    this.bisectCoordinator = deps.bisectCoordinator ?? new ParallelCowGitBisectCoordinator();
+    this.gcSweeper = deps.gcSweeper ?? new DistributedCasGcSweeper();
+    this.metrics = deps.metrics ?? new OtelAndPrometheusExporter();
+    this.outboxDispatcher = deps.outboxDispatcher ?? new TransactionalOutboxDispatcher();
   }
 
   public ensureInitialized(): void {
@@ -215,6 +251,9 @@ export class PlatformManagementPlaneEngine {
     );
     sql.exec(
       "CREATE TABLE IF NOT EXISTS v25_mgmt_node_overrides (node_id TEXT PRIMARY KEY, region TEXT, role_label TEXT, status TEXT, cpu_pct REAL, psi_pct REAL)"
+    );
+    sql.exec(
+      "CREATE TABLE IF NOT EXISTS v25_mgmt_a2a_blackboard (bb_key TEXT PRIMARY KEY, value_json TEXT, version INTEGER, author_agent TEXT, updated_at_ms INTEGER)"
     );
 
     const existingTenants = sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_tenants").toArray();
@@ -503,6 +542,30 @@ export class PlatformManagementPlaneEngine {
         a.decidedBy ?? ""
       );
     }
+
+    const defaultBb: Array<{ key: string; value: Record<string, unknown>; author: string }> = [
+      { key: "arch/zero-trust-policy", value: { mTLS: "STRICT", spiffeTrustDomain: "ansts.io" }, author: "agent-northstar" },
+      { key: "ledger/shard-cursor", value: { shardRange: "0..127", checkpointTurn: 5 }, author: "agent-helios" },
+    ];
+    for (const item of defaultBb) {
+      const existing = this.blackboard.get(item.key);
+      if (!existing) {
+        const res = this.blackboard.putCas(item.key, item.value, 0, item.author);
+        sql.exec(
+          "INSERT OR REPLACE INTO v25_mgmt_a2a_blackboard (bb_key, value_json, version, author_agent, updated_at_ms) VALUES (?, ?, ?, ?, ?)",
+          res.entry.key,
+          JSON.stringify(res.entry.value),
+          res.entry.version,
+          res.entry.authorAgentId,
+          res.entry.updatedAtMs
+        );
+      }
+    }
+    this.deadlockDetector.removeAgent("agent-ns-worker-1");
+    this.deadlockDetector.removeAgent("agent-ns-worker-2");
+    this.deadlockDetector.removeAgent("agent-ns-worker-3");
+    this.deadlockDetector.addWaitEdge("agent-ns-worker-1", "agent-ns-worker-2");
+    this.deadlockDetector.addWaitEdge("agent-ns-worker-2", "agent-ns-worker-3");
 
     this.appendAudit("chen", "SRE_ADMIN", "初始化平台管理面控制基线与 256-Slot 分片映射", "Global", "已生效 (RPO=0)");
     this.appendAudit("lin", "OPERATOR", "触发 LayerFS 分支 feat-ns-auth 快照同步至 s3://ansts-fleet", "us-west-2 / Northstar", "成功 (Commit C1)");
@@ -841,6 +904,8 @@ export class PlatformManagementPlaneEngine {
       approvals,
       auditLogs,
       layerfsStats: this.deps.layerfs.storeEngine.getStorageStats(),
+      a2aState: this.getA2aGovernanceSnapshot(),
+      gcSweepReport: this.lastGcSweepReport,
       status: "HEALTHY",
     };
   }
@@ -1979,4 +2044,523 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
 
     return { total: filtered.length, audits: filtered };
   }
+
+  public getA2aGovernanceSnapshot(): Record<string, unknown> {
+    this.ensureInitialized();
+    const sql = this.deps.v25Store.sql;
+    const rows = sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_a2a_blackboard").toArray();
+    const blackboardEntries = rows.map((r) => {
+      let parsedVal: unknown = r.value_json;
+      try {
+        parsedVal = JSON.parse(String(r.value_json));
+      } catch {
+        // keep string
+      }
+      return {
+        key: String(r.bb_key),
+        value: parsedVal,
+        version: Number(r.version ?? 1),
+        authorAgentId: String(r.author_agent ?? "agent-northstar"),
+        updatedAtMs: Number(r.updated_at_ms ?? Date.now()),
+      };
+    });
+    const deadlock = this.deadlockDetector.detectCycle();
+    return {
+      blackboardEntries,
+      deadlock,
+      lastGitArbitration: this.lastGitArbitration,
+      lastBisectResult: this.lastBisectResult,
+    };
+  }
+
+  public executeA2aGovernanceAction(params: {
+    action: "put_blackboard_cas" | "arbitrate_git_patches" | "inject_deadlock_cycle" | "break_deadlock" | "run_cow_bisect";
+    key?: string;
+    value?: unknown;
+    expectedVersion?: number;
+    authorAgentId?: string;
+    patches?: Array<{ agentId: string; touchedFiles: string[]; priorityScore: number }>;
+    victimAgentId?: string;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行 A2A 多智能体协同治理写操作" },
+      };
+    }
+    const sql = this.deps.v25Store.sql;
+
+    if (params.action === "put_blackboard_cas") {
+      const key = params.key ?? "arch/zero-trust-policy";
+      const author = params.authorAgentId ?? `agent-${params.actor}`;
+      const existingRow = sql
+        .exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_a2a_blackboard WHERE bb_key = ?", key)
+        .one();
+      const memEntry = this.blackboard.get(key);
+      const currentVer = memEntry ? memEntry.version : existingRow ? Number(existingRow.version ?? 0) : 0;
+      const expectedVer = params.expectedVersion !== undefined ? Number(params.expectedVersion) : currentVer;
+
+      if (expectedVer !== currentVer) {
+        return {
+          status: 409,
+          body: {
+            error: "A2A_BLACKBOARD_CAS_CONFLICT",
+            key,
+            expectedVersion: expectedVer,
+            actualVersion: currentVer,
+            message: `A2A 共享黑板 CAS 冲突：键 '${key}' 期望版本 v${expectedVer}，实际版本 v${currentVer}`,
+          },
+        };
+      }
+
+      while ((this.blackboard.get(key)?.version ?? 0) < currentVer) {
+        const curV = this.blackboard.get(key)?.version ?? 0;
+        this.blackboard.putCas(key, existingRow ? existingRow.value_json : {}, curV, author);
+      }
+      const nextVal = params.value ?? { mTLS: "STRICT", updatedBy: params.actor, revision: currentVer + 1 };
+      const committed = this.blackboard.putCas(key, nextVal, currentVer, author);
+      sql.exec(
+        "INSERT OR REPLACE INTO v25_mgmt_a2a_blackboard (bb_key, value_json, version, author_agent, updated_at_ms) VALUES (?, ?, ?, ?, ?)",
+        committed.entry.key,
+        JSON.stringify(committed.entry.value),
+        committed.entry.version,
+        committed.entry.authorAgentId,
+        committed.entry.updatedAtMs
+      );
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `A2A 黑板 CAS 更新键 [${key}] → v${committed.entry.version} (Author: ${author})`,
+        "Global / A2A-Blackboard",
+        `COMMITTED (v${committed.entry.version})`
+      );
+      return {
+        status: 200,
+        body: {
+          committed: true,
+          entry: committed.entry,
+          a2aState: this.getA2aGovernanceSnapshot(),
+        },
+      };
+    }
+
+    if (params.action === "arbitrate_git_patches") {
+      const patches = params.patches ?? [
+        { agentId: "agent-ns-auth-p0", touchedFiles: ["src/auth/jwt.ts", "src/auth/spiffe.ts"], priorityScore: 95 },
+        { agentId: "agent-ns-refactor-p2", touchedFiles: ["src/auth/jwt.ts", "src/utils/logger.ts"], priorityScore: 60 },
+        { agentId: "agent-hl-ledger-p1", touchedFiles: ["src/ledger/wal.ts"], priorityScore: 85 },
+      ];
+      const arb = this.blackboard.arbitrateGitPatchTouches(patches);
+      this.lastGitArbitration = arb;
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 A2A 多智能体 Git 补丁冲突仲裁：准入 [${arb.acceptedAgentIds.join(", ")}]，拦截冲突 [${arb.conflictedAgentIds.join(", ")}]`,
+        "Global / GitArbiter",
+        `准入 ${arb.acceptedAgentIds.length} / 冲突 ${arb.conflictedAgentIds.length}`
+      );
+      return {
+        status: 200,
+        body: {
+          ...arb,
+          a2aState: this.getA2aGovernanceSnapshot(),
+        },
+      };
+    }
+
+    if (params.action === "inject_deadlock_cycle") {
+      this.deadlockDetector.addWaitEdge("agent-ns-worker-1", "agent-ns-worker-2");
+      this.deadlockDetector.addWaitEdge("agent-ns-worker-2", "agent-ns-worker-3");
+      this.deadlockDetector.addWaitEdge("agent-ns-worker-3", "agent-ns-worker-1");
+      const cycle = this.deadlockDetector.detectCycle();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `A2A WFG 死锁检测器捕获环形等待链：${cycle.cyclePath.join(" → ")}`,
+        "Global / A2A-WFG",
+        "DEADLOCK_DETECTED"
+      );
+      return {
+        status: 200,
+        body: {
+          ...cycle,
+          a2aState: this.getA2aGovernanceSnapshot(),
+        },
+      };
+    }
+
+    if (params.action === "break_deadlock") {
+      const victim = params.victimAgentId ?? "agent-ns-worker-3";
+      this.deadlockDetector.removeAgent(victim);
+      const cycle = this.deadlockDetector.detectCycle();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `解除 A2A WFG 环形死锁：抢占释放低优等待节点 [${victim}]`,
+        "Global / A2A-WFG",
+        "DEADLOCK_RESOLVED"
+      );
+      return {
+        status: 200,
+        body: {
+          victimAgentId: victim,
+          ...cycle,
+          a2aState: this.getA2aGovernanceSnapshot(),
+        },
+      };
+    }
+
+    // action === "run_cow_bisect"
+    const bisectBranch = "bisect-main-line";
+    try {
+      this.deps.layerfs.getBranchHeadCommit(bisectBranch);
+    } catch {
+      this.deps.layerfs.forkBranch("main", bisectBranch);
+    }
+    const c1 = this.deps.layerfs.executeInProcessFileTool({
+      branchName: bisectBranch,
+      agentId: "agent-bisect",
+      stepId: "bisect-c1",
+      operation: "write",
+      filePath: "src/health_check.txt",
+      newContent: "STATUS=OK\n",
+    });
+    const c2 = this.deps.layerfs.executeInProcessFileTool({
+      branchName: bisectBranch,
+      agentId: "agent-bisect",
+      stepId: "bisect-c2",
+      operation: "write",
+      filePath: "src/health_check.txt",
+      newContent: "STATUS=REGRESSION_BUG\n",
+    });
+    const c3 = this.deps.layerfs.executeInProcessFileTool({
+      branchName: bisectBranch,
+      agentId: "agent-bisect",
+      stepId: "bisect-c3",
+      operation: "write",
+      filePath: "src/health_check.txt",
+      newContent: "STATUS=REGRESSION_BUG_2\n",
+    });
+    const commitChain = ["C0", c1.commitId, c2.commitId, c3.commitId];
+    const bisectRes = this.bisectCoordinator.identifyFirstBadCommit(
+      commitChain,
+      (cid) => cid === "C0" || cid === c1.commitId
+    );
+    const probedCommits = commitChain.map((cid, idx) => ({
+      commitId: cid,
+      passed: cid === "C0" || cid === c1.commitId,
+      branchName: `bisect-probe-${cid}-${idx}`,
+    }));
+    this.lastBisectResult = {
+      firstBadCommit: bisectRes.firstBadCommit,
+      probesExecuted: bisectRes.probesExecuted,
+      probedCommits,
+    };
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行并行 CoW 二分排障 (LayerFS Zero-Copy Bisect)：${bisectRes.probesExecuted} 次探测定位首个异常提交 [${bisectRes.firstBadCommit}]`,
+      "Global / CoW-Bisect",
+      `FIRST_BAD=${bisectRes.firstBadCommit}`
+    );
+    return {
+      status: 200,
+      body: {
+        ...this.lastBisectResult,
+        a2aState: this.getA2aGovernanceSnapshot(),
+      },
+    };
+  }
+
+  public async migrateTaskAcrossBodyNodes(params: {
+    taskId: string;
+    targetNodeId?: string;
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行跨节点任务热迁移" },
+      };
+    }
+    const sql = this.deps.v25Store.sql;
+    const task =
+      this.deps.scheduler.allTasks.get(params.taskId) ?? this.deps.v25Store.getPersistedTask(params.taskId);
+    if (!task) {
+      return { status: 404, body: { error: "TASK_NOT_FOUND", taskId: params.taskId } };
+    }
+    const sourceNodeId = task.assigned_node_id ?? "body-host-02";
+    const targetNodeId = params.targetNodeId || (sourceNodeId === "body-host-02" ? "body-host-03" : "body-host-02");
+    const newFencingToken = task.lease_fencing_token + 1;
+    const walEntries = this.deps.walEngine.getTaskWalEntries(params.taskId);
+    const turnIndex = Math.max(1, walEntries.length);
+    const snapshotBytes = new TextEncoder().encode(
+      JSON.stringify({
+        taskId: params.taskId,
+        turnIndex,
+        sourceNodeId,
+        targetNodeId,
+        fencingToken: newFencingToken,
+      })
+    );
+
+    const migRes = await this.deps.heavyMigrator.migrateHeavyTaskAcrossNodes({
+      taskId: params.taskId,
+      turnIndex,
+      sourceNodeId,
+      targetNodeId,
+      newFencingToken,
+      upperdirSnapshotBytes: snapshotBytes,
+    });
+
+    task.assigned_node_id = targetNodeId;
+    task.lease_fencing_token = newFencingToken;
+    this.deps.scheduler.allTasks.set(task.task_id, task);
+    sql.exec(
+      "UPDATE v25_scheduler_tasks SET assigned_node_id = ?, fencing_token = ?, spec_json = ? WHERE task_id = ?",
+      targetNodeId,
+      newFencingToken,
+      JSON.stringify(task),
+      task.task_id
+    );
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `跨节点热迁移任务 ${params.taskId} (${sourceNodeId} → ${targetNodeId}, Fencing Token 推进至 epoch:${newFencingToken}, R2 快照: ${migRes.snapshotKey})`,
+      `Cluster / ${params.taskId}`,
+      `MIGRATED (${migRes.migrationDurationMs}ms)`
+    );
+
+    return {
+      status: 200,
+      body: {
+        taskId: params.taskId,
+        sourceNodeId,
+        targetNodeId,
+        newFencingToken,
+        ...migRes,
+      },
+    };
+  }
+
+  public inspectLayerFsFileBlame(params: {
+    taskId?: string;
+    branchOrCommit?: string;
+    filePath?: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const taskId = params.taskId ?? "task-ns-8841";
+    const branchName =
+      params.branchOrCommit ??
+      (taskId === "task-ns-8841"
+        ? "feat-ns-auth"
+        : taskId === "task-ns-8842"
+        ? "fix-ns-ledger"
+        : taskId === "task-hl-3019"
+        ? "gdpr-audit-eu"
+        : `task-${taskId}`);
+    const filePath = params.filePath ?? `src/${taskId}.ts`;
+
+    try {
+      this.deps.layerfs.getBranchHeadCommit(branchName);
+    } catch {
+      this.deps.layerfs.forkBranch("main", branchName);
+    }
+
+    const headCommit = this.deps.layerfs.getBranchHeadCommit(branchName);
+    if (!headCommit.filesTree.has(filePath)) {
+      this.deps.layerfs.executeInProcessFileTool({
+        branchName,
+        agentId: "agent-northstar",
+        stepId: `blame-seed-${taskId}`,
+        operation: "write",
+        filePath,
+        newContent: `export const taskId = "${taskId}";\nexport const branch = "${branchName}";\nexport const verifiedBy = "LayerFS-CoW";\n`,
+      });
+    }
+
+    const lines = this.deps.layerfs.blameFile(branchName, filePath);
+    const updatedHead = this.deps.layerfs.getBranchHeadCommit(branchName);
+    return {
+      status: 200,
+      body: {
+        taskId,
+        branchName,
+        headCommitId: updatedHead.commitId,
+        filePath,
+        lines,
+      },
+    };
+  }
+
+  public executeStorageGcAndEpochAudit(params: {
+    action: "seed_orphans" | "sweep_cas" | "epoch_gc_audit";
+    graceSecs?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER" && params.action !== "epoch_gc_audit") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发分布式 CAS 垃圾回收清理" },
+      };
+    }
+
+    if (params.action === "seed_orphans") {
+      const seededIds: string[] = [];
+      for (let i = 1; i <= 3; i++) {
+        const content = `orphan-aborted-branch-blob-${Date.now()}-${i}-${"x".repeat(256)}`;
+        const meta = this.deps.layerfs.storeEngine.putFileObject(`orphan-${i}.txt`, content);
+        seededIds.push(meta.object.objectId);
+      }
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `生成 3 个孤儿 CAS 数据块用于两阶段 Mark-and-Sweep GC 验证`,
+        "Storage / LayerFS-CAS",
+        `SEEDED (${seededIds.length} blobs)`
+      );
+      return {
+        status: 200,
+        body: {
+          seededOrphanBlobIds: seededIds,
+          storageStats: this.deps.layerfs.storeEngine.getStorageStats(),
+        },
+      };
+    }
+
+    if (params.action === "sweep_cas") {
+      const sweepRes = this.gcSweeper.sweepLayerFsWorkspaceStore(this.deps.layerfs);
+      this.lastGcSweepReport = {
+        retainedCount: sweepRes.retainedBlobIds.length,
+        sweptCount: sweepRes.sweptBlobIds.length,
+        reclaimedBytes: sweepRes.reclaimedBytes,
+        sweptBlobIds: sweepRes.sweptBlobIds,
+      };
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行分布式 CAS 两阶段 Mark-and-Sweep GC：保留活跃对象 ${sweepRes.retainedBlobIds.length} 个，物理回收孤儿块 ${sweepRes.sweptBlobIds.length} 个 (${sweepRes.reclaimedBytes} Bytes)`,
+        "Storage / LayerFS-CAS",
+        `SWEPT (${sweepRes.reclaimedBytes}B reclaimed)`
+      );
+      return {
+        status: 200,
+        body: {
+          ...this.lastGcSweepReport,
+          storageStats: this.deps.layerfs.storeEngine.getStorageStats(),
+        },
+      };
+    }
+
+    const graceSecs = Number(params.graceSecs ?? 3600);
+    const candidates = [
+      { cellScope: "AnstsSchedulerCell:shard-01", epochId: 10, ownerCurrentEpoch: 14, ageSeconds: 7200, isFacetStream: false, isPagedCell: false, hydrateMbps: 120, bytes: 16384 },
+      { cellScope: "AnstsSchedulerCell:shard-02", epochId: 11, ownerCurrentEpoch: 14, ageSeconds: 5400, isFacetStream: false, isPagedCell: false, hydrateMbps: 115, bytes: 24576 },
+      { cellScope: "AnstsHarnessCell:facet-stream", epochId: 9, ownerCurrentEpoch: 14, ageSeconds: 9000, isFacetStream: true, isPagedCell: false, hydrateMbps: 100, bytes: 8192 },
+      { cellScope: "AnstsSchedulerCell:shard-03", epochId: 13, ownerCurrentEpoch: 14, ageSeconds: 7200, isFacetStream: false, isPagedCell: false, hydrateMbps: 110, bytes: 32768 },
+    ];
+    const deletable = candidates.filter(
+      (c) => !c.isFacetStream && !(c.isPagedCell && c.hydrateMbps === 0) && c.epochId < c.ownerCurrentEpoch - 1 && c.ageSeconds >= graceSecs
+    );
+    const reclaimableBytes = deletable.reduce((acc, c) => acc + c.bytes, 0);
+    return {
+      status: 200,
+      body: {
+        dryRun: true,
+        graceSecs,
+        deletableEpochCount: deletable.length,
+        reclaimableBytes,
+        deletableScopes: deletable.map((d) => `${d.cellScope}@epoch-${d.epochId}`),
+        skippedActiveOrFacetCount: candidates.length - deletable.length,
+      },
+    };
+  }
+
+  public runFleetRollingUpgradeDiagnostics(params: {
+    expectedProtocol?: string;
+    enqueueWebhookTest?: boolean;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const expectedProtocol = params.expectedProtocol ?? "v0.6.3";
+    const sql = this.deps.v25Store.sql;
+    const nodeRows = sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_node_overrides").toArray();
+    const peerProbes = nodeRows.map((nr) => {
+      const st = String(nr.status ?? "READY");
+      return {
+        nodeId: String(nr.node_id),
+        region: String(nr.region ?? "us-west-2"),
+        status: st,
+        leaseExpired: st === "DRAIN_FAILED",
+        reachable: this.scenario !== "offline",
+        protocolVersion: "v0.6.3",
+        restoringCount: this.scenario === "verification" ? 1 : 0,
+      };
+    });
+    const expiredLeases = peerProbes.filter((p) => p.leaseExpired).map((p) => p.nodeId);
+    const unreachablePeers = peerProbes.filter((p) => !p.reachable).map((p) => p.nodeId);
+    const protocolMismatches = peerProbes.filter((p) => p.protocolVersion !== expectedProtocol).map((p) => p.nodeId);
+    const totalRestoring = peerProbes.reduce((acc, p) => acc + p.restoringCount, 0);
+    const rollingUpgradeSafe =
+      expiredLeases.length === 0 &&
+      unreachablePeers.length === 0 &&
+      protocolMismatches.length === 0 &&
+      totalRestoring === 0;
+
+    this.metrics.setGauge("ansts_cluster_nodes_total", nodeRows.length);
+    this.metrics.setGauge("ansts_active_tasks_total", this.deps.scheduler.allTasks.size);
+    this.metrics.setGauge("ansts_rolling_upgrade_safe", rollingUpgradeSafe ? 1 : 0);
+    this.metrics.incCounter("ansts_diagnostics_probes_total", 1);
+    const traceparent = OtelAndPrometheusExporter.createTraceparent();
+
+    let webhookResult: Record<string, unknown> | null = null;
+    if (params.enqueueWebhookTest) {
+      const msgId = `outbox-${Date.now()}`;
+      this.outboxDispatcher.enqueueOutbox(msgId, "cluster-diagnose", "https://sre-webhook.ansts.internal/events", {
+        event: "io.ansts.cluster.diagnose",
+        rollingUpgradeSafe,
+        traceparent,
+      });
+      const dispatchStats = this.outboxDispatcher.processPending(() => true);
+      webhookResult = {
+        messageId: msgId,
+        ...dispatchStats,
+        hmacHeaderSample: this.outboxDispatcher.signPayload(JSON.stringify({ rollingUpgradeSafe })),
+      };
+    }
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行集群滚动升级安全探针 (anstsctl diagnose · protocol=${expectedProtocol}) → ${rollingUpgradeSafe ? "SAFE_TO_UPGRADE" : "BLOCKED"}`,
+      "Global / FleetDiagnostics",
+      rollingUpgradeSafe ? "SAFE (0 异常租约)" : "UPGRADE_BLOCKED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        expectedProtocol,
+        rollingUpgradeSafe,
+        expiredLeases,
+        unreachablePeers,
+        protocolMismatches,
+        totalRestoring,
+        peerProbes,
+        traceparent,
+        prometheusMetrics: this.metrics.renderPrometheusMetrics(),
+        webhookOutbox: webhookResult,
+      },
+    };
+  }
+
 }
