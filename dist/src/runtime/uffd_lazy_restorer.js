@@ -21,6 +21,20 @@ class UffdLazyPageFaultRestorer {
     return digest;
   }
 
+  stageBufferInto4KiBPages(rawBuffer) {
+    const pageSize = 4096;
+    const totalPages = Math.max(1, Math.ceil(rawBuffer.byteLength / pageSize));
+    const staged = [];
+    for (let i = 0; i < totalPages; i++) {
+      const slice = rawBuffer.subarray(i * pageSize, Math.min(rawBuffer.byteLength, (i + 1) * pageSize));
+      const padded = new Uint8Array(pageSize);
+      padded.set(slice, 0);
+      const sha256Digest = this.stageRemoteSnapshotPage(i, padded);
+      staged.push({ pageIndex: i, sha256Digest, byteLength: padded.byteLength });
+    }
+    return staged;
+  }
+
   handlePageFault(pageIndex)
 
 
@@ -50,6 +64,22 @@ class UffdLazyPageFaultRestorer {
       fetchedFromRemote: true,
       sha256Digest,
       byteLength: frame.byteLength
+    };
+  }
+
+  getStats()
+
+
+
+  {
+    let restoredTotalBytes = 0;
+    for (const f of this.faultedPages.values()) {
+      restoredTotalBytes += f.byteLength;
+    }
+    return {
+      stagedPagesCount: this.remoteBackingPages.size,
+      faultedPagesCount: this.faultedPages.size,
+      restoredTotalBytes
     };
   }
 }exports.UffdLazyPageFaultRestorer = UffdLazyPageFaultRestorer;

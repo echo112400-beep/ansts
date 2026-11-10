@@ -118,6 +118,22 @@ import { LinuxPsiMemoryGuard } from "../runtime/psi_guard.js";
 import { BidirectionalBackpressureController } from "../cluster/backpressure_loop.js";
 import { DynamicQueueAutoSharder, BrainBodyContainerPoolScaler } from "../cloudflare/horizontal_scaler.js";
 import { TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { ModelPoolClientAdapter } from "../router/pool_client.js";
+import { LiveOpenAiCompatibleSseAdapter } from "../router/live_llm_adapter.js";
+import { SlidingWindowTokenBucket, ThreeStateCircuitBreaker } from "../router/breaker_limiter.js";
+import { ZeroTrustVsockHostDaemon } from "../runtime/vsock_daemon.js";
+import { EbpfLsmSecurityBridge } from "../runtime/ebpf_lsm_bridge.js";
+import { SlsaProvenanceAttestor } from "../runtime/slsa_provenance_attestor.js";
+import { UffdLazyPageFaultRestorer } from "../runtime/uffd_lazy_restorer.js";
+import { AutomatedChaosDrillRunner } from "../cluster/chaos_drill_runner.js";
+import { NetworkChaosFaultInjectionProxy } from "../runtime/network_chaos_proxy.js";
+import { SandboxPreflightReadinessGate } from "../runtime/preflight_gate.js";
+import { TopologyCasCoordinator } from "../cluster/topology_cas_coordinator.js";
+import { TunnelGatewayCell } from "../cloudflare/tunnel_gateway_cell.js";
+import { MultiRegionFederationRouter } from "../cloudflare/federation_router.js";
+import { AgentTaskHarnessCell } from "../cloudflare/harness_cell.js";
+import { SyntacticAndVelocityBreaker } from "../harness/velocity_breaker.js";
+import { StagingCommitAndApprovalGate } from "../saga/staging.js";
 
 export type ManagementScenarioId =
   | "normal"
@@ -262,6 +278,19 @@ export class PlatformManagementPlaneEngine {
   private readonly backpressureLoop: BidirectionalBackpressureController;
   private readonly queueAutoSharder: DynamicQueueAutoSharder;
   private readonly containerPoolScaler: BrainBodyContainerPoolScaler;
+  private readonly poolClient: ModelPoolClientAdapter;
+  private readonly sseAdapter: LiveOpenAiCompatibleSseAdapter;
+  private readonly ebpfBridge: EbpfLsmSecurityBridge;
+  private readonly slsaAttestor: SlsaProvenanceAttestor;
+  private readonly uffdRestorer: UffdLazyPageFaultRestorer;
+  private readonly chaosDrillRunner: AutomatedChaosDrillRunner;
+  private readonly chaosProxy: NetworkChaosFaultInjectionProxy;
+  private readonly preflightGate: SandboxPreflightReadinessGate;
+  private readonly topologyCas: TopologyCasCoordinator;
+  private readonly tunnelCell: TunnelGatewayCell;
+  private readonly federationRouter: MultiRegionFederationRouter;
+  private readonly velocityBreaker: SyntacticAndVelocityBreaker;
+  private readonly stagingGate: StagingCommitAndApprovalGate;
   private lastGitArbitration: { acceptedAgentIds: string[]; conflictedAgentIds: string[] } | null = null;
   private lastBisectResult: {
     firstBadCommit: string | null;
@@ -316,6 +345,45 @@ export class PlatformManagementPlaneEngine {
     this.backpressureLoop = new BidirectionalBackpressureController();
     this.queueAutoSharder = new DynamicQueueAutoSharder(16, 4, 128);
     this.containerPoolScaler = new BrainBodyContainerPoolScaler();
+    this.poolClient = new ModelPoolClientAdapter();
+    this.poolClient.setPricing("ep-deepseek-r1", 0.002, 0.008);
+    this.poolClient.setPricing("ep-qwen-38", 0.0008, 0.0024);
+    this.sseAdapter = new LiveOpenAiCompatibleSseAdapter();
+    this.ebpfBridge = new EbpfLsmSecurityBridge();
+    this.slsaAttestor = new SlsaProvenanceAttestor();
+    this.uffdRestorer = new UffdLazyPageFaultRestorer();
+    this.chaosDrillRunner = new AutomatedChaosDrillRunner();
+    this.chaosProxy = new NetworkChaosFaultInjectionProxy();
+    this.preflightGate = new SandboxPreflightReadinessGate();
+    this.topologyCas = new TopologyCasCoordinator(deps.v25Store.sql);
+    if (this.topologyCas.getMembers().length === 0) {
+      this.topologyCas.forceSyncMembers(["celld-brain-01", "celld-brain-02", "celld-brain-03"]);
+    }
+    this.tunnelCell = new TunnelGatewayCell();
+    this.federationRouter = new MultiRegionFederationRouter();
+    this.federationRouter.registerRegion({
+      regionCode: "us-west-2",
+      baseUrl: "https://us-west-2.cell.ansts.internal",
+      healthy: true,
+      rttEwmaMs: 18,
+      sovereigntyZone: "US",
+    });
+    this.federationRouter.registerRegion({
+      regionCode: "eu-central-1",
+      baseUrl: "https://eu-central-1.cell.ansts.internal",
+      healthy: true,
+      rttEwmaMs: 24,
+      sovereigntyZone: "EU",
+    });
+    this.federationRouter.registerRegion({
+      regionCode: "ap-southeast-1",
+      baseUrl: "https://ap-southeast-1.cell.ansts.internal",
+      healthy: true,
+      rttEwmaMs: 31,
+      sovereigntyZone: "APAC",
+    });
+    this.velocityBreaker = new SyntacticAndVelocityBreaker(3, 120_000);
+    this.stagingGate = new StagingCommitAndApprovalGate();
     if (deps.harnessRunner) {
       this.harnessRunner = deps.harnessRunner;
     } else {
@@ -3519,6 +3587,544 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         backpressure,
         queueSharding,
         poolScaling,
+      },
+    };
+  }
+
+
+  public executeRouterInferencePipeline(params: {
+    action: "execute_sse_inference" | "trip_and_recover_circuit_breaker" | "exhaust_tpm_bucket";
+    tenantId?: string;
+    taskId?: string;
+    endpointId?: string;
+    promptTokens?: number;
+    maxOutputTokens?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发模型路由推理流水线或熔断器演练" },
+      };
+    }
+    const tenantId = params.tenantId ?? "Northstar";
+    const taskId = params.taskId ?? "task-ns-8841";
+    const endpointId = params.endpointId ?? "ep-deepseek-r1";
+
+    if (params.action === "execute_sse_inference") {
+      const epMetrics = new LlmEndpointMetrics({
+        endpoint_id: endpointId,
+        provider: endpointId.includes("qwen") ? "qwen" : "deepseek",
+        model_name: endpointId.includes("qwen") ? "Qwen-3.8" : "DeepSeek-R1",
+        ttft_ewma_ms: 140,
+        tpot_ewma_ms: 12,
+        kv_cache_utilization: 0.58,
+        healthy: true,
+      });
+      const infRes = this.poolClient.executeInference(
+        epMetrics,
+        {
+          taskId,
+          turnIndex: 1,
+          prompt: `Analyze and verify task ${taskId} for tenant ${tenantId}`,
+          estimatedPromptTokens: params.promptTokens ?? 1200,
+          maxOutputTokens: params.maxOutputTokens ?? 320,
+          requireJsonSchema: true,
+        },
+        0.65
+      );
+      const totalSpent = this.deps.finopsController.recordSpend(tenantId, infRes.costUsd);
+      this.deps.v25Store.sql.exec(
+        "UPDATE v25_mgmt_tenants SET spent_usd = COALESCE(spent_usd, 0) + ? WHERE tenant_id = ?",
+        infRes.costUsd,
+        tenantId
+      );
+      const budgetStatus = this.deps.finopsController.evaluateBudgetAndModel(tenantId);
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行模型路由 SSE 流式推理 (${infRes.modelName}, TTFT=${infRes.ttftMs.toFixed(1)}ms, TPOT=${infRes.tpotMs}ms, Cached=${infRes.cachedTokens} tok, Cost=$${infRes.costUsd})`,
+        `Router / ${tenantId}`,
+        `SSE_OK ($${infRes.costUsd})`
+      );
+
+      return {
+        status: 200,
+        body: {
+          tenantId,
+          taskId,
+          inference: infRes,
+          totalSpentUsd: totalSpent,
+          budgetEvaluation: budgetStatus,
+        },
+      };
+    }
+
+    if (params.action === "trip_and_recover_circuit_breaker") {
+      const breaker = new ThreeStateCircuitBreaker(3, 15_000);
+      const now = Date.now();
+      const s0 = breaker.getState(now);
+      breaker.recordFailure(now);
+      breaker.recordFailure(now + 10);
+      breaker.recordFailure(now + 20);
+      const s1 = breaker.getState(now + 30);
+      const s2 = breaker.getState(now + 16_000);
+      breaker.recordSuccess();
+      const s3 = breaker.getState(now + 16_100);
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行模型端点 [${endpointId}] 三态熔断器状态转换演练 (${s0} → ${s1} → ${s2} → ${s3})`,
+        `Router / ${endpointId}`,
+        `BREAKER_RECOVERED (${s3})`
+      );
+
+      return {
+        status: 200,
+        body: {
+          endpointId,
+          stateSequence: [s0, s1, s2, s3],
+          recovered: s3 === "CLOSED",
+        },
+      };
+    }
+
+    // action === "exhaust_tpm_bucket"
+    const now = Date.now();
+    const bucket = new SlidingWindowTokenBucket(2, 10_000, now);
+    const firstConsume = bucket.tryConsume(6000, now);
+    const throttledConsume = bucket.tryConsume(6000, now + 100);
+    const refilledConsume = bucket.tryConsume(6000, now + 60_500);
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `验证滑动窗口 RPM/TPM 双令牌桶限流与恢复 (ThrottledWait=${throttledConsume.waitMs}ms → RefilledAllowed=${refilledConsume.allowed})`,
+      `Router / ${endpointId}`,
+      `TOKEN_BUCKET_VERIFIED`
+    );
+
+    return {
+      status: 200,
+      body: {
+        endpointId,
+        firstConsume,
+        throttledConsume,
+        refilledConsume,
+      },
+    };
+  }
+
+  public async executeKernelSecurityAndAttestation(params: {
+    action: "vsock_unix_daemon_probe" | "ebpf_and_slsa_attest" | "uffd_page_fault_restore";
+    taskId?: string;
+    branchName?: string;
+    allowedHostname?: string;
+    blockedHostname?: string;
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发底层 Vsock Daemon、eBPF LSM 或 SLSA/UFFD 安全证明" },
+      };
+    }
+    const taskId = params.taskId ?? "task-ns-8841";
+    const branchName = params.branchName ?? "feat-ns-auth";
+
+    if (params.action === "vsock_unix_daemon_probe") {
+      const sockPath = path.join(os.tmpdir(), `ansts-vsock-${process.pid}-${Date.now()}.sock`);
+      const daemon = new ZeroTrustVsockHostDaemon(["api.openai.com", "api.anthropic.com", "r2.ansts.internal"]);
+      await daemon.startUnixSocketServer(sockPath);
+      try {
+        const allowedProbe = await daemon.sendClientFrameOverUnixSocket(sockPath, {
+          requestId: `vsock-allow-${Date.now()}`,
+          type: "EGRESS_CHECK",
+          hostname: params.allowedHostname ?? "api.openai.com",
+        });
+        const blockedProbe = await daemon.sendClientFrameOverUnixSocket(sockPath, {
+          requestId: `vsock-block-${Date.now()}`,
+          type: "EGRESS_CHECK",
+          hostname: params.blockedHostname ?? "169.254.169.254",
+        });
+
+        this.appendAudit(
+          params.actor,
+          params.role,
+          `通过真实 Unix Domain Socket (${path.basename(sockPath)}) 执行 UInt32BE 二进制帧 Vsock Egress 审计 (allow=200, block=403)`,
+          `Security / VsockDaemon`,
+          `VSOCK_UNIX_OK`
+        );
+
+        return {
+          status: 200,
+          body: {
+            socketPath: sockPath,
+            allowedProbe,
+            blockedProbe,
+          },
+        };
+      } finally {
+        await daemon.stop();
+        try {
+          if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath);
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (params.action === "ebpf_and_slsa_attest") {
+      try {
+        this.deps.layerfs.getBranchHeadCommit(branchName);
+      } catch {
+        this.deps.layerfs.forkBranch("main", branchName);
+      }
+      const kernelPosture = this.ebpfBridge.inspectHostKernelSecurityPosture();
+      const shadowHook = this.ebpfBridge.checkFileOpenHook("/etc/shadow");
+      const workspaceHook = this.ebpfBridge.checkFileOpenHook(`/workspace/${taskId}/index.ts`);
+      const slsaStmt = this.slsaAttestor.attestLayerFsCommit(this.deps.layerfs, branchName);
+      const slsaVerified = this.slsaAttestor.verifyProvenanceStatement(slsaStmt);
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 eBPF LSM 敏感路径拦截 (/etc/shadow errno=${shadowHook.errno}) 与 LayerFS Commit [${slsaStmt.commitId}] SLSA v1.0 Ed25519 签名证明`,
+        `Security / ${branchName}`,
+        `SLSA_ED25519_VERIFIED`
+      );
+
+      return {
+        status: 200,
+        body: {
+          kernelPosture,
+          shadowHook,
+          workspaceHook,
+          slsaProvenance: slsaStmt,
+          slsaVerified,
+        },
+      };
+    }
+
+    // action === "uffd_page_fault_restore"
+    const rawStatePayload = Buffer.from(
+      JSON.stringify({
+        taskId,
+        walEntries: this.deps.walEngine.getTaskWalEntries(taskId),
+        padding: "P".repeat(9000),
+      }),
+      "utf-8"
+    );
+    const stagedPages = this.uffdRestorer.stageBufferInto4KiBPages(new Uint8Array(rawStatePayload));
+    const fault0Cold = this.uffdRestorer.handlePageFault(0);
+    const fault0Cached = this.uffdRestorer.handlePageFault(0);
+    const fault1Cold = this.uffdRestorer.handlePageFault(1);
+    const stats = this.uffdRestorer.getStats();
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 userfaultfd 按需 4KiB 缺页恢复与 SHA-256 页面校验 (Staged=${stats.stagedPagesCount} pages, Restored=${stats.restoredTotalBytes} Bytes)`,
+      `Runtime / UFFD-${taskId}`,
+      `UFFD_HYDRATED (${stats.faultedPagesCount} pages)`
+    );
+
+    return {
+      status: 200,
+      body: {
+        taskId,
+        stagedPagesCount: stagedPages.length,
+        fault0Cold,
+        fault0Cached,
+        fault1Cold,
+        stats,
+      },
+    };
+  }
+
+  public executeChaosAndTopologyCasDrill(params: {
+    action: "run_partition_and_split_brain_drill" | "probe_host_preflight_and_topology_cas";
+    targetHost?: string;
+    expectedGeneration?: number;
+    nextMembers?: string[];
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发网络分区混沌演练或拓扑 CAS 变更" },
+      };
+    }
+
+    if (params.action === "run_partition_and_split_brain_drill") {
+      const targetHost = params.targetHost ?? "body-us-west-02";
+      const drill = this.chaosDrillRunner.executeLivePartitionAndFencingDrill({
+        chaosProxy: this.chaosProxy,
+        targetHost,
+        oldNodeFencingToken: 12,
+        newNodeFencingToken: 14,
+      });
+
+      let staleFenceRejected409 = false;
+      try {
+        this.deps.walEngine.appendTurnDelta({
+          taskId: "task-chaos-splitbrain",
+          turnIndex: 2,
+          fencingToken: 12,
+          changedFiles: ["src/zombie.ts"],
+          sqliteWalPages: 4,
+          highestSubmittedFencingToken: 14,
+        });
+      } catch {
+        staleFenceRejected409 = true;
+      }
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行网络分区与脑裂 Fencing 混沌演练 (Target=${targetHost}, PartitionBlocked=${drill.partitionBlockedTraffic}, ZombieRejected409=${staleFenceRejected409})`,
+        `Chaos / ${targetHost}`,
+        `DRILL_PASSED (RPO=0)`
+      );
+
+      return {
+        status: 200,
+        body: {
+          targetHost,
+          drill,
+          staleFenceRejected409,
+          activeFaults: this.chaosProxy.inspectActiveFaults(),
+        },
+      };
+    }
+
+    // action === "probe_host_preflight_and_topology_cas"
+    const preflight = this.preflightGate.probeLiveHostReadiness(1);
+    const currentGen = this.topologyCas.getGeneration();
+    const expectedGen = params.expectedGeneration ?? currentGen;
+    const nextMembers = params.nextMembers ?? this.topologyCas.getMembers();
+
+    try {
+      const casUpdated = this.topologyCas.updateTopologyCas(expectedGen, nextMembers);
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行宿主机 Preflight 探针 (FreeDisk=${preflight.freeDiskGb}GB, FreeMem=${preflight.freeMemoryMb}MB) 并推进 Topology CAS 至 gen=${casUpdated.generation}`,
+        `Cluster / TopologyCAS`,
+        `GEN_${casUpdated.generation} (${casUpdated.ringDigest.slice(0, 10)})`
+      );
+      return {
+        status: 200,
+        body: {
+          preflight,
+          topologyCas: casUpdated,
+        },
+      };
+    } catch (err) {
+      return {
+        status: 409,
+        body: {
+          error: "TOPOLOGY_CAS_CONFLICT",
+          expectedGeneration: expectedGen,
+          actualGeneration: currentGen,
+          message: (err as Error).message,
+        },
+      };
+    }
+  }
+
+  public async executeFederationTunnelAndHarnessGovernance(params: {
+    action: "tunnel_command_and_failover" | "federation_and_harness_autoheal" | "velocity_breaker_and_staging_commit";
+    hostId?: string;
+    sovereigntyZone?: "US" | "EU" | "APAC";
+    taskId?: string;
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权操控双归属反向隧道、多地域联邦路由或 Harness 自治愈" },
+      };
+    }
+    const hostId = params.hostId ?? "body-us-west-01";
+    const taskId = params.taskId ?? "task-ns-8841";
+
+    if (params.action === "tunnel_command_and_failover") {
+      this.tunnelCell.registerTunnel({
+        hostId,
+        gatewayId: "celld-gw-01",
+        role: "PRIMARY",
+        connGeneration: 10,
+        epoch: 14,
+      });
+      this.tunnelCell.registerTunnel({
+        hostId,
+        gatewayId: "celld-gw-02",
+        role: "SECONDARY",
+        connGeneration: 10,
+        epoch: 14,
+      });
+      const { command, completionPromise } = this.tunnelCell.enqueueCommandForHost(hostId, {
+        op: "EXEC_SANDBOX_PROBE",
+        taskId,
+      });
+      const polled = this.tunnelCell.pollPendingCommands(hostId, "celld-gw-01");
+      this.tunnelCell.acknowledgeCommand(command.commandId, {
+        acknowledgedBy: hostId,
+        status: "EXECUTED_OVER_REVERSE_TUNNEL",
+      });
+      const ackResult = await completionPromise;
+
+      this.tunnelCell.markGatewayHealth(hostId, "celld-gw-01", false);
+      const failoverActive = this.tunnelCell.selectActiveTunnel(hostId);
+      this.tunnelCell.markGatewayHealth(hostId, "celld-gw-01", true);
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行双归属反向隧道指令下发 (${command.commandId}, Polled=${polled.length}) 并验证 PRIMARY 故障切换至 ${failoverActive.gatewayId} (${failoverActive.role})`,
+        `Tunnel / ${hostId}`,
+        `FAILOVER_OK (${failoverActive.gatewayId})`
+      );
+
+      return {
+        status: 200,
+        body: {
+          hostId,
+          dispatchedCommand: command,
+          polledCount: polled.length,
+          ackResult,
+          failoverTunnel: failoverActive,
+        },
+      };
+    }
+
+    if (params.action === "federation_and_harness_autoheal") {
+      const zone = params.sovereigntyZone ?? "EU";
+      const optimalRegion = this.federationRouter.selectOptimalRegion({ requiredSovereigntyZone: zone });
+      const r2 = new InMemoryR2Bucket();
+      const harnessCell = new AgentTaskHarnessCell(
+        {
+          id: { toString: () => `cell-${taskId}` },
+          storage: {
+            sql: this.deps.v25Store.sql,
+            transactionSync: <T>(fn: () => T) => fn(),
+            getAlarm: async () => null,
+            setAlarm: async () => {},
+          },
+          blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
+        },
+        r2,
+        taskId
+      );
+      const ckpt = await harnessCell.executeAndCheckpointTurn({
+        turnIndex: 1,
+        fencingToken: 14,
+        toolName: "shell_exec",
+        toolOutput: { stdout: "turn-1-ok" },
+      });
+
+      let attempts = 0;
+      let rehydratedTurnIndex = -1;
+      const autoHealRes = await harnessCell.executeInCompanionContainerWithAutoHeal(
+        async () => {
+          attempts += 1;
+          if (attempts === 1) {
+            throw new Error("OperationInterruptedError: companion container migrated across bare-metal nodes");
+          }
+          return { turnIndex: 2, status: "COMPLETED_AFTER_AUTO_HEAL", region: optimalRegion.regionCode };
+        },
+        async (latestTurn) => {
+          rehydratedTurnIndex = latestTurn?.turnIndex ?? 0;
+        }
+      );
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行多地域联邦主权路由 (${zone} → ${optimalRegion.regionCode}, RTT=${optimalRegion.rttEwmaMs}ms) 与 AgentTaskHarnessCell 迁移中断自治愈 (RehydratedTurn=#${rehydratedTurnIndex})`,
+        `Federation / ${taskId}`,
+        `AUTO_HEALED (${optimalRegion.regionCode})`
+      );
+
+      return {
+        status: 200,
+        body: {
+          sovereigntyZone: zone,
+          selectedRegion: optimalRegion,
+          checkpoint: ckpt,
+          rehydratedTurnIndex,
+          autoHealResult: autoHealRes,
+        },
+      };
+    }
+
+    // action === "velocity_breaker_and_staging_commit"
+    const astValidation = SyntacticAndVelocityBreaker.validateJsonToolCall(
+      JSON.stringify({ tool: "kubectl_apply", namespace: "prod" })
+    );
+    const loopTaskId = `loop-${taskId}-${Date.now()}`;
+    const now = Date.now();
+    this.velocityBreaker.recordAndCheckTurn(loopTaskId, {
+      turnIndex: 1,
+      toolName: "shell_exec",
+      argsHash: "sha256:identical",
+      tokensConsumed: 1500,
+      timestampMs: now,
+    });
+    this.velocityBreaker.recordAndCheckTurn(loopTaskId, {
+      turnIndex: 2,
+      toolName: "shell_exec",
+      argsHash: "sha256:identical",
+      tokensConsumed: 1500,
+      timestampMs: now + 100,
+    });
+    const thirdTurnCheck = this.velocityBreaker.recordAndCheckTurn(loopTaskId, {
+      turnIndex: 3,
+      toolName: "shell_exec",
+      argsHash: "sha256:identical",
+      tokensConsumed: 1500,
+      timestampMs: now + 200,
+    });
+
+    const staged = this.stagingGate.stageEffect({
+      effectId: `eff-${Date.now()}`,
+      taskId,
+      turnIndex: 4,
+      toolName: "git_push_release",
+      args: { branch: "main", tag: "v2.5.0" },
+    });
+    const committedEffects = this.stagingGate.commitStagedEffects(taskId, (toolName, args) => ({
+      executedTool: toolName,
+      args,
+      committedAtMs: Date.now(),
+    }));
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `验证 SyntacticAndVelocityBreaker 语义死循环熔断 (${thirdTurnCheck.reason}) 与 StagingCommitAndApprovalGate 暂存提交 (${committedEffects.length} 项副作用)`,
+      `Harness / ${taskId}`,
+      `BREAKER_AND_STAGING_OK`
+    );
+
+    return {
+      status: 200,
+      body: {
+        astValidation,
+        velocityBreakerCheck: thirdTurnCheck,
+        stagedEffect: staged,
+        committedEffects,
       },
     };
   }

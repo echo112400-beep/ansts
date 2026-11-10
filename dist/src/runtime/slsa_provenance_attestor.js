@@ -1,9 +1,12 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.SlsaProvenanceAttestor = void 0;
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M25 & M36 SLSA v1.0 In-Toto Build, Sandbox Image & LayerFS Commit Tree Provenance Attestor.
+ * Supports both HMAC-SHA256 and asymmetric Ed25519 signatures (`node:crypto`).
  */
+
 
 
 
@@ -17,9 +20,16 @@ var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequir
 
 class SlsaProvenanceAttestor {
   signingKey;
+  privateKey;
+  publicKey;
+  publicKeyDerHex;
 
   constructor(signingKey = "ansts-slsa-v1-signing-key") {
     this.signingKey = signingKey;
+    const kp = crypto.generateKeyPairSync("ed25519");
+    this.privateKey = kp.privateKey;
+    this.publicKey = kp.publicKey;
+    this.publicKeyDerHex = kp.publicKey.export({ type: "spki", format: "der" }).toString("hex");
   }
 
   createSignedProvenanceStatement(params)
@@ -31,6 +41,7 @@ class SlsaProvenanceAttestor {
   {
     const body = `${params.imageReference}:${params.sha256Digest}:${params.builderId}:${params.commitId ?? ""}`;
     const signatureHex = crypto.createHmac("sha256", this.signingKey).update(body, "utf-8").digest("hex");
+    const ed25519SignatureHex = crypto.sign(null, Buffer.from(body, "utf-8"), this.privateKey).toString("hex");
     return {
       _type: "https://in-toto.io/Statement/v1",
       predicateType: "https://slsa.dev/provenance/v1",
@@ -39,14 +50,32 @@ class SlsaProvenanceAttestor {
       imageReference: params.imageReference,
       commitId: params.commitId,
       fileCount: params.fileCount,
-      signatureHex
+      signatureHex,
+      ed25519SignatureHex,
+      publicKeyDerHex: this.publicKeyDerHex
     };
   }
 
   verifyProvenanceStatement(stmt) {
     const body = `${stmt.imageReference}:${stmt.subjectDigest}:${stmt.builderId}:${stmt.commitId ?? ""}`;
     const expected = crypto.createHmac("sha256", this.signingKey).update(body, "utf-8").digest("hex");
-    return expected === stmt.signatureHex;
+    if (expected !== stmt.signatureHex) {
+      return false;
+    }
+    if (stmt.ed25519SignatureHex) {
+      try {
+        const ok = crypto.verify(
+        null,
+        Buffer.from(body, "utf-8"),
+        this.publicKey,
+        Buffer.from(stmt.ed25519SignatureHex, "hex"));
+
+        if (!ok) return false;
+      } catch {
+        return false;
+      }
+    }
+    return true;
   }
 
   attestLayerFsCommit(

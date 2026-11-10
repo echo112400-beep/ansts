@@ -368,6 +368,54 @@ gatewayUrl = process.env.ANSTS_GATEWAY_URL ?? "http://127.0.0.1:18080")
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-router-pipeline") {
+    const action = rest[0] ?? "execute_sse_inference";
+    const tenantId = rest[1] ?? "Northstar";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/router/inference-pipeline`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, tenantId, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-security") {
+    const action = rest[0] ?? "vsock_unix_daemon_probe";
+    const taskId = rest[1] ?? "task-ns-8841";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/security/kernel-attestation`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, taskId, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-chaos") {
+    const action = rest[0] ?? "run_partition_and_split_brain_drill";
+    const targetHost = rest[1] ?? "body-us-west-02";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/chaos/drill`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, targetHost, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-federation") {
+    const action = rest[0] ?? "tunnel_command_and_failover";
+    const sovereigntyZone = rest[1] ?? "EU";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/federation/tunnel-harness`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, sovereigntyZone, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-diagnose") {
     const expectedProtocol = rest[0] ?? "v0.6.3";
     const resp = await fetch(`${baseUrl}/v1beta1/management/diagnostics/probe`, {

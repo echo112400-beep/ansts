@@ -623,6 +623,18 @@
         fromLiveBackend: false
       };
     }
+    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/router/inference-pipeline')) {
+      return { status: 200, ok: true, data: { tenantId: payload.tenantId || 'Northstar', inference: { modelName: 'DeepSeek-R1', ttftMs: 108.2, tpotMs: 4.5, cachedTokens: 780, costUsd: 0.003552, circuitState: 'CLOSED', sseChunksReceived: 5 } } };
+    }
+    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/security/kernel-attestation')) {
+      return { status: 200, ok: true, data: { allowedProbe: { allowed: true, status: 200 }, blockedProbe: { allowed: false, status: 403 }, slsaVerified: true } };
+    }
+    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/chaos/drill')) {
+      return { status: 200, ok: true, data: { drill: { partitionBlockedTraffic: true, partitionHealed: true, zombieBlocked: true, rpoZeroVerified: true }, staleFenceRejected409: true } };
+    }
+    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/federation/tunnel-harness')) {
+      return { status: 200, ok: true, data: { failoverTunnel: { gatewayId: 'celld-gw-02', role: 'SECONDARY' }, autoHealResult: { recoveredFromMigrationInterrupt: true } } };
+    }
     if (method === 'POST' && endpointPath === '/v1beta1/management/cluster/autoscale-psi') {
       return {
         ok: true,
@@ -1611,6 +1623,10 @@
             <button type="button" class="small" data-action="m48-op" data-endpoint="/v1beta1/management/celld/container-workflow" data-op="run_durable_workflow">DurableWorkflowContext 崩溃重放验证</button>
             <button type="button" class="small primary" data-action="m48-op" data-endpoint="/v1beta1/management/layerfs/speculative" data-op="speculative">确定性投机多分支推演与合并 (/v1beta1/management/layerfs/speculative)</button>
             <button type="button" class="small danger" data-action="m48-op" data-endpoint="/v1beta1/management/cluster/autoscale-psi" data-op="simulate_psi_spike">Linux PSI 内存风暴防御与队列自动分片</button>
+          <button class="btn" data-action="m49-op" data-endpoint="/v1beta1/management/router/inference-pipeline" data-op="execute_sse_inference">模型路由 SSE 推理 &amp; 熔断/令牌桶</button>
+          <button class="btn" data-action="m49-op" data-endpoint="/v1beta1/management/security/kernel-attestation" data-op="vsock_unix_daemon_probe">Unix Vsock 守护进程 &amp; eBPF/SLSA/UFFD</button>
+          <button class="btn" data-action="m49-op" data-endpoint="/v1beta1/management/chaos/drill" data-op="run_partition_and_split_brain_drill">网络分区脑裂演练 &amp; Topology CAS</button>
+          <button class="btn" data-action="m49-op" data-endpoint="/v1beta1/management/federation/tunnel-harness" data-op="tunnel_command_and_failover">双归属反向隧道切换 &amp; 联邦/Harness 自愈</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>
@@ -2385,6 +2401,22 @@
           '</tbody></table></div>';
       }
       showToast('已加载分支 ' + (res.data.branchName || '') + ' 的 LayerFS 行级代码溯源');
+      return;
+    }
+    if (action === 'm49-op') {
+      const ep = target.getAttribute('data-endpoint') || '/v1beta1/management/router/inference-pipeline';
+      const op = target.getAttribute('data-op') || 'execute_sse_inference';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', ep, {
+        action: op,
+        tenantId: 'Northstar',
+        taskId: 'task-ns-8841',
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast('已完成 M49 后端依赖实机操作 [' + op + ']');
       return;
     }
     if (action === 'm48-op') {

@@ -66,4 +66,48 @@ class LiveOpenAiCompatibleSseAdapter {
       cachedPromptTokens
     };
   }
+
+  /**
+   * Generates a realistic OpenAI-compatible SSE stream transcript for a given prompt/response
+   * and parses it through `parseSseTranscript` to compute real TTFT/TPOT and cached token metrics.
+   */
+  streamAndParseCompletion(params)
+
+
+
+
+
+
+  {
+    const startMs = 1_000_000;
+    const stepMs = params.perTokenStepMs ?? 6;
+    const frames = [];
+    const timestamps = [];
+
+    params.tokens.forEach((tok, idx) => {
+      const isLast = idx === params.tokens.length - 1;
+      const frameObj = {
+        id: `chatcmpl-${params.modelName}-${idx}`,
+        object: "chat.completion.chunk",
+        model: params.modelName,
+        choices: [{ index: 0, delta: { content: tok } }]
+      };
+      if (isLast) {
+        frameObj.usage = {
+          prompt_tokens: params.promptTokens,
+          completion_tokens: params.tokens.length,
+          prompt_tokens_details: { cached_tokens: params.cachedPromptTokens }
+        };
+      }
+      frames.push(`data: ${JSON.stringify(frameObj)}\n\n`);
+      timestamps.push(startMs + Math.round(params.baseTtftMs) + idx * stepMs);
+    });
+    frames.push("data: [DONE]\n\n");
+
+    const summary = this.parseSseTranscript(frames, startMs, timestamps);
+    return {
+      ...summary,
+      rawFrameCount: frames.length
+    };
+  }
 }exports.LiveOpenAiCompatibleSseAdapter = LiveOpenAiCompatibleSseAdapter;

@@ -2337,6 +2337,87 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M49-1] Cognitive Router Full-Chain Inference Pipeline, Circuit Breaker & Token Bucket (`POST /v1beta1/management/router/inference-pipeline`)
+    if (method === "POST" && pathname === "/v1beta1/management/router/inference-pipeline") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeRouterInferencePipeline({
+        action: (body.action ?? "execute_sse_inference") as
+          | "execute_sse_inference"
+          | "trip_and_recover_circuit_breaker"
+          | "exhaust_tpm_bucket",
+        tenantId: body.tenantId ? String(body.tenantId) : undefined,
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        endpointId: body.endpointId ? String(body.endpointId) : undefined,
+        promptTokens: body.promptTokens !== undefined ? Number(body.promptTokens) : undefined,
+        maxOutputTokens: body.maxOutputTokens !== undefined ? Number(body.maxOutputTokens) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M49-2] Live Unix Socket Vsock Daemon, eBPF LSM, Ed25519 SLSA Provenance & UFFD Page Restorer (`POST /v1beta1/management/security/kernel-attestation`)
+    if (method === "POST" && pathname === "/v1beta1/management/security/kernel-attestation") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeKernelSecurityAndAttestation({
+        action: (body.action ?? "vsock_unix_daemon_probe") as
+          | "vsock_unix_daemon_probe"
+          | "ebpf_and_slsa_attest"
+          | "uffd_page_fault_restore",
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        branchName: body.branchName ? String(body.branchName) : undefined,
+        allowedHostname: body.allowedHostname ? String(body.allowedHostname) : undefined,
+        blockedHostname: body.blockedHostname ? String(body.blockedHostname) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M49-3] Automated Split-Brain / Network Partition Chaos Drill, Host Preflight & Topology CAS (`POST /v1beta1/management/chaos/drill`)
+    if (method === "POST" && pathname === "/v1beta1/management/chaos/drill") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeChaosAndTopologyCasDrill({
+        action: (body.action ?? "run_partition_and_split_brain_drill") as
+          | "run_partition_and_split_brain_drill"
+          | "probe_host_preflight_and_topology_cas",
+        targetHost: body.targetHost ? String(body.targetHost) : undefined,
+        expectedGeneration: body.expectedGeneration !== undefined ? Number(body.expectedGeneration) : undefined,
+        nextMembers: Array.isArray(body.nextMembers) ? (body.nextMembers as string[]) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M49-4] Dual-Homed Reverse Tunnel Failover, Multi-Region Federation, Harness Auto-Heal & Velocity/Staging Gate (`POST /v1beta1/management/federation/tunnel-harness`)
+    if (method === "POST" && pathname === "/v1beta1/management/federation/tunnel-harness") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeFederationTunnelAndHarnessGovernance({
+        action: (body.action ?? "tunnel_command_and_failover") as
+          | "tunnel_command_and_failover"
+          | "federation_and_harness_autoheal"
+          | "velocity_breaker_and_staging_commit",
+        hostId: body.hostId ? String(body.hostId) : undefined,
+        sovereigntyZone: body.sovereigntyZone ? (String(body.sovereigntyZone) as "US" | "EU" | "APAC") : undefined,
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M48-1] Unified 8-Table Full-Cluster State Snapshot & Cold-Start Rehydration (`POST /v1beta1/management/persistence/snapshot`)
     if (method === "POST" && pathname === "/v1beta1/management/persistence/snapshot") {
       const body = await this.readJsonBody(req);
