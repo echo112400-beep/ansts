@@ -1,5 +1,6 @@
 /**
- * @fileoverview M11 TASK-40: Length-Prefixed Binary Framing Unix Domain / virtio-vsock Host Daemon.
+ * @fileoverview M11 TASK-40 & M57-6: Length-Prefixed Binary Framing Unix Domain / virtio-vsock Host Daemon
+ * with Stream Reassembly Buffer, Multi-Frame Pipelining Support & Frame Length Validation.
  */
 import * as net from "node:net";
 import * as fs from "node:fs";
@@ -7,9 +8,14 @@ import * as fs from "node:fs";
 export class ZeroTrustVsockHostDaemon {
   private server: net.Server | null = null;
   private readonly allowedHosts: Set<string>;
+  public readonly maxFrameBytes: number;
 
-  constructor(allowedHosts: string[] = ["api.openai.com", "api.anthropic.com", "r2.ansts.internal"]) {
+  constructor(
+    allowedHosts: string[] = ["api.openai.com", "api.anthropic.com", "r2.ansts.internal"],
+    maxFrameBytes = 4 * 1024 * 1024
+  ) {
     this.allowedHosts = new Set(allowedHosts);
+    this.maxFrameBytes = maxFrameBytes;
   }
 
   public static encodeFrame(payload: Record<string, unknown>): Buffer {
@@ -24,8 +30,29 @@ export class ZeroTrustVsockHostDaemon {
       throw new Error("Vsock frame shorter than 4-byte length header");
     }
     const len = frame.readUInt32BE(0);
+    if (frame.length < 4 + len) {
+      throw new Error(`Incomplete Vsock frame: expected ${4 + len} bytes, received ${frame.length} bytes`);
+    }
     const jsonStr = frame.subarray(4, 4 + len).toString("utf-8");
     return JSON.parse(jsonStr) as Record<string, unknown>;
+  }
+
+  private handleDecodedRequest(req: Record<string, unknown>): Record<string, unknown> {
+    if (req.type === "EGRESS_CHECK") {
+      const host = String(req.hostname ?? "");
+      const allowed = this.allowedHosts.has(host);
+      return {
+        requestId: req.requestId,
+        hostname: host,
+        allowed,
+        status: allowed ? 200 : 403,
+      };
+    }
+    return {
+      requestId: req.requestId,
+      status: 200,
+      echo: req,
+    };
   }
 
   public async startUnixSocketServer(socketPath: string): Promise<void> {
@@ -38,28 +65,37 @@ export class ZeroTrustVsockHostDaemon {
     }
     return new Promise((resolve, reject) => {
       this.server = net.createServer((socket) => {
+        let rxBuf = Buffer.alloc(0);
         socket.on("data", (chunk: Buffer) => {
-          const req = ZeroTrustVsockHostDaemon.decodeFrame(chunk);
-          if (req.type === "EGRESS_CHECK") {
-            const host = String(req.hostname ?? "");
-            const allowed = this.allowedHosts.has(host);
-            socket.write(
-              ZeroTrustVsockHostDaemon.encodeFrame({
-                requestId: req.requestId,
-                hostname: host,
-                allowed,
-                status: allowed ? 200 : 403,
-              })
-            );
-          } else {
-            socket.write(
-              ZeroTrustVsockHostDaemon.encodeFrame({
-                requestId: req.requestId,
-                status: 200,
-                echo: req,
-              })
-            );
+          rxBuf = Buffer.concat([rxBuf, chunk]);
+          while (rxBuf.length >= 4) {
+            const bodyLen = rxBuf.readUInt32BE(0);
+            if (bodyLen > this.maxFrameBytes) {
+              socket.destroy(new Error(`Vsock frame exceeds maxFrameBytes (${bodyLen} > ${this.maxFrameBytes})`));
+              return;
+            }
+            if (rxBuf.length < 4 + bodyLen) {
+              // Wait for remaining fragmented bytes
+              break;
+            }
+            const fullFrame = rxBuf.subarray(0, 4 + bodyLen);
+            rxBuf = rxBuf.subarray(4 + bodyLen);
+            try {
+              const req = ZeroTrustVsockHostDaemon.decodeFrame(fullFrame);
+              const resp = this.handleDecodedRequest(req);
+              socket.write(ZeroTrustVsockHostDaemon.encodeFrame(resp));
+            } catch (err) {
+              socket.write(
+                ZeroTrustVsockHostDaemon.encodeFrame({
+                  status: 400,
+                  error: (err as Error).message,
+                })
+              );
+            }
           }
+        });
+        socket.on("error", () => {
+          // Prevent unhandled socket error crashes
         });
       });
       this.server.on("error", reject);
@@ -72,12 +108,17 @@ export class ZeroTrustVsockHostDaemon {
     payload: Record<string, unknown>
   ): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
+      let rxBuf = Buffer.alloc(0);
       const client = net.createConnection(socketPath, () => {
         client.write(ZeroTrustVsockHostDaemon.encodeFrame(payload));
       });
       client.on("data", (chunk: Buffer) => {
+        rxBuf = Buffer.concat([rxBuf, chunk]);
+        if (rxBuf.length < 4) return;
+        const bodyLen = rxBuf.readUInt32BE(0);
+        if (rxBuf.length < 4 + bodyLen) return;
         try {
-          const decoded = ZeroTrustVsockHostDaemon.decodeFrame(chunk);
+          const decoded = ZeroTrustVsockHostDaemon.decodeFrame(rxBuf.subarray(0, 4 + bodyLen));
           client.end();
           resolve(decoded);
         } catch (err) {

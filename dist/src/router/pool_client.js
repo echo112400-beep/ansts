@@ -5,7 +5,7 @@
 
 var _live_llm_adapter = require("./live_llm_adapter.js");
 var _breaker_limiter = require("./breaker_limiter.js"); /**
- * @fileoverview M3 TASK-06: Multi-Provider LLM Pool Client Adapter with Token Accounting,
+ * @fileoverview M3 TASK-06 & M57-1: Multi-Provider LLM Pool Client Adapter with Token Accounting,
  * SSE Stream Assembly (`LiveOpenAiCompatibleSseAdapter`), Sliding-Window Token Bucket, and 3-State Circuit Breaker.
  */
 
@@ -64,18 +64,36 @@ class ModelPoolClientAdapter {
   executeInference(
   endpoint,
   req,
-  prefixCacheMatchedRatio = 0.5)
+  prefixCacheMatchedRatio = 0.5,
+  nowMs = Date.now())
   {
     const breaker = this.getOrCreateBreaker(endpoint.endpoint_id);
-    if (!endpoint.healthy || !breaker.canPass()) {
-      breaker.recordFailure();
-      throw new Error(`Endpoint ${endpoint.endpoint_id} is currently unhealthy or circuit OPEN (${breaker.getState()})`);
+    if (!endpoint.healthy) {
+      breaker.recordFailure(nowMs);
+      throw new Error(`Endpoint ${endpoint.endpoint_id} is currently unhealthy (${breaker.getState(nowMs)})`);
+    }
+
+    const slot = breaker.tryAcquireRequestSlot(nowMs);
+    if (!slot.admitted) {
+      // [M57-1] Do NOT call breaker.recordFailure() when rejected by an already-OPEN circuit or in-flight HALF_OPEN probe;
+      // otherwise every rejected request resets openedAtMs and prevents the circuit from ever transitioning to HALF_OPEN.
+      throw new Error(
+      `Endpoint ${endpoint.endpoint_id} circuit breaker rejected request (state=${slot.state})`);
+
     }
 
     const bucket = this.getOrCreateBucket(endpoint.endpoint_id);
     const totalRequestedTokens = req.estimatedPromptTokens + req.maxOutputTokens;
-    const consumeRes = bucket.tryConsume(totalRequestedTokens);
+    const consumeRes = bucket.tryConsume(totalRequestedTokens, nowMs);
     if (!consumeRes.allowed) {
+      if (slot.isHalfOpenProbe) {
+        breaker.releaseHalfOpenProbe();
+      }
+      if (consumeRes.unserviceable) {
+        throw new Error(
+        `QuotaCapacityExceeded on ${endpoint.endpoint_id}: requested ${totalRequestedTokens} tokens exceeds bucket capacity`);
+
+      }
       throw new Error(`RateLimitExceeded on ${endpoint.endpoint_id}: wait ${consumeRes.waitMs}ms`);
     }
 
@@ -119,7 +137,7 @@ class ModelPoolClientAdapter {
       cachedTokens: sseSummary.cachedPromptTokens,
       costUsd: Number(costUsd.toFixed(6)),
       outputText: sseSummary.assembledContent,
-      circuitState: breaker.getState(),
+      circuitState: breaker.getState(nowMs),
       sseChunksReceived: sseSummary.chunksReceived
     };
   }

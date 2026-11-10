@@ -1,10 +1,11 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TaskSpecValidator = exports.TaskSpecValidationError = void 0;
 
 
+
 var _models = require("../models.js"); /**
- * @fileoverview M1 TASK-01: TaskSpec v1beta1 Schema Validator & Semantic Sanitizer.
- */class TaskSpecValidationError extends Error {
-  field;
+ * @fileoverview M1 TASK-01 & M57-5: TaskSpec v1beta1 Schema Validator & Semantic Sanitizer
+ * with Strict Finite-Number DRF Poisoning Guard & Dependency Deduplication.
+ */class TaskSpecValidationError extends Error {field;
   constructor(field, message) {
     super(`Invalid TaskSpec field '${field}': ${message}`);
     this.name = "TaskSpecValidationError";
@@ -14,7 +15,7 @@ var _models = require("../models.js"); /**
 
 class TaskSpecValidator {
   static validateAndNormalize(payload) {
-    if (!payload || typeof payload !== "object") {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
       throw new TaskSpecValidationError("root", "Payload must be a JSON object");
     }
     const apiVersion = payload.apiVersion ?? "agent.scheduler.io/v1beta1";
@@ -30,7 +31,7 @@ class TaskSpecValidator {
       throw new TaskSpecValidationError("tenant_id", "tenant_id is required");
     }
     const priorityNum = Number(payload.priority ?? _models.TaskPriority.P2_STANDARD);
-    if (![0, 1, 2, 3].includes(priorityNum)) {
+    if (!Number.isInteger(priorityNum) || ![0, 1, 2, 3].includes(priorityNum)) {
       throw new TaskSpecValidationError("priority", "priority must be 0, 1, 2, or 3");
     }
     const maxTurns = Number(payload.max_turns ?? 30);
@@ -38,8 +39,8 @@ class TaskSpecValidator {
       throw new TaskSpecValidationError("max_turns", "max_turns must be an integer in [1, 500]");
     }
     const timeoutSeconds = Number(payload.timeout_seconds ?? 1800);
-    if (timeoutSeconds < 5 || timeoutSeconds > 86400) {
-      throw new TaskSpecValidationError("timeout_seconds", "timeout_seconds must be in [5, 86400]");
+    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 5 || timeoutSeconds > 86400) {
+      throw new TaskSpecValidationError("timeout_seconds", "timeout_seconds must be a finite number in [5, 86400]");
     }
     const rawRp = payload.resource_profile ?? {};
     const resourceProfile = {
@@ -48,13 +49,42 @@ class TaskSpecValidator {
       act_memory_mb: Number(rawRp.act_memory_mb ?? 8192),
       disk_mb: Number(rawRp.disk_mb ?? 10240)
     };
-    if (resourceProfile.think_cpu_cores <= 0 || resourceProfile.act_cpu_cores < resourceProfile.think_cpu_cores) {
+    if (
+    !Number.isFinite(resourceProfile.think_cpu_cores) ||
+    !Number.isFinite(resourceProfile.act_cpu_cores) ||
+    resourceProfile.think_cpu_cores <= 0 ||
+    resourceProfile.act_cpu_cores < resourceProfile.think_cpu_cores)
+    {
       throw new TaskSpecValidationError(
       "resource_profile.cpu",
-      "act_cpu_cores must be >= think_cpu_cores and > 0");
+      "act_cpu_cores and think_cpu_cores must be finite numbers with act_cpu_cores >= think_cpu_cores > 0");
 
     }
-    const deps = Array.isArray(payload.dependencies) ? payload.dependencies.map(String) : [];
+    if (
+    !Number.isFinite(resourceProfile.act_memory_mb) ||
+    resourceProfile.act_memory_mb <= 0 ||
+    !Number.isFinite(resourceProfile.disk_mb) ||
+    resourceProfile.disk_mb <= 0)
+    {
+      throw new TaskSpecValidationError(
+      "resource_profile.memory",
+      "act_memory_mb and disk_mb must be finite numbers > 0");
+
+    }
+    const expectedSubAgents = Number(payload.expected_SubAgent_count ?? 0);
+    if (!Number.isInteger(expectedSubAgents) || expectedSubAgents < 0 || expectedSubAgents > 256) {
+      throw new TaskSpecValidationError(
+      "expected_SubAgent_count",
+      "expected_SubAgent_count must be an integer in [0, 256]");
+
+    }
+    const rawDeps = Array.isArray(payload.dependencies) ?
+    payload.dependencies.map((d) => String(d ?? "").trim()) :
+    [];
+    if (rawDeps.some((d) => d.length === 0)) {
+      throw new TaskSpecValidationError("dependencies", "Dependency task_id cannot be empty");
+    }
+    const deps = Array.from(new Set(rawDeps));
     if (deps.includes(taskId)) {
       throw new TaskSpecValidationError("dependencies", "Task cannot depend on itself");
     }
@@ -69,7 +99,7 @@ class TaskSpecValidator {
       dependencies: deps,
       idempotency_key: payload.idempotency_key ? String(payload.idempotency_key) : undefined,
       parent_task_id: payload.parent_task_id ? String(payload.parent_task_id) : undefined,
-      expected_SubAgent_count: Number(payload.expected_SubAgent_count ?? 0)
+      expected_SubAgent_count: expectedSubAgents
     });
   }
 }exports.TaskSpecValidator = TaskSpecValidator;

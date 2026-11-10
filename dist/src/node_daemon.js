@@ -1,11 +1,13 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.NodeDaemon = void 0;
 
 
-var _models = require("./models.js");
-var _lease_coordinator = require("./lease_coordinator.js"); /**
- * @fileoverview M4 TASK-18: NodeDaemon Runtime Agent with Turn-Level WAL Checkpointing.
- */
 
+var _models = require("./models.js");
+
+var _lease_coordinator = require("./lease_coordinator.js"); /**
+ * @fileoverview M4 TASK-18 & M57-4: NodeDaemon Runtime Agent with Turn-Level WAL Checkpointing,
+ * Cross-Node Turn Monotonicity Guard, Max-Turns Enforcement & Failure State Rollback.
+ */const TERMINAL_STATES = new Set([_models.TaskState.SUCCEEDED, _models.TaskState.FAILED, _models.TaskState.DEAD_LETTER, _models.TaskState.CANCELLED]);
 class NodeDaemon {
   nodeId;
   totalCpu;
@@ -48,7 +50,13 @@ class NodeDaemon {
       scheduler.leaseCoordinator.getLease(task.task_id)?.fencing_token ?? -1);
 
     }
-    task.current_turn = turnIndex;
+    const latest = this.latestCheckpoint(task.task_id);
+    if (latest && latest.fencing_token === task.lease_fencing_token && turnIndex <= latest.turn_index) {
+      throw new Error(
+      `Non-monotonic turn checkpoint rejected for task '${task.task_id}': turnIndex=${turnIndex} <= latest=${latest.turn_index}`);
+
+    }
+    task.current_turn = Math.max(task.current_turn, turnIndex);
     const record = {
       checkpoint_id: `ckpt-${task.task_id}-t${turnIndex}-f${task.lease_fencing_token}`,
       task_id: task.task_id,
@@ -77,23 +85,38 @@ class NodeDaemon {
   toolName,
   toolArgs)
   {
+    if (TERMINAL_STATES.has(task.state)) {
+      throw new Error(`Cannot execute agent step for task '${task.task_id}' in terminal state '${task.state}'`);
+    }
     if (!scheduler.leaseCoordinator.renewLease(task.task_id, this.nodeId, task.lease_fencing_token)) {
       throw new Error(`Lease renewal failed for task ${task.task_id} on node ${this.nodeId}`);
     }
     const ckpt = this.latestCheckpoint(task.task_id);
-    const nextTurn = ckpt ? ckpt.turn_index + 1 : 1;
+    // [M57-4] Respect task.current_turn across cross-node migrations where local checkpointStore is empty
+    const baseTurn = Math.max(task.current_turn ?? 0, ckpt ? ckpt.turn_index : 0);
+    if (baseTurn >= task.max_turns) {
+      task.state = _models.TaskState.DEAD_LETTER;
+      throw new Error(`Task '${task.task_id}' reached max_turns (${task.max_turns})`);
+    }
+    const nextTurn = baseTurn + 1;
+    const prevState = task.state;
 
-    task.state = _models.TaskState.RUNNING_THINK;
-    task.state = _models.TaskState.RUNNING_ACT;
-    const [result, deduplicated] = sagaGateway.invokeTool(task.task_id, nextTurn, toolName, toolArgs);
+    try {
+      task.state = _models.TaskState.RUNNING_THINK;
+      task.state = _models.TaskState.RUNNING_ACT;
+      const [result, deduplicated] = sagaGateway.invokeTool(task.task_id, nextTurn, toolName, toolArgs);
 
-    this.writeTurnCheckpoint(
-    scheduler,
-    task,
-    nextTurn,
-    `sha256:turn-${nextTurn}`,
-    `s3://checkpoints/${task.task_id}/turn-${nextTurn}.tar.zst`);
+      this.writeTurnCheckpoint(
+      scheduler,
+      task,
+      nextTurn,
+      `sha256:turn-${nextTurn}`,
+      `s3://checkpoints/${task.task_id}/turn-${nextTurn}.tar.zst`);
 
-    return { turn: nextTurn, result, deduplicated };
+      return { turn: nextTurn, result, deduplicated };
+    } catch (err) {
+      task.state = prevState;
+      throw err;
+    }
   }
 }exports.NodeDaemon = NodeDaemon;

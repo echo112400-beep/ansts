@@ -1,6 +1,6 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ParallelCowGitBisectCoordinator = void 0; /**
- * @fileoverview M22 Parallel Copy-on-Write Git Bisect & Speculative Multi-Agent Test Runner.
- * Connected to `LayerFsWorkspaceDriver` for real CoW branch forking and shell test execution.
+ * @fileoverview M22 & M57-2: Parallel Copy-on-Write Git Bisect & Speculative Multi-Agent Test Runner.
+ * Connected to `LayerFsWorkspaceDriver` for real CoW branch forking, shell test execution, and automatic probe branch cleanup.
  */
 
 
@@ -32,9 +32,12 @@ class ParallelCowGitBisectCoordinator {
 
   /**
    * Executes a live binary-search CoW bisect across real LayerFS commits by forking ephemeral
-   * zero-copy branches (`forkCommitBranch`) and running `testShellCommand` in each materialized workspace.
+   * zero-copy branches (`forkBranch`), running `testShellCommand` in each materialized workspace,
+   * and automatically cleaning up temporary probe branches (`deleteBranch`) so ephemeral probe
+   * objects do not leak or pin orphan CAS blobs.
    */
   executeLiveLayerFsBisect(params)
+
 
 
 
@@ -47,6 +50,7 @@ class ParallelCowGitBisectCoordinator {
     const res = this.identifyFirstBadCommit(params.commits, (commitId) => {
       const branchName = `bisect-probe-${commitId}-${probedCommits.length}`;
       params.driver.forkBranch(commitId, branchName);
+      let passed = false;
       try {
         params.driver.executeEphemeralBashWorkspace({
           branchName,
@@ -54,11 +58,17 @@ class ParallelCowGitBisectCoordinator {
           stepId: `bisect-${commitId}`,
           command: params.testShellCommand
         });
-        probedCommits.push({ commitId, passed: true, branchName });
+        passed = true;
         return true;
       } catch {
-        probedCommits.push({ commitId, passed: false, branchName });
+        passed = false;
         return false;
+      } finally {
+        let cleanedUp = false;
+        if (!params.retainProbeBranches) {
+          cleanedUp = params.driver.deleteBranch(branchName);
+        }
+        probedCommits.push({ commitId, passed, branchName, cleanedUp });
       }
     });
 

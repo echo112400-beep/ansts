@@ -1,4 +1,5 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var _layerfs_store_engine = require("../checkpoint/layerfs_store_engine.js");
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var _zero_trust_security_guard = require("../runtime/zero_trust_security_guard.js");
+var _layerfs_store_engine = require("../checkpoint/layerfs_store_engine.js");
 var crypto = _interopRequireWildcard(require("node:crypto"));
 
 
@@ -5957,6 +5958,211 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           facetAndIsolateLeakGuardVerified
         },
         allM56RisksEliminated
+      }
+    };
+  }
+
+  /**
+   * [M57] Executes the 6-Point Runtime Edge, Router Cooldown/Quota, Leaf-First CAS GC, Role-Isolated Scale/Drain,
+   * NodeDaemon Turn Monotonicity, Validator NaN/DRF Guard & Vsock Stream Framing Audit (`POST /v1beta1/management/system/runtime-edge-audit`).
+   */
+  async executeRuntimeEdgeAndGatewayAudit(params)
+
+
+  {
+    // 1. ModelPoolClientAdapter cooldown preservation & oversized token guard
+    const pool = new _pool_client.ModelPoolClientAdapter();
+    const ep = new _models.LlmEndpointMetrics({
+      endpoint_id: "ep-m57-audit",
+      provider: "openai",
+      model_name: "gpt-4o",
+      healthy: false,
+      ttft_ewma_ms: 100
+    });
+    for (let i = 0; i < 3; i++) {
+      try {
+        pool.executeInference(ep, { taskId: "t1", turnIndex: 1, prompt: "p", estimatedPromptTokens: 50, maxOutputTokens: 50 }, 0.5, 1000);
+      } catch {
+
+        // expected
+      }}
+    ep.healthy = true;
+    try {
+      pool.executeInference(ep, { taskId: "t1", turnIndex: 1, prompt: "p", estimatedPromptTokens: 50, maxOutputTokens: 50 }, 0.5, 10_000);
+    } catch {
+
+      // rejected at 10s without resetting openedAtMs=1000
+    }const recoveredAt16s = pool.executeInference(
+    ep,
+    { taskId: "t1", turnIndex: 1, prompt: "p", estimatedPromptTokens: 50, maxOutputTokens: 50 },
+    0.5,
+    16_000);
+
+    let oversizedRejected = false;
+    try {
+      pool.executeInference(ep, { taskId: "t1", turnIndex: 2, prompt: "p", estimatedPromptTokens: 200_000, maxOutputTokens: 100_000 }, 0.5, 17_000);
+    } catch (e) {
+      oversizedRejected = e.message.includes("QuotaCapacityExceeded");
+    }
+    const routerCooldownAndQuotaVerified = recoveredAt16s.circuitState === "CLOSED" && oversizedRejected;
+
+    // 2. ParallelCowGitBisectCoordinator probe cleanup & DistributedCasGcSweeper leaf-first sweep
+    const drv = new _layerfs_workspace_driver.LayerFsWorkspaceDriver();
+    const c1 = drv.executeInProcessFileTool({
+      branchName: "main",
+      agentId: "agent-1",
+      stepId: "s1",
+      operation: "write", filePath: "app.ts", newContent: "const prefix = \"0123456789abcdef0123456789abcdef\";\nexport const a = 1;\n"
+    });
+    const bisect = new _parallel_cow_bisect.ParallelCowGitBisectCoordinator();
+    const bisectOut = bisect.executeLiveLayerFsBisect({
+      driver: drv,
+      commits: [c1.commitId],
+      testShellCommand: "test -f app.ts"
+    });
+    drv.forkBranch(c1.commitId, "temp-orphan-branch");
+    drv.executeInProcessFileTool({
+      branchName: "temp-orphan-branch",
+      agentId: "agent-2",
+      stepId: "s2",
+      operation: "write", filePath: "orphan.ts", newContent: "const shared = \"abcdefghijklmnopqrstuvwxyz0123456789\";\nexport const v = 1;\n"
+    });
+    drv.executeInProcessFileTool({
+      branchName: "temp-orphan-branch",
+      agentId: "agent-2",
+      stepId: "s3",
+      operation: "write", filePath: "orphan.ts", newContent: "const shared = \"abcdefghijklmnopqrstuvwxyz0123456789\";\nexport const v = 2;\n"
+    });
+    drv.deleteBranch("temp-orphan-branch");
+    const sweeper = new _distributed_gc_sweeper.DistributedCasGcSweeper();
+    const sweepRes = sweeper.sweepLayerFsWorkspaceStore(drv);
+    const casGcAndBisectCleanupVerified =
+    bisectOut.probedCommits[0]?.cleanedUp === true &&
+    sweepRes.sweptBlobIds.length >= 2 &&
+    sweepRes.pinnedOrphanBlobIds.length === 0;
+
+    // 3. ManualFleetScaleController role-isolated rebalance & atomic cordon/drain pre-check
+    const scaleCtrl = new _manual_scale_controller.ManualFleetScaleController();
+    scaleCtrl.registerBareMetalNode({
+      nodeId: "worker-audit-1",
+      ipAddress: "10.0.1.10",
+      role: "worker",
+      runningCells: ["c1", "c2", "c3", "c4"],
+      systemdUnit: "ansts-node-daemon.service"
+    });
+    const storageOut = scaleCtrl.scaleOutNode("storage-audit-1", "10.0.2.10", "storage");
+    let drainRejected = false;
+    try {
+      scaleCtrl.cordonAndDrainNode("worker-audit-1");
+    } catch {
+      drainRejected = true;
+    }
+    const workerNodeAfterFailedDrain = scaleCtrl.listNodes().find((n) => n.nodeId === "worker-audit-1");
+    const scaleRoleAndDrainAtomicityVerified =
+    storageOut.rebalancedCells.length === 0 &&
+    drainRejected &&
+    workerNodeAfterFailedDrain?.state === "ACTIVE";
+
+    // 4. NodeDaemon cross-node turn monotonicity
+    const sched = new _scheduler.CoreScheduler5D();
+    const d1 = new _node_daemon.NodeDaemon("node-audit-1");
+    const d2 = new _node_daemon.NodeDaemon("node-audit-2");
+    sched.registerOrUpdateNode(d1.emitHeartbeat(0));
+    sched.registerOrUpdateNode(d2.emitHeartbeat(0));
+    const saga = new _saga_gateway.SagaToolGateway();
+    saga.registerTool("ping", _models.ToolCallEffectClass.READ_ONLY, () => ({ pong: true }));
+    const tSpec = new _models.TaskSpec({ task_id: "task-m57-audit", tenant_id: "Northstar", priority: _models.TaskPriority.P1_HIGH, max_turns: 4 });
+    sched.submitTask(tSpec);
+    sched.scheduleTick(1000);
+    const turn1 = d1.executeAgentStep(sched, saga, tSpec, "ping", {});
+    const lease2 = sched.leaseCoordinator.acquireLease(tSpec.task_id, "node-audit-2", 2000);
+    tSpec.lease_fencing_token = lease2.fencing_token;
+    const turn2 = d2.executeAgentStep(sched, saga, tSpec, "ping", {});
+    const nodeDaemonTurnMonotonicityVerified = turn1.turn === 1 && turn2.turn === 2;
+
+    // 5. TaskSpecValidator NaN/DRF guard & deduplication
+    let nanRejected = false;
+    try {
+      _validator.TaskSpecValidator.validateAndNormalize({
+        task_id: "nan-task",
+        tenant_id: "Northstar",
+        resource_profile: { think_cpu_cores: "NaN", act_cpu_cores: 2 }
+      });
+    } catch {
+      nanRejected = true;
+    }
+    const normalizedSpec = _validator.TaskSpecValidator.validateAndNormalize({
+      task_id: "valid-m57-task",
+      tenant_id: "Northstar",
+      dependencies: ["d1", "d1", "d2"]
+    });
+    const validatorAndGatewayGuardVerified = nanRejected && normalizedSpec.dependencies.length === 2;
+
+    // 6. ZeroTrustVsockHostDaemon incomplete frame guard & ZeroTrustSandboxSecurityGuard command patterns
+    let incompleteFrameCaught = false;
+    try {
+      const full = _vsock_daemon.ZeroTrustVsockHostDaemon.encodeFrame({ hello: "world" });
+      _vsock_daemon.ZeroTrustVsockHostDaemon.decodeFrame(full.subarray(0, 6));
+    } catch {
+      incompleteFrameCaught = true;
+    }
+    const secGuard = new _zero_trust_security_guard.ZeroTrustSandboxSecurityGuard();
+    const vsockAndSecurityGuardVerified =
+    incompleteFrameCaught &&
+    !secGuard.evaluateShellCommand("rm -rf /*").allowed &&
+    !secGuard.evaluateShellCommand("curl http://169.254.169.254/latest/meta-data/").allowed &&
+    !secGuard.evaluateShellCommand("cat /var/run/docker.sock").allowed;
+
+    const allM57RisksEliminated =
+    routerCooldownAndQuotaVerified &&
+    casGcAndBisectCleanupVerified &&
+    scaleRoleAndDrainAtomicityVerified &&
+    nodeDaemonTurnMonotonicityVerified &&
+    validatorAndGatewayGuardVerified &&
+    vsockAndSecurityGuardVerified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M57 运行时边缘、连接池冷却/配额、拓扑叶子优先 GC、角色隔离扩缩容与 Vsock 分帧安全自检 (Router=${routerCooldownAndQuotaVerified}, CasGcBisect=${casGcAndBisectCleanupVerified}, ScaleRole=${scaleRoleAndDrainAtomicityVerified}, NodeDaemonTurn=${nodeDaemonTurnMonotonicityVerified}, ValidatorNaN=${validatorAndGatewayGuardVerified}, VsockSec=${vsockAndSecurityGuardVerified})`,
+    "SystemWide / M57-RuntimeEdgeAudit",
+    "ALL_M57_RISKS_ELIMINATED");
+
+
+    return {
+      status: 200,
+      body: {
+        routerCooldownAndQuota1: {
+          recoveredStateAt16s: recoveredAt16s.circuitState,
+          oversizedRejected,
+          routerCooldownAndQuotaVerified
+        },
+        casGcAndBisectCleanup2: {
+          bisectProbeCleanedUp: bisectOut.probedCommits[0]?.cleanedUp,
+          sweptCount: sweepRes.sweptBlobIds.length,
+          pinnedOrphanCount: sweepRes.pinnedOrphanBlobIds.length,
+          casGcAndBisectCleanupVerified
+        },
+        scaleRoleAndDrainAtomicity3: {
+          storageRebalancedCells: storageOut.rebalancedCells.length,
+          workerStateAfterFailedDrain: workerNodeAfterFailedDrain?.state,
+          scaleRoleAndDrainAtomicityVerified
+        },
+        nodeDaemonTurnMonotonicity4: {
+          turnOnNode1: turn1.turn,
+          turnOnNode2AfterMigration: turn2.turn,
+          nodeDaemonTurnMonotonicityVerified
+        },
+        validatorAndGatewayGuard5: {
+          nanRejected,
+          dedupedDependenciesCount: normalizedSpec.dependencies.length,
+          validatorAndGatewayGuardVerified
+        },
+        vsockAndSecurityGuard6: {
+          incompleteFrameCaught,
+          vsockAndSecurityGuardVerified
+        },
+        allM57RisksEliminated
       }
     };
   }

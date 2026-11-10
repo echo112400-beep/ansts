@@ -1,5 +1,6 @@
 /**
- * @fileoverview M1 TASK-04: Stateless HTTP/REST & SSE Gateway Server.
+ * @fileoverview M1 TASK-04 & M57-5: Stateless HTTP/REST & SSE Gateway Server
+ * with Bounded Payload Size Guard (HTTP 413) to prevent OOM DoS.
  */
 import * as http from "node:http";
 import { TaskSpecValidator, TaskSpecValidationError } from "./validator.js";
@@ -11,16 +12,19 @@ export class ApiGatewayServer {
   private readonly scheduler: CoreScheduler5D;
   private readonly backpressure: IngressBackpressureController;
   public readonly sseGateway: SseEventStreamGateway;
+  public readonly maxBodyBytes: number;
   private server: http.Server | null = null;
 
   constructor(
     scheduler: CoreScheduler5D,
     backpressure = new IngressBackpressureController(),
-    sseGateway = new SseEventStreamGateway()
+    sseGateway = new SseEventStreamGateway(),
+    maxBodyBytes = 1024 * 1024
   ) {
     this.scheduler = scheduler;
     this.backpressure = backpressure;
     this.sseGateway = sseGateway;
+    this.maxBodyBytes = maxBodyBytes;
   }
 
   public handleSubmitRequest(
@@ -74,8 +78,21 @@ export class ApiGatewayServer {
         }
         if (req.method === "POST" && req.url === "/v1/tasks") {
           const chunks: Buffer[] = [];
-          req.on("data", (c: Buffer) => chunks.push(c));
+          let totalBytes = 0;
+          let aborted = false;
+          req.on("data", (c: Buffer) => {
+            if (aborted) return;
+            totalBytes += c.byteLength;
+            if (totalBytes > this.maxBodyBytes) {
+              aborted = true;
+              res.writeHead(413, { "content-type": "application/json" });
+              res.end(JSON.stringify({ error: "PAYLOAD_TOO_LARGE", maxBodyBytes: this.maxBodyBytes }));
+              return;
+            }
+            chunks.push(c);
+          });
           req.on("end", () => {
+            if (aborted) return;
             try {
               const body = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as Record<string, unknown>;
               const resp = this.handleSubmitRequest(body);

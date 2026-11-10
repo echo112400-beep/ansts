@@ -3,8 +3,8 @@
 
 
 var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M13 TASK-62 & M53-4: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller
- * with Drain-Token Lease TTL Auto-Expiration to prevent rolling-shutdown deadlocks.
+ * @fileoverview M13 TASK-62, M53-4 & M57-3: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller
+ * with Role-Isolated Cell Rebalancing, Atomic Cordon/Drain Pre-Check, and Drain-Token Lease TTL Auto-Expiration.
  */ /**
  * Consistent Hash Virtual Slot Ring Manager (`VirtualHashSlotRingManager`) for Non-K8s Bare-Metal Manual Scale-Out/In.
  * Maps keys onto a ring of `totalVirtualSlots` (default 1024) with configurable virtual nodes per physical node.
@@ -95,18 +95,30 @@ class ManualFleetScaleController {
   nodes = new Map();
   slotRing = new VirtualHashSlotRingManager(1024, 16);
 
-  registerBareMetalNode(node) {
+  registerBareMetalNode(
+  node)
+  {
+    const existing = this.nodes.get(node.nodeId);
+    const mergedCells = node.runningCells ?
+    [...node.runningCells] :
+    existing ?
+    [...existing.runningCells] :
+    [];
     const full = {
       ...node,
       state: "ACTIVE",
-      runningCells: node.runningCells ? [...node.runningCells] : []
+      runningCells: Array.from(new Set(mergedCells))
     };
     this.nodes.set(node.nodeId, full);
     this.slotRing.addNode(node.nodeId);
     return full;
   }
 
-  scaleOutNode(nodeId, ipAddress, role = "worker")
+  scaleOutNode(
+  nodeId,
+  ipAddress,
+  role = "worker")
+
 
 
   {
@@ -117,8 +129,14 @@ class ManualFleetScaleController {
       systemdUnit: role === "control-plane" ? "celld.service" : "ansts-node-daemon.service"
     });
     const rebalancedCells = [];
+    // [M57-3] Role-isolated rebalancing: only steal cells from ACTIVE nodes of the exact same role
     for (const existing of this.nodes.values()) {
-      if (existing.nodeId !== nodeId && existing.state === "ACTIVE" && existing.runningCells.length > 2) {
+      if (
+      existing.nodeId !== nodeId &&
+      existing.state === "ACTIVE" &&
+      existing.role === role &&
+      existing.runningCells.length > 2)
+      {
         const moved = existing.runningCells.pop();
         newNode.runningCells.push(moved);
         rebalancedCells.push(moved);
@@ -135,14 +153,16 @@ class ManualFleetScaleController {
     if (!source) {
       throw new Error(`Node '${nodeId}' not found in ManualFleetScaleController`);
     }
-    source.state = "CORDONED";
     const activeTargets = Array.from(this.nodes.values()).filter(
     (n) => n.nodeId !== nodeId && n.state === "ACTIVE" && n.role === source.role);
 
+    // [M57-3] Atomic pre-check BEFORE mutating source.state to CORDONED so a rejected drain on the last active node
+    // of a role never leaves that node stranded in CORDONED state.
     if (activeTargets.length === 0 && source.runningCells.length > 0) {
       throw new Error(`Cannot drain node '${nodeId}': no other ACTIVE nodes with role '${source.role}'`);
     }
 
+    source.state = "CORDONED";
     source.state = "DRAINING";
     const drainedCells = [];
     let idx = 0;

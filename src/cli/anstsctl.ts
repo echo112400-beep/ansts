@@ -368,6 +368,16 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-runtime-edge-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/runtime-edge-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-kernel-storage-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/system/kernel-storage-audit`, {
       method: "POST",

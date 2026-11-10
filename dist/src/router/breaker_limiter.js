@@ -1,6 +1,6 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ThreeStateCircuitBreaker = exports.SlidingWindowTokenBucket = void 0; /**
- * @fileoverview M3 TASK-07 & M54-2: Dual-Token Bucket Rate Limiter (TPM/RPM) & 3-State Circuit Breaker
- * with Single-Probe Half-Open Stampede Guard & Stuck-Probe Timeout Recovery.
+ * @fileoverview M3 TASK-07, M54-2 & M57-1: Dual-Token Bucket Rate Limiter (TPM/RPM) & 3-State Circuit Breaker
+ * with Single-Probe Half-Open Stampede Guard, Stuck-Probe Timeout Recovery & Unserviceable Oversized Request Guard.
  */
 
 
@@ -19,17 +19,27 @@ class SlidingWindowTokenBucket {
     this.lastRefillMs = nowMs;
   }
 
-  tryConsume(tokens, nowMs = Date.now()) {
+  tryConsume(
+  tokens,
+  nowMs = Date.now())
+  {
+    if (!Number.isFinite(tokens) || tokens < 0 || this.maxRpm <= 0 || this.maxTpm <= 0 || tokens > this.maxTpm) {
+      return { allowed: false, waitMs: -1, unserviceable: true };
+    }
     this.refill(nowMs);
     if (this.remainingRequests >= 1 && this.remainingTokens >= tokens) {
       this.remainingRequests -= 1;
       this.remainingTokens -= tokens;
-      return { allowed: true, waitMs: 0 };
+      return { allowed: true, waitMs: 0, unserviceable: false };
     }
     const deficitTokens = Math.max(0, tokens - this.remainingTokens);
     const tokenWaitMs = deficitTokens / this.maxTpm * 60_000;
     const reqWaitMs = this.remainingRequests < 1 ? 1 / this.maxRpm * 60_000 : 0;
-    return { allowed: false, waitMs: Math.ceil(Math.max(tokenWaitMs, reqWaitMs, 50)) };
+    return {
+      allowed: false,
+      waitMs: Math.ceil(Math.max(tokenWaitMs, reqWaitMs, 50)),
+      unserviceable: false
+    };
   }
 
   refill(nowMs) {
@@ -110,6 +120,13 @@ class ThreeStateCircuitBreaker {
     return { admitted: false, state: "OPEN", isHalfOpenProbe: false };
   }
 
+  releaseHalfOpenProbe() {
+    if (this.state === "HALF_OPEN") {
+      this.halfOpenProbeInFlight = false;
+      this.halfOpenProbeStartedAtMs = 0;
+    }
+  }
+
   recordSuccess() {
     this.consecutiveFailures = 0;
     this.state = "CLOSED";
@@ -122,8 +139,10 @@ class ThreeStateCircuitBreaker {
     this.halfOpenProbeInFlight = false;
     this.halfOpenProbeStartedAtMs = 0;
     if (this.state === "HALF_OPEN" || this.consecutiveFailures >= this.failureThreshold) {
+      if (this.state !== "OPEN" || nowMs - this.openedAtMs >= this.openCooldownMs) {
+        this.openedAtMs = nowMs;
+      }
       this.state = "OPEN";
-      this.openedAtMs = nowMs;
     }
   }
 }exports.ThreeStateCircuitBreaker = ThreeStateCircuitBreaker;

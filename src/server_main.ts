@@ -2337,6 +2337,18 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M57] Runtime Edge, Router Cooldown/Quota, Leaf-First CAS GC, Role-Isolated Scale/Drain, NodeDaemon Turn Monotonicity, Validator NaN/DRF Guard & Vsock Framing Audit (`POST /v1beta1/management/system/runtime-edge-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/runtime-edge-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeRuntimeEdgeAndGatewayAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M56] Unified Cold-Start Lease/Fencing Rehydration, LayerFS 3-Way Merge Deletion & Base-Object Pinning, P0 Emergency Ingress Headroom, CelldAdmin Epoch Guard & Facet/Isolate Memory Leak Elimination Audit (`POST /v1beta1/management/system/kernel-storage-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/kernel-storage-audit") {
       const body = await this.readJsonBody(req);

@@ -1,26 +1,30 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ApiGatewayServer = void 0;
 
 
+
 var http = _interopRequireWildcard(require("node:http"));
 var _validator = require("./validator.js");
 var _backpressure = require("./backpressure.js");
 var _sse_stream = require("./sse_stream.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M1 TASK-04: Stateless HTTP/REST & SSE Gateway Server.
- */
-class ApiGatewayServer {
+ * @fileoverview M1 TASK-04 & M57-5: Stateless HTTP/REST & SSE Gateway Server
+ * with Bounded Payload Size Guard (HTTP 413) to prevent OOM DoS.
+ */class ApiGatewayServer {
   scheduler;
   backpressure;
   sseGateway;
+  maxBodyBytes;
   server = null;
 
   constructor(
   scheduler,
   backpressure = new _backpressure.IngressBackpressureController(),
-  sseGateway = new _sse_stream.SseEventStreamGateway())
+  sseGateway = new _sse_stream.SseEventStreamGateway(),
+  maxBodyBytes = 1024 * 1024)
   {
     this.scheduler = scheduler;
     this.backpressure = backpressure;
     this.sseGateway = sseGateway;
+    this.maxBodyBytes = maxBodyBytes;
   }
 
   handleSubmitRequest(
@@ -74,8 +78,21 @@ class ApiGatewayServer {
         }
         if (req.method === "POST" && req.url === "/v1/tasks") {
           const chunks = [];
-          req.on("data", (c) => chunks.push(c));
+          let totalBytes = 0;
+          let aborted = false;
+          req.on("data", (c) => {
+            if (aborted) return;
+            totalBytes += c.byteLength;
+            if (totalBytes > this.maxBodyBytes) {
+              aborted = true;
+              res.writeHead(413, { "content-type": "application/json" });
+              res.end(JSON.stringify({ error: "PAYLOAD_TOO_LARGE", maxBodyBytes: this.maxBodyBytes }));
+              return;
+            }
+            chunks.push(c);
+          });
           req.on("end", () => {
+            if (aborted) return;
             try {
               const body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
               const resp = this.handleSubmitRequest(body);

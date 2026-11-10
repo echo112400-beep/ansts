@@ -1,18 +1,26 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ZeroTrustSandboxSecurityGuard = void 0;
 
 
+
 var _ebpf_lsm_bridge = require("./ebpf_lsm_bridge.js");
 var _vsock_bridge = require("./vsock_bridge.js"); /**
- * @fileoverview M22 & M36 Zero-Trust Sandbox Security Guard (Seccomp-BPF, Landlock, Shell Command & Egress Policy).
- */class ZeroTrustSandboxSecurityGuard {
-  lsmBridge = new _ebpf_lsm_bridge.EbpfLsmSecurityBridge();
+ * @fileoverview M22, M36 & M57-6: Zero-Trust Sandbox Security Guard (Seccomp-BPF, Landlock, Shell Command & Egress Policy)
+ * with Root Glob (`/*`), `--no-preserve-root`, Docker Socket & Cloud IMDS (`169.254.169.254`) Blocking.
+ */class ZeroTrustSandboxSecurityGuard {lsmBridge = new _ebpf_lsm_bridge.EbpfLsmSecurityBridge();
   vsockBridge = new _vsock_bridge.ZeroTrustVsockBridge();
 
   blockedCommandPatterns = [
-  { pattern: /rm\s+-rf\s+\/(?:\s|$)/i, reason: "ROOT_FS_DESTRUCTION_BLOCKED" },
+  {
+    pattern: /rm\s+(?:-[a-zA-Z]+\s+)*(?:--no-preserve-root\s+)?-?[rR][fF]?\s+\/(?:\*|\s|$)|rm\s+-rf\s+--no-preserve-root/i,
+    reason: "ROOT_FS_DESTRUCTION_BLOCKED"
+  },
   { pattern: /:\(\)\s*\{\s*:\|:&\s*\};:/, reason: "FORK_BOMB_BLOCKED" },
-  { pattern: /\/etc\/shadow|\/proc\/kcore/, reason: "SENSITIVE_KERNEL_FILE_ACCESS_BLOCKED" },
-  { pattern: /\/dev\/tcp\//, reason: "RAW_TCP_REVERSE_SHELL_BLOCKED" }];
+  {
+    pattern: /\/etc\/shadow|\/proc\/kcore|\/var\/run\/docker\.sock|docker\.sock/,
+    reason: "SENSITIVE_KERNEL_FILE_ACCESS_BLOCKED"
+  },
+  { pattern: /\/dev\/tcp\//, reason: "RAW_TCP_REVERSE_SHELL_BLOCKED" },
+  { pattern: /169\.254\.169\.254|metadata\.google\.internal/i, reason: "CLOUD_IMDS_METADATA_BLOCKED" }];
 
 
   evaluateAction(params)
