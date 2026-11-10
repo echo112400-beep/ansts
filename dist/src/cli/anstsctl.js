@@ -264,6 +264,50 @@ gatewayUrl = process.env.ANSTS_GATEWAY_URL ?? "http://127.0.0.1:18080")
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-snapshot") {
+    const action = rest[0] ?? "verify_cold_start_rehydration";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/persistence/snapshot`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-container") {
+    const action = rest[0] ?? "start_and_probe_container";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/celld/container-workflow`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-speculative") {
+    const sourceBranch = rest[0] ?? "feat-ns-auth";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/layerfs/speculative`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sourceBranch, mergeWinningBranch: true, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-autoscale") {
+    const action = rest[0] ?? "probe_and_autoscale";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/cluster/autoscale-psi`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-sandbox") {
     const action = rest[0] ?? "allocate_and_mount";
     const taskId = rest[1] ?? "task-ns-8841";

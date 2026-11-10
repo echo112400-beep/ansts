@@ -563,6 +563,79 @@
       }
       return { ok: true, status: 200, data: state.canary, fromLiveBackend: false };
     }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/persistence/snapshot') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          action: body.action || 'verify_cold_start_rehydration',
+          restoredTasksCount: state.tasks.length,
+          restoredFinopsCount: state.tenants.length,
+          restoredApprovalsCount: state.approvals.length,
+          restoredMcpCount: (state.mcpState?.tools || []).length,
+          rpoZeroVerified: true,
+          tableCounts: { persisted_tasks: state.tasks.length, persisted_leases: state.tasks.length, persisted_finops_ledgers: state.tenants.length, persisted_mcp_tools: 1 }
+        },
+        fromLiveBackend: false
+      };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/celld/container-workflow') {
+      if (body.action === 'run_durable_workflow') {
+        return {
+          ok: true,
+          status: 200,
+          data: {
+            workflowId: 'wf-release-ns-8841',
+            stepName: 'step-ltx-checkpoint',
+            firstExecution: { replayedFromJournal: false, result: { ltxKey: 'ltx/cell-wf-release-ns-8841/tx-00000001-f14.ltx', sizeBytes: 64 } },
+            crashReplayExecution: { replayedFromJournal: true, result: { ltxKey: 'ltx/cell-wf-release-ns-8841/tx-00000001-f14.ltx', sizeBytes: 64 } }
+          },
+          fromLiveBackend: false
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          cellId: 'cell-sandbox-ns-8841',
+          started: { running: true, ociRuntime: 'kata', resolvConf: ['1.1.1.1', '1.0.0.1'], committedMemoryMb: 6144 },
+          execResult: { exitCode: 0, rawStdout: 'nameserver 1.1.1.1' },
+          webSocketProbe: { status: 101, webSocketUpgraded: true, port: 8080 },
+          celldFenceImdsBlocked: true
+        },
+        fromLiveBackend: false
+      };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/layerfs/speculative') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          taskId: 'task-ns-8841',
+          sourceBranch: 'feat-ns-auth',
+          deterministicReproducible: true,
+          branches: [
+            { branchName: 'spec-task-ns-8841-a', commitId: 'C4', seed: 20261110 },
+            { branchName: 'spec-task-ns-8841-b', commitId: 'C5', seed: 20261110 }
+          ],
+          mergeResult: { mergedCommitId: 'C6' }
+        },
+        fromLiveBackend: false
+      };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/cluster/autoscale-psi') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          psiDefense: { level: 'FREEZE_AND_CHECKPOINT', evictedTaskIds: ['task-ns-8842'] },
+          backpressure: { mode: 'RED_SHEDDING', recommendedDispatchRateScale: 0.2 },
+          queueSharding: { previousShards: 16, newShards: 32, rebalanced: true },
+          poolScaling: { totalContainerPoolSize: 8 }
+        },
+        fromLiveBackend: false
+      };
+    }
     if (method === 'POST' && endpointPath === '/v1beta1/management/runtime/sandbox') {
       if (body.action === 'allocate_and_mount') {
         return {
@@ -1533,6 +1606,11 @@
             <button type="button" class="small" data-action="runtime-sandbox-op" data-op="vsock_exec_and_io">Vsock 真实文件 I/O 与子进程执行</button>
             <button type="button" class="small" data-action="runtime-sandbox-op" data-op="issue_and_verify_mtls_tee">Ed25519 SPIFFE SVID &amp; SEV-SNP 验签</button>
             <button type="button" class="small" data-action="runtime-sandbox-op" data-op="migrate_celld_actor">CelldAdmin 跨节点热迁移 DO Cell</button>
+            <button type="button" class="small primary" data-action="m48-op" data-endpoint="/v1beta1/management/persistence/snapshot" data-op="verify_cold_start_rehydration">8表全量快照与冷启动恢复校验 (/v1beta1/management/persistence/snapshot)</button>
+            <button type="button" class="small" data-action="m48-op" data-endpoint="/v1beta1/management/celld/container-workflow" data-op="start_and_probe_container">原生 kata ctx.container + celld-fence 探针</button>
+            <button type="button" class="small" data-action="m48-op" data-endpoint="/v1beta1/management/celld/container-workflow" data-op="run_durable_workflow">DurableWorkflowContext 崩溃重放验证</button>
+            <button type="button" class="small primary" data-action="m48-op" data-endpoint="/v1beta1/management/layerfs/speculative" data-op="speculative">确定性投机多分支推演与合并 (/v1beta1/management/layerfs/speculative)</button>
+            <button type="button" class="small danger" data-action="m48-op" data-endpoint="/v1beta1/management/cluster/autoscale-psi" data-op="simulate_psi_spike">Linux PSI 内存风暴防御与队列自动分片</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>
@@ -2307,6 +2385,22 @@
           '</tbody></table></div>';
       }
       showToast('已加载分支 ' + (res.data.branchName || '') + ' 的 LayerFS 行级代码溯源');
+      return;
+    }
+    if (action === 'm48-op') {
+      const ep = target.getAttribute('data-endpoint') || '/v1beta1/management/persistence/snapshot';
+      const op = target.getAttribute('data-op') || 'verify_cold_start_rehydration';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', ep, {
+        action: op,
+        taskId: 'task-ns-8841',
+        sourceBranch: 'feat-ns-auth',
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast('已完成 M48 全栈实机操作 [' + op + ']');
       return;
     }
     if (action === 'runtime-sandbox-op') {

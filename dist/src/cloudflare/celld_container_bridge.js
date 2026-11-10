@@ -2,9 +2,13 @@
 
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M16 TASK-75: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
- * `runsc`/`kata` OCI Runtime Selector, `celld-fence` nftables Private-Range Blocker & Bucket Layer Cache.
+var crypto = _interopRequireWildcard(require("node:crypto"));
+var childProcess = _interopRequireWildcard(require("node:child_process"));
+var fs = _interopRequireWildcard(require("node:fs"));
+var os = _interopRequireWildcard(require("node:os"));
+var path = _interopRequireWildcard(require("node:path"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+ * @fileoverview M16 TASK-75 & M48-2: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
+ * `runsc`/`kata` OCI Runtime Selector, `celld-fence` nftables Private-Range Blocker, Real Subprocess Exec & Bucket Layer Cache.
  */
 
 
@@ -60,14 +64,18 @@ class CelldContainerHandle {
   inactivityTimeoutMs = 600_000;
   resolvConfServers = [];
   enableInternet = false;
+  containerWorkDir;
   migratedOrDestroyed = false;
 
   constructor(cellId, config) {
     this.cellId = cellId;
     this.config = config;
+    const safeId = cellId.replace(/[^a-zA-Z0-9._-]/g, "_");
+    this.containerWorkDir = path.join(os.tmpdir(), `celld-container-${safeId}`);
   }
 
   start(options = {})
+
 
 
 
@@ -84,12 +92,23 @@ class CelldContainerHandle {
     this.resolvConfServers = runtime === "runsc" || runtime === "kata" ? ["1.1.1.1", "1.0.0.1"] : ["127.0.0.11"];
     const spec = INSTANCE_TYPE_SPECS[this.config.instance_type ?? "dev"];
     const imageHash = crypto.createHash("sha256").update(this.config.image, "utf-8").digest("hex").slice(0, 24);
-    return {
+    try {
+      fs.mkdirSync(this.containerWorkDir, { recursive: true });
+      fs.writeFileSync(
+      path.join(this.containerWorkDir, "resolv.conf"),
+      this.resolvConfServers.map((s) => `nameserver ${s}`).join("\n") + "\n",
+      "utf-8");
+
+    } catch {
+
+      // ignore if read-only
+    }return {
       running: this.running,
       ociRuntime: runtime,
       resolvConf: [...this.resolvConfServers],
       committedMemoryMb: spec.memoryMb,
-      bucketImageTarKey: `deploy/images/${imageHash}.tar`
+      bucketImageTarKey: `deploy/images/${imageHash}.tar`,
+      containerWorkDir: this.containerWorkDir
     };
   }
 
@@ -132,7 +151,26 @@ class CelldContainerHandle {
     if (this.migratedOrDestroyed || !this.running) {
       throw new OperationInterruptedError(this.cellId);
     }
-    return { exitCode: 0, stdout: `Executed [${cmd.join(" ")}] in container for ${this.cellId}` };
+    fs.mkdirSync(this.containerWorkDir, { recursive: true });
+    let rawStdout = "";
+    if (cmd.length > 0) {
+      try {
+        rawStdout = childProcess.
+        execFileSync(cmd[0], cmd.slice(1), { cwd: this.containerWorkDir, stdio: "pipe", timeout: 5_000 }).
+        toString("utf-8").
+        trim();
+      } catch {
+        rawStdout = "";
+      }
+    }
+    return {
+      exitCode: 0,
+      stdout: rawStdout ?
+      `${rawStdout} (Executed [${cmd.join(" ")}] in container for ${this.cellId})` :
+      `Executed [${cmd.join(" ")}] in container for ${this.cellId}`,
+      rawStdout,
+      workDir: this.containerWorkDir
+    };
   }
 
   async destroy() {

@@ -108,6 +108,15 @@ import { ConfidentialTeeAttestationBridge } from "../runtime/confidential_tee_br
 import { MtlsReverseTunnelBridge } from "../runtime/mtls_tunnel_bridge.js";
 import { TaskResourceProfiler } from "../profiler.js";
 import { CelldAdminClient } from "../cloudflare/celld_admin_client.js";
+import { UnifiedComponentPersistenceStore } from "../checkpoint/unified_state_store.js";
+import { CelldNativeContainerSandboxManager } from "../cloudflare/celld_container_bridge.js";
+import { DurableWorkflowContext, RpoZeroDurabilityEngine } from "../cloudflare/celld_ha_engine.js";
+import { InMemoryR2Bucket } from "../cloudflare/env.js";
+import { CoWSandboxBranchForker } from "../runtime/sandbox_branch_forker.js";
+import { LayerFsMultiAgentBranchCoordinator } from "../dag/layerfs_branch_coordinator.js";
+import { LinuxPsiMemoryGuard } from "../runtime/psi_guard.js";
+import { BidirectionalBackpressureController } from "../cluster/backpressure_loop.js";
+import { DynamicQueueAutoSharder, BrainBodyContainerPoolScaler } from "../cloudflare/horizontal_scaler.js";
 import { TaskPriority, TaskSpec, TaskState } from "../models.js";
 
 export type ManagementScenarioId =
@@ -244,6 +253,15 @@ export class PlatformManagementPlaneEngine {
   private readonly mtlsBridge: MtlsReverseTunnelBridge;
   private readonly resourceProfiler: TaskResourceProfiler;
   private readonly celldAdmin: CelldAdminClient;
+  private readonly unifiedStore: UnifiedComponentPersistenceStore;
+  private readonly containerManager: CelldNativeContainerSandboxManager;
+  private readonly rpoEngine: RpoZeroDurabilityEngine;
+  private readonly branchForker: CoWSandboxBranchForker;
+  private readonly branchCoordinator: LayerFsMultiAgentBranchCoordinator;
+  private readonly psiGuard: LinuxPsiMemoryGuard;
+  private readonly backpressureLoop: BidirectionalBackpressureController;
+  private readonly queueAutoSharder: DynamicQueueAutoSharder;
+  private readonly containerPoolScaler: BrainBodyContainerPoolScaler;
   private lastGitArbitration: { acceptedAgentIds: string[]; conflictedAgentIds: string[] } | null = null;
   private lastBisectResult: {
     firstBadCommit: string | null;
@@ -282,6 +300,22 @@ export class PlatformManagementPlaneEngine {
     this.mtlsBridge = new MtlsReverseTunnelBridge();
     this.resourceProfiler = new TaskResourceProfiler();
     this.celldAdmin = new CelldAdminClient(deps.v25Store.sql);
+    this.unifiedStore = new UnifiedComponentPersistenceStore(deps.v25Store.sql);
+    this.containerManager = new CelldNativeContainerSandboxManager();
+    this.containerManager.registerContainerClass({
+      class_name: "AnstsSandboxContainer",
+      image: "ghcr.io/ansts/sandbox-ubuntu24:v2.5",
+      instance_type: "standard-2",
+      max_instances: 64,
+      runtime: "kata",
+    });
+    this.rpoEngine = new RpoZeroDurabilityEngine(new InMemoryR2Bucket());
+    this.branchForker = new CoWSandboxBranchForker(deps.layerfs);
+    this.branchCoordinator = new LayerFsMultiAgentBranchCoordinator(deps.layerfs);
+    this.psiGuard = new LinuxPsiMemoryGuard();
+    this.backpressureLoop = new BidirectionalBackpressureController();
+    this.queueAutoSharder = new DynamicQueueAutoSharder(16, 4, 128);
+    this.containerPoolScaler = new BrainBodyContainerPoolScaler();
     if (deps.harnessRunner) {
       this.harnessRunner = deps.harnessRunner;
     } else {
@@ -3133,6 +3167,358 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       body: {
         cellId,
         ...migrated,
+      },
+    };
+  }
+
+
+  public executeUnifiedPersistenceSnapshot(params: {
+    action: "snapshot_all" | "verify_cold_start_rehydration";
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发全集群 8 表持久化快照或冷启动恢复演练" },
+      };
+    }
+    const sql = this.deps.v25Store.sql;
+    const schedSnap = this.unifiedStore.snapshotSchedulerState(this.deps.scheduler);
+
+    const tenants = sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_tenants").toArray();
+    for (const t of tenants) {
+      const tId = String(t.tenant_id);
+      this.unifiedStore.saveComponentRecord("persisted_finops_ledgers", "tenant_id", tId, t);
+      this.unifiedStore.saveComponentRecord("persisted_escrows", "parent_task_id", `escrow-${tId}`, {
+        tenantId: tId,
+        escrowReserved: Number(t.escrow_reserved ?? 8),
+      });
+    }
+
+    this.unifiedStore.saveComponentRecord("persisted_router_state", "endpoint_id", "ep-deepseek-r1", {
+      endpointId: "ep-deepseek-r1",
+      ttftEwmaMs: 180,
+      healthy: true,
+    });
+    this.unifiedStore.saveComponentRecord("persisted_router_state", "endpoint_id", "ep-qwen-38", {
+      endpointId: "ep-qwen-38",
+      ttftEwmaMs: 150,
+      healthy: true,
+    });
+
+    for (const [tId] of this.deps.scheduler.allTasks.entries()) {
+      for (const st of this.deps.sagaGateway.compensator.getTaskSteps(tId)) {
+        this.unifiedStore.saveComponentRecord("persisted_saga_steps", "step_id", st.stepId, {
+          stepId: st.stepId,
+          taskId: st.taskId,
+          turnIndex: st.turnIndex,
+          toolName: st.toolName,
+          compensated: st.compensated,
+        });
+      }
+    }
+
+    const approvals = sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_approvals").toArray();
+    for (const a of approvals) {
+      this.unifiedStore.saveComponentRecord("persisted_approval_tickets", "ticket_id", String(a.approval_id), a);
+    }
+
+    const mcpTools = sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_mcp_tools").toArray();
+    for (const m of mcpTools) {
+      this.unifiedStore.saveComponentRecord("persisted_mcp_tools", "tool_name", String(m.tool_name), m);
+    }
+
+    const tableCounts = this.unifiedStore.getTableCounts();
+
+    if (params.action === "verify_cold_start_rehydration") {
+      const freshScheduler = new CoreScheduler5D();
+      const restoredTasksCount = this.unifiedStore.rehydrateSchedulerFromSql(freshScheduler);
+      const restoredFinops = this.unifiedStore.loadComponentRecords("persisted_finops_ledgers");
+      const restoredApprovals = this.unifiedStore.loadComponentRecords("persisted_approval_tickets");
+      const restoredMcp = this.unifiedStore.loadComponentRecords("persisted_mcp_tools");
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行全集群 8 表冷启动恢复验证 (UnifiedComponentPersistenceStore)：恢复任务 ${restoredTasksCount} 个、FinOps 账本 ${restoredFinops.length} 份、MCP 工具 ${restoredMcp.length} 个`,
+        "Global / UnifiedStateStore",
+        `REHYDRATED (${restoredTasksCount} tasks, RPO=0)`
+      );
+
+      return {
+        status: 200,
+        body: {
+          action: "verify_cold_start_rehydration",
+          restoredTasksCount,
+          restoredFinopsCount: restoredFinops.length,
+          restoredApprovalsCount: restoredApprovals.length,
+          restoredMcpCount: restoredMcp.length,
+          tableCounts,
+          rpoZeroVerified: restoredTasksCount >= schedSnap.tasksSaved,
+        },
+      };
+    }
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `生成全集群 8 表原子持久化快照 (Tasks=${tableCounts.persisted_tasks}, Leases=${tableCounts.persisted_leases}, FinOps=${tableCounts.persisted_finops_ledgers})`,
+      "Global / UnifiedStateStore",
+      "SNAPSHOT_SAVED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        action: "snapshot_all",
+        ...schedSnap,
+        tableCounts,
+      },
+    };
+  }
+
+  public async executeCelldContainerAndWorkflow(params: {
+    action: "start_and_probe_container" | "run_durable_workflow";
+    cellId?: string;
+    runtime?: "runc" | "runsc" | "kata";
+    workflowId?: string;
+    stepName?: string;
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权操控 ctx.container 或 DurableWorkflowContext" },
+      };
+    }
+
+    if (params.action === "start_and_probe_container") {
+      const cellId = params.cellId ?? "cell-sandbox-ns-8841";
+      const runtime = params.runtime ?? "kata";
+      const handle = this.containerManager.getOrCreateContainerHandle(cellId, {
+        class_name: "AnstsSandboxContainer",
+        image: "ghcr.io/ansts/sandbox-ubuntu24:v2.5",
+        instance_type: "standard-2",
+        runtime,
+      });
+      const started = handle.start({ enableInternet: true, hardTimeout: 60_000 });
+      const execOut = await handle.exec(["sh", "-c", "cat resolv.conf | head -n 1"]);
+      const wsUpgrade = await handle.getTcpPort(8080).fetch("http://container.bridge.local:8080/ws", {
+        headers: { Upgrade: "websocket" },
+      });
+
+      let imdsBlocked = false;
+      try {
+        await handle.getTcpPort(80).fetch("http://169.254.169.254/latest/meta-data/");
+      } catch {
+        imdsBlocked = true;
+      }
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `启动 celld 原生 ctx.container (${cellId}, OCI=${runtime}, DNS=${started.resolvConf.join(",")}) 并验证 celld-fence 拦截 169.254.169.254 IMDSv2`,
+        `Runtime / ${cellId}`,
+        `CONTAINER_OK (IMDS_BLOCKED=${imdsBlocked})`
+      );
+
+      return {
+        status: 200,
+        body: {
+          cellId,
+          started,
+          execResult: execOut,
+          webSocketProbe: wsUpgrade,
+          celldFenceImdsBlocked: imdsBlocked,
+        },
+      };
+    }
+
+    // action === "run_durable_workflow"
+    const workflowId = params.workflowId ?? "wf-release-ns-8841";
+    const stepName = params.stepName ?? "step-ltx-checkpoint";
+    const wfCtx = new DurableWorkflowContext(this.deps.v25Store.sql, workflowId);
+
+    const firstRun = await wfCtx.stepDo(stepName, async () => {
+      const walBytes = new TextEncoder().encode(`workflow=${workflowId}:step=${stepName}:ts=${Date.now()}`);
+      const ltxMeta = await this.rpoEngine.commitWithSyncLtxFlush(
+        `cell-${workflowId}`,
+        14,
+        () => {},
+        walBytes
+      );
+      return {
+        ltxKey: ltxMeta.r2Key,
+        sha256: ltxMeta.sha256,
+        sizeBytes: ltxMeta.sizeBytes,
+      };
+    });
+
+    const replayRun = await wfCtx.stepDo(stepName, async () => {
+      throw new Error("Should not re-execute memoized workflow step!");
+    });
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 DurableWorkflowContext [${workflowId}/${stepName}] 并验证崩溃重放幂等记忆化 (replayedFromJournal=${replayRun.replayedFromJournal})`,
+      `Workflow / ${workflowId}`,
+      "MEMOIZED_RPO_ZERO"
+    );
+
+    return {
+      status: 200,
+      body: {
+        workflowId,
+        stepName,
+        firstExecution: firstRun,
+        crashReplayExecution: replayRun,
+      },
+    };
+  }
+
+  public executeSpeculativeDeterministicBranches(params: {
+    taskId?: string;
+    sourceBranch?: string;
+    mergeWinningBranch?: boolean;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发确定性投机多分支执行" },
+      };
+    }
+    const taskId = params.taskId ?? "task-ns-8841";
+    const sourceBranch = params.sourceBranch ?? "feat-ns-auth";
+    try {
+      this.deps.layerfs.getBranchHeadCommit(sourceBranch);
+    } catch {
+      this.deps.layerfs.forkBranch("main", sourceBranch);
+    }
+    const baseCommitId = this.deps.layerfs.getBranchHeadCommit(sourceBranch).commitId;
+    const suffix = Date.now() % 10000;
+    const branchA = `spec-${taskId}-a-${suffix}`;
+    const branchB = `spec-${taskId}-b-${suffix}`;
+
+    const results = this.branchForker.executeDeterministicSpeculativeBranches({
+      sourceBranch,
+      branches: [
+        {
+          branchName: branchA,
+          seed: 20261110,
+          command: `printf "SEED=%s\nCLOCK=%s\nRAND=%s\n" "$ANSTS_DETERMINISTIC_SEED" "$ANSTS_VIRTUAL_CLOCK_MS" "$ANSTS_DET_RAND" > spec_winner.txt && cat spec_winner.txt`,
+        },
+        {
+          branchName: branchB,
+          seed: 20261110,
+          command: `printf "SEED=%s\nCLOCK=%s\nRAND=%s\n" "$ANSTS_DETERMINISTIC_SEED" "$ANSTS_VIRTUAL_CLOCK_MS" "$ANSTS_DET_RAND" > spec_candidate.txt && cat spec_candidate.txt`,
+        },
+      ],
+    });
+
+    const deterministicReproducible =
+      results.length >= 2 && results[0].stdout.trim() === results[1].stdout.trim() && results[0].stdout.includes("SEED=20261110");
+
+    let mergeResult: Record<string, unknown> | null = null;
+    if (params.mergeWinningBranch !== false) {
+      const merged = this.branchCoordinator.mergeBranchIntoTarget(
+        branchA,
+        sourceBranch,
+        baseCommitId
+      );
+      mergeResult = merged;
+    }
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行确定性投机多分支 CoW 推演 (${branchA} / ${branchB}, Seed=20261110, Bit-Exact=${deterministicReproducible}) 并合并优胜分支至 ${sourceBranch}`,
+      `LayerFS / ${sourceBranch}`,
+      `SPECULATIVE_MERGED (${mergeResult?.mergedCommitId ?? results[0].commitId})`
+    );
+
+    return {
+      status: 200,
+      body: {
+        taskId,
+        sourceBranch,
+        baseCommitId,
+        deterministicReproducible,
+        branches: results,
+        mergeResult,
+      },
+    };
+  }
+
+  public executeAutoscaleAndPsiLoop(params: {
+    action: "probe_and_autoscale" | "simulate_psi_spike";
+    simulatedPsiFullPct?: number;
+    incomingWriteRps?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发 PSI 内存防御或队列动态分片扩缩容" },
+      };
+    }
+
+    const livePsi = this.psiGuard.probeLiveKernelPsiSample();
+    const effectiveSample =
+      params.action === "simulate_psi_spike"
+        ? {
+            someAvg10Pct: 78.5,
+            fullAvg10Pct: params.simulatedPsiFullPct ?? 74.0,
+            freeSwapMb: 96,
+          }
+        : {
+            someAvg10Pct: livePsi.someAvg10Pct,
+            fullAvg10Pct: livePsi.fullAvg10Pct,
+            freeSwapMb: livePsi.freeSwapMb,
+          };
+
+    const runningTasks = Array.from(this.deps.scheduler.allTasks.values());
+    const psiDefense = this.psiGuard.evaluateAndDefend(effectiveSample, runningTasks);
+    const backpressure = this.backpressureLoop.computeClusterHealthState({
+      maxNodePsiSomePct: effectiveSample.someAvg10Pct,
+      globalRateLimitedEndpoints: params.action === "simulate_psi_spike" ? 1 : 0,
+      totalEndpoints: 2,
+      globalQueueDepth: this.deps.scheduler.queueManager.totalQueued(),
+    });
+    const writeRps = params.incomingWriteRps ?? (params.action === "simulate_psi_spike" ? 14400 : 3600);
+    const queueSharding = this.queueAutoSharder.adjustShards(writeRps, 450);
+    const poolScaling = this.containerPoolScaler.computeTargetSandboxContainers({
+      activeThinkCells: Math.max(4, runningTasks.length * 2),
+      activeActCells: Math.max(2, runningTasks.length),
+      warmStandbyRatio: 0.25,
+    });
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行闭环 PSI 内存守卫与队列自动分片 (${params.action}) → PSI=${psiDefense.level}, Backpressure=${backpressure.mode}, QueueShards=${queueSharding.newShards}`,
+      "Cluster / AutoScaler-PSI",
+      `${backpressure.mode} (${queueSharding.newShards} shards)`
+    );
+
+    return {
+      status: 200,
+      body: {
+        liveKernelPsi: livePsi,
+        effectivePsiSample: effectiveSample,
+        psiDefense,
+        backpressure,
+        queueSharding,
+        poolScaling,
       },
     };
   }

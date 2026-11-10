@@ -3,7 +3,7 @@
 
 
 var http = _interopRequireWildcard(require("node:http"));
-
+var _scheduler = require("../scheduler.js");
 var _manual_scale_controller = require("../cluster/manual_scale_controller.js");
 
 
@@ -107,7 +107,16 @@ var _vsock_bridge = require("../runtime/vsock_bridge.js");
 var _confidential_tee_bridge = require("../runtime/confidential_tee_bridge.js");
 var _mtls_tunnel_bridge = require("../runtime/mtls_tunnel_bridge.js");
 var _profiler = require("../profiler.js");
-var _celld_admin_client = require("../cloudflare/celld_admin_client.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var _celld_admin_client = require("../cloudflare/celld_admin_client.js");
+var _unified_state_store = require("../checkpoint/unified_state_store.js");
+var _celld_container_bridge = require("../cloudflare/celld_container_bridge.js");
+var _celld_ha_engine = require("../cloudflare/celld_ha_engine.js");
+var _env = require("../cloudflare/env.js");
+var _sandbox_branch_forker = require("../runtime/sandbox_branch_forker.js");
+var _layerfs_branch_coordinator = require("../dag/layerfs_branch_coordinator.js");
+var _psi_guard = require("../runtime/psi_guard.js");
+var _backpressure_loop = require("../cluster/backpressure_loop.js");
+var _horizontal_scaler = require("../cloudflare/horizontal_scaler.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M13 TASK-47: Real-Time Control Plane Web UI & Operational Dashboard Backend Server.
  */class DashboardBridgeService {scheduler;fleet;constructor(scheduler, fleet = new _manual_scale_controller.ManualFleetScaleController()) {this.scheduler = scheduler;this.fleet = fleet;}buildClusterOverview() {return { totalTasks: this.scheduler.allTasks.size, queuedTasks: this.scheduler.queueManager.totalQueued(), completedTasks: this.scheduler.completedIds.size, nodes: this.fleet.listNodes() };}}exports.DashboardBridgeService = DashboardBridgeService;class DashboardBackendServer {bridge;host;server = null;constructor(bridge, host = "127.0.0.1") {this.bridge = bridge;this.host = host;}async listen(port = 0) {return new Promise((resolve, reject) => {this.server = http.createServer((req, res) => {if (req.url === "/api/overview" || req.url === "/healthz") {res.writeHead(200, { "content-type": "application/json" });res.end(JSON.stringify(this.bridge.buildClusterOverview()));return;}res.writeHead(200, { "content-type": "text/html; charset=utf-8" });res.end("<!doctype html><html><head><title>ANSTS v2 Control Plane</title></head><body><h1>ANSTS v2 Dashboard</h1></body></html>");});this.server.on("error", reject);this.server.listen(port, this.host, () => {const addr = this.server.address();resolve(typeof addr === "object" && addr ? addr.port : port);});});}async close() {if (!this.server) return;return new Promise((resolve) => {this.server.closeAllConnections?.();this.server.close(() => {this.server = null;resolve();});});}}exports.DashboardBackendServer = DashboardBackendServer;
 
@@ -244,6 +253,15 @@ class PlatformManagementPlaneEngine {
   mtlsBridge;
   resourceProfiler;
   celldAdmin;
+  unifiedStore;
+  containerManager;
+  rpoEngine;
+  branchForker;
+  branchCoordinator;
+  psiGuard;
+  backpressureLoop;
+  queueAutoSharder;
+  containerPoolScaler;
   lastGitArbitration = null;
   lastBisectResult =
 
@@ -282,6 +300,22 @@ class PlatformManagementPlaneEngine {
     this.mtlsBridge = new _mtls_tunnel_bridge.MtlsReverseTunnelBridge();
     this.resourceProfiler = new _profiler.TaskResourceProfiler();
     this.celldAdmin = new _celld_admin_client.CelldAdminClient(deps.v25Store.sql);
+    this.unifiedStore = new _unified_state_store.UnifiedComponentPersistenceStore(deps.v25Store.sql);
+    this.containerManager = new _celld_container_bridge.CelldNativeContainerSandboxManager();
+    this.containerManager.registerContainerClass({
+      class_name: "AnstsSandboxContainer",
+      image: "ghcr.io/ansts/sandbox-ubuntu24:v2.5",
+      instance_type: "standard-2",
+      max_instances: 64,
+      runtime: "kata"
+    });
+    this.rpoEngine = new _celld_ha_engine.RpoZeroDurabilityEngine(new _env.InMemoryR2Bucket());
+    this.branchForker = new _sandbox_branch_forker.CoWSandboxBranchForker(deps.layerfs);
+    this.branchCoordinator = new _layerfs_branch_coordinator.LayerFsMultiAgentBranchCoordinator(deps.layerfs);
+    this.psiGuard = new _psi_guard.LinuxPsiMemoryGuard();
+    this.backpressureLoop = new _backpressure_loop.BidirectionalBackpressureController();
+    this.queueAutoSharder = new _horizontal_scaler.DynamicQueueAutoSharder(16, 4, 128);
+    this.containerPoolScaler = new _horizontal_scaler.BrainBodyContainerPoolScaler();
     if (deps.harnessRunner) {
       this.harnessRunner = deps.harnessRunner;
     } else {
@@ -3133,6 +3167,358 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       body: {
         cellId,
         ...migrated
+      }
+    };
+  }
+
+
+  executeUnifiedPersistenceSnapshot(params)
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发全集群 8 表持久化快照或冷启动恢复演练" }
+      };
+    }
+    const sql = this.deps.v25Store.sql;
+    const schedSnap = this.unifiedStore.snapshotSchedulerState(this.deps.scheduler);
+
+    const tenants = sql.exec("SELECT * FROM v25_mgmt_tenants").toArray();
+    for (const t of tenants) {
+      const tId = String(t.tenant_id);
+      this.unifiedStore.saveComponentRecord("persisted_finops_ledgers", "tenant_id", tId, t);
+      this.unifiedStore.saveComponentRecord("persisted_escrows", "parent_task_id", `escrow-${tId}`, {
+        tenantId: tId,
+        escrowReserved: Number(t.escrow_reserved ?? 8)
+      });
+    }
+
+    this.unifiedStore.saveComponentRecord("persisted_router_state", "endpoint_id", "ep-deepseek-r1", {
+      endpointId: "ep-deepseek-r1",
+      ttftEwmaMs: 180,
+      healthy: true
+    });
+    this.unifiedStore.saveComponentRecord("persisted_router_state", "endpoint_id", "ep-qwen-38", {
+      endpointId: "ep-qwen-38",
+      ttftEwmaMs: 150,
+      healthy: true
+    });
+
+    for (const [tId] of this.deps.scheduler.allTasks.entries()) {
+      for (const st of this.deps.sagaGateway.compensator.getTaskSteps(tId)) {
+        this.unifiedStore.saveComponentRecord("persisted_saga_steps", "step_id", st.stepId, {
+          stepId: st.stepId,
+          taskId: st.taskId,
+          turnIndex: st.turnIndex,
+          toolName: st.toolName,
+          compensated: st.compensated
+        });
+      }
+    }
+
+    const approvals = sql.exec("SELECT * FROM v25_mgmt_approvals").toArray();
+    for (const a of approvals) {
+      this.unifiedStore.saveComponentRecord("persisted_approval_tickets", "ticket_id", String(a.approval_id), a);
+    }
+
+    const mcpTools = sql.exec("SELECT * FROM v25_mgmt_mcp_tools").toArray();
+    for (const m of mcpTools) {
+      this.unifiedStore.saveComponentRecord("persisted_mcp_tools", "tool_name", String(m.tool_name), m);
+    }
+
+    const tableCounts = this.unifiedStore.getTableCounts();
+
+    if (params.action === "verify_cold_start_rehydration") {
+      const freshScheduler = new _scheduler.CoreScheduler5D();
+      const restoredTasksCount = this.unifiedStore.rehydrateSchedulerFromSql(freshScheduler);
+      const restoredFinops = this.unifiedStore.loadComponentRecords("persisted_finops_ledgers");
+      const restoredApprovals = this.unifiedStore.loadComponentRecords("persisted_approval_tickets");
+      const restoredMcp = this.unifiedStore.loadComponentRecords("persisted_mcp_tools");
+
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `执行全集群 8 表冷启动恢复验证 (UnifiedComponentPersistenceStore)：恢复任务 ${restoredTasksCount} 个、FinOps 账本 ${restoredFinops.length} 份、MCP 工具 ${restoredMcp.length} 个`,
+      "Global / UnifiedStateStore",
+      `REHYDRATED (${restoredTasksCount} tasks, RPO=0)`);
+
+
+      return {
+        status: 200,
+        body: {
+          action: "verify_cold_start_rehydration",
+          restoredTasksCount,
+          restoredFinopsCount: restoredFinops.length,
+          restoredApprovalsCount: restoredApprovals.length,
+          restoredMcpCount: restoredMcp.length,
+          tableCounts,
+          rpoZeroVerified: restoredTasksCount >= schedSnap.tasksSaved
+        }
+      };
+    }
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `生成全集群 8 表原子持久化快照 (Tasks=${tableCounts.persisted_tasks}, Leases=${tableCounts.persisted_leases}, FinOps=${tableCounts.persisted_finops_ledgers})`,
+    "Global / UnifiedStateStore",
+    "SNAPSHOT_SAVED");
+
+
+    return {
+      status: 200,
+      body: {
+        action: "snapshot_all",
+        ...schedSnap,
+        tableCounts
+      }
+    };
+  }
+
+  async executeCelldContainerAndWorkflow(params)
+
+
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权操控 ctx.container 或 DurableWorkflowContext" }
+      };
+    }
+
+    if (params.action === "start_and_probe_container") {
+      const cellId = params.cellId ?? "cell-sandbox-ns-8841";
+      const runtime = params.runtime ?? "kata";
+      const handle = this.containerManager.getOrCreateContainerHandle(cellId, {
+        class_name: "AnstsSandboxContainer",
+        image: "ghcr.io/ansts/sandbox-ubuntu24:v2.5",
+        instance_type: "standard-2",
+        runtime
+      });
+      const started = handle.start({ enableInternet: true, hardTimeout: 60_000 });
+      const execOut = await handle.exec(["sh", "-c", "cat resolv.conf | head -n 1"]);
+      const wsUpgrade = await handle.getTcpPort(8080).fetch("http://container.bridge.local:8080/ws", {
+        headers: { Upgrade: "websocket" }
+      });
+
+      let imdsBlocked = false;
+      try {
+        await handle.getTcpPort(80).fetch("http://169.254.169.254/latest/meta-data/");
+      } catch {
+        imdsBlocked = true;
+      }
+
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `启动 celld 原生 ctx.container (${cellId}, OCI=${runtime}, DNS=${started.resolvConf.join(",")}) 并验证 celld-fence 拦截 169.254.169.254 IMDSv2`,
+      `Runtime / ${cellId}`,
+      `CONTAINER_OK (IMDS_BLOCKED=${imdsBlocked})`);
+
+
+      return {
+        status: 200,
+        body: {
+          cellId,
+          started,
+          execResult: execOut,
+          webSocketProbe: wsUpgrade,
+          celldFenceImdsBlocked: imdsBlocked
+        }
+      };
+    }
+
+    // action === "run_durable_workflow"
+    const workflowId = params.workflowId ?? "wf-release-ns-8841";
+    const stepName = params.stepName ?? "step-ltx-checkpoint";
+    const wfCtx = new _celld_ha_engine.DurableWorkflowContext(this.deps.v25Store.sql, workflowId);
+
+    const firstRun = await wfCtx.stepDo(stepName, async () => {
+      const walBytes = new TextEncoder().encode(`workflow=${workflowId}:step=${stepName}:ts=${Date.now()}`);
+      const ltxMeta = await this.rpoEngine.commitWithSyncLtxFlush(
+      `cell-${workflowId}`,
+      14,
+      () => {},
+      walBytes);
+
+      return {
+        ltxKey: ltxMeta.r2Key,
+        sha256: ltxMeta.sha256,
+        sizeBytes: ltxMeta.sizeBytes
+      };
+    });
+
+    const replayRun = await wfCtx.stepDo(stepName, async () => {
+      throw new Error("Should not re-execute memoized workflow step!");
+    });
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 DurableWorkflowContext [${workflowId}/${stepName}] 并验证崩溃重放幂等记忆化 (replayedFromJournal=${replayRun.replayedFromJournal})`,
+    `Workflow / ${workflowId}`,
+    "MEMOIZED_RPO_ZERO");
+
+
+    return {
+      status: 200,
+      body: {
+        workflowId,
+        stepName,
+        firstExecution: firstRun,
+        crashReplayExecution: replayRun
+      }
+    };
+  }
+
+  executeSpeculativeDeterministicBranches(params)
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发确定性投机多分支执行" }
+      };
+    }
+    const taskId = params.taskId ?? "task-ns-8841";
+    const sourceBranch = params.sourceBranch ?? "feat-ns-auth";
+    try {
+      this.deps.layerfs.getBranchHeadCommit(sourceBranch);
+    } catch {
+      this.deps.layerfs.forkBranch("main", sourceBranch);
+    }
+    const baseCommitId = this.deps.layerfs.getBranchHeadCommit(sourceBranch).commitId;
+    const suffix = Date.now() % 10000;
+    const branchA = `spec-${taskId}-a-${suffix}`;
+    const branchB = `spec-${taskId}-b-${suffix}`;
+
+    const results = this.branchForker.executeDeterministicSpeculativeBranches({
+      sourceBranch,
+      branches: [
+      {
+        branchName: branchA,
+        seed: 20261110,
+        command: `printf "SEED=%s\nCLOCK=%s\nRAND=%s\n" "$ANSTS_DETERMINISTIC_SEED" "$ANSTS_VIRTUAL_CLOCK_MS" "$ANSTS_DET_RAND" > spec_winner.txt && cat spec_winner.txt`
+      },
+      {
+        branchName: branchB,
+        seed: 20261110,
+        command: `printf "SEED=%s\nCLOCK=%s\nRAND=%s\n" "$ANSTS_DETERMINISTIC_SEED" "$ANSTS_VIRTUAL_CLOCK_MS" "$ANSTS_DET_RAND" > spec_candidate.txt && cat spec_candidate.txt`
+      }]
+
+    });
+
+    const deterministicReproducible =
+    results.length >= 2 && results[0].stdout.trim() === results[1].stdout.trim() && results[0].stdout.includes("SEED=20261110");
+
+    let mergeResult = null;
+    if (params.mergeWinningBranch !== false) {
+      const merged = this.branchCoordinator.mergeBranchIntoTarget(
+      branchA,
+      sourceBranch,
+      baseCommitId);
+
+      mergeResult = merged;
+    }
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行确定性投机多分支 CoW 推演 (${branchA} / ${branchB}, Seed=20261110, Bit-Exact=${deterministicReproducible}) 并合并优胜分支至 ${sourceBranch}`,
+    `LayerFS / ${sourceBranch}`,
+    `SPECULATIVE_MERGED (${mergeResult?.mergedCommitId ?? results[0].commitId})`);
+
+
+    return {
+      status: 200,
+      body: {
+        taskId,
+        sourceBranch,
+        baseCommitId,
+        deterministicReproducible,
+        branches: results,
+        mergeResult
+      }
+    };
+  }
+
+  executeAutoscaleAndPsiLoop(params)
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发 PSI 内存防御或队列动态分片扩缩容" }
+      };
+    }
+
+    const livePsi = this.psiGuard.probeLiveKernelPsiSample();
+    const effectiveSample =
+    params.action === "simulate_psi_spike" ?
+    {
+      someAvg10Pct: 78.5,
+      fullAvg10Pct: params.simulatedPsiFullPct ?? 74.0,
+      freeSwapMb: 96
+    } :
+    {
+      someAvg10Pct: livePsi.someAvg10Pct,
+      fullAvg10Pct: livePsi.fullAvg10Pct,
+      freeSwapMb: livePsi.freeSwapMb
+    };
+
+    const runningTasks = Array.from(this.deps.scheduler.allTasks.values());
+    const psiDefense = this.psiGuard.evaluateAndDefend(effectiveSample, runningTasks);
+    const backpressure = this.backpressureLoop.computeClusterHealthState({
+      maxNodePsiSomePct: effectiveSample.someAvg10Pct,
+      globalRateLimitedEndpoints: params.action === "simulate_psi_spike" ? 1 : 0,
+      totalEndpoints: 2,
+      globalQueueDepth: this.deps.scheduler.queueManager.totalQueued()
+    });
+    const writeRps = params.incomingWriteRps ?? (params.action === "simulate_psi_spike" ? 14400 : 3600);
+    const queueSharding = this.queueAutoSharder.adjustShards(writeRps, 450);
+    const poolScaling = this.containerPoolScaler.computeTargetSandboxContainers({
+      activeThinkCells: Math.max(4, runningTasks.length * 2),
+      activeActCells: Math.max(2, runningTasks.length),
+      warmStandbyRatio: 0.25
+    });
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行闭环 PSI 内存守卫与队列自动分片 (${params.action}) → PSI=${psiDefense.level}, Backpressure=${backpressure.mode}, QueueShards=${queueSharding.newShards}`,
+    "Cluster / AutoScaler-PSI",
+    `${backpressure.mode} (${queueSharding.newShards} shards)`);
+
+
+    return {
+      status: 200,
+      body: {
+        liveKernelPsi: livePsi,
+        effectivePsiSample: effectiveSample,
+        psiDefense,
+        backpressure,
+        queueSharding,
+        poolScaling
       }
     };
   }

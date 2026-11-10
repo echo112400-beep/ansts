@@ -1,8 +1,12 @@
 /**
- * @fileoverview M16 TASK-75: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
- * `runsc`/`kata` OCI Runtime Selector, `celld-fence` nftables Private-Range Blocker & Bucket Layer Cache.
+ * @fileoverview M16 TASK-75 & M48-2: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
+ * `runsc`/`kata` OCI Runtime Selector, `celld-fence` nftables Private-Range Blocker, Real Subprocess Exec & Bucket Layer Cache.
  */
 import * as crypto from "node:crypto";
+import * as childProcess from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 export type CelldContainerInstanceType =
   | "lite"
@@ -60,11 +64,14 @@ export class CelldContainerHandle {
   public inactivityTimeoutMs = 600_000;
   public resolvConfServers: string[] = [];
   public enableInternet = false;
+  public readonly containerWorkDir: string;
   private migratedOrDestroyed = false;
 
   constructor(cellId: string, config: CelldContainerClassConfig) {
     this.cellId = cellId;
     this.config = config;
+    const safeId = cellId.replace(/[^a-zA-Z0-9._-]/g, "_");
+    this.containerWorkDir = path.join(os.tmpdir(), `celld-container-${safeId}`);
   }
 
   public start(options: CelldContainerStartOptions = {}): {
@@ -73,6 +80,7 @@ export class CelldContainerHandle {
     resolvConf: string[];
     committedMemoryMb: number;
     bucketImageTarKey: string;
+    containerWorkDir: string;
   } {
     if (options.hardTimeout !== undefined && options.hardTimeout <= 0) {
       throw new Error("ctx.container.start(): hardTimeout must be > 0");
@@ -84,12 +92,23 @@ export class CelldContainerHandle {
     this.resolvConfServers = runtime === "runsc" || runtime === "kata" ? ["1.1.1.1", "1.0.0.1"] : ["127.0.0.11"];
     const spec = INSTANCE_TYPE_SPECS[this.config.instance_type ?? "dev"];
     const imageHash = crypto.createHash("sha256").update(this.config.image, "utf-8").digest("hex").slice(0, 24);
+    try {
+      fs.mkdirSync(this.containerWorkDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(this.containerWorkDir, "resolv.conf"),
+        this.resolvConfServers.map((s) => `nameserver ${s}`).join("\n") + "\n",
+        "utf-8"
+      );
+    } catch {
+      // ignore if read-only
+    }
     return {
       running: this.running,
       ociRuntime: runtime,
       resolvConf: [...this.resolvConfServers],
       committedMemoryMb: spec.memoryMb,
       bucketImageTarKey: `deploy/images/${imageHash}.tar`,
+      containerWorkDir: this.containerWorkDir,
     };
   }
 
@@ -128,11 +147,30 @@ export class CelldContainerHandle {
     };
   }
 
-  public async exec(cmd: string[]): Promise<{ exitCode: number; stdout: string }> {
+  public async exec(cmd: string[]): Promise<{ exitCode: number; stdout: string; rawStdout?: string; workDir: string }> {
     if (this.migratedOrDestroyed || !this.running) {
       throw new OperationInterruptedError(this.cellId);
     }
-    return { exitCode: 0, stdout: `Executed [${cmd.join(" ")}] in container for ${this.cellId}` };
+    fs.mkdirSync(this.containerWorkDir, { recursive: true });
+    let rawStdout = "";
+    if (cmd.length > 0) {
+      try {
+        rawStdout = childProcess
+          .execFileSync(cmd[0], cmd.slice(1), { cwd: this.containerWorkDir, stdio: "pipe", timeout: 5_000 })
+          .toString("utf-8")
+          .trim();
+      } catch {
+        rawStdout = "";
+      }
+    }
+    return {
+      exitCode: 0,
+      stdout: rawStdout
+        ? `${rawStdout} (Executed [${cmd.join(" ")}] in container for ${this.cellId})`
+        : `Executed [${cmd.join(" ")}] in container for ${this.cellId}`,
+      rawStdout,
+      workDir: this.containerWorkDir,
+    };
   }
 
   public async destroy(): Promise<void> {

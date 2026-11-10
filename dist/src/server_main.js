@@ -2337,6 +2337,66 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M48-1] Unified 8-Table Full-Cluster State Snapshot & Cold-Start Rehydration (`POST /v1beta1/management/persistence/snapshot`)
+    if (method === "POST" && pathname === "/v1beta1/management/persistence/snapshot") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeUnifiedPersistenceSnapshot({
+        action: body.action ?? "snapshot_all",
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M48-2] Native denoland/celld ctx.container + celld-fence & DurableWorkflowContext (`POST /v1beta1/management/celld/container-workflow`)
+    if (method === "POST" && pathname === "/v1beta1/management/celld/container-workflow") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeCelldContainerAndWorkflow({
+        action: body.action ?? "start_and_probe_container",
+        cellId: body.cellId ? String(body.cellId) : undefined,
+        runtime: body.runtime ? String(body.runtime) : undefined,
+        workflowId: body.workflowId ? String(body.workflowId) : undefined,
+        stepName: body.stepName ? String(body.stepName) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M48-3] Speculative Deterministic Multi-Branch CoW Execution (`POST /v1beta1/management/layerfs/speculative`)
+    if (method === "POST" && pathname === "/v1beta1/management/layerfs/speculative") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeSpeculativeDeterministicBranches({
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        sourceBranch: body.sourceBranch ? String(body.sourceBranch) : undefined,
+        mergeWinningBranch: body.mergeWinningBranch !== undefined ? Boolean(body.mergeWinningBranch) : true,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M48-4] Closed-Loop Linux PSI Memory Guard, Bidirectional Backpressure & Dynamic Queue/Container Auto-Scaler (`POST /v1beta1/management/cluster/autoscale-psi`)
+    if (method === "POST" && pathname === "/v1beta1/management/cluster/autoscale-psi") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeAutoscaleAndPsiLoop({
+        action: body.action ?? "probe_and_autoscale",
+        simulatedPsiFullPct: body.simulatedPsiFullPct !== undefined ? Number(body.simulatedPsiFullPct) : undefined,
+        incomingWriteRps: body.incomingWriteRps !== undefined ? Number(body.incomingWriteRps) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M47-3] Physical Linux Cgroup v2, OverlayFS Upperdir, Vsock RPC, Ed25519 SPIFFE/TEE & CelldAdmin Cell Migration (`POST /v1beta1/management/runtime/sandbox`)
     if (method === "POST" && pathname === "/v1beta1/management/runtime/sandbox") {
       const body = await this.readJsonBody(req);

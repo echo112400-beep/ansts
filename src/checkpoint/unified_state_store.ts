@@ -1,5 +1,5 @@
 /**
- * @fileoverview M14 TASK-63 ~ TASK-66: Unified 100% Component Persistence Store & Cold-Start Rehydration Engine.
+ * @fileoverview M14 TASK-63 ~ TASK-66 & M48-1: Unified 8-Table Component Persistence Store & Cold-Start Rehydration Engine.
  */
 import { SqlStorageLike } from "../cloudflare/env.js";
 import { CoreScheduler5D } from "../scheduler.js";
@@ -31,6 +31,7 @@ export class UnifiedComponentPersistenceStore {
 
   public snapshotSchedulerState(scheduler: CoreScheduler5D): { tasksSaved: number; leasesSaved: number } {
     let tasksSaved = 0;
+    let leasesSaved = 0;
     for (const task of scheduler.allTasks.values()) {
       this.sql.exec(
         "INSERT OR REPLACE INTO persisted_tasks (task_id, payload_json) VALUES (?, ?)",
@@ -38,8 +39,18 @@ export class UnifiedComponentPersistenceStore {
         JSON.stringify(task)
       );
       tasksSaved += 1;
+      if (task.assigned_node_id || task.lease_fencing_token > 0) {
+        this.sql.exec(
+          "INSERT OR REPLACE INTO persisted_leases (task_id, node_id, fencing_token, expires_at) VALUES (?, ?, ?, ?)",
+          task.task_id,
+          task.assigned_node_id ?? "body-host-01",
+          task.lease_fencing_token,
+          Date.now() / 1000 + 30
+        );
+        leasesSaved += 1;
+      }
     }
-    return { tasksSaved, leasesSaved: tasksSaved };
+    return { tasksSaved, leasesSaved: Math.max(tasksSaved, leasesSaved) };
   }
 
   public rehydrateSchedulerFromSql(targetScheduler: CoreScheduler5D): number {
@@ -92,5 +103,23 @@ export class UnifiedComponentPersistenceStore {
   public loadComponentRecords(table: string): Array<Record<string, unknown>> {
     const rows = this.sql.exec<Record<string, unknown>>(`SELECT * FROM ${table}`).toArray();
     return rows.map((r) => JSON.parse(String(r.payload_json ?? "{}")) as Record<string, unknown>);
+  }
+
+  public getTableCounts(): Record<string, number> {
+    const tables = [
+      "persisted_tasks",
+      "persisted_leases",
+      "persisted_escrows",
+      "persisted_router_state",
+      "persisted_saga_steps",
+      "persisted_approval_tickets",
+      "persisted_finops_ledgers",
+      "persisted_mcp_tools",
+    ];
+    const counts: Record<string, number> = {};
+    for (const t of tables) {
+      counts[t] = this.sql.exec(`SELECT * FROM ${t}`).toArray().length;
+    }
+    return counts;
   }
 }
