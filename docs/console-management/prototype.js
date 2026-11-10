@@ -623,6 +623,9 @@
         fromLiveBackend: false
       };
     }
+    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/scheduler/kernel-audit')) {
+      return { status: 200, ok: true, data: { stale1HeartbeatTtlEvicted: true, stale2LeaseCapacityReclaimed: true, deadlock1HolBypassPlacedSmallTask: true, deadlock2DagCascadedDeadLetter: true, starvation1FairPreemptionRotation: true, allInvariantsVerified: true } };
+    }
     if (method === 'GET' && endpointPath.startsWith('/v1beta1/management/design/blueprint')) {
       return { status: 200, ok: true, data: { designVersion: 'v2.5-M50', pillars: ['DESIGN', 'CONFIGURATION', 'RUNTIME', 'OBSERVABILITY_OPS'], sourceModulesCount: 86, sqliteTablesCount: 16, invariantsVerified: true } };
     }
@@ -1643,6 +1646,7 @@
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/config/center" data-op="validate_and_apply_config">配置中心 CAS 热更新 &amp; 版本回滚</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/runtime/celld-engine" data-op="scheduler_cell_rpc_and_alarm">celld 运行时引擎 &amp; LTX/LayerFS 调优</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/ops/observability" data-op="probe_slo_traces_and_metrics">全链路 SLO 燃烧率监控 &amp; 自愈 Runbook</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/scheduler/kernel-audit" data-op="kernel_5_invariants_audit">调度器防 Stale / 防死锁 / 防饥饿 5 项内核自检</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>

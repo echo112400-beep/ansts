@@ -186,6 +186,9 @@ export class TaskSpec {
   public assigned_node_id?: string;
   public lease_fencing_token = 0;
   public retry_count = 0;
+  public preempted_count = 0;
+  public last_preempted_at = 0;
+  public dead_letter_reason?: string;
   public created_at: number;
 
   constructor(init: TaskSpecInit) {
@@ -221,6 +224,7 @@ export interface NodeHeartbeatInit {
   running_tasks?: number;
   healthy?: boolean;
   cached_images?: Iterable<string>;
+  timestamp?: number;
 }
 
 export class NodeHeartbeat {
@@ -247,7 +251,7 @@ export class NodeHeartbeat {
     this.running_tasks = init.running_tasks ?? 0;
     this.healthy = init.healthy ?? true;
     this.cached_images = new Set(init.cached_images ?? []);
-    this.timestamp = Date.now() / 1000;
+    this.timestamp = init.timestamp ?? Date.now() / 1000;
   }
 }
 

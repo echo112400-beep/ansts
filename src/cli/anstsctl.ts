@@ -368,6 +368,16 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-scheduler-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/scheduler/kernel-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-design") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/design/blueprint`);
     const data = await resp.json();

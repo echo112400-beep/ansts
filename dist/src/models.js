@@ -186,6 +186,9 @@ class TaskSpec {
   assigned_node_id;
   lease_fencing_token = 0;
   retry_count = 0;
+  preempted_count = 0;
+  last_preempted_at = 0;
+  dead_letter_reason;
   created_at;
 
   constructor(init) {
@@ -209,6 +212,7 @@ class TaskSpec {
     this.created_at = Date.now() / 1000;
   }
 }exports.TaskSpec = TaskSpec;
+
 
 
 
@@ -247,7 +251,7 @@ class NodeHeartbeat {
     this.running_tasks = init.running_tasks ?? 0;
     this.healthy = init.healthy ?? true;
     this.cached_images = new Set(init.cached_images ?? []);
-    this.timestamp = Date.now() / 1000;
+    this.timestamp = init.timestamp ?? Date.now() / 1000;
   }
 }exports.NodeHeartbeat = NodeHeartbeat;
 

@@ -1,5 +1,5 @@
 /**
- * @fileoverview M2 TASK-06 & M16 TASK-80: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging Tournament Queue Manager.
+ * @fileoverview M2 TASK-06, M16 TASK-80 & M51-3: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging/Preemption-Compensation Tournament Queue Manager.
  */
 import { TaskPriority, TaskSpec } from "./models.js";
 
@@ -13,9 +13,11 @@ export class HierarchicalQueueManager {
   private readonly tenantHeaps: Map<string, TenantHeapNode[]> = new Map();
   public readonly tenantActiveCount: Map<string, number> = new Map();
   private readonly agingBoostPerSec: number;
+  private readonly preemptionCompensationBoost: number;
 
-  constructor(agingBoostPerSec = 0.05) {
+  constructor(agingBoostPerSec = 0.05, preemptionCompensationBoost = 120.0) {
     this.agingBoostPerSec = agingBoostPerSec;
+    this.preemptionCompensationBoost = preemptionCompensationBoost;
   }
 
   private getBasePriorityScore(priority: TaskPriority): number {
@@ -35,9 +37,14 @@ export class HierarchicalQueueManager {
       heap = [];
       this.tenantHeaps.set(task.tenant_id, heap);
     }
+    const preemptionBonus = (task.preempted_count ?? 0) * this.preemptionCompensationBoost;
     const intraTenantStaticKey =
-      this.getBasePriorityScore(task.priority) - task.created_at * this.agingBoostPerSec;
+      this.getBasePriorityScore(task.priority) + preemptionBonus - task.created_at * this.agingBoostPerSec;
     this.heapPush(heap, { task, intraTenantStaticKey });
+  }
+
+  public removeQueuedTask(taskId: string): void {
+    this.queuedTasks.delete(taskId);
   }
 
   public getTenantActiveCount(tenantId: string): number {
@@ -52,9 +59,10 @@ export class HierarchicalQueueManager {
     const base = this.getBasePriorityScore(task.priority);
     const waitSeconds = Math.max(0, nowSec - task.created_at);
     const agingBonus = waitSeconds * this.agingBoostPerSec;
+    const preemptionBonus = (task.preempted_count ?? 0) * this.preemptionCompensationBoost;
     const activeForTenant = this.getTenantActiveCount(task.tenant_id);
     const drfPenalty = activeForTenant * 25.0;
-    return base + agingBonus - drfPenalty;
+    return base + agingBonus + preemptionBonus - drfPenalty;
   }
 
   public popNext(): TaskSpec | null {

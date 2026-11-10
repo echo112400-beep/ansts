@@ -38,7 +38,7 @@ class LeaseCoordinator {
     this.leaseTtlSeconds = leaseTtlSeconds;
   }
 
-  acquireLease(taskId, nodeId) {
+  acquireLease(taskId, nodeId, nowSec = Date.now() / 1000) {
     const prevToken = this.highestTokenByTask.get(taskId) ?? 0;
     const nextToken = prevToken + 1;
     this.highestTokenByTask.set(taskId, nextToken);
@@ -47,7 +47,7 @@ class LeaseCoordinator {
     const nextDual = prevDual ? prevDual.nextEpoch() : new _models.FenceToken(nextToken, 0, taskId);
     this.dualTupleFencesByTask.set(taskId, nextDual);
 
-    const now = Date.now() / 1000;
+    const now = nowSec;
     const record = {
       task_id: taskId,
       node_id: nodeId,
