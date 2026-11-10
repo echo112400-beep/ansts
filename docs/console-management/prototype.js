@@ -623,6 +623,18 @@
         fromLiveBackend: false
       };
     }
+    if (method === 'GET' && endpointPath.startsWith('/v1beta1/management/design/blueprint')) {
+      return { status: 200, ok: true, data: { designVersion: 'v2.5-M50', pillars: ['DESIGN', 'CONFIGURATION', 'RUNTIME', 'OBSERVABILITY_OPS'], sourceModulesCount: 86, sqliteTablesCount: 16, invariantsVerified: true } };
+    }
+    if (endpointPath.startsWith('/v1beta1/management/config/center')) {
+      return { status: 200, ok: true, data: { activeRevision: 2, hotReloaded: true, changedKeys: ['maxCellConcurrentRequests'] } };
+    }
+    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/runtime/celld-engine')) {
+      return { status: 200, ok: true, data: { submittedTaskId: 'cell-rpc-101', rehydratedTasksCount: 4 } };
+    }
+    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/ops/observability')) {
+      return { status: 200, ok: true, data: { sloEvaluation: { alertSeverity: 'TICKET_P1', burnRate1h: 1.8, errorBudgetRemainingPct: 82.0 }, runbookId: 'RB-SLO-BURN-AND-DLQ-HEAL' } };
+    }
     if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/router/inference-pipeline')) {
       return { status: 200, ok: true, data: { tenantId: payload.tenantId || 'Northstar', inference: { modelName: 'DeepSeek-R1', ttftMs: 108.2, tpotMs: 4.5, cachedTokens: 780, costUsd: 0.003552, circuitState: 'CLOSED', sseChunksReceived: 5 } } };
     }
@@ -1627,6 +1639,10 @@
           <button class="btn" data-action="m49-op" data-endpoint="/v1beta1/management/security/kernel-attestation" data-op="vsock_unix_daemon_probe">Unix Vsock 守护进程 &amp; eBPF/SLSA/UFFD</button>
           <button class="btn" data-action="m49-op" data-endpoint="/v1beta1/management/chaos/drill" data-op="run_partition_and_split_brain_drill">网络分区脑裂演练 &amp; Topology CAS</button>
           <button class="btn" data-action="m49-op" data-endpoint="/v1beta1/management/federation/tunnel-harness" data-op="tunnel_command_and_failover">双归属反向隧道切换 &amp; 联邦/Harness 自愈</button>
+          <button class="btn" data-action="m50-op" data-method="GET" data-endpoint="/v1beta1/management/design/blueprint" data-op="inspect_blueprint">架构设计蓝图 &amp; 契约合规矩阵</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/config/center" data-op="validate_and_apply_config">配置中心 CAS 热更新 &amp; 版本回滚</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/runtime/celld-engine" data-op="scheduler_cell_rpc_and_alarm">celld 运行时引擎 &amp; LTX/LayerFS 调优</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/ops/observability" data-op="probe_slo_traces_and_metrics">全链路 SLO 燃烧率监控 &amp; 自愈 Runbook</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>
@@ -2401,6 +2417,23 @@
           '</tbody></table></div>';
       }
       showToast('已加载分支 ' + (res.data.branchName || '') + ' 的 LayerFS 行级代码溯源');
+      return;
+    }
+    if (action === 'm50-op') {
+      const method = target.getAttribute('data-method') || 'POST';
+      const ep = target.getAttribute('data-endpoint') || '/v1beta1/management/ops/observability';
+      const op = target.getAttribute('data-op') || 'probe_slo_traces_and_metrics';
+      const p = getPrincipal();
+      const res = await callBackendApi(method, ep, method === 'GET' ? undefined : {
+        action: op,
+        runtimeOverrides: { maxCellConcurrentRequests: 96 },
+        taskId: 'task-ns-8841',
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast('已完成 M50 设计/配置/运行时/监控运维操作 [' + op + ']');
       return;
     }
     if (action === 'm49-op') {

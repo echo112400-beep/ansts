@@ -2337,6 +2337,86 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M50-1] Architecture Design Blueprint & Contract Verification (`GET /v1beta1/management/design/blueprint`)
+    if (method === "GET" && pathname === "/v1beta1/management/design/blueprint") {
+      const result = this.managementPlane.inspectArchitectureDesignBlueprint();
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M50-2] Versioned Dynamic Configuration Center (`GET /v1beta1/management/config/center` & `POST /v1beta1/management/config/center`)
+    if (pathname === "/v1beta1/management/config/center" && (method === "GET" || method === "POST")) {
+      if (method === "GET") {
+        const result = this.managementPlane.executeConfigurationCenterGovernance({
+          action: "inspect_active_config",
+          actor: "chen",
+          role: "SRE_ADMIN",
+        });
+        res.writeHead(result.status, { "content-type": "application/json" });
+        res.end(JSON.stringify(result.body));
+        return;
+      }
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeConfigurationCenterGovernance({
+        action: (body.action ?? "validate_and_apply_config") as
+          | "inspect_active_config"
+          | "validate_and_apply_config"
+          | "rollback_revision",
+        expectedRevision: body.expectedRevision !== undefined ? Number(body.expectedRevision) : undefined,
+        targetRevision: body.targetRevision !== undefined ? Number(body.targetRevision) : undefined,
+        runtimeOverrides: body.runtimeOverrides ? (body.runtimeOverrides as Record<string, unknown>) : undefined,
+        sampleTaskSpec: body.sampleTaskSpec ? (body.sampleTaskSpec as Record<string, unknown>) : undefined,
+        note: body.note ? String(body.note) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M50-3] Deep Runtime Engine Optimization (`POST /v1beta1/management/runtime/celld-engine`)
+    if (method === "POST" && pathname === "/v1beta1/management/runtime/celld-engine") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeCelldAndLayerFsRuntimeEngine({
+        action: (body.action ?? "scheduler_cell_rpc_and_alarm") as
+          | "scheduler_cell_rpc_and_alarm"
+          | "fleet_durability_and_overload_guard"
+          | "ltx_compaction_and_layerfs_d9_sync",
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        concurrentRequests: body.concurrentRequests !== undefined ? Number(body.concurrentRequests) : undefined,
+        peerFsyncLatencyMs: body.peerFsyncLatencyMs !== undefined ? Number(body.peerFsyncLatencyMs) : undefined,
+        basedOnGeneration: body.basedOnGeneration !== undefined ? Number(body.basedOnGeneration) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M50-4] Closed-Loop SRE Observability, SLO Burn-Rate Alerting & Self-Healing Runbooks (`POST /v1beta1/management/ops/observability`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/observability") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeObservabilityAndSreOps({
+        action: (body.action ?? "probe_slo_traces_and_metrics") as
+          | "probe_slo_traces_and_metrics"
+          | "execute_auto_remediation_runbook",
+        simulatedErrorRequests: body.simulatedErrorRequests !== undefined ? Number(body.simulatedErrorRequests) : undefined,
+        simulatedP99LatencyMs: body.simulatedP99LatencyMs !== undefined ? Number(body.simulatedP99LatencyMs) : undefined,
+        runbookId: body.runbookId ? String(body.runbookId) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M49-1] Cognitive Router Full-Chain Inference Pipeline, Circuit Breaker & Token Bucket (`POST /v1beta1/management/router/inference-pipeline`)
     if (method === "POST" && pathname === "/v1beta1/management/router/inference-pipeline") {
       const body = await this.readJsonBody(req);

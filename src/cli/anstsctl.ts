@@ -368,6 +368,54 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-design") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/design/blueprint`);
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-config") {
+    const action = rest[0] ?? "inspect_active_config";
+    const arg1 = rest[1];
+    const bodyObj: Record<string, unknown> = { action, actor: "chen", role: "SRE_ADMIN" };
+    if (action === "validate_and_apply_config") {
+      bodyObj.runtimeOverrides = { maxCellConcurrentRequests: Number(arg1 ?? 96) };
+    } else if (action === "rollback_revision") {
+      bodyObj.targetRevision = Number(arg1 ?? 1);
+    }
+    const resp = await fetch(`${baseUrl}/v1beta1/management/config/center`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(bodyObj),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-runtime-engine") {
+    const action = rest[0] ?? "scheduler_cell_rpc_and_alarm";
+    const taskId = rest[1] ?? "task-ns-8841";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/runtime/celld-engine`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, taskId, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-ops") {
+    const action = rest[0] ?? "probe_slo_traces_and_metrics";
+    const runbookId = rest[1] ?? "RB-SLO-BURN-AND-DLQ-HEAL";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/observability`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, runbookId, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-router-pipeline") {
     const action = rest[0] ?? "execute_sse_inference";
     const tenantId = rest[1] ?? "Northstar";
