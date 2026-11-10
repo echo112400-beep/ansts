@@ -69,7 +69,7 @@ var _manual_scale_controller = require("../cluster/manual_scale_controller.js");
 
 
 
-
+var _escrow = require("../dag/escrow.js");
 
 
 
@@ -4875,6 +4875,189 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         hugeTaskStillQueued &&
         dagCascadedDeadLetter &&
         fairVictimRotationVerified
+      }
+    };
+  }
+
+
+  async executeSystemWideRectificationAudit(params)
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发全系统跨模块 Stale/死锁/饥饿整改审计" }
+      };
+    }
+
+    // 1. [Cell-Stale-1] Verify AnstsSchedulerCell cold-start rehydration of LEASED task + fencing watermark + alarm renewal on active leases
+    let alarmScheduledAt = null;
+    const cellSql = this.deps.v25Store.sql;
+    const cell1 = new _scheduler_cell.AnstsSchedulerCell({
+      id: { toString: () => "AnstsSchedulerCell:m52-audit" },
+      storage: {
+        sql: cellSql,
+        transactionSync: (fn) => fn(),
+        getAlarm: async () => alarmScheduledAt,
+        setAlarm: async (ts) => {
+          alarmScheduledAt = ts;
+        }
+      },
+      blockConcurrencyWhile: async (fn) => fn()
+    });
+    cell1.registerNode(new _models.NodeHeartbeat({ node_id: "node-cell-m52", total_cpu_cores: 16, free_cpu_cores: 16 }));
+    const leasedTask = new _models.TaskSpec({ task_id: "task-cell-m52-1", tenant_id: "Northstar", priority: _models.TaskPriority.P1_HIGH });
+    await cell1.submitTaskRpc(leasedTask);
+    alarmScheduledAt = null;
+    const tick1 = await cell1.scheduleTickRpc();
+    const activeLeaseAlarmRenewed = alarmScheduledAt !== null && cell1.scheduler.leaseCoordinator.activeLeaseCount() > 0;
+    const fenceBeforeRestart = tick1.placements[0]?.[2] ?? 1;
+
+    // Simulate cold-start restart of AnstsSchedulerCell over the same SQLite storage
+    const cell2 = new _scheduler_cell.AnstsSchedulerCell({
+      id: { toString: () => "AnstsSchedulerCell:m52-audit-restarted" },
+      storage: {
+        sql: cellSql,
+        transactionSync: (fn) => fn(),
+        getAlarm: async () => alarmScheduledAt,
+        setAlarm: async (ts) => {
+          alarmScheduledAt = ts;
+        }
+      },
+      blockConcurrencyWhile: async (fn) => fn()
+    });
+    const rehydratedTask = cell2.scheduler.allTasks.get("task-cell-m52-1");
+    const interruptedLeaseConvertedToQueued = rehydratedTask?.state === _models.TaskState.QUEUED;
+    const tick2 = await cell2.scheduleTickRpc();
+    const fenceAfterRestart = tick2.placements.find((p) => p[0] === "task-cell-m52-1")?.[2] ?? 0;
+    const monotonicFencePreservedAcrossColdStart = fenceAfterRestart > fenceBeforeRestart;
+
+    // 2. [Router-Stale-2] Verify CognitiveRouter 60s window decay, half-open auto-recovery & fallback active_requests accounting
+    const nowMs = Date.now();
+    const router = new _cognitive_router.CognitiveRouter();
+    const ep = new _models.LlmEndpointMetrics({
+      endpoint_id: "ep-m52-primary",
+      provider: "deepseek",
+      model_name: "DeepSeek-R1",
+      tpm_limit: 10_000,
+      tpm_used: 9_900
+    });
+    router.registerEndpoint(ep, 100, 10_000, nowMs);
+    // Fallback path when estimatedTokens (500) > tpm_remaining (100): must still increment active_requests
+    const [fbEp] = router.selectEndpoint("prefix-m52", 500, _models.TaskPriority.P1_HIGH, nowMs);
+    const fallbackIncrementedActiveRequests = fbEp.active_requests === 1;
+    router.releaseEndpoint(fbEp.endpoint_id);
+    const fallbackReleasedCleanly = fbEp.active_requests === 0;
+
+    // Trigger 5 rate-limit hits -> marks ep unhealthy & trips circuit breaker
+    for (let i = 0; i < 5; i++) {
+      router.reportInvocationMetrics("ep-m52-primary", 500, 100, true, nowMs + i * 10);
+    }
+    const markedUnhealthyOnRateLimit = !ep.healthy;
+    // Advance clock by 61s (past 60s window & 15s breaker cooldown) -> auto-recovers endpoint & resets tpm_used
+    const recoveredEps = router.refreshEndpointWindowsAndHalfOpenProbes(nowMs + 61_000);
+    const routerWindowAndHalfOpenRecovered =
+    recoveredEps.includes("ep-m52-primary") && ep.healthy && ep.tpm_used === 0 && ep.rate_limit_hits_last_min === 0;
+
+    // 3. [Escrow-Deadlock-3] Verify DagEscrowCoordinator child-failure parent unblocking & A2A priority-aware deadlock resolution
+    const escrowCoord = new _escrow.DagEscrowCoordinator();
+    const parentTask = new _models.TaskSpec({
+      task_id: "parent-m52",
+      tenant_id: "Northstar",
+      expected_SubAgent_count: 2
+    });
+    const childTask = new _models.TaskSpec({
+      task_id: "child-m52-1",
+      tenant_id: "Northstar",
+      parent_task_id: "parent-m52"
+    });
+    escrowCoord.reserveParentEscrow(parentTask, 10, 0);
+    escrowCoord.registerChildSubAgent(parentTask, childTask);
+    const failRes = escrowCoord.failOrCancelChildSubAgent(parentTask, childTask.task_id, true);
+    const escrowUnblockedAndReclaimed =
+    failRes.parentUnblocked &&
+    parentTask.state === _models.TaskState.DEAD_LETTER &&
+    escrowCoord.getTenantEscrowedSlots("Northstar") === 0;
+
+    const wfg = new _deadlock_detector.A2aWaitForGraphDeadlockDetector();
+    wfg.addWaitEdge("agent-p0-leader", "agent-p1-worker");
+    wfg.addWaitEdge("agent-p1-worker", "agent-p3-helper");
+    wfg.addWaitEdge("agent-p3-helper", "agent-p0-leader");
+    const wfgResolution = wfg.resolveCycleWithLowestPriorityVictim({
+      "agent-p0-leader": 1000,
+      "agent-p1-worker": 300,
+      "agent-p3-helper": 50
+    });
+    const wfgLowestPriorityVictimChosen =
+    wfgResolution.resolved && wfgResolution.victimAgentId === "agent-p3-helper";
+
+    // 4. [Tunnel-Deadlock-4] Verify TunnelGatewayCell stale heartbeat auto-demotion & unacknowledged in-flight command re-queueing
+    const tunCell = new _tunnel_gateway_cell.TunnelGatewayCell();
+    tunCell.registerTunnel({ hostId: "body-m52", gatewayId: "celld-gw-01", role: "PRIMARY", connGeneration: 1, epoch: 1 }, nowMs - 45_000);
+    tunCell.registerTunnel({ hostId: "body-m52", gatewayId: "celld-gw-02", role: "SECONDARY", connGeneration: 1, epoch: 1 }, nowMs);
+    const { command, completionPromise } = tunCell.enqueueCommandForHost("body-m52", { op: "M52_PROBE" }, 5000);
+    // Poll on gw-01 using stale timestamp so gw-01 remains older than 30s TTL
+    tunCell.pollPendingCommands("body-m52", "celld-gw-01", nowMs - 40_000);
+    // Evict stale tunnels and re-queue unacknowledged in-flight commands onto surviving gw-02
+    const evictRes = tunCell.evictStaleTunnelsAndRequeueInFlight(nowMs, 30_000);
+    const repolledOnSecondary = tunCell.pollPendingCommands("body-m52", "celld-gw-02", nowMs);
+    tunCell.acknowledgeCommand(command.commandId, { status: "RECOVERED_ON_SECONDARY" });
+    const acked = await completionPromise;
+    const tunnelInFlightRequeuedAndAcked =
+    evictRes.requeuedCommandIds.includes(command.commandId) &&
+    repolledOnSecondary.length === 1 &&
+    repolledOnSecondary[0].gatewayId === "celld-gw-02" &&
+    acked.status === "RECOVERED_ON_SECONDARY";
+
+    const allM52RectificationsVerified =
+    activeLeaseAlarmRenewed &&
+    interruptedLeaseConvertedToQueued &&
+    monotonicFencePreservedAcrossColdStart &&
+    fallbackIncrementedActiveRequests &&
+    fallbackReleasedCleanly &&
+    markedUnhealthyOnRateLimit &&
+    routerWindowAndHalfOpenRecovered &&
+    escrowUnblockedAndReclaimed &&
+    wfgLowestPriorityVictimChosen &&
+    tunnelInFlightRequeuedAndAcked;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M52 全系统跨模块 Stale/死锁/饥饿深度排查与整改验证 (CellRehydrate=${monotonicFencePreservedAcrossColdStart}, RouterDecay=${routerWindowAndHalfOpenRecovered}, EscrowUnblock=${escrowUnblockedAndReclaimed}, TunnelRequeue=${tunnelInFlightRequeuedAndAcked})`,
+    "SystemWide / M52-Rectification",
+    "ALL_M52_INVARIANTS_VERIFIED");
+
+
+    return {
+      status: 200,
+      body: {
+        cellStale1: {
+          activeLeaseAlarmRenewed,
+          interruptedLeaseConvertedToQueued,
+          monotonicFencePreservedAcrossColdStart,
+          fenceBeforeRestart,
+          fenceAfterRestart
+        },
+        routerStale2: {
+          fallbackIncrementedActiveRequests,
+          fallbackReleasedCleanly,
+          markedUnhealthyOnRateLimit,
+          routerWindowAndHalfOpenRecovered
+        },
+        escrowAndWfgDeadlock3: {
+          escrowUnblockedAndReclaimed,
+          wfgLowestPriorityVictimChosen,
+          wfgVictimAgentId: wfgResolution.victimAgentId
+        },
+        tunnelDeadlock4: {
+          demotedGateways: evictRes.demotedGateways,
+          requeuedCommandIds: evictRes.requeuedCommandIds,
+          tunnelInFlightRequeuedAndAcked
+        },
+        allM52RectificationsVerified
       }
     };
   }

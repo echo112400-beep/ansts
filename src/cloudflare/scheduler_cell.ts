@@ -1,5 +1,6 @@
 /**
- * @fileoverview M7 TASK-26: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing).
+ * @fileoverview M7 TASK-26 & M52-1: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
+ * Monotonic Fencing Watermark Rehydration, Interrupted-Lease Recovery & Active-Lease Alarm Renewal).
  */
 import { DurableObjectStateLike } from "./env.js";
 import { CoreScheduler5D } from "../scheduler.js";
@@ -43,7 +44,36 @@ export class AnstsSchedulerCell {
     return this.alarm();
   }
 
+  /**
+   * [M52-1] Rehydrates registered nodes, monotonic fencing token watermarks, and interrupted LEASED tasks
+   * (converting orphaned LEASED tasks back to QUEUED on cell migration/restart so they never hang).
+   */
   public rehydrateFromSql(): number {
+    const nodeRows = this.ctx.storage.sql
+      .exec<Record<string, unknown>>("SELECT * FROM ansts_nodes")
+      .toArray();
+    for (const nr of nodeRows) {
+      if (!nr.heartbeat_json) continue;
+      try {
+        const parsedHb = JSON.parse(String(nr.heartbeat_json)) as Record<string, unknown>;
+        this.scheduler.registerOrUpdateNode(
+          new NodeHeartbeat({
+            node_id: String(nr.node_id),
+            total_cpu_cores: Number(parsedHb.total_cpu_cores ?? 32),
+            free_cpu_cores: Number(parsedHb.free_cpu_cores ?? 32),
+            total_memory_mb: Number(parsedHb.total_memory_mb ?? 65536),
+            free_memory_mb: Number(parsedHb.free_memory_mb ?? 65536),
+            warm_pool_ready: Number(parsedHb.warm_pool_ready ?? 8),
+            psi_memory_some_avg10: Number(parsedHb.psi_memory_some_avg10 ?? 1.5),
+            running_tasks: Number(parsedHb.running_tasks ?? 0),
+            healthy: Boolean(parsedHb.healthy ?? true),
+          })
+        );
+      } catch {
+        // ignore malformed node row
+      }
+    }
+
     const rows = this.ctx.storage.sql
       .exec<Record<string, unknown>>("SELECT * FROM ansts_tasks")
       .toArray();
@@ -62,12 +92,32 @@ export class AnstsSchedulerCell {
       });
       spec.state = (r.state as TaskState) ?? TaskState.QUEUED;
       spec.lease_fencing_token = Number(r.fencing_token ?? 0);
+      spec.retry_count = Number(parsed.retry_count ?? 0);
+      spec.preempted_count = Number(parsed.preempted_count ?? 0);
       spec.assigned_node_id = r.assigned_node_id ? String(r.assigned_node_id) : undefined;
+
+      if (spec.lease_fencing_token > 0) {
+        this.scheduler.leaseCoordinator.seedHighestFencingToken(spec.task_id, spec.lease_fencing_token);
+      }
+
+      if (
+        spec.state === TaskState.LEASED ||
+        spec.state === TaskState.RUNNING_THINK ||
+        spec.state === TaskState.RUNNING_ACT
+      ) {
+        if (!this.scheduler.leaseCoordinator.getLease(spec.task_id)) {
+          spec.state = TaskState.QUEUED;
+          spec.assigned_node_id = undefined;
+        }
+      }
+
       this.scheduler.allTasks.set(spec.task_id, spec);
       if (spec.state === TaskState.QUEUED) {
         this.scheduler.queueManager.enqueue(spec);
       } else if (spec.state === TaskState.COMPLETED) {
         this.scheduler.completedIds.add(spec.task_id);
+      } else if (spec.state === TaskState.DEAD_LETTER) {
+        this.scheduler.deadLetterIds.add(spec.task_id);
       }
       count += 1;
     }
@@ -88,6 +138,9 @@ export class AnstsSchedulerCell {
         max_turns: task.max_turns,
         timeout_seconds: task.timeout_seconds,
         dependencies: task.dependencies,
+        retry_count: task.retry_count,
+        preempted_count: task.preempted_count,
+        dead_letter_reason: task.dead_letter_reason,
       })
     );
   }
@@ -112,14 +165,22 @@ export class AnstsSchedulerCell {
     );
   }
 
+  /**
+   * [M52-1] Persists all reconciled/dead-lettered tasks as well as newly placed tasks,
+   * and renews the DO alarm whenever queued tasks OR active leases exist.
+   */
   public async alarm(): Promise<{ placements: Array<[string, string, number]>; recoveredIds: string[] }> {
     const recoveredIds = this.scheduler.reconcileOrphanedLeases();
     const placements = this.scheduler.scheduleTick();
-    for (const [taskId] of placements) {
-      const t = this.scheduler.allTasks.get(taskId);
-      if (t) this.persistTask(t);
+
+    for (const t of this.scheduler.allTasks.values()) {
+      this.persistTask(t);
     }
-    if (this.scheduler.queueManager.totalQueued() > 0) {
+
+    if (
+      this.scheduler.queueManager.totalQueued() > 0 ||
+      this.scheduler.leaseCoordinator.activeLeaseCount() > 0
+    ) {
       await this.ctx.storage.setAlarm(Date.now() + 1000);
     }
     return { placements, recoveredIds };

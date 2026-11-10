@@ -1,5 +1,6 @@
 /**
- * @fileoverview M3 TASK-08: Prefix-Cache Aware Cognitive Router with Automatic Degradation.
+ * @fileoverview M3 TASK-08 & M52-2: Prefix-Cache Aware Cognitive Router with Sliding-Window Quota Decay,
+ * Half-Open Circuit-Breaker Auto-Recovery & Accurate Fallback Concurrency Accounting.
  */
 import * as crypto from "node:crypto";
 import { LlmEndpointMetrics, TaskPriority } from "./models.js";
@@ -10,16 +11,19 @@ export class CognitiveRouter {
   private readonly prefixRadixIndex: Map<string, string> = new Map();
   private readonly breakers: Map<string, ThreeStateCircuitBreaker> = new Map();
   private readonly limiters: Map<string, SlidingWindowTokenBucket> = new Map();
+  private readonly lastWindowResetMs: Map<string, number> = new Map();
+  private readonly rateLimitDegradedSet: Set<string> = new Set();
   private readonly ewmaAlpha: number;
 
   constructor(ewmaAlpha = 0.3) {
     this.ewmaAlpha = ewmaAlpha;
   }
 
-  public registerEndpoint(ep: LlmEndpointMetrics, maxRpm = 1000, maxTpm = 2_000_000): void {
+  public registerEndpoint(ep: LlmEndpointMetrics, maxRpm = 1000, maxTpm = 2_000_000, nowMs = Date.now()): void {
     this.endpoints.set(ep.endpoint_id, ep);
     this.breakers.set(ep.endpoint_id, new ThreeStateCircuitBreaker());
-    this.limiters.set(ep.endpoint_id, new SlidingWindowTokenBucket(maxRpm, maxTpm));
+    this.limiters.set(ep.endpoint_id, new SlidingWindowTokenBucket(maxRpm, maxTpm, nowMs));
+    this.lastWindowResetMs.set(ep.endpoint_id, nowMs);
   }
 
   public static computePrefixHash(systemPrompt: string, toolDefinitions: string, historyPrefix = ""): string {
@@ -27,11 +31,37 @@ export class CognitiveRouter {
     return crypto.createHash("sha256").update(raw, "utf-8").digest("hex").slice(0, 24);
   }
 
+  /**
+   * [M52-2] Refreshes 60-second TPM/RPM/rate-limit windows and auto-recovers rate-limit-degraded
+   * endpoints once their circuit breaker cooldown enters `HALF_OPEN` or `CLOSED`.
+   */
+  public refreshEndpointWindowsAndHalfOpenProbes(nowMs = Date.now()): string[] {
+    const recoveredEndpointIds: string[] = [];
+    for (const [epId, ep] of this.endpoints.entries()) {
+      const lastReset = this.lastWindowResetMs.get(epId) ?? 0;
+      if (nowMs - lastReset >= 60_000) {
+        ep.tpm_used = 0;
+        ep.rpm_used = 0;
+        ep.rate_limit_hits_last_min = 0;
+        this.lastWindowResetMs.set(epId, nowMs);
+      }
+      const breaker = this.breakers.get(epId);
+      if (!ep.healthy && this.rateLimitDegradedSet.has(epId) && breaker && breaker.canPass(nowMs)) {
+        ep.healthy = true;
+        ep.rate_limit_hits_last_min = 0;
+        this.rateLimitDegradedSet.delete(epId);
+        recoveredEndpointIds.push(epId);
+      }
+    }
+    return recoveredEndpointIds;
+  }
+
   public reportInvocationMetrics(
     endpointId: string,
     observedTtftMs: number,
     tokensUsed: number,
-    isRateLimited = false
+    isRateLimited = false,
+    nowMs = Date.now()
   ): void {
     const ep = this.endpoints.get(endpointId);
     if (!ep) return;
@@ -40,25 +70,29 @@ export class CognitiveRouter {
     ep.tpm_used = Math.min(ep.tpm_limit, ep.tpm_used + tokensUsed);
     if (isRateLimited) {
       ep.rate_limit_hits_last_min += 1;
-      breaker?.recordFailure();
+      breaker?.recordFailure(nowMs);
       if (ep.rate_limit_hits_last_min >= 5) {
         ep.healthy = false;
+        this.rateLimitDegradedSet.add(endpointId);
       }
     } else {
       breaker?.recordSuccess();
+      this.rateLimitDegradedSet.delete(endpointId);
     }
   }
 
   public selectEndpoint(
     prefixHash: string,
     estimatedTokens: number,
-    priority: TaskPriority
+    priority: TaskPriority,
+    nowMs = Date.now()
   ): [LlmEndpointMetrics, boolean] {
+    this.refreshEndpointWindowsAndHalfOpenProbes(nowMs);
     const cachedEpId = this.prefixRadixIndex.get(prefixHash);
     const candidates = Array.from(this.endpoints.values()).filter(
       (ep) =>
         ep.healthy &&
-        (this.breakers.get(ep.endpoint_id)?.canPass() ?? true) &&
+        (this.breakers.get(ep.endpoint_id)?.canPass(nowMs) ?? true) &&
         ep.tpm_remaining >= estimatedTokens &&
         ep.active_requests < ep.max_concurrency
     );
@@ -69,7 +103,10 @@ export class CognitiveRouter {
         throw new Error("All LLM endpoints in CognitiveRouter are unhealthy");
       }
       fallback.sort((a, b) => a.active_requests - b.active_requests);
-      return [fallback[0], false];
+      const chosen = fallback[0];
+      chosen.active_requests += 1;
+      chosen.rpm_used += 1;
+      return [chosen, false];
     }
 
     const scoreEndpoint = (ep: LlmEndpointMetrics): number => {

@@ -2337,6 +2337,18 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M52] System-Wide Stale, Deadlock, Starvation & State-Consistency Rectification Audit (`POST /v1beta1/management/system/deep-rectification-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/deep-rectification-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeSystemWideRectificationAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M51] Scheduler Kernel Anti-Stale, Deadlock-Free & Starvation-Proof Audit (`POST /v1beta1/management/scheduler/kernel-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/scheduler/kernel-audit") {
       const body = await this.readJsonBody(req);

@@ -1,5 +1,5 @@
 /**
- * @fileoverview M2 TASK-07: Monotonic Fencing Token & Dual-Tuple `FenceToken` Lease Coordinator with `StaleFenceError` (HTTP 409) Split-Brain Rejection.
+ * @fileoverview M2 TASK-07 & M52-1: Monotonic Fencing Token & Dual-Tuple `FenceToken` Lease Coordinator with `StaleFenceError` (HTTP 409) Split-Brain Rejection.
  */
 import { FenceToken, LeaseRecord } from "./models.js";
 
@@ -36,6 +36,21 @@ export class LeaseCoordinator {
 
   constructor(leaseTtlSeconds = 15.0) {
     this.leaseTtlSeconds = leaseTtlSeconds;
+  }
+
+  public activeLeaseCount(): number {
+    return this.activeLeases.size;
+  }
+
+  /**
+   * [M52-1] Restores monotonic fencing watermark on cell/node cold-start so rehydrated tasks never regress fencing tokens.
+   */
+  public seedHighestFencingToken(taskId: string, token: number): void {
+    const curr = this.highestTokenByTask.get(taskId) ?? 0;
+    if (token > curr) {
+      this.highestTokenByTask.set(taskId, token);
+      this.dualTupleFencesByTask.set(taskId, new FenceToken(token, 0, taskId));
+    }
   }
 
   public acquireLease(taskId: string, nodeId: string, nowSec = Date.now() / 1000): LeaseRecord {
@@ -90,13 +105,13 @@ export class LeaseCoordinator {
     }
   }
 
-  public renewLease(taskId: string, nodeId: string, fencingToken: number): boolean {
+  public renewLease(taskId: string, nodeId: string, fencingToken: number, nowSec = Date.now() / 1000): boolean {
     const lease = this.activeLeases.get(taskId);
     if (!lease) return false;
     if (lease.node_id !== nodeId || lease.fencing_token !== fencingToken) {
       return false;
     }
-    lease.expires_at = Date.now() / 1000 + this.leaseTtlSeconds;
+    lease.expires_at = nowSec + this.leaseTtlSeconds;
     return true;
   }
 

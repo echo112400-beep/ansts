@@ -1,5 +1,5 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.A2aWaitForGraphDeadlockDetector = void 0; /**
- * @fileoverview M23 A2A Wait-For Graph (WFG) Cycle & Distributed Deadlock Detector.
+ * @fileoverview M23 & M52-3: A2A Wait-For Graph (WFG) Cycle & Priority-Aware Distributed Deadlock Resolver.
  */
 class A2aWaitForGraphDeadlockDetector {
   edges = new Map();
@@ -58,5 +58,32 @@ class A2aWaitForGraphDeadlockDetector {
       }
     }
     return { hasDeadlock: false, cyclePath: [] };
+  }
+
+  /**
+   * [M52-3] Automatically selects the lowest-priority agent in a detected Wait-For Graph cycle
+   * and aborts only its outgoing wait edges to break the deadlock cleanly.
+   */
+  resolveCycleWithLowestPriorityVictim(
+  agentPriorityScores = {})
+  {
+    const { hasDeadlock, cyclePath } = this.detectCycle();
+    if (!hasDeadlock || cyclePath.length === 0) {
+      return { resolved: false, victimAgentId: null, cyclePath: [] };
+    }
+    const uniqueAgents = Array.from(new Set(cyclePath));
+    uniqueAgents.sort((a, b) => {
+      const pa = agentPriorityScores[a] ?? 50;
+      const pb = agentPriorityScores[b] ?? 50;
+      if (pa !== pb) return pa - pb;
+      return b.localeCompare(a);
+    });
+    const victimAgentId = uniqueAgents[0];
+    this.edges.delete(victimAgentId);
+    return {
+      resolved: !this.detectCycle().hasDeadlock,
+      victimAgentId,
+      cyclePath
+    };
   }
 }exports.A2aWaitForGraphDeadlockDetector = A2aWaitForGraphDeadlockDetector;

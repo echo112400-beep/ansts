@@ -1,10 +1,11 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.DagEscrowCoordinator = void 0;
 
 
-var _models = require("../models.js"); /**
- * @fileoverview M2 TASK-05: Deadlock-Free Parent-Child Sub-Agent Quota Escrow Coordinator.
- */
 
+var _models = require("../models.js"); /**
+ * @fileoverview M2 TASK-05 & M52-3: Deadlock-Free Parent-Child Sub-Agent Quota Escrow Coordinator
+ * with Child-Failure Unblocking & Parent Escrow Slot Reclamation.
+ */
 
 
 
@@ -65,6 +66,60 @@ class DagEscrowCoordinator {
       return true;
     }
     return false;
+  }
+
+  /**
+   * [M52-3] Handles child sub-agent failure/cancellation so the parent never hangs forever in `WAITING_SUB_AGENT`,
+   * and reclaims the escrowed slot immediately.
+   */
+  failOrCancelChildSubAgent(
+  parent,
+  childTaskId,
+  abortParentOnChildFailure = true)
+  {
+    const escrow = this.escrows.get(parent.task_id);
+    let reclaimed = 0;
+    if (escrow) {
+      if (escrow.childTaskIds.delete(childTaskId) && escrow.usedSlots > 0) {
+        escrow.usedSlots -= 1;
+        reclaimed += 1;
+      }
+    }
+    this.dependencyGraph.delete(childTaskId);
+
+    if (abortParentOnChildFailure) {
+      parent.state = _models.TaskState.DEAD_LETTER;
+      parent.dead_letter_reason = `CHILD_SUB_AGENT_FAILED:${childTaskId}`;
+      reclaimed += this.releaseParentEscrow(parent.task_id);
+      return { parentUnblocked: true, parentState: parent.state, reclaimedEscrowSlots: reclaimed };
+    }
+
+    if (!escrow || escrow.childTaskIds.size === 0) {
+      parent.state = _models.TaskState.RUNNING_THINK;
+      return { parentUnblocked: true, parentState: parent.state, reclaimedEscrowSlots: reclaimed };
+    }
+    return { parentUnblocked: false, parentState: parent.state, reclaimedEscrowSlots: reclaimed };
+  }
+
+  /**
+   * [M52-3] Releases a parent task's escrow reservation upon completion or dead-letter termination.
+   */
+  releaseParentEscrow(parentTaskId) {
+    const escrow = this.escrows.get(parentTaskId);
+    if (!escrow) return 0;
+    const freed = escrow.escrowedSlots;
+    this.escrows.delete(parentTaskId);
+    return freed;
+  }
+
+  getTenantEscrowedSlots(tenantId) {
+    let total = 0;
+    for (const rec of this.escrows.values()) {
+      if (rec.tenantId === tenantId) {
+        total += rec.escrowedSlots;
+      }
+    }
+    return total;
   }
 
   assertNoCycle(sourceTaskId, targets) {

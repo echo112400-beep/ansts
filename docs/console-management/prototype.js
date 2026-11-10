@@ -623,6 +623,9 @@
         fromLiveBackend: false
       };
     }
+    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/system/deep-rectification-audit')) {
+      return { status: 200, ok: true, data: { allM52RectificationsVerified: true } };
+    }
     if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/scheduler/kernel-audit')) {
       return { status: 200, ok: true, data: { stale1HeartbeatTtlEvicted: true, stale2LeaseCapacityReclaimed: true, deadlock1HolBypassPlacedSmallTask: true, deadlock2DagCascadedDeadLetter: true, starvation1FairPreemptionRotation: true, allInvariantsVerified: true } };
     }
@@ -1647,6 +1650,7 @@
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/runtime/celld-engine" data-op="scheduler_cell_rpc_and_alarm">celld 运行时引擎 &amp; LTX/LayerFS 调优</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/ops/observability" data-op="probe_slo_traces_and_metrics">全链路 SLO 燃烧率监控 &amp; 自愈 Runbook</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/scheduler/kernel-audit" data-op="kernel_5_invariants_audit">调度器防 Stale / 防死锁 / 防饥饿 5 项内核自检</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-rectification-audit" data-op="system_wide_m52_rectification">全系统跨模块 Stale/死锁/饥饿 深度整改自检 (M52)</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>
