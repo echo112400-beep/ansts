@@ -1,6 +1,6 @@
 /**
- * @fileoverview M1 TASK-04 & M57-5: Stateless HTTP/REST & SSE Gateway Server
- * with Bounded Payload Size Guard (HTTP 413) to prevent OOM DoS.
+ * @fileoverview M1 TASK-04, M57-5 & M60-5: Stateless HTTP/REST & SSE Gateway Server
+ * with Bounded Payload Size Guard (HTTP 413) & Mergeable Duplicate Submission Inspection.
  */
 import * as http from "node:http";
 import { TaskSpecValidator, TaskSpecValidationError } from "./validator.js";
@@ -33,6 +33,31 @@ export class ApiGatewayServer {
   ): { statusCode: number; headers: Record<string, string>; body: Record<string, unknown> } {
     try {
       const spec = TaskSpecValidator.validateAndNormalize(payload);
+      const mergeDuplicateInFlight = Boolean(
+        payload.merge_duplicate ?? payload.deduplicate_by_fingerprint ?? false
+      );
+      // [M60-5] Pre-check duplicate/mergeable task BEFORE backpressure rejection so idempotent retries
+      // or urgent priority-promoting duplicate requests can merge into an already-admitted task!
+      const dupCheck = this.scheduler.inspectAndMergeDuplicateTask(spec, {
+        mergeDuplicateInFlight,
+      });
+      if (dupCheck.deduplicated) {
+        const canonical = dupCheck.canonicalTask;
+        return {
+          statusCode: 202,
+          headers: { "X-Ansts-Deduplicated": dupCheck.mergedBy },
+          body: {
+            task_id: canonical.task_id,
+            state: canonical.state,
+            lease_fencing_token: canonical.lease_fencing_token,
+            deduplicated: true,
+            merged_by: dupCheck.mergedBy,
+            priority_promoted: dupCheck.priorityPromoted,
+            merged_duplicate_count: canonical.merged_duplicate_count,
+          },
+        };
+      }
+
       const decision = this.backpressure.evaluateAdmission({
         priority: spec.priority,
         globalQueueDepth: this.scheduler.queueManager.totalQueued(),
@@ -46,7 +71,7 @@ export class ApiGatewayServer {
           body: { error: "TOO_MANY_REQUESTS", reason: decision.reason },
         };
       }
-      const submitted = this.scheduler.submitTask(spec);
+      const submitted = this.scheduler.submitTask(spec, { mergeDuplicateInFlight });
       return {
         statusCode: 202,
         headers: {},
@@ -54,6 +79,8 @@ export class ApiGatewayServer {
           task_id: submitted.task_id,
           state: submitted.state,
           lease_fencing_token: submitted.lease_fencing_token,
+          deduplicated: false,
+          merged_duplicate_count: submitted.merged_duplicate_count,
         },
       };
     } catch (err) {
@@ -105,7 +132,7 @@ export class ApiGatewayServer {
           });
           return;
         }
-        res.writeHead(404);
+        res.writeHead(404, { "content-type": "application/json" });
         res.end();
       });
       this.server.on("error", reject);

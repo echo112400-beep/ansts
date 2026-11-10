@@ -8,7 +8,9 @@ TaskPriority;exports.TaskPriority = TaskPriority;(function (TaskPriority) {TaskP
 
 
 
-TaskState;exports.TaskState = TaskState;(function (TaskState) {TaskState["SUBMITTED"] = "SUBMITTED";TaskState["QUEUED"] = "QUEUED";TaskState["LEASED"] = "LEASED";TaskState["RUNNING_THINK"] = "RUNNING_THINK";TaskState["RUNNING_ACT"] = "RUNNING_ACT";TaskState["WAITING_SUB_AGENT"] = "WAITING_SUB_AGENT";TaskState["SUSPENDED_APPROVAL"] = "SUSPENDED_APPROVAL";TaskState["PREEMPTING"] = "PREEMPTING";TaskState["COMPLETED"] = "COMPLETED";TaskState["FAILED"] = "FAILED";TaskState["DEAD_LETTER"] = "DEAD_LETTER";})(TaskState || (exports.TaskState = TaskState = {}));let
+TaskState;exports.TaskState = TaskState;(function (TaskState) {TaskState["SUBMITTED"] = "SUBMITTED";TaskState["QUEUED"] = "QUEUED";TaskState["LEASED"] = "LEASED";TaskState["RUNNING_THINK"] = "RUNNING_THINK";TaskState["RUNNING_ACT"] = "RUNNING_ACT";TaskState["WAITING_SUB_AGENT"] = "WAITING_SUB_AGENT";TaskState["SUSPENDED_APPROVAL"] = "SUSPENDED_APPROVAL";TaskState["PREEMPTING"] = "PREEMPTING";TaskState["COMPLETED"] = "COMPLETED";TaskState["SUCCEEDED"] = "COMPLETED";TaskState["FAILED"] = "FAILED";TaskState["DEAD_LETTER"] = "DEAD_LETTER";TaskState["CANCELLED"] = "DEAD_LETTER";})(TaskState || (exports.TaskState = TaskState = {}));let
+
+
 
 
 
@@ -115,7 +117,9 @@ class TurnWalFrame {
     this.changedFiles = [...params.changedFiles];
     this.sqliteWalPages = params.sqliteWalPages;
     this.createdAtMs = params.createdAtMs ?? Date.now();
-    this.crc32Hex = params.crc32Hex ?? TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+    this.crc32Hex =
+    params.crc32Hex ??
+    TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
   }
 
   static computeCrc32Hex(
@@ -168,6 +172,10 @@ class TurnWalFrame {
 
 
 
+
+
+
+
 class TaskSpec {
   task_id;
   tenant_id;
@@ -182,6 +190,10 @@ class TaskSpec {
   parent_task_id;
   expected_SubAgent_count;
   prefix_Cache_hash = "";
+  content_fingerprint = "";
+  merged_duplicate_count = 0;
+  merged_request_ids = [];
+  merged_idempotency_keys = [];
   state = TaskState.SUBMITTED;
   assigned_node_id;
   lease_fencing_token = 0;
@@ -209,6 +221,14 @@ class TaskSpec {
     this.parent_task_id = init.parent_task_id;
     this.expected_SubAgent_count = init.expected_SubAgent_count ?? 0;
     this.prefix_Cache_hash = init.prefix_Cache_hash ?? "";
+    this.content_fingerprint = init.content_fingerprint ?? "";
+    this.merged_duplicate_count = init.merged_duplicate_count ?? 0;
+    this.merged_request_ids = init.merged_request_ids ? [...init.merged_request_ids] : [];
+    this.merged_idempotency_keys = init.merged_idempotency_keys ?
+    [...init.merged_idempotency_keys] :
+    init.idempotency_key ?
+    [init.idempotency_key] :
+    [];
     this.created_at = Date.now() / 1000;
   }
 }exports.TaskSpec = TaskSpec;

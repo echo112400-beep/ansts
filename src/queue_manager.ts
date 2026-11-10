@@ -1,5 +1,6 @@
 /**
- * @fileoverview M2 TASK-06, M16 TASK-80 & M51-3: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging/Preemption-Compensation Tournament Queue Manager.
+ * @fileoverview M2 TASK-06, M16 TASK-80, M51-3 & M60-5: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging/Preemption-Compensation
+ * Tournament Queue Manager with Idempotent Enqueue & In-Place Priority Promotion on Duplicate Coalescing.
  */
 import { TaskPriority, TaskSpec } from "./models.js";
 
@@ -30,17 +31,49 @@ export class HierarchicalQueueManager {
     return basePriorityScore[priority] ?? 100;
   }
 
+  private computeStaticKey(task: TaskSpec): number {
+    const preemptionBonus = (task.preempted_count ?? 0) * this.preemptionCompensationBoost;
+    return (
+      this.getBasePriorityScore(task.priority) +
+      preemptionBonus -
+      task.created_at * this.agingBoostPerSec
+    );
+  }
+
+  /**
+   * [M60-5] Idempotent enqueue: if `task.task_id` is already present in the tenant heap,
+   * replaces and re-heapifies it in place rather than inserting duplicate heap nodes.
+   */
   public enqueue(task: TaskSpec): void {
+    const alreadyQueued = this.queuedTasks.has(task.task_id);
     this.queuedTasks.set(task.task_id, task);
     let heap = this.tenantHeaps.get(task.tenant_id);
     if (!heap) {
       heap = [];
       this.tenantHeaps.set(task.tenant_id, heap);
     }
-    const preemptionBonus = (task.preempted_count ?? 0) * this.preemptionCompensationBoost;
-    const intraTenantStaticKey =
-      this.getBasePriorityScore(task.priority) + preemptionBonus - task.created_at * this.agingBoostPerSec;
+    if (alreadyQueued) {
+      const filtered = heap.filter((n) => n.task.task_id !== task.task_id);
+      heap.length = 0;
+      for (const item of filtered) {
+        this.heapPush(heap, item);
+      }
+    }
+    const intraTenantStaticKey = this.computeStaticKey(task);
     this.heapPush(heap, { task, intraTenantStaticKey });
+  }
+
+  /**
+   * [M60-5] Promotes/updates the priority of an already-queued task when a higher-urgency
+   * duplicate request is merged into it, re-heapifying the tenant queue immediately.
+   */
+  public reprioritizeQueuedTask(task: TaskSpec, newPriority: TaskPriority): boolean {
+    task.priority = newPriority;
+    if (!this.queuedTasks.has(task.task_id)) {
+      return false;
+    }
+    this.enqueue(task);
+    return true;
   }
 
   public removeQueuedTask(taskId: string): void {

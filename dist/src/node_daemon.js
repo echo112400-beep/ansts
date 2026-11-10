@@ -3,11 +3,18 @@
 
 
 var _models = require("./models.js");
-
 var _lease_coordinator = require("./lease_coordinator.js"); /**
- * @fileoverview M4 TASK-18 & M57-4: NodeDaemon Runtime Agent with Turn-Level WAL Checkpointing,
- * Cross-Node Turn Monotonicity Guard, Max-Turns Enforcement & Failure State Rollback.
- */const TERMINAL_STATES = new Set([_models.TaskState.SUCCEEDED, _models.TaskState.FAILED, _models.TaskState.DEAD_LETTER, _models.TaskState.CANCELLED]);
+ * @fileoverview M4 TASK-18, M57-4 & M60-4: NodeDaemon Runtime Agent with Turn-Level WAL Checkpointing,
+ * Cross-Node Turn Monotonicity Guard, Max-Turns Enforcement, Failure State Rollback & Deterministic Breakpoint Crash-Recovery.
+ */
+
+const TERMINAL_STATES = new Set([
+_models.TaskState.SUCCEEDED,
+_models.TaskState.FAILED,
+_models.TaskState.DEAD_LETTER,
+_models.TaskState.CANCELLED]);
+
+
 class NodeDaemon {
   nodeId;
   totalCpu;
@@ -34,6 +41,63 @@ class NodeDaemon {
       psi_memory_some_avg10: this.psiMemorySomeAvg10,
       running_tasks: runningTasks
     });
+  }
+
+  /**
+   * [M60-4] Recovers a task on this `NodeDaemon` from its committed `TurnWalEngine` breakpoint after
+   * a crash, lease expiration, or cross-node preemption:
+   * - Reconstructs the local `checkpointStore` from the canonical WAL entries up to `restoredTurnIndex`,
+   * - Synchronizes `task.current_turn = restoredTurnIndex`,
+   * - Automatically rolls back and invalidates any uncommitted mid-turn Saga side-effects at `turn >= restoredTurnIndex + 1`,
+   * - Ensures the next `executeAgentStep` continues deterministically from `restoredTurnIndex + 1`.
+   */
+  recoverTaskFromBreakpoint(
+  scheduler,
+  task,
+  walEngine,
+  sagaGateway)
+
+
+
+
+
+
+
+  {
+    if (!scheduler.leaseCoordinator.validateFencingToken(task.task_id, task.lease_fencing_token)) {
+      throw new _lease_coordinator.StaleFenceError(
+      task.task_id,
+      task.lease_fencing_token,
+      scheduler.leaseCoordinator.getLease(task.task_id)?.fencing_token ?? -1);
+
+    }
+
+    const breakpoint = walEngine.recoverTaskBreakpoint(task.task_id, task.lease_fencing_token);
+    const checkpoints = breakpoint.canonicalEntries.map((e) => ({
+      ...e.checkpoint,
+      fencing_token: e.fencingToken,
+      turn_index: e.turnIndex
+    }));
+    this.checkpointStore.set(task.task_id, checkpoints);
+    task.current_turn = breakpoint.restoredTurnIndex;
+
+    let rolledBackUncommittedSteps = 0;
+    if (sagaGateway) {
+      const rb = sagaGateway.rollbackAndInvalidateTask(
+      task.task_id,
+      breakpoint.restoredTurnIndex + 1);
+
+      rolledBackUncommittedSteps = rb.rolledBackSteps.length + rb.invalidatedIdemKeys.length;
+    }
+
+    return {
+      restoredTurnIndex: breakpoint.restoredTurnIndex,
+      restoredFencingToken: breakpoint.restoredFencingToken,
+      rehydratedCheckpoints: checkpoints.length,
+      rolledBackUncommittedSteps,
+      discardedWalFrames: breakpoint.discardedFrameIds.length,
+      nextTurnToExecute: breakpoint.restoredTurnIndex + 1
+    };
   }
 
   writeTurnCheckpoint(

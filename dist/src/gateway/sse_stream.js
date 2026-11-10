@@ -3,8 +3,8 @@
 
 
 var _nodeStream = require("node:stream"); /**
- * @fileoverview M1 TASK-03 & M54-4: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer
- * with Evicted `Last-Event-ID` Fallback Replay & Completed Task Stream Garbage Collection.
+ * @fileoverview M1 TASK-03, M54-4 & M60-3: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer
+ * with Evicted `Last-Event-ID` Fallback Replay, Completed Task Stream GC & Idempotent `envelope.id` Deduplication.
  */
 
 
@@ -46,6 +46,7 @@ class ClientStreamSubscription {
 class SseEventStreamGateway {
   subscriptionsByTask = new Map();
   historyByTask = new Map();
+  seenEventIdsByTask = new Map();
   maxHistoryPerTask;
 
   constructor(maxHistoryPerTask = 100) {
@@ -126,13 +127,30 @@ class SseEventStreamGateway {
           this.subscriptionsByTask.delete(taskId);
         }
         this.historyByTask.delete(taskId);
+        this.seenEventIdsByTask.delete(taskId);
         cleanedTasks += 1;
       }
     }
     return cleanedTasks;
   }
 
+  /**
+   * [M60-3] Idempotent event publication: suppresses duplicate `envelope.id` publications for the same
+   * `taskId` so retried turn emitters never duplicate history entries or double-stream frames to clients.
+   */
   publish(envelope) {
+    let seenSet = this.seenEventIdsByTask.get(envelope.taskId);
+    if (!seenSet) {
+      seenSet = new Set();
+      this.seenEventIdsByTask.set(envelope.taskId, seenSet);
+    }
+    if (envelope.id && seenSet.has(envelope.id)) {
+      return 0;
+    }
+    if (envelope.id) {
+      seenSet.add(envelope.id);
+    }
+
     let history = this.historyByTask.get(envelope.taskId);
     if (!history) {
       history = [];
@@ -140,7 +158,10 @@ class SseEventStreamGateway {
     }
     history.push(envelope);
     if (history.length > this.maxHistoryPerTask) {
-      history.shift();
+      const evicted = history.shift();
+      if (evicted?.id && seenSet.size > this.maxHistoryPerTask * 4) {
+        seenSet.delete(evicted.id);
+      }
     }
     const taskSubs = this.subscriptionsByTask.get(envelope.taskId);
     if (!taskSubs) return 0;
@@ -152,5 +173,9 @@ class SseEventStreamGateway {
       }
     }
     return delivered;
+  }
+
+  getTaskHistory(taskId) {
+    return [...(this.historyByTask.get(taskId) ?? [])];
   }
 }exports.SseEventStreamGateway = SseEventStreamGateway;

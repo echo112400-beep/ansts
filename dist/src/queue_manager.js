@@ -1,10 +1,11 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.HierarchicalQueueManager = void 0;
 
 
-var _models = require("./models.js"); /**
- * @fileoverview M2 TASK-06, M16 TASK-80 & M51-3: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging/Preemption-Compensation Tournament Queue Manager.
- */
 
+var _models = require("./models.js"); /**
+ * @fileoverview M2 TASK-06, M16 TASK-80, M51-3 & M60-5: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging/Preemption-Compensation
+ * Tournament Queue Manager with Idempotent Enqueue & In-Place Priority Promotion on Duplicate Coalescing.
+ */
 
 
 
@@ -30,17 +31,49 @@ class HierarchicalQueueManager {
     return basePriorityScore[priority] ?? 100;
   }
 
+  computeStaticKey(task) {
+    const preemptionBonus = (task.preempted_count ?? 0) * this.preemptionCompensationBoost;
+    return (
+      this.getBasePriorityScore(task.priority) +
+      preemptionBonus -
+      task.created_at * this.agingBoostPerSec);
+
+  }
+
+  /**
+   * [M60-5] Idempotent enqueue: if `task.task_id` is already present in the tenant heap,
+   * replaces and re-heapifies it in place rather than inserting duplicate heap nodes.
+   */
   enqueue(task) {
+    const alreadyQueued = this.queuedTasks.has(task.task_id);
     this.queuedTasks.set(task.task_id, task);
     let heap = this.tenantHeaps.get(task.tenant_id);
     if (!heap) {
       heap = [];
       this.tenantHeaps.set(task.tenant_id, heap);
     }
-    const preemptionBonus = (task.preempted_count ?? 0) * this.preemptionCompensationBoost;
-    const intraTenantStaticKey =
-    this.getBasePriorityScore(task.priority) + preemptionBonus - task.created_at * this.agingBoostPerSec;
+    if (alreadyQueued) {
+      const filtered = heap.filter((n) => n.task.task_id !== task.task_id);
+      heap.length = 0;
+      for (const item of filtered) {
+        this.heapPush(heap, item);
+      }
+    }
+    const intraTenantStaticKey = this.computeStaticKey(task);
     this.heapPush(heap, { task, intraTenantStaticKey });
+  }
+
+  /**
+   * [M60-5] Promotes/updates the priority of an already-queued task when a higher-urgency
+   * duplicate request is merged into it, re-heapifying the tenant queue immediately.
+   */
+  reprioritizeQueuedTask(task, newPriority) {
+    task.priority = newPriority;
+    if (!this.queuedTasks.has(task.task_id)) {
+      return false;
+    }
+    this.enqueue(task);
+    return true;
   }
 
   removeQueuedTask(taskId) {

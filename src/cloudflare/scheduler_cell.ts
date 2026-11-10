@@ -1,6 +1,6 @@
 /**
- * @fileoverview M7 TASK-26 & M52-1: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
- * Monotonic Fencing Watermark Rehydration, Interrupted-Lease Recovery & Active-Lease Alarm Renewal).
+ * @fileoverview M7 TASK-26, M52-1 & M60-1: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
+ * Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, Interrupted-Lease Recovery & Alarm Renewal).
  */
 import { DurableObjectStateLike } from "./env.js";
 import { CoreScheduler5D } from "../scheduler.js";
@@ -45,8 +45,8 @@ export class AnstsSchedulerCell {
   }
 
   /**
-   * [M52-1] Rehydrates registered nodes, monotonic fencing token watermarks, and interrupted LEASED tasks
-   * (converting orphaned LEASED tasks back to QUEUED on cell migration/restart so they never hang).
+   * [M52-1 & M60-1] Rehydrates registered nodes, monotonic fencing token watermarks, tenant-scoped `idempotencyIndex`,
+   * `contentFingerprintIndex`, `current_turn` breakpoint progress, and interrupted LEASED tasks.
    */
   public rehydrateFromSql(): number {
     const nodeRows = this.ctx.storage.sql
@@ -89,12 +89,29 @@ export class AnstsSchedulerCell {
         max_turns: Number(parsed.max_turns ?? 30),
         timeout_seconds: Number(parsed.timeout_seconds ?? 1800),
         dependencies: Array.isArray(parsed.dependencies) ? parsed.dependencies.map(String) : [],
+        idempotency_key: parsed.idempotency_key ? String(parsed.idempotency_key) : undefined,
+        content_fingerprint: parsed.content_fingerprint ? String(parsed.content_fingerprint) : undefined,
+        merged_duplicate_count:
+          parsed.merged_duplicate_count !== undefined ? Number(parsed.merged_duplicate_count) : 0,
+        merged_request_ids: Array.isArray(parsed.merged_request_ids)
+          ? parsed.merged_request_ids.map(String)
+          : [],
+        merged_idempotency_keys: Array.isArray(parsed.merged_idempotency_keys)
+          ? parsed.merged_idempotency_keys.map(String)
+          : undefined,
       });
+      if (parsed.current_turn !== undefined) {
+        spec.current_turn = Number(parsed.current_turn);
+      }
       spec.state = (r.state as TaskState) ?? TaskState.QUEUED;
       spec.lease_fencing_token = Number(r.fencing_token ?? 0);
       spec.retry_count = Number(parsed.retry_count ?? 0);
       spec.preempted_count = Number(parsed.preempted_count ?? 0);
+      spec.dead_letter_reason = parsed.dead_letter_reason ? String(parsed.dead_letter_reason) : undefined;
       spec.assigned_node_id = r.assigned_node_id ? String(r.assigned_node_id) : undefined;
+      if (!spec.content_fingerprint) {
+        spec.content_fingerprint = CoreScheduler5D.computeTaskContentFingerprint(spec);
+      }
 
       if (spec.lease_fencing_token > 0) {
         this.scheduler.leaseCoordinator.seedHighestFencingToken(spec.task_id, spec.lease_fencing_token);
@@ -112,6 +129,20 @@ export class AnstsSchedulerCell {
       }
 
       this.scheduler.allTasks.set(spec.task_id, spec);
+      if (spec.idempotency_key) {
+        this.scheduler.idempotencyIndex.set(
+          CoreScheduler5D.scopeIdempotencyKey(spec.tenant_id, spec.idempotency_key),
+          spec.task_id
+        );
+      }
+      for (const mKey of spec.merged_idempotency_keys) {
+        this.scheduler.idempotencyIndex.set(
+          CoreScheduler5D.scopeIdempotencyKey(spec.tenant_id, mKey),
+          spec.task_id
+        );
+      }
+      this.scheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+
       if (spec.state === TaskState.QUEUED) {
         this.scheduler.queueManager.enqueue(spec);
       } else if (spec.state === TaskState.COMPLETED) {
@@ -136,8 +167,14 @@ export class AnstsSchedulerCell {
       JSON.stringify({
         prompt: task.prompt,
         max_turns: task.max_turns,
+        current_turn: task.current_turn,
         timeout_seconds: task.timeout_seconds,
         dependencies: task.dependencies,
+        idempotency_key: task.idempotency_key,
+        content_fingerprint: task.content_fingerprint,
+        merged_duplicate_count: task.merged_duplicate_count,
+        merged_request_ids: task.merged_request_ids,
+        merged_idempotency_keys: task.merged_idempotency_keys,
         retry_count: task.retry_count,
         preempted_count: task.preempted_count,
         dead_letter_reason: task.dead_letter_reason,
@@ -145,8 +182,8 @@ export class AnstsSchedulerCell {
     );
   }
 
-  public async submitTask(task: TaskSpec): Promise<TaskSpec> {
-    const submitted = this.scheduler.submitTask(task);
+  public async submitTask(task: TaskSpec, options?: { mergeDuplicateInFlight?: boolean }): Promise<TaskSpec> {
+    const submitted = this.scheduler.submitTask(task, options);
     this.persistTask(submitted);
     const currentAlarm = await this.ctx.storage.getAlarm();
     if (!currentAlarm) {
@@ -195,12 +232,22 @@ export class AnstsSchedulerCell {
         tenant_id: String(body.tenant_id ?? "default"),
         priority: Number(body.priority ?? TaskPriority.P2_STANDARD) as TaskPriority,
         prompt: String(body.prompt ?? ""),
+        idempotency_key: body.idempotency_key ? String(body.idempotency_key) : undefined,
       });
-      const submitted = await this.submitTask(spec);
-      return new Response(JSON.stringify({ task_id: submitted.task_id, state: submitted.state }), {
-        status: 202,
-        headers: { "content-type": "application/json" },
+      const submitted = await this.submitTask(spec, {
+        mergeDuplicateInFlight: Boolean(body.merge_duplicate ?? false),
       });
+      return new Response(
+        JSON.stringify({
+          task_id: submitted.task_id,
+          state: submitted.state,
+          merged_duplicate_count: submitted.merged_duplicate_count,
+        }),
+        {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        }
+      );
     }
     if (request.method === "POST" && url.pathname === "/schedule-tick") {
       const res = await this.alarm();

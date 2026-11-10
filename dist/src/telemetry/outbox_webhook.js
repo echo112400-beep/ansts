@@ -3,9 +3,10 @@
 
 
 var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M6 TASK-23 & M54-4: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher
- * with Per-Message Exception Isolation, Replay-Window Signature Verification & Completed Message Compaction.
+ * @fileoverview M6 TASK-23, M54-4 & M60-1: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher
+ * with SQLite Durability, Per-Message Exception Isolation, Replay-Window Signature Verification & Compaction.
  */
+
 
 
 
@@ -20,10 +21,60 @@ class TransactionalOutboxDispatcher {
   outbox = new Map();
   maxAttempts;
   signingSecret;
+  sql;
 
-  constructor(signingSecret = "ansts-webhook-hmac-secret", maxAttempts = 4) {
+  constructor(signingSecret = "ansts-webhook-hmac-secret", maxAttempts = 4, sql) {
     this.signingSecret = signingSecret;
     this.maxAttempts = maxAttempts;
+    if (sql) {
+      this.bindSqlStorage(sql);
+    }
+  }
+
+  /**
+   * [M60-1] Binds SQLite storage so queued webhook messages survive process crashes before delivery.
+   */
+  bindSqlStorage(sql) {
+    this.sql = sql;
+    this.sql.exec(
+    "CREATE TABLE IF NOT EXISTS transactional_outbox_messages (message_id TEXT PRIMARY KEY, task_id TEXT, target_url TEXT, payload_json TEXT, attempts INTEGER, delivered INTEGER, dead_lettered INTEGER, last_error TEXT, signature_header TEXT)");
+
+    const rows = this.sql.
+    exec("SELECT * FROM transactional_outbox_messages").
+    toArray();
+    let restored = 0;
+    for (const r of rows) {
+      const msg = {
+        messageId: String(r.message_id),
+        taskId: String(r.task_id),
+        targetUrl: String(r.target_url),
+        payload: JSON.parse(String(r.payload_json ?? "{}")),
+        attempts: Number(r.attempts ?? 0),
+        delivered: Boolean(Number(r.delivered ?? 0)),
+        deadLettered: Boolean(Number(r.dead_lettered ?? 0)),
+        lastError: r.last_error ? String(r.last_error) : undefined,
+        signatureHeader: r.signature_header ? String(r.signature_header) : undefined
+      };
+      this.outbox.set(msg.messageId, msg);
+      restored += 1;
+    }
+    return restored;
+  }
+
+  persistOutboxMessage(msg) {
+    if (!this.sql) return;
+    this.sql.exec(
+    "INSERT OR REPLACE INTO transactional_outbox_messages (message_id, task_id, target_url, payload_json, attempts, delivered, dead_lettered, last_error, signature_header) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    msg.messageId,
+    msg.taskId,
+    msg.targetUrl,
+    JSON.stringify(msg.payload),
+    msg.attempts,
+    msg.delivered ? 1 : 0,
+    msg.deadLettered ? 1 : 0,
+    msg.lastError ?? "",
+    msg.signatureHeader ?? "");
+
   }
 
   enqueueOutbox(
@@ -46,7 +97,12 @@ class TransactionalOutboxDispatcher {
       deadLettered: false
     };
     this.outbox.set(messageId, msg);
+    this.persistOutboxMessage(msg);
     return msg;
+  }
+
+  listMessages() {
+    return Array.from(this.outbox.values());
   }
 
   signPayload(payloadJson, timestampSec = Math.floor(Date.now() / 1000)) {
@@ -77,8 +133,7 @@ class TransactionalOutboxDispatcher {
   }
 
   /**
-   * [M54-4] Isolates exceptions thrown by `sender(msg)` per message so one poisoned/failing webhook endpoint
-   * never aborts the dispatch loop or starves subsequent messages in the outbox.
+   * [M54-4 & M60-1] Isolates exceptions thrown by `sender(msg)` per message and persists delivery state to SQLite.
    */
   processPending(sender)
 
@@ -110,6 +165,7 @@ class TransactionalOutboxDispatcher {
           deadLetterCount += 1;
         }
       }
+      this.persistOutboxMessage(msg);
     }
     return { deliveredCount, deadLetterCount, failedAttemptCount };
   }
@@ -119,6 +175,9 @@ class TransactionalOutboxDispatcher {
     for (const [id, msg] of Array.from(this.outbox.entries())) {
       if (msg.delivered || msg.deadLettered) {
         this.outbox.delete(id);
+        if (this.sql) {
+          this.sql.exec("DELETE FROM transactional_outbox_messages WHERE message_id = ?", id);
+        }
         purged += 1;
       }
     }

@@ -4,10 +4,14 @@
 
 
 
+var _scheduler = require("../scheduler.js");
 var _models = require("../models.js"); /**
- * @fileoverview M14 TASK-63 ~ TASK-66, M48-1 & M56-1: Unified 8-Table Component Persistence Store & Cold-Start Rehydration Engine
- * with Monotonic Fencing Watermark Rehydration & Interrupted In-Flight Task Recovery.
- */class UnifiedComponentPersistenceStore {sql;
+ * @fileoverview M14 TASK-63 ~ TASK-66, M48-1, M56-1 & M60-1: Unified Component & Full-Link Persistence Store & Cold-Start Rehydration Engine
+ * with Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, Interrupted In-Flight Task Recovery,
+ * and End-to-End Snapshot/Rehydration across Scheduler, TurnWalEngine, SagaToolGateway & TransactionalOutboxDispatcher.
+ */
+class UnifiedComponentPersistenceStore {
+  sql;
 
   constructor(sql) {
     this.sql = sql;
@@ -55,7 +59,8 @@ var _models = require("../models.js"); /**
   }
 
   /**
-   * [M56-1] Rehydrates tasks and fencing watermarks from `persisted_tasks` and `persisted_leases`.
+   * [M56-1 & M60-1] Rehydrates tasks, fencing watermarks, tenant-scoped `idempotencyIndex`,
+   * `contentFingerprintIndex`, `deadLetterIds`, and merged duplicate metadata from `persisted_tasks` and `persisted_leases`.
    * Any task that was interrupted mid-flight (`LEASED`, `RUNNING_THINK`, `RUNNING_ACT`) is safely
    * transitioned back to `QUEUED` and enqueued so it is re-dispatched with a higher monotonic fencing token.
    */
@@ -88,14 +93,35 @@ var _models = require("../models.js"); /**
         idempotency_key: raw.idempotency_key ? String(raw.idempotency_key) : undefined,
         parent_task_id: raw.parent_task_id ? String(raw.parent_task_id) : undefined,
         expected_SubAgent_count:
-        raw.expected_SubAgent_count !== undefined ? Number(raw.expected_SubAgent_count) : undefined
+        raw.expected_SubAgent_count !== undefined ? Number(raw.expected_SubAgent_count) : undefined,
+        content_fingerprint: raw.content_fingerprint ? String(raw.content_fingerprint) : undefined,
+        merged_duplicate_count:
+        raw.merged_duplicate_count !== undefined ? Number(raw.merged_duplicate_count) : 0,
+        merged_request_ids: Array.isArray(raw.merged_request_ids) ?
+        raw.merged_request_ids.map(String) :
+        [],
+        merged_idempotency_keys: Array.isArray(raw.merged_idempotency_keys) ?
+        raw.merged_idempotency_keys.map(String) :
+        undefined
       });
       if (raw.current_turn !== undefined) {
         spec.current_turn = Number(raw.current_turn);
       }
+      if (raw.retry_count !== undefined) {
+        spec.retry_count = Number(raw.retry_count);
+      }
+      if (raw.preempted_count !== undefined) {
+        spec.preempted_count = Number(raw.preempted_count);
+      }
+      if (raw.dead_letter_reason) {
+        spec.dead_letter_reason = String(raw.dead_letter_reason);
+      }
       spec.state = raw.state ?? _models.TaskState.QUEUED;
       spec.lease_fencing_token = Number(raw.lease_fencing_token ?? 0);
       spec.assigned_node_id = raw.assigned_node_id ? String(raw.assigned_node_id) : undefined;
+      if (!spec.content_fingerprint) {
+        spec.content_fingerprint = _scheduler.CoreScheduler5D.computeTaskContentFingerprint(spec);
+      }
 
       if (spec.lease_fencing_token > 0) {
         targetScheduler.leaseCoordinator.rehydrateFencingWatermark(spec.task_id, spec.lease_fencing_token);
@@ -112,14 +138,127 @@ var _models = require("../models.js"); /**
       }
 
       targetScheduler.allTasks.set(spec.task_id, spec);
+      if (spec.idempotency_key) {
+        targetScheduler.idempotencyIndex.set(
+        _scheduler.CoreScheduler5D.scopeIdempotencyKey(spec.tenant_id, spec.idempotency_key),
+        spec.task_id);
+
+      }
+      for (const mKey of spec.merged_idempotency_keys) {
+        targetScheduler.idempotencyIndex.set(
+        _scheduler.CoreScheduler5D.scopeIdempotencyKey(spec.tenant_id, mKey),
+        spec.task_id);
+
+      }
+      targetScheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+
       if (spec.state === _models.TaskState.QUEUED) {
         targetScheduler.queueManager.enqueue(spec);
       } else if (spec.state === _models.TaskState.COMPLETED) {
         targetScheduler.completedIds.add(spec.task_id);
+      } else if (spec.state === _models.TaskState.DEAD_LETTER) {
+        targetScheduler.deadLetterIds.add(spec.task_id);
       }
       restored += 1;
     }
     return restored;
+  }
+
+  /**
+   * [M60-1] Atomically snapshots the full end-to-end execution chain (Scheduler, TurnWalEngine,
+   * SagaToolGateway journal & steps, and TransactionalOutboxDispatcher) into SQLite.
+   */
+  snapshotFullLinkState(params)
+
+
+
+
+
+
+
+
+
+
+  {
+    const schedSnap = this.snapshotSchedulerState(params.scheduler);
+    let walEntriesSaved = 0;
+    if (params.walEngine) {
+      params.walEngine.bindSqlStorage(this.sql);
+      for (const task of params.scheduler.allTasks.values()) {
+        const entries = params.walEngine.getTaskWalEntries(task.task_id);
+        for (const e of entries) {
+          this.sql.exec(
+          "INSERT OR REPLACE INTO turn_wal_entries (task_id, wal_seq, turn_index, fencing_token, changed_files_json, sqlite_wal_pages, checksum_sha256, frame_crc32, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          e.taskId,
+          e.walSeq,
+          e.turnIndex,
+          e.fencingToken,
+          JSON.stringify(e.changedFiles),
+          e.sqliteWalPages,
+          e.checksumSha256,
+          e.frame.crc32Hex,
+          e.checkpoint.created_at);
+
+          walEntriesSaved += 1;
+        }
+      }
+    }
+
+    let sagaJournalSaved = 0;
+    if (params.sagaGateway) {
+      params.sagaGateway.bindSqlStorage(this.sql);
+      const records = params.sagaGateway.exportJournalRecords();
+      sagaJournalSaved = params.sagaGateway.importJournalRecords(records);
+    }
+
+    let outboxMessagesSaved = 0;
+    if (params.outboxDispatcher) {
+      params.outboxDispatcher.bindSqlStorage(this.sql);
+      for (const msg of params.outboxDispatcher.listMessages()) {
+        params.outboxDispatcher.enqueueOutbox(msg.messageId, msg.taskId, msg.targetUrl, msg.payload);
+        outboxMessagesSaved += 1;
+      }
+    }
+
+    return {
+      tasksSaved: schedSnap.tasksSaved,
+      leasesSaved: schedSnap.leasesSaved,
+      walEntriesSaved,
+      sagaJournalSaved,
+      outboxMessagesSaved
+    };
+  }
+
+  /**
+   * [M60-1] Rehydrates the full end-to-end execution chain (Scheduler, TurnWalEngine, SagaToolGateway,
+   * and TransactionalOutboxDispatcher) from SQLite on process/cell cold-start.
+   */
+  rehydrateFullLinkState(params)
+
+
+
+
+
+
+
+
+
+
+  {
+    const tasksRestored = this.rehydrateSchedulerFromSql(params.scheduler, {
+      requeueInterruptedLeases: params.requeueInterruptedLeases ?? true
+    });
+    const walEntriesRestored = params.walEngine ? params.walEngine.bindSqlStorage(this.sql) : 0;
+    const sagaJournalRestored = params.sagaGateway ? params.sagaGateway.bindSqlStorage(this.sql) : 0;
+    const outboxMessagesRestored = params.outboxDispatcher ?
+    params.outboxDispatcher.bindSqlStorage(this.sql) :
+    0;
+    return {
+      tasksRestored,
+      walEntriesRestored,
+      sagaJournalRestored,
+      outboxMessagesRestored
+    };
   }
 
   saveComponentRecord(

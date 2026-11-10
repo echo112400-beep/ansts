@@ -18,8 +18,10 @@ export enum TaskState {
   SUSPENDED_APPROVAL = "SUSPENDED_APPROVAL",
   PREEMPTING = "PREEMPTING",
   COMPLETED = "COMPLETED",
+  SUCCEEDED = "COMPLETED",
   FAILED = "FAILED",
   DEAD_LETTER = "DEAD_LETTER",
+  CANCELLED = "DEAD_LETTER",
 }
 
 export enum ToolCallEffectClass {
@@ -115,7 +117,9 @@ export class TurnWalFrame {
     this.changedFiles = [...params.changedFiles];
     this.sqliteWalPages = params.sqliteWalPages;
     this.createdAtMs = params.createdAtMs ?? Date.now();
-    this.crc32Hex = params.crc32Hex ?? TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+    this.crc32Hex =
+      params.crc32Hex ??
+      TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
   }
 
   public static computeCrc32Hex(
@@ -166,6 +170,10 @@ export interface TaskSpecInit {
   parent_task_id?: string;
   expected_SubAgent_count?: number;
   prefix_Cache_hash?: string;
+  content_fingerprint?: string;
+  merged_duplicate_count?: number;
+  merged_request_ids?: string[];
+  merged_idempotency_keys?: string[];
 }
 
 export class TaskSpec {
@@ -182,6 +190,10 @@ export class TaskSpec {
   public parent_task_id?: string;
   public expected_SubAgent_count: number;
   public prefix_Cache_hash = "";
+  public content_fingerprint = "";
+  public merged_duplicate_count = 0;
+  public merged_request_ids: string[] = [];
+  public merged_idempotency_keys: string[] = [];
   public state: TaskState = TaskState.SUBMITTED;
   public assigned_node_id?: string;
   public lease_fencing_token = 0;
@@ -209,6 +221,14 @@ export class TaskSpec {
     this.parent_task_id = init.parent_task_id;
     this.expected_SubAgent_count = init.expected_SubAgent_count ?? 0;
     this.prefix_Cache_hash = init.prefix_Cache_hash ?? "";
+    this.content_fingerprint = init.content_fingerprint ?? "";
+    this.merged_duplicate_count = init.merged_duplicate_count ?? 0;
+    this.merged_request_ids = init.merged_request_ids ? [...init.merged_request_ids] : [];
+    this.merged_idempotency_keys = init.merged_idempotency_keys
+      ? [...init.merged_idempotency_keys]
+      : init.idempotency_key
+        ? [init.idempotency_key]
+        : [];
     this.created_at = Date.now() / 1000;
   }
 }

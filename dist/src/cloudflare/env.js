@@ -504,7 +504,12 @@ class InMemoryQueueProducer {
 }exports.InMemoryQueueProducer = InMemoryQueueProducer;
 
 class DurableDiskCellSqlStorage extends InMemoryCellSqlStorage {
-  constructor(storageFilePath) {
-    super(storageFilePath);
+  constructor(storagePathOrDir, cellName) {
+    const resolvedPath = cellName ?
+    path.join(storagePathOrDir, `${cellName}.sqlite.json`) :
+    fs.existsSync(storagePathOrDir) && fs.statSync(storagePathOrDir).isDirectory() ?
+    path.join(storagePathOrDir, "cell-default.sqlite.json") :
+    storagePathOrDir;
+    super(resolvedPath);
   }
 }exports.DurableDiskCellSqlStorage = DurableDiskCellSqlStorage;

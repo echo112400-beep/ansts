@@ -6,8 +6,8 @@ var http = _interopRequireWildcard(require("node:http"));
 var _validator = require("./validator.js");
 var _backpressure = require("./backpressure.js");
 var _sse_stream = require("./sse_stream.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M1 TASK-04 & M57-5: Stateless HTTP/REST & SSE Gateway Server
- * with Bounded Payload Size Guard (HTTP 413) to prevent OOM DoS.
+ * @fileoverview M1 TASK-04, M57-5 & M60-5: Stateless HTTP/REST & SSE Gateway Server
+ * with Bounded Payload Size Guard (HTTP 413) & Mergeable Duplicate Submission Inspection.
  */class ApiGatewayServer {
   scheduler;
   backpressure;
@@ -33,6 +33,31 @@ var _sse_stream = require("./sse_stream.js");function _getRequireWildcardCache(n
   {
     try {
       const spec = _validator.TaskSpecValidator.validateAndNormalize(payload);
+      const mergeDuplicateInFlight = Boolean(
+      payload.merge_duplicate ?? payload.deduplicate_by_fingerprint ?? false);
+
+      // [M60-5] Pre-check duplicate/mergeable task BEFORE backpressure rejection so idempotent retries
+      // or urgent priority-promoting duplicate requests can merge into an already-admitted task!
+      const dupCheck = this.scheduler.inspectAndMergeDuplicateTask(spec, {
+        mergeDuplicateInFlight
+      });
+      if (dupCheck.deduplicated) {
+        const canonical = dupCheck.canonicalTask;
+        return {
+          statusCode: 202,
+          headers: { "X-Ansts-Deduplicated": dupCheck.mergedBy },
+          body: {
+            task_id: canonical.task_id,
+            state: canonical.state,
+            lease_fencing_token: canonical.lease_fencing_token,
+            deduplicated: true,
+            merged_by: dupCheck.mergedBy,
+            priority_promoted: dupCheck.priorityPromoted,
+            merged_duplicate_count: canonical.merged_duplicate_count
+          }
+        };
+      }
+
       const decision = this.backpressure.evaluateAdmission({
         priority: spec.priority,
         globalQueueDepth: this.scheduler.queueManager.totalQueued(),
@@ -46,14 +71,16 @@ var _sse_stream = require("./sse_stream.js");function _getRequireWildcardCache(n
           body: { error: "TOO_MANY_REQUESTS", reason: decision.reason }
         };
       }
-      const submitted = this.scheduler.submitTask(spec);
+      const submitted = this.scheduler.submitTask(spec, { mergeDuplicateInFlight });
       return {
         statusCode: 202,
         headers: {},
         body: {
           task_id: submitted.task_id,
           state: submitted.state,
-          lease_fencing_token: submitted.lease_fencing_token
+          lease_fencing_token: submitted.lease_fencing_token,
+          deduplicated: false,
+          merged_duplicate_count: submitted.merged_duplicate_count
         }
       };
     } catch (err) {
@@ -105,7 +132,7 @@ var _sse_stream = require("./sse_stream.js");function _getRequireWildcardCache(n
           });
           return;
         }
-        res.writeHead(404);
+        res.writeHead(404, { "content-type": "application/json" });
         res.end();
       });
       this.server.on("error", reject);

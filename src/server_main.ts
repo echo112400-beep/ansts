@@ -2356,6 +2356,18 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M60] End-to-End Full-Link Persistence, Tenant-Scoped & Deep-Canonical Idempotency, Deterministic Breakpoint Crash-Recovery & Coalescing Duplicate Inspection Audit (`POST /v1beta1/management/system/persistence-idempotency-recovery-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/persistence-idempotency-recovery-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeFullLinkPersistenceIdempotencyBreakpointAndCoalesceAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M59] SQLite Composite-PK/DELETE-Flush/LIMIT Engine Hardening, KV TTL Expiration, SSE Malformed-Frame/Clock-Skew Resilience, UFFD Page Cache Invalidation, Vsock Scheme/IMDS Guard & LTX/Facet Metadata Hygiene Audit (`POST /v1beta1/management/system/sql-kv-sse-uffd-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/sql-kv-sse-uffd-audit") {
       const body = await this.readJsonBody(req);

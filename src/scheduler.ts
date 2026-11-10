@@ -1,11 +1,30 @@
 /**
- * @fileoverview M2 TASK-08 & M51: 5D Weighted Scoring Engine, Anti-Stale Heartbeat TTL,
- * Head-of-Line Non-Blocking Dispatch, Cascading DAG Dead-Letter Propagation & Fair Preemption Core Scheduler.
+ * @fileoverview M2 TASK-08, M51 & M60: 5D Weighted Scoring Engine, Anti-Stale Heartbeat TTL,
+ * Head-of-Line Non-Blocking Dispatch, Cascading DAG Dead-Letter Propagation, Fair Preemption,
+ * Tenant-Scoped Idempotency & Mergeable Duplicate In-Flight Coalescing Core Scheduler.
  */
+import * as crypto from "node:crypto";
 import { LeaseCoordinator } from "./lease_coordinator.js";
 import { NodeHeartbeat, TaskPriority, TaskSpec, TaskState } from "./models.js";
 import { TaskResourceProfiler } from "./profiler.js";
 import { HierarchicalQueueManager } from "./queue_manager.js";
+
+export interface DuplicateInspectionResult {
+  deduplicated: boolean;
+  mergedBy: "IDEMPOTENCY_KEY" | "CONTENT_FINGERPRINT" | "NONE";
+  priorityPromoted: boolean;
+  canonicalTask: TaskSpec;
+}
+
+const MERGEABLE_ACTIVE_STATES = new Set<TaskState>([
+  TaskState.SUBMITTED,
+  TaskState.QUEUED,
+  TaskState.LEASED,
+  TaskState.RUNNING_THINK,
+  TaskState.RUNNING_ACT,
+  TaskState.WAITING_SUB_AGENT,
+  TaskState.SUSPENDED_APPROVAL,
+]);
 
 export class CoreScheduler5D {
   public readonly queueManager: HierarchicalQueueManager;
@@ -14,6 +33,7 @@ export class CoreScheduler5D {
   public readonly nodes: Map<string, NodeHeartbeat> = new Map();
   public readonly allTasks: Map<string, TaskSpec> = new Map();
   public readonly idempotencyIndex: Map<string, string> = new Map();
+  public readonly contentFingerprintIndex: Map<string, string> = new Map();
   public readonly completedIds: Set<string> = new Set();
   public readonly deadLetterIds: Set<string> = new Set();
   public readonly nodeHeartbeatTtlSeconds: number;
@@ -34,6 +54,36 @@ export class CoreScheduler5D {
     this.preemptionCooldownSeconds = preemptionCooldownSeconds;
   }
 
+  /**
+   * [M60-2] Tenant-scoped idempotency key builder preventing cross-tenant collisions.
+   */
+  public static scopeIdempotencyKey(tenantId: string, idempotencyKey: string): string {
+    return `${tenantId}::${idempotencyKey}`;
+  }
+
+  /**
+   * [M60-5] Computes a deterministic SHA-256 content fingerprint across `(tenant_id, parent_task_id, sorted dependencies, normalized prompt)`
+   * so identical concurrent submissions can be inspected and merged into an existing in-flight task.
+   */
+  public static computeTaskContentFingerprint(
+    task: Pick<TaskSpec, "tenant_id" | "prompt" | "dependencies" | "parent_task_id">
+  ): string {
+    const sortedDeps = [...(task.dependencies ?? [])].sort().join(",");
+    const canonical = `${task.tenant_id}::${task.parent_task_id ?? ""}::${sortedDeps}::${(task.prompt ?? "").trim()}`;
+    return crypto.createHash("sha256").update(canonical, "utf-8").digest("hex");
+  }
+
+  public resolveTaskByIdempotencyKey(tenantId: string, idempotencyKey: string): TaskSpec | undefined {
+    const scoped = CoreScheduler5D.scopeIdempotencyKey(tenantId, idempotencyKey);
+    const id = this.idempotencyIndex.get(scoped) ?? this.idempotencyIndex.get(idempotencyKey);
+    if (!id) return undefined;
+    const found = this.allTasks.get(id);
+    if (found && found.tenant_id === tenantId) {
+      return found;
+    }
+    return undefined;
+  }
+
   public registerOrUpdateNode(heartbeat: NodeHeartbeat): void {
     this.nodes.set(heartbeat.node_id, heartbeat);
   }
@@ -52,19 +102,111 @@ export class CoreScheduler5D {
     return staleNodeIds;
   }
 
-  public submitTask(task: TaskSpec): TaskSpec {
-    if (task.idempotency_key) {
-      const existingId = this.idempotencyIndex.get(task.idempotency_key);
-      if (existingId !== undefined) {
-        return this.allTasks.get(existingId)!;
+  private mergeIntoCanonicalTask(
+    canonical: TaskSpec,
+    incoming: TaskSpec,
+    mergedBy: "IDEMPOTENCY_KEY" | "CONTENT_FINGERPRINT"
+  ): DuplicateInspectionResult {
+    if (incoming.task_id !== canonical.task_id) {
+      if (!canonical.merged_request_ids.includes(incoming.task_id)) {
+        canonical.merged_request_ids.push(incoming.task_id);
+        canonical.merged_duplicate_count += 1;
+      } else {
+        canonical.merged_duplicate_count += 1;
       }
+    } else {
+      canonical.merged_duplicate_count += 1;
+    }
+
+    if (incoming.idempotency_key) {
+      const scopedIncoming = CoreScheduler5D.scopeIdempotencyKey(
+        incoming.tenant_id,
+        incoming.idempotency_key
+      );
+      this.idempotencyIndex.set(scopedIncoming, canonical.task_id);
+      if (!canonical.merged_idempotency_keys.includes(incoming.idempotency_key)) {
+        canonical.merged_idempotency_keys.push(incoming.idempotency_key);
+      }
+    }
+
+    let priorityPromoted = false;
+    if (
+      incoming.priority < canonical.priority &&
+      (canonical.state === TaskState.QUEUED || canonical.state === TaskState.SUBMITTED)
+    ) {
+      this.queueManager.reprioritizeQueuedTask(canonical, incoming.priority);
+      priorityPromoted = true;
+    }
+
+    return {
+      deduplicated: true,
+      mergedBy,
+      priorityPromoted,
+      canonicalTask: canonical,
+    };
+  }
+
+  /**
+   * [M60-5] Inspects an incoming task for tenant-scoped `idempotency_key` matches OR (when `mergeDuplicateInFlight` is enabled)
+   * identical content-fingerprint in-flight/queued matches, merging duplicate metadata and promoting priority if needed.
+   */
+  public inspectAndMergeDuplicateTask(
+    task: TaskSpec,
+    options?: { mergeDuplicateInFlight?: boolean }
+  ): DuplicateInspectionResult {
+    if (!task.content_fingerprint) {
+      task.content_fingerprint = CoreScheduler5D.computeTaskContentFingerprint(task);
+    }
+
+    if (task.idempotency_key) {
+      const scopedKey = CoreScheduler5D.scopeIdempotencyKey(task.tenant_id, task.idempotency_key);
+      const existingId = this.idempotencyIndex.get(scopedKey);
+      if (existingId !== undefined) {
+        const existingTask = this.allTasks.get(existingId);
+        if (existingTask && existingTask.tenant_id === task.tenant_id) {
+          return this.mergeIntoCanonicalTask(existingTask, task, "IDEMPOTENCY_KEY");
+        }
+      }
+    }
+
+    if (options?.mergeDuplicateInFlight) {
+      const fpTaskId = this.contentFingerprintIndex.get(task.content_fingerprint);
+      if (fpTaskId !== undefined) {
+        const existingTask = this.allTasks.get(fpTaskId);
+        if (
+          existingTask &&
+          existingTask.tenant_id === task.tenant_id &&
+          MERGEABLE_ACTIVE_STATES.has(existingTask.state)
+        ) {
+          return this.mergeIntoCanonicalTask(existingTask, task, "CONTENT_FINGERPRINT");
+        }
+      }
+    }
+
+    return {
+      deduplicated: false,
+      mergedBy: "NONE",
+      priorityPromoted: false,
+      canonicalTask: task,
+    };
+  }
+
+  public submitTask(task: TaskSpec, options?: { mergeDuplicateInFlight?: boolean }): TaskSpec {
+    const inspection = this.inspectAndMergeDuplicateTask(task, options);
+    if (inspection.deduplicated) {
+      return inspection.canonicalTask;
     }
 
     task.resource_profile = this.profiler.recommendProfile(task);
     this.allTasks.set(task.task_id, task);
     if (task.idempotency_key) {
-      this.idempotencyIndex.set(task.idempotency_key, task.task_id);
+      const scopedKey = CoreScheduler5D.scopeIdempotencyKey(task.tenant_id, task.idempotency_key);
+      this.idempotencyIndex.set(scopedKey, task.task_id);
+      if (!task.merged_idempotency_keys.includes(task.idempotency_key)) {
+        task.merged_idempotency_keys.push(task.idempotency_key);
+      }
     }
+    this.contentFingerprintIndex.set(task.content_fingerprint, task.task_id);
 
     // [M51-2 / Deadlock-2 Fix] If any upstream dependency is already in DEAD_LETTER, immediately fail fast
     const failedDep = task.dependencies.find(
@@ -217,11 +359,16 @@ export class CoreScheduler5D {
       const node = this.nodes.get(nodeId)!;
       node.free_cpu_cores = Math.min(
         node.total_cpu_cores,
-        node.free_cpu_cores + Math.max(urgentTask.resource_profile.think_cpu_cores, victim.resource_profile.think_cpu_cores, 1.0)
+        node.free_cpu_cores +
+          Math.max(urgentTask.resource_profile.think_cpu_cores, victim.resource_profile.think_cpu_cores, 1.0)
       );
       node.free_memory_mb = Math.min(
         node.total_memory_mb,
-        node.free_memory_mb + Math.max(urgentTask.resource_profile.act_memory_mb, Math.floor(victim.resource_profile.act_memory_mb * 0.25))
+        node.free_memory_mb +
+          Math.max(
+            urgentTask.resource_profile.act_memory_mb,
+            Math.floor(victim.resource_profile.act_memory_mb * 0.25)
+          )
       );
       node.running_tasks = Math.max(0, node.running_tasks - 1);
     }

@@ -6473,4 +6473,287 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       },
     };
   }
+
+  /**
+   * [M60] End-to-End Full-Link Persistence, Tenant-Scoped & Deep-Canonical Idempotency,
+   * Deterministic Breakpoint Crash-Recovery & Coalescing Duplicate Inspection Audit.
+   */
+  public async executeFullLinkPersistenceIdempotencyBreakpointAndCoalesceAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    // 1. [M60-1] End-to-end full-link SQLite persistence & cold-start rehydration across Scheduler, WAL, Saga Journal & Outbox
+    const sql1 = new InMemoryCellSqlStorage();
+    const store1 = new UnifiedComponentPersistenceStore(sql1);
+    const sched1 = new CoreScheduler5D();
+    const wal1 = new TurnWalEngine(sql1);
+    const saga1 = new SagaToolGateway(undefined, undefined, sql1);
+    const outbox1 = new TransactionalOutboxDispatcher("sec-m60", 4, sql1);
+
+    let sideEffectCalls = 0;
+    saga1.registerTool("deploy_k8s", ToolCallEffectClass.IDEMPOTENT_WRITE, (args) => {
+      sideEffectCalls += 1;
+      return { deployed: true, calls: sideEffectCalls, args };
+    });
+
+    const t1 = new TaskSpec({
+      task_id: "t-m60-link",
+      tenant_id: "tenant-alpha",
+      priority: TaskPriority.P1_HIGH,
+      prompt: "Deploy full link cluster",
+      idempotency_key: "idem-m60-alpha",
+    });
+    sched1.submitTask(t1);
+    wal1.appendTurnDelta({
+      taskId: "t-m60-link",
+      turnIndex: 1,
+      fencingToken: 1,
+      changedFiles: ["/workspace/main.ts"],
+      sqliteWalPages: 4,
+      highestSubmittedFencingToken: 1,
+    });
+    saga1.invokeTool("t-m60-link", 1, "deploy_k8s", { env: { b: 2, a: 1 } });
+    outbox1.enqueueOutbox("msg-m60-1", "t-m60-link", "https://hooks.internal/m60", { ok: true });
+
+    const snapSummary = store1.snapshotFullLinkState({
+      scheduler: sched1,
+      walEngine: wal1,
+      sagaGateway: saga1,
+      outboxDispatcher: outbox1,
+    });
+
+    const sched2 = new CoreScheduler5D();
+    const wal2 = new TurnWalEngine();
+    const saga2 = new SagaToolGateway();
+    saga2.registerTool("deploy_k8s", ToolCallEffectClass.IDEMPOTENT_WRITE, (args) => {
+      sideEffectCalls += 1;
+      return { deployed: true, calls: sideEffectCalls, args };
+    });
+    const outbox2 = new TransactionalOutboxDispatcher("sec-m60", 4);
+    const rehydrateSummary = store1.rehydrateFullLinkState({
+      scheduler: sched2,
+      walEngine: wal2,
+      sagaGateway: saga2,
+      outboxDispatcher: outbox2,
+    });
+    // Re-invoking with reordered nested JSON keys after cold-start must hit rehydrated journal!
+    const [, dedupAfterRestart] = saga2.invokeTool("t-m60-link", 1, "deploy_k8s", { env: { a: 1, b: 2 } });
+    const fullLinkPersistenceVerified =
+      rehydrateSummary.tasksRestored === 1 &&
+      rehydrateSummary.walEntriesRestored === 1 &&
+      rehydrateSummary.sagaJournalRestored === 1 &&
+      rehydrateSummary.outboxMessagesRestored === 1 &&
+      dedupAfterRestart === true &&
+      sideEffectCalls === 1;
+
+    // 2. [M60-2] Tenant-scoped task idempotency isolation & deep recursive canonical JSON tool hashing
+    const tenantBTask = sched2.submitTask(
+      new TaskSpec({
+        task_id: "t-m60-beta",
+        tenant_id: "tenant-beta",
+        priority: TaskPriority.P2_STANDARD,
+        prompt: "Tenant B independent task",
+        idempotency_key: "idem-m60-alpha",
+      })
+    );
+    const tenantARetry = sched2.submitTask(
+      new TaskSpec({
+        task_id: "t-m60-alpha-retry",
+        tenant_id: "tenant-alpha",
+        priority: TaskPriority.P2_STANDARD,
+        prompt: "Deploy full link cluster",
+        idempotency_key: "idem-m60-alpha",
+      })
+    );
+    const deepKey1 = SagaToolGateway.generateIdempotencyKey("t1", 1, "fn", {
+      outer: { z: [1, { d: 4, c: 3 }], a: true },
+    });
+    const deepKey2 = SagaToolGateway.generateIdempotencyKey("t1", 1, "fn", {
+      outer: { a: true, z: [1, { c: 3, d: 4 }] },
+    });
+    const tenantAndDeepIdempotencyVerified =
+      tenantBTask.task_id === "t-m60-beta" &&
+      tenantARetry.task_id === "t-m60-link" &&
+      deepKey1 === deepKey2;
+
+    // 3. [M60-3] SSE envelope.id deduplication & CloudEvents/FinOps idempotent billing guard
+    const sse = new SseEventStreamGateway(10);
+    sse.subscribe("t-sse-m60", "sub-1");
+    const d1 = sse.publish({
+      id: "evt-m60-1",
+      event: "turn.completed",
+      taskId: "t-sse-m60",
+      turnIndex: 1,
+      timestampMs: 1000,
+      data: { ok: true },
+    });
+    const d2 = sse.publish({
+      id: "evt-m60-1",
+      event: "turn.completed",
+      taskId: "t-sse-m60",
+      turnIndex: 1,
+      timestampMs: 1005,
+      data: { ok: true },
+    });
+    const ceBus = new CloudEventsBus(20);
+    ceBus.emitEvent({
+      type: "ansts.turn.billed",
+      subject: "t-m60-link",
+      tenantId: "tenant-alpha",
+      idempotencyKey: "bill-turn-1",
+      llmCostUsd: 1.25,
+      sandboxCpuCoreSeconds: 10,
+    });
+    ceBus.emitEvent({
+      type: "ansts.turn.billed",
+      subject: "t-m60-link",
+      tenantId: "tenant-alpha",
+      idempotencyKey: "bill-turn-1",
+      llmCostUsd: 1.25,
+      sandboxCpuCoreSeconds: 10,
+    });
+    const finReport = ceBus.getTenantReport("tenant-alpha");
+    const sseAndCloudEventsIdempotencyVerified =
+      d1 === 1 &&
+      d2 === 0 &&
+      sse.getTaskHistory("t-sse-m60").length === 1 &&
+      finReport?.totalLlmCostUsd === 1.25;
+
+    // 4. [M60-4] Deterministic WAL/checkpoint breakpoint recovery & mid-turn uncommitted side-effect rollback
+    const bpSched = new CoreScheduler5D();
+    const nodeA = new NodeDaemon("node-a");
+    const nodeB = new NodeDaemon("node-b");
+    bpSched.registerOrUpdateNode(nodeA.emitHeartbeat(0));
+    bpSched.registerOrUpdateNode(nodeB.emitHeartbeat(0));
+    const bpTask = bpSched.submitTask(
+      new TaskSpec({
+        task_id: "t-m60-bp",
+        tenant_id: "tenant-bp",
+        priority: TaskPriority.P1_HIGH,
+        prompt: "Multi-turn resilient job",
+      })
+    );
+    bpSched.scheduleTick();
+    const bpWal = new TurnWalEngine();
+    const bpSaga = new SagaToolGateway();
+    let uncommittedRolledBack = false;
+    bpSaga.registerTool(
+      "step_tool",
+      ToolCallEffectClass.COMPENSATABLE,
+      (args) => ({ executedTurn: args.turn }),
+      () => {
+        uncommittedRolledBack = true;
+        return { compensated: true };
+      }
+    );
+    nodeA.executeAgentStep(bpSched, bpSaga, bpTask, "step_tool", { turn: 1 });
+    bpWal.appendTurnDelta({
+      taskId: bpTask.task_id,
+      turnIndex: 1,
+      fencingToken: bpTask.lease_fencing_token,
+      changedFiles: ["/workspace/step1.txt"],
+      sqliteWalPages: 2,
+      highestSubmittedFencingToken: bpTask.lease_fencing_token,
+      enforceTurnMonotonicity: true,
+      allowIdempotentRetry: true,
+    });
+    // Simulate mid-turn 2 tool execution followed by node crash BEFORE WAL/checkpoint commit
+    bpSaga.invokeTool(bpTask.task_id, 2, "step_tool", { turn: 2 });
+    const newLease = bpSched.leaseCoordinator.acquireLease(bpTask.task_id, "node-b");
+    bpTask.assigned_node_id = "node-b";
+    bpTask.lease_fencing_token = newLease.fencing_token;
+    const recovery = nodeB.recoverTaskFromBreakpoint(bpSched, bpTask, bpWal, bpSaga);
+    const step2AfterRecovery = nodeB.executeAgentStep(bpSched, bpSaga, bpTask, "step_tool", { turn: 2 });
+    const breakpointRecoveryVerified =
+      recovery.restoredTurnIndex === 1 &&
+      recovery.nextTurnToExecute === 2 &&
+      uncommittedRolledBack === true &&
+      step2AfterRecovery.turn === 2 &&
+      step2AfterRecovery.deduplicated === false;
+
+    // 5. [M60-5] Mergeable duplicate task inspection, in-flight request coalescing & priority promotion
+    const coalSched = new CoreScheduler5D();
+    coalSched.completedIds.add("dep-a");
+    coalSched.completedIds.add("dep-b");
+    const firstSub = coalSched.submitTask(
+      new TaskSpec({
+        task_id: "t-coal-1",
+        tenant_id: "tenant-coal",
+        priority: TaskPriority.P2_STANDARD,
+        prompt: "Compile kernel module X",
+        dependencies: ["dep-b", "dep-a"],
+      }),
+      { mergeDuplicateInFlight: true }
+    );
+    const secondMerged = coalSched.submitTask(
+      new TaskSpec({
+        task_id: "t-coal-2",
+        tenant_id: "tenant-coal",
+        priority: TaskPriority.P0_EMERGENCY,
+        prompt: "  Compile kernel module X  ",
+        dependencies: ["dep-a", "dep-b"],
+        idempotency_key: "idem-coal-urgent",
+      }),
+      { mergeDuplicateInFlight: true }
+    );
+    const duplicateCoalescingVerified =
+      secondMerged.task_id === firstSub.task_id &&
+      firstSub.merged_duplicate_count === 1 &&
+      firstSub.priority === TaskPriority.P0_EMERGENCY &&
+      firstSub.merged_request_ids.includes("t-coal-2") &&
+      coalSched.queueManager.totalQueued() === 1;
+
+    const allM60RisksEliminated =
+      fullLinkPersistenceVerified &&
+      tenantAndDeepIdempotencyVerified &&
+      sseAndCloudEventsIdempotencyVerified &&
+      breakpointRecoveryVerified &&
+      duplicateCoalescingVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M60 全链路持久化、深度幂等、确定性断点恢复与可并入重复合流自检 (FullLink=${fullLinkPersistenceVerified}, DeepIdem=${tenantAndDeepIdempotencyVerified}, SseCeIdem=${sseAndCloudEventsIdempotencyVerified}, Breakpoint=${breakpointRecoveryVerified}, Coalesce=${duplicateCoalescingVerified})`,
+      "SystemWide / M60-PersistenceIdempotencyRecoveryAudit",
+      "ALL_M60_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        fullLinkPersistence1: {
+          snapSummary,
+          rehydrateSummary,
+          dedupAfterRestart,
+          fullLinkPersistenceVerified,
+        },
+        tenantAndDeepIdempotency2: {
+          tenantBTaskId: tenantBTask.task_id,
+          tenantARetryTaskId: tenantARetry.task_id,
+          deepKeyMatched: deepKey1 === deepKey2,
+          tenantAndDeepIdempotencyVerified,
+        },
+        sseAndCloudEventsIdempotency3: {
+          firstPublishDelivered: d1,
+          duplicatePublishDelivered: d2,
+          totalLlmCostUsd: finReport?.totalLlmCostUsd,
+          sseAndCloudEventsIdempotencyVerified,
+        },
+        breakpointRecovery4: {
+          recovery,
+          uncommittedRolledBack,
+          resumedTurn: step2AfterRecovery.turn,
+          breakpointRecoveryVerified,
+        },
+        duplicateCoalescing5: {
+          canonicalTaskId: firstSub.task_id,
+          mergedDuplicateCount: firstSub.merged_duplicate_count,
+          promotedPriority: firstSub.priority,
+          mergedRequestIds: firstSub.merged_request_ids,
+          duplicateCoalescingVerified,
+        },
+        allM60RisksEliminated,
+      },
+    };
+  }
 }

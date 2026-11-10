@@ -4,11 +4,13 @@
 
 
 var _env = require("./env.js");
-var _models = require("../models.js"); /**
- * @fileoverview v2.5 Single-Write-Path Scheduler Persistence & Queue Deduplication Store (`b566a53`) & M55-1.
- * Hardened with tenant-scoped cross-task idempotency lookup, full `spec_json` fidelity rehydration,
- * strict single-write-path monotonic fencing token allocation, and anti-regressive RustFS S3 LTX restoration.
+var _models = require("../models.js");
+var _scheduler = require("../scheduler.js"); /**
+ * @fileoverview v2.5 Single-Write-Path Scheduler Persistence & Queue Deduplication Store (`b566a53`), M55-1 & M60-5.
+ * Hardened with tenant-scoped cross-task idempotency lookup, content-fingerprint mergeable duplicate coalescing,
+ * priority promotion on merge, full `spec_json` fidelity rehydration, and anti-regressive RustFS S3 LTX restoration.
  */class SchedulerV25SingleWritePathStore {sql;seenIdempotencyKeys = new Map();
+  seenFingerprints = new Map();
   maxFencingToken = 0;
 
   constructor(sql = new _env.InMemoryCellSqlStorage()) {
@@ -16,12 +18,19 @@ var _models = require("../models.js"); /**
     this.sql.exec(
     "CREATE TABLE IF NOT EXISTS v25_scheduler_tasks (task_id TEXT PRIMARY KEY, tenant_id TEXT, priority INTEGER, state TEXT, fencing_token INTEGER, assigned_node_id TEXT, idem_key TEXT, spec_json TEXT)");
 
-    // Cold-start rehydration from durable SQL table
     const existingRows = this.sql.exec("SELECT * FROM v25_scheduler_tasks").toArray();
     for (const r of existingRows) {
+      const taskId = String(r.task_id);
       if (r.idem_key) {
         const scopedKey = `${String(r.tenant_id ?? "default")}::${String(r.idem_key)}`;
-        this.seenIdempotencyKeys.set(scopedKey, String(r.task_id));
+        this.seenIdempotencyKeys.set(scopedKey, taskId);
+      }
+      const restored = this.rowToTaskSpec(r);
+      for (const mKey of restored.merged_idempotency_keys) {
+        this.seenIdempotencyKeys.set(`${restored.tenant_id}::${mKey}`, taskId);
+      }
+      if (restored.content_fingerprint) {
+        this.seenFingerprints.set(restored.content_fingerprint, taskId);
       }
       const ft = Number(r.fencing_token ?? 0);
       if (ft > this.maxFencingToken) {
@@ -30,14 +39,33 @@ var _models = require("../models.js"); /**
     }
   }
 
-  commitTaskSingleWritePath(task, assignedNodeId)
+  commitTaskSingleWritePath(
+  task,
+  assignedNodeId,
+  options)
+
+
+
 
 
 
   {
+    if (!task.content_fingerprint) {
+      task.content_fingerprint = _scheduler.CoreScheduler5D.computeTaskContentFingerprint(task);
+    }
     const idemKey = task.idempotency_key ?? `idem:${task.tenant_id}:${task.task_id}`;
     const scopedKey = `${task.tenant_id}::${idemKey}`;
-    const mappedTaskId = this.seenIdempotencyKeys.get(scopedKey);
+    let mappedTaskId = this.seenIdempotencyKeys.get(scopedKey);
+    let mergedBy = "IDEMPOTENCY_KEY";
+
+    if (!mappedTaskId && options?.mergeDuplicateInFlight) {
+      const fpTaskId = this.seenFingerprints.get(task.content_fingerprint);
+      if (fpTaskId) {
+        mappedTaskId = fpTaskId;
+        mergedBy = "CONTENT_FINGERPRINT";
+      }
+    }
+
     if (mappedTaskId) {
       const existing =
       this.sql.
@@ -48,14 +76,49 @@ var _models = require("../models.js"); /**
       one();
       if (existing) {
         const restored = this.rowToTaskSpec(existing);
-        return {
-          deduplicated: true,
-          fencingToken: restored.lease_fencing_token,
-          task: restored
-        };
+        const isTerminal =
+        restored.state === _models.TaskState.COMPLETED ||
+        restored.state === _models.TaskState.DEAD_LETTER ||
+        restored.state === _models.TaskState.FAILED;
+        if (mergedBy === "IDEMPOTENCY_KEY" || !isTerminal) {
+          restored.merged_duplicate_count += 1;
+          if (task.task_id !== restored.task_id && !restored.merged_request_ids.includes(task.task_id)) {
+            restored.merged_request_ids.push(task.task_id);
+          }
+          if (task.idempotency_key && !restored.merged_idempotency_keys.includes(task.idempotency_key)) {
+            restored.merged_idempotency_keys.push(task.idempotency_key);
+          }
+          this.seenIdempotencyKeys.set(scopedKey, restored.task_id);
+
+          let priorityPromoted = false;
+          if (task.priority < restored.priority && !isTerminal) {
+            restored.priority = task.priority;
+            priorityPromoted = true;
+          }
+          this.sql.exec(
+          "INSERT OR REPLACE INTO v25_scheduler_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, idem_key, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          restored.task_id,
+          restored.tenant_id,
+          restored.priority,
+          restored.state,
+          restored.lease_fencing_token,
+          restored.assigned_node_id ?? "",
+          restored.idempotency_key ?? idemKey,
+          JSON.stringify(restored));
+
+          return {
+            deduplicated: true,
+            mergedBy,
+            priorityPromoted,
+            fencingToken: restored.lease_fencing_token,
+            task: restored
+          };
+        }
       }
     }
+
     this.seenIdempotencyKeys.set(scopedKey, task.task_id);
+    this.seenFingerprints.set(task.content_fingerprint, task.task_id);
     if (task.lease_fencing_token > this.maxFencingToken) {
       this.maxFencingToken = task.lease_fencing_token;
     } else {
@@ -106,10 +169,22 @@ var _models = require("../models.js"); /**
       dependencies: Array.isArray(parsed.dependencies) ? parsed.dependencies : undefined,
       parent_task_id: parsed.parent_task_id ? String(parsed.parent_task_id) : undefined,
       expected_SubAgent_count:
-      parsed.expected_SubAgent_count !== undefined ? Number(parsed.expected_SubAgent_count) : undefined
+      parsed.expected_SubAgent_count !== undefined ? Number(parsed.expected_SubAgent_count) : undefined,
+      content_fingerprint: parsed.content_fingerprint ? String(parsed.content_fingerprint) : undefined,
+      merged_duplicate_count:
+      parsed.merged_duplicate_count !== undefined ? Number(parsed.merged_duplicate_count) : 0,
+      merged_request_ids: Array.isArray(parsed.merged_request_ids) ?
+      parsed.merged_request_ids.map(String) :
+      [],
+      merged_idempotency_keys: Array.isArray(parsed.merged_idempotency_keys) ?
+      parsed.merged_idempotency_keys.map(String) :
+      undefined
     });
     if (parsed.current_turn !== undefined) {
       t.current_turn = Number(parsed.current_turn);
+    }
+    if (!t.content_fingerprint) {
+      t.content_fingerprint = _scheduler.CoreScheduler5D.computeTaskContentFingerprint(t);
     }
     t.state = r.state ?? _models.TaskState.QUEUED;
     t.lease_fencing_token = Number(r.fencing_token ?? 0);
@@ -173,6 +248,10 @@ var _models = require("../models.js"); /**
         if (r.idem_key) {
           const scopedKey = `${String(r.tenant_id ?? "default")}::${String(r.idem_key)}`;
           this.seenIdempotencyKeys.set(scopedKey, taskId);
+        }
+        const restoredSpec = this.rowToTaskSpec(r);
+        if (restoredSpec.content_fingerprint) {
+          this.seenFingerprints.set(restoredSpec.content_fingerprint, taskId);
         }
         if (incomingToken > this.maxFencingToken) {
           this.maxFencingToken = incomingToken;
