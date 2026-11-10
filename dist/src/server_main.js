@@ -311,6 +311,7 @@ class AnstsLocalAndComposeServer {
 
     const bridge = new _server.DashboardBridgeService(this.scheduler, this.fleetController);
     this.dashboardServer = new _server.DashboardBackendServer(bridge, this.host);
+    this.facetSupervisor = new _celld_native_optimizations.DurableObjectFacetSupervisor();
     this.managementPlane = new _server.PlatformManagementPlaneEngine({
       nodeId: this.nodeId,
       scheduler: this.scheduler,
@@ -339,11 +340,14 @@ class AnstsLocalAndComposeServer {
       gcSweeper: this.gcSweeper,
       metrics: this.metrics,
       outboxDispatcher: this.outboxDispatcher,
+      harnessRunner: this.harnessRunner,
+      phaseController: this.phaseController,
+      mcpRegistry: this.mcpRegistry,
+      facetSupervisor: this.facetSupervisor,
       peerBrainUrls: this.peerBrainUrls,
       peerBodyUrls: this.peerBodyUrls,
       s3Endpoint: this.s3Endpoint
     });
-    this.facetSupervisor = new _celld_native_optimizations.DurableObjectFacetSupervisor();
     this.dynamicWorkerLoader = new _celld_native_optimizations.DynamicWorkerSandboxLoader();
     this.kvOptimizer = new _celld_native_optimizations.CelldKvOptimizerAndGuard(new _env.InMemoryKvNamespace(), 32);
     this.heapBudgetGuard = new _celld_native_optimizations.V8HeapAndSqlBudgetGuard(96, 128, 5000);
@@ -697,6 +701,24 @@ class AnstsLocalAndComposeServer {
       }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ...result, executedByNodeId: this.nodeId, nodeRole: this.nodeRole, s3Synced }));
+      return;
+    }
+
+    // [M46-2] Internal Body LayerFS Live Migration Bundle Import (`POST /internal/v1beta1/body/layerfs-import`)
+    if (method === "POST" && pathname === "/internal/v1beta1/body/layerfs-import") {
+      const body = await this.readJsonBody(req);
+      const bundle = body.branchBundle;
+      if (bundle && Array.isArray(bundle.commits)) {
+        this.layerfs.importBranchBundle(bundle);
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        importedByNodeId: this.nodeId,
+        branchName: bundle?.branchName ?? "unknown",
+        headCommitId: bundle?.headCommitId ?? "C0"
+      }));
+
       return;
     }
 
@@ -2273,6 +2295,9 @@ class AnstsLocalAndComposeServer {
       const body = await this.readJsonBody(req);
       const result = this.managementPlane.executeTaskTurnStep({
         taskId: String(body.taskId ?? "task-ns-8841"),
+        toolName: body.toolName ? String(body.toolName) : undefined,
+        shellCommand: body.shellCommand ? String(body.shellCommand) : undefined,
+        executeRealBash: Boolean(body.executeRealBash ?? false),
         actor: String(body.actor ?? "chen"),
         role: String(body.role ?? "SRE_ADMIN")
       });
@@ -2309,6 +2334,28 @@ class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // [M46-3] Dynamic MCP Tool Registry & Saga LIFO Rollback (`POST /v1beta1/management/mcp`)
+    if (method === "POST" && pathname === "/v1beta1/management/mcp") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeMcpAndSagaGovernance({
+        action: body.action ?? "invoke_mcp_tool",
+        serverName: body.serverName ? String(body.serverName) : undefined,
+        toolName: body.toolName ? String(body.toolName) : undefined,
+        description: body.description ? String(body.description) : undefined,
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        turnIndex: body.turnIndex !== undefined ? Number(body.turnIndex) : undefined,
+        toolArgs: body.toolArgs ? body.toolArgs : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 

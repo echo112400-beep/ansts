@@ -119,6 +119,12 @@
         lastBisectResult: null
       },
       layerfsStats: { totalObjects: 18, fullObjects: 6, deltaObjects: 12, totalLogicalBytes: 49152, totalCompressedBytes: 18432 },
+      mcpState: {
+        tools: [
+          { toolName: 'mcp_pg_migration_apply', serverName: 'mcp-postgres-prod', description: 'Apply reversible schema migration with Saga LIFO rollback hook', effectClass: 'COMPENSATABLE_WRITE', registeredBy: 'chen' }
+        ],
+        lastSagaRollbackReport: null
+      },
       gcSweepReport: null,
       taskFilterSearch: '',
       taskFilterState: 'ALL',
@@ -237,6 +243,7 @@
       if (d.sla) state.sla = d.sla;
       if (d.canary) state.canary = d.canary;
       if (d.a2aState) state.a2aState = d.a2aState;
+      if (d.mcpState) state.mcpState = d.mcpState;
       if (d.layerfsStats) state.layerfsStats = d.layerfsStats;
       if (d.gcSweepReport !== undefined) state.gcSweepReport = d.gcSweepReport;
       if (d.slotDistribution) state.slotDistribution = d.slotDistribution;
@@ -549,6 +556,20 @@
         state.canary = { state: nextW >= 100 ? 'PROMOTED' : 'CANARY_ACTIVE', trafficWeightPct: nextW };
       }
       return { ok: true, status: 200, data: state.canary, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/mcp') {
+      if (!state.mcpState) state.mcpState = createBaselineState().mcpState;
+      if (body.action === 'register_mcp_tool') {
+        const tName = body.toolName || ('mcp_tool_' + Math.floor(100 + Math.random() * 899));
+        const item = { toolName: tName, serverName: body.serverName || 'mcp-k8s-fleet', description: body.description || 'Dynamic MCP JSON-RPC 2.0 compensatable tool', effectClass: 'COMPENSATABLE_WRITE', registeredBy: body.actor || 'chen' };
+        state.mcpState.tools.push(item);
+        return { ok: true, status: 201, data: { ...item, mcpState: state.mcpState }, fromLiveBackend: false };
+      }
+      if (body.action === 'invoke_mcp_tool') {
+        return { ok: true, status: 200, data: { taskId: body.taskId || 'task-ns-8841', toolName: body.toolName || 'mcp_pg_migration_apply', output: { status: 'COMMITTED' }, deduplicated: false, mcpState: state.mcpState }, fromLiveBackend: false };
+      }
+      state.mcpState.lastSagaRollbackReport = { taskId: body.taskId || 'task-ns-8841', compensatedTools: [{ status: 'ROLLED_BACK_LIFO' }] };
+      return { ok: true, status: 200, data: { taskId: body.taskId || 'task-ns-8841', compensatedCount: 1, mcpState: state.mcpState }, fromLiveBackend: false };
     }
     if (method === 'POST' && endpointPath === '/v1beta1/management/a2a') {
       if (!state.a2aState) state.a2aState = createBaselineState().a2aState;
@@ -1503,6 +1524,38 @@
         <div class="panel">
           <div class="panel-header">
             <div>
+              <h2 class="panel-title">动态 MCP 工具注册表与 Saga 逆序 (LIFO) 补偿门控 (POST /v1beta1/management/mcp)</h2>
+              <p class="panel-subtitle">对接 <code>McpDynamicToolRegistry</code> 与 <code>SagaToolGateway</code>，支持动态注册 JSON-RPC 2.0 工具并触发逆序事务补偿。</p>
+            </div>
+            <div class="btn-row">
+              <span class="status-pill ok">已注册 MCP 工具: ${(state.mcpState?.tools || []).length} 个</span>
+            </div>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="mcp-action" data-op="register_mcp_tool">+ 注册动态 MCP 工具</button>
+            <button type="button" class="small" data-action="mcp-action" data-op="invoke_mcp_tool">调用 MCP 事务工具 (Saga 挂载)</button>
+            <button type="button" class="small danger" data-action="mcp-action" data-op="saga_rollback_task">触发 Saga 逆序 (LIFO) 补偿回滚</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>MCP 工具名称</th><th>所属服务 (Server)</th><th>副作用级别</th><th>描述</th></tr></thead>
+              <tbody>
+                ${(state.mcpState?.tools || []).map((t) => `
+                  <tr>
+                    <td class="mono"><strong>${t.toolName}</strong></td>
+                    <td class="mono">${t.serverName}</td>
+                    <td><span class="status-pill warn">${t.effectClass}</span></td>
+                    <td>${t.description}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
               <h2 class="panel-title">分布式 CAS 两阶段垃圾回收与 celld Epoch 安全审计 (POST /v1beta1/management/storage/gc-sweep)</h2>
               <p class="panel-subtitle">对接 <code>DistributedCasGcSweeper</code> 物理回收孤儿块并保留活跃 Delta 基线，支持 <code>anstsctl gc-audit</code> 演练。</p>
             </div>
@@ -2198,6 +2251,20 @@
           '</tbody></table></div>';
       }
       showToast('已加载分支 ' + (res.data.branchName || '') + ' 的 LayerFS 行级代码溯源');
+      return;
+    }
+    if (action === 'mcp-action') {
+      const op = target.getAttribute('data-op') || 'invoke_mcp_tool';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/mcp', {
+        action: op,
+        taskId: 'task-ns-8841',
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast('已完成 MCP / Saga 操作 [' + op + ']');
       return;
     }
     if (action === 'a2a-action') {

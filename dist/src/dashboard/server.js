@@ -90,9 +90,19 @@ var _parallel_cow_bisect = require("../a2a/parallel_cow_bisect.js");
 var _distributed_gc_sweeper = require("../storage/distributed_gc_sweeper.js");
 var _otel_prometheus = require("../telemetry/otel_prometheus.js");
 var _outbox_webhook = require("../telemetry/outbox_webhook.js");
+var _runner = require("../harness/runner.js");
+var _phase_controller = require("../runtime/phase_controller.js");
+var _mcp_registry = require("../saga/mcp_registry.js");
+var _celld_native_optimizations = require("../cloudflare/celld_native_optimizations.js");
+var _cognitive_router = require("../cognitive_router.js");
 var _models = require("../models.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
  * @fileoverview M13 TASK-47: Real-Time Control Plane Web UI & Operational Dashboard Backend Server.
  */class DashboardBridgeService {scheduler;fleet;constructor(scheduler, fleet = new _manual_scale_controller.ManualFleetScaleController()) {this.scheduler = scheduler;this.fleet = fleet;}buildClusterOverview() {return { totalTasks: this.scheduler.allTasks.size, queuedTasks: this.scheduler.queueManager.totalQueued(), completedTasks: this.scheduler.completedIds.size, nodes: this.fleet.listNodes() };}}exports.DashboardBridgeService = DashboardBridgeService;class DashboardBackendServer {bridge;host;server = null;constructor(bridge, host = "127.0.0.1") {this.bridge = bridge;this.host = host;}async listen(port = 0) {return new Promise((resolve, reject) => {this.server = http.createServer((req, res) => {if (req.url === "/api/overview" || req.url === "/healthz") {res.writeHead(200, { "content-type": "application/json" });res.end(JSON.stringify(this.bridge.buildClusterOverview()));return;}res.writeHead(200, { "content-type": "text/html; charset=utf-8" });res.end("<!doctype html><html><head><title>ANSTS v2 Control Plane</title></head><body><h1>ANSTS v2 Dashboard</h1></body></html>");});this.server.on("error", reject);this.server.listen(port, this.host, () => {const addr = this.server.address();resolve(typeof addr === "object" && addr ? addr.port : port);});});}async close() {if (!this.server) return;return new Promise((resolve) => {this.server.closeAllConnections?.();this.server.close(() => {this.server = null;resolve();});});}}exports.DashboardBackendServer = DashboardBackendServer;
+
+
+
+
+
 
 
 
@@ -208,6 +218,11 @@ class PlatformManagementPlaneEngine {
   gcSweeper;
   metrics;
   outboxDispatcher;
+  harnessRunner;
+  phaseController;
+  mcpRegistry;
+  facetSupervisor;
+  lastSagaRollbackReport = null;
   lastGitArbitration = null;
   lastBisectResult =
 
@@ -230,6 +245,24 @@ class PlatformManagementPlaneEngine {
     this.gcSweeper = deps.gcSweeper ?? new _distributed_gc_sweeper.DistributedCasGcSweeper();
     this.metrics = deps.metrics ?? new _otel_prometheus.OtelAndPrometheusExporter();
     this.outboxDispatcher = deps.outboxDispatcher ?? new _outbox_webhook.TransactionalOutboxDispatcher();
+    this.phaseController = deps.phaseController ?? new _phase_controller.CgroupPhaseController();
+    this.mcpRegistry = deps.mcpRegistry ?? new _mcp_registry.McpDynamicToolRegistry();
+    this.facetSupervisor = deps.facetSupervisor ?? new _celld_native_optimizations.DurableObjectFacetSupervisor();
+    if (deps.harnessRunner) {
+      this.harnessRunner = deps.harnessRunner;
+    } else {
+      const fallbackRouter = new _cognitive_router.CognitiveRouter();
+      fallbackRouter.registerEndpoint(
+      new _models.LlmEndpointMetrics({ endpoint_id: "ep-deepseek-r1", provider: "deepseek", model_name: "DeepSeek", ttft_ewma_ms: 160 }));
+
+      deps.sagaGateway.registerTool(
+      "shell_exec",
+      _models.ToolCallEffectClass.IDEMPOTENT_WRITE,
+      (args) => ({ executed: args.cmd ?? "echo ok", status: "SUCCESS" }),
+      (args) => ({ rolledBackCmd: args.cmd ?? "echo ok", status: "COMPENSATED" }));
+
+      this.harnessRunner = new _runner.AgentHarnessRunner(fallbackRouter, deps.sagaGateway);
+    }
   }
 
   ensureInitialized() {
@@ -254,6 +287,9 @@ class PlatformManagementPlaneEngine {
 
     sql.exec(
     "CREATE TABLE IF NOT EXISTS v25_mgmt_a2a_blackboard (bb_key TEXT PRIMARY KEY, value_json TEXT, version INTEGER, author_agent TEXT, updated_at_ms INTEGER)");
+
+    sql.exec(
+    "CREATE TABLE IF NOT EXISTS v25_mgmt_mcp_tools (tool_name TEXT PRIMARY KEY, server_name TEXT, description TEXT, effect_class TEXT, registered_by TEXT, registered_at TEXT)");
 
 
     const existingTenants = sql.exec("SELECT * FROM v25_mgmt_tenants").toArray();
@@ -566,6 +602,36 @@ class PlatformManagementPlaneEngine {
     this.deadlockDetector.removeAgent("agent-ns-worker-3");
     this.deadlockDetector.addWaitEdge("agent-ns-worker-1", "agent-ns-worker-2");
     this.deadlockDetector.addWaitEdge("agent-ns-worker-2", "agent-ns-worker-3");
+
+    // Seed default MCP tool into McpDynamicToolRegistry & SagaToolGateway & SQLite
+    this.mcpRegistry.registerMcpServerTools(
+    "mcp-postgres-prod",
+    [
+    {
+      toolName: "mcp_pg_migration_apply",
+      description: "Apply reversible schema migration with Saga LIFO rollback hook",
+      effectClass: _models.ToolCallEffectClass.COMPENSATABLE_WRITE,
+      inputSchema: { type: "object", properties: { migrationId: { type: "string" } } }
+    }],
+
+    this.deps.sagaGateway,
+    (method, rpcParams) => ({ jsonrpc: "2.0", method, result: { applied: true, rpcParams } }));
+
+    this.deps.sagaGateway.registerTool(
+    "mcp_pg_migration_apply",
+    _models.ToolCallEffectClass.COMPENSATABLE_WRITE,
+    (args) => ({ jsonrpc: "2.0", tool: "mcp_pg_migration_apply", appliedMigration: args.migrationId ?? "0042_add_idx", status: "COMMITTED" }),
+    (args) => ({ jsonrpc: "2.0", tool: "mcp_pg_migration_apply", revertedMigration: args.migrationId ?? "0042_add_idx", status: "ROLLED_BACK_LIFO" }));
+
+    sql.exec(
+    "INSERT OR REPLACE INTO v25_mgmt_mcp_tools (tool_name, server_name, description, effect_class, registered_by, registered_at) VALUES (?, ?, ?, ?, ?, ?)",
+    "mcp_pg_migration_apply",
+    "mcp-postgres-prod",
+    "Apply reversible schema migration with Saga LIFO rollback hook",
+    "COMPENSATABLE_WRITE",
+    "chen",
+    "09:20:00 UTC");
+
 
     this.appendAudit("chen", "SRE_ADMIN", "初始化平台管理面控制基线与 256-Slot 分片映射", "Global", "已生效 (RPO=0)");
     this.appendAudit("lin", "OPERATOR", "触发 LayerFS 分支 feat-ns-auth 快照同步至 s3://ansts-fleet", "us-west-2 / Northstar", "成功 (Commit C1)");
@@ -905,6 +971,7 @@ class PlatformManagementPlaneEngine {
       auditLogs,
       layerfsStats: this.deps.layerfs.storeEngine.getStorageStats(),
       a2aState: this.getA2aGovernanceSnapshot(),
+      mcpState: this.getMcpGovernanceSnapshot(),
       gcSweepReport: this.lastGcSweepReport,
       status: "HEALTHY"
     };
@@ -1869,6 +1936,9 @@ class PlatformManagementPlaneEngine {
 
 
 
+
+
+
   {
     this.ensureInitialized();
     if (params.role === "VIEWER") {
@@ -1884,6 +1954,20 @@ class PlatformManagementPlaneEngine {
     }
     const existingWal = this.deps.walEngine.getTaskWalEntries(params.taskId);
     const nextTurnIndex = existingWal.length + 1;
+    task.current_turn = existingWal.length;
+    task.max_turns = Math.max(task.max_turns, nextTurnIndex + 10);
+
+    // 1. Apply THINK cgroup phase (0.25 core) -> Execute AgentHarnessRunner (CognitiveRouter + VelocityBreaker + SagaToolGateway) -> Apply ACT cgroup phase (4.0 cores)
+    const profile = task.resource_profile ?? { think_cpu_cores: 0.25, act_cpu_cores: 4.0, act_memory_mb: 4096, disk_mb: 10240 };
+    const thinkCgroup = this.phaseController.applyThinkPhase(task.task_id, profile);
+    const toolName = params.toolName ?? "shell_exec";
+    const cmdStr = params.shellCommand ?? `step-${params.taskId}-turn-${nextTurnIndex}`;
+    const harnessSummary = this.harnessRunner.executeSingleTurn(task, toolName, {
+      cmd: cmdStr,
+      turnIndex: nextTurnIndex
+    });
+    const actCgroup = this.phaseController.applyActPhase(task.task_id, profile);
+
     const changedFile = `src/${params.taskId}-turn${nextTurnIndex}.ts`;
     const walEntry = this.deps.walEngine.appendTurnDelta({
       taskId: params.taskId,
@@ -1907,21 +1991,41 @@ class PlatformManagementPlaneEngine {
     } catch {
       this.deps.layerfs.forkBranch("main", branchName);
     }
-    const lfsCommit = this.deps.layerfs.executeInProcessFileTool({
-      branchName,
-      agentId: params.actor,
-      stepId: `step-${params.taskId}-t${nextTurnIndex}`,
-      operation: "write",
-      filePath: changedFile,
-      newContent: `export const turn = ${nextTurnIndex};
+
+    let commitId = "C1";
+    if (params.executeRealBash) {
+      const bashRes = this.deps.layerfs.executeEphemeralBashWorkspace({
+        branchName,
+        agentId: params.actor,
+        stepId: `step-${params.taskId}-t${nextTurnIndex}`,
+        command: params.shellCommand ?? `printf 'export const turn = ${nextTurnIndex};\nexport const crc32 = "${walEntry.frame.crc32Hex}";\n' > ${changedFile}`
+      });
+      commitId = bashRes.commitId;
+    } else {
+      const lfsCommit = this.deps.layerfs.executeInProcessFileTool({
+        branchName,
+        agentId: params.actor,
+        stepId: `step-${params.taskId}-t${nextTurnIndex}`,
+        operation: "write",
+        filePath: changedFile,
+        newContent: `export const turn = ${nextTurnIndex};
 export const crc32 = "${walEntry.frame.crc32Hex}";
 `
-    });
+      });
+      commitId = lfsCommit.commitId;
+    }
+
+    this.deps.v25Store.sql.exec(
+    "UPDATE v25_scheduler_tasks SET state = ?, spec_json = ? WHERE task_id = ?",
+    task.state,
+    JSON.stringify(task),
+    task.task_id);
+
 
     this.appendAudit(
     params.actor,
     params.role,
-    `推进任务 ${params.taskId} 至 Turn #${nextTurnIndex} (WAL CRC32=0x${walEntry.frame.crc32Hex}, LayerFS Commit=${lfsCommit.commitId})`,
+    `推进任务 ${params.taskId} 至 Turn #${nextTurnIndex} (Router=${harnessSummary.endpointId}, WAL CRC32=0x${walEntry.frame.crc32Hex}, LayerFS Commit=${commitId})`,
     `us-west-2 / ${task.tenant_id}`,
     `Turn #${nextTurnIndex} 已提交`);
 
@@ -1932,8 +2036,13 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         taskId: params.taskId,
         turnIndex: nextTurnIndex,
         crc32Hex: walEntry.frame.crc32Hex,
-        commitId: lfsCommit.commitId,
-        branchName
+        commitId,
+        branchName,
+        harnessExecution: harnessSummary,
+        cgroupTransition: {
+          thinkQuotaUs: thinkCgroup.cpuQuotaUsPer100ms,
+          actQuotaUs: actCgroup.cpuQuotaUsPer100ms
+        }
       }
     };
   }
@@ -2213,58 +2322,58 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       };
     }
 
-    // action === "run_cow_bisect"
-    const bisectBranch = "bisect-main-line";
-    try {
-      this.deps.layerfs.getBranchHeadCommit(bisectBranch);
-    } catch {
-      this.deps.layerfs.forkBranch("main", bisectBranch);
-    }
-    const c1 = this.deps.layerfs.executeInProcessFileTool({
+    // action === "run_cow_bisect" (Real OS subprocess execution via executeLiveLayerFsBisect)
+    const bisectBranch = `bisect-line-${Date.now()}`;
+    this.deps.layerfs.forkBranch("main", bisectBranch);
+    const c0Good = this.deps.layerfs.executeInProcessFileTool({
       branchName: bisectBranch,
       agentId: "agent-bisect",
-      stepId: "bisect-c1",
+      stepId: "bisect-c0-good",
       operation: "write",
       filePath: "src/health_check.txt",
       newContent: "STATUS=OK\n"
     });
-    const c2 = this.deps.layerfs.executeInProcessFileTool({
+    const c1Good = this.deps.layerfs.executeInProcessFileTool({
       branchName: bisectBranch,
       agentId: "agent-bisect",
-      stepId: "bisect-c2",
+      stepId: "bisect-c1-good",
+      operation: "write",
+      filePath: "src/health_check.txt",
+      newContent: "STATUS=OK\nVERIFIED=1\n"
+    });
+    const c2Bad = this.deps.layerfs.executeInProcessFileTool({
+      branchName: bisectBranch,
+      agentId: "agent-bisect",
+      stepId: "bisect-c2-bad",
       operation: "write",
       filePath: "src/health_check.txt",
       newContent: "STATUS=REGRESSION_BUG\n"
     });
-    const c3 = this.deps.layerfs.executeInProcessFileTool({
+    const c3Bad = this.deps.layerfs.executeInProcessFileTool({
       branchName: bisectBranch,
       agentId: "agent-bisect",
-      stepId: "bisect-c3",
+      stepId: "bisect-c3-bad",
       operation: "write",
       filePath: "src/health_check.txt",
       newContent: "STATUS=REGRESSION_BUG_2\n"
     });
-    const commitChain = ["C0", c1.commitId, c2.commitId, c3.commitId];
-    const bisectRes = this.bisectCoordinator.identifyFirstBadCommit(
-    commitChain,
-    (cid) => cid === "C0" || cid === c1.commitId);
-
-    const probedCommits = commitChain.map((cid, idx) => ({
-      commitId: cid,
-      passed: cid === "C0" || cid === c1.commitId,
-      branchName: `bisect-probe-${cid}-${idx}`
-    }));
+    const commitChain = [c0Good.commitId, c1Good.commitId, c2Bad.commitId, c3Bad.commitId];
+    const liveBisectRes = this.bisectCoordinator.executeLiveLayerFsBisect({
+      driver: this.deps.layerfs,
+      commits: commitChain,
+      testShellCommand: "grep -q 'STATUS=OK' src/health_check.txt"
+    });
     this.lastBisectResult = {
-      firstBadCommit: bisectRes.firstBadCommit,
-      probesExecuted: bisectRes.probesExecuted,
-      probedCommits
+      firstBadCommit: liveBisectRes.firstBadCommit,
+      probesExecuted: liveBisectRes.probesExecuted,
+      probedCommits: liveBisectRes.probedCommits
     };
     this.appendAudit(
     params.actor,
     params.role,
-    `执行并行 CoW 二分排障 (LayerFS Zero-Copy Bisect)：${bisectRes.probesExecuted} 次探测定位首个异常提交 [${bisectRes.firstBadCommit}]`,
+    `执行并行 CoW 二分排障 (LayerFS Zero-Copy Bisect)：${liveBisectRes.probesExecuted} 次探测定位首个异常提交 [${liveBisectRes.firstBadCommit}]`,
     "Global / CoW-Bisect",
-    `FIRST_BAD=${bisectRes.firstBadCommit}`);
+    `FIRST_BAD=${liveBisectRes.firstBadCommit}`);
 
     return {
       status: 200,
@@ -2299,13 +2408,28 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const newFencingToken = task.lease_fencing_token + 1;
     const walEntries = this.deps.walEngine.getTaskWalEntries(params.taskId);
     const turnIndex = Math.max(1, walEntries.length);
+    const branchName =
+    params.taskId === "task-ns-8841" ?
+    "feat-ns-auth" :
+    params.taskId === "task-ns-8842" ?
+    "fix-ns-ledger" :
+    params.taskId === "task-hl-3019" ?
+    "gdpr-audit-eu" :
+    `task-${params.taskId}`;
+    try {
+      this.deps.layerfs.getBranchHeadCommit(branchName);
+    } catch {
+      this.deps.layerfs.forkBranch("main", branchName);
+    }
+    const branchBundle = this.deps.layerfs.exportBranchBundle(branchName);
     const snapshotBytes = new TextEncoder().encode(
     JSON.stringify({
       taskId: params.taskId,
       turnIndex,
       sourceNodeId,
       targetNodeId,
-      fencingToken: newFencingToken
+      fencingToken: newFencingToken,
+      layerfsBranchBundle: branchBundle
     }));
 
 
@@ -2317,6 +2441,24 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       newFencingToken,
       upperdirSnapshotBytes: snapshotBytes
     });
+
+    if (this.deps.s3Endpoint) {
+      await this.deps.layerfs.pushBranchToRemoteS3(branchName, this.deps.s3Endpoint);
+    }
+    let remoteBodyImported = false;
+    const targetBodyUrl = this.deps.peerBodyUrls[targetNodeId];
+    if (targetBodyUrl) {
+      try {
+        const importResp = await fetch(`${targetBodyUrl.replace(/\/$/, "")}/internal/v1beta1/body/layerfs-import`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ branchBundle, taskId: params.taskId, fencingToken: newFencingToken })
+        });
+        remoteBodyImported = importResp.ok;
+      } catch {
+        remoteBodyImported = false;
+      }
+    }
 
     task.assigned_node_id = targetNodeId;
     task.lease_fencing_token = newFencingToken;
@@ -2344,6 +2486,8 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         sourceNodeId,
         targetNodeId,
         newFencingToken,
+        branchName,
+        remoteBodyImported,
         ...migRes
       }
     };
@@ -2385,8 +2529,14 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       });
     }
 
-    const lines = this.deps.layerfs.blameFile(branchName, filePath);
+    const rawLines = this.deps.layerfs.blameFile(branchName, filePath);
     const updatedHead = this.deps.layerfs.getBranchHeadCommit(branchName);
+    const lines = rawLines.map((ln) => ({
+      ...ln,
+      content: ln.text,
+      commitId: updatedHead.commitId,
+      agentId: updatedHead.agentId
+    }));
     return {
       status: 200,
       body: {
@@ -2461,12 +2611,55 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     }
 
     const graceSecs = Number(params.graceSecs ?? 3600);
-    const candidates = [
+    const dynamicCandidates =
+
+
+
+
+
+
+
+
+    [
     { cellScope: "AnstsSchedulerCell:shard-01", epochId: 10, ownerCurrentEpoch: 14, ageSeconds: 7200, isFacetStream: false, isPagedCell: false, hydrateMbps: 120, bytes: 16384 },
     { cellScope: "AnstsSchedulerCell:shard-02", epochId: 11, ownerCurrentEpoch: 14, ageSeconds: 5400, isFacetStream: false, isPagedCell: false, hydrateMbps: 115, bytes: 24576 },
     { cellScope: "AnstsHarnessCell:facet-stream", epochId: 9, ownerCurrentEpoch: 14, ageSeconds: 9000, isFacetStream: true, isPagedCell: false, hydrateMbps: 100, bytes: 8192 },
     { cellScope: "AnstsSchedulerCell:shard-03", epochId: 13, ownerCurrentEpoch: 14, ageSeconds: 7200, isFacetStream: false, isPagedCell: false, hydrateMbps: 110, bytes: 32768 }];
 
+    for (const [tId, tk] of this.deps.scheduler.allTasks.entries()) {
+      const walFrames = this.deps.walEngine.getTaskWalEntries(tId);
+      const staleEpochs = new Set();
+      for (const wf of walFrames) {
+        if (wf.fencingToken < tk.lease_fencing_token - 1) {
+          staleEpochs.add(wf.fencingToken);
+        }
+      }
+      for (const oldEp of staleEpochs) {
+        dynamicCandidates.push({
+          cellScope: `TaskCell:${tId}`,
+          epochId: oldEp,
+          ownerCurrentEpoch: tk.lease_fencing_token,
+          ageSeconds: 7200,
+          isFacetStream: false,
+          isPagedCell: false,
+          hydrateMbps: 125,
+          bytes: 12288
+        });
+      }
+    }
+    for (const facet of this.facetSupervisor.listFacets()) {
+      dynamicCandidates.push({
+        cellScope: `FacetCell:${facet.facetName}`,
+        epochId: 1,
+        ownerCurrentEpoch: 5,
+        ageSeconds: 9000,
+        isFacetStream: true,
+        isPagedCell: false,
+        hydrateMbps: 100,
+        bytes: 4096
+      });
+    }
+    const candidates = dynamicCandidates;
     const deletable = candidates.filter(
     (c) => !c.isFacetStream && !(c.isPagedCell && c.hydrateMbps === 0) && c.epochId < c.ownerCurrentEpoch - 1 && c.ageSeconds >= graceSecs);
 
@@ -2559,6 +2752,151 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         traceparent,
         prometheusMetrics: this.metrics.renderPrometheusMetrics(),
         webhookOutbox: webhookResult
+      }
+    };
+  }
+
+
+  getMcpGovernanceSnapshot() {
+    this.ensureInitialized();
+    const rows = this.deps.v25Store.sql.exec("SELECT * FROM v25_mgmt_mcp_tools").toArray();
+    const tools = rows.map((r) => ({
+      toolName: String(r.tool_name),
+      serverName: String(r.server_name),
+      description: String(r.description),
+      effectClass: String(r.effect_class),
+      registeredBy: String(r.registered_by ?? "chen"),
+      registeredAt: String(r.registered_at ?? "09:20:00 UTC")
+    }));
+    return {
+      tools,
+      lastSagaRollbackReport: this.lastSagaRollbackReport
+    };
+  }
+
+  executeMcpAndSagaGovernance(params)
+
+
+
+
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权注册 MCP 工具或执行 Saga 事务补偿" }
+      };
+    }
+    const sql = this.deps.v25Store.sql;
+
+    if (params.action === "register_mcp_tool") {
+      const serverName = params.serverName ?? "mcp-k8s-fleet";
+      const toolName = params.toolName ?? `mcp_tool_${Math.floor(100 + Math.random() * 899)}`;
+      const description = params.description ?? "Dynamic MCP JSON-RPC 2.0 compensatable tool";
+      const nowUtc = `${new Date().toISOString().slice(11, 19)} UTC`;
+
+      this.mcpRegistry.registerMcpServerTools(
+      serverName,
+      [
+      {
+        toolName,
+        description,
+        effectClass: _models.ToolCallEffectClass.COMPENSATABLE_WRITE,
+        inputSchema: { type: "object" }
+      }],
+
+      this.deps.sagaGateway,
+      (method, rpcParams) => ({ jsonrpc: "2.0", method, result: { executed: true, rpcParams } }));
+
+      this.deps.sagaGateway.registerTool(
+      toolName,
+      _models.ToolCallEffectClass.COMPENSATABLE_WRITE,
+      (args) => ({ jsonrpc: "2.0", serverName, toolName, executedArgs: args, status: "COMMITTED" }),
+      (args) => ({ jsonrpc: "2.0", serverName, toolName, rolledBackArgs: args, status: "ROLLED_BACK_LIFO" }));
+
+
+      sql.exec(
+      "INSERT OR REPLACE INTO v25_mgmt_mcp_tools (tool_name, server_name, description, effect_class, registered_by, registered_at) VALUES (?, ?, ?, ?, ?, ?)",
+      toolName,
+      serverName,
+      description,
+      "COMPENSATABLE_WRITE",
+      params.actor,
+      nowUtc);
+
+
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `注册动态 MCP 工具 [${serverName}/${toolName}] 并绑定 Saga LIFO 补偿钩子`,
+      `Global / MCP-Registry`,
+      "REGISTERED");
+
+
+      return {
+        status: 201,
+        body: {
+          toolName,
+          serverName,
+          effectClass: "COMPENSATABLE_WRITE",
+          mcpState: this.getMcpGovernanceSnapshot()
+        }
+      };
+    }
+
+    if (params.action === "invoke_mcp_tool") {
+      const taskId = params.taskId ?? "task-ns-8841";
+      const toolName = params.toolName ?? "mcp_pg_migration_apply";
+      const turnIndex = Number(params.turnIndex ?? Date.now() % 10000);
+      const toolArgs = params.toolArgs ?? { migrationId: `mig_${turnIndex}` };
+      const [output, deduplicated] = this.deps.sagaGateway.invokeTool(taskId, turnIndex, toolName, toolArgs);
+
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `调用 MCP 事务工具 [${toolName}] (Task=${taskId}, Turn=#${turnIndex}, Deduplicated=${deduplicated})`,
+      `us-west-2 / ${taskId}`,
+      "COMMITTED (Saga Hook Armed)");
+
+
+      return {
+        status: 200,
+        body: {
+          taskId,
+          turnIndex,
+          toolName,
+          output,
+          deduplicated,
+          mcpState: this.getMcpGovernanceSnapshot()
+        }
+      };
+    }
+
+    // action === "saga_rollback_task"
+    const taskId = params.taskId ?? "task-ns-8841";
+    const compensated = this.deps.sagaGateway.compensator.rollbackTask(taskId);
+    this.lastSagaRollbackReport = { taskId, compensatedTools: compensated };
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `触发任务 ${taskId} 的 Saga 逆序 (LIFO) 事务补偿回滚，共回滚 ${compensated.length} 步外部副作用`,
+    `us-west-2 / ${taskId}`,
+    `ROLLED_BACK (${compensated.length} steps)`);
+
+
+    return {
+      status: 200,
+      body: {
+        taskId,
+        compensatedCount: compensated.length,
+        compensatedTools: compensated,
+        mcpState: this.getMcpGovernanceSnapshot()
       }
     };
   }

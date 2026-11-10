@@ -264,6 +264,19 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-mcp") {
+    const action = rest[0] ?? "invoke_mcp_tool";
+    const toolName = rest[1] ?? "mcp_pg_migration_apply";
+    const taskId = rest[2] ?? "task-ns-8841";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, toolName, taskId, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-a2a") {
     const action = rest[0] ?? "put_blackboard_cas";
     const key = rest[1] ?? "arch/zero-trust-policy";
