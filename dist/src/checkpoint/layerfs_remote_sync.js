@@ -1,6 +1,6 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.LayerFsStalePushRefusedError = exports.LayerFsRemoteStoreSynchronizer = void 0; /**
- * @fileoverview M17 TASK-88: LayerFS Store RPO=0 Remote Storage & CAS Pull/Push Synchronizer
- * (Addresses LayerFS 2.0 Issue #446 `R · Remote storage for the SQLite Store file` & `D9 · Pull/Push refusal`).
+ * @fileoverview M17 TASK-88 & M55-3: LayerFS Store RPO=0 Remote Storage & CAS Pull/Push Synchronizer
+ * with Pull-to-Push Generation & ETag State Synchronization (eliminating post-pull Rule D9 deadlock).
  */
 
 
@@ -28,6 +28,10 @@ class LayerFsRemoteStoreSynchronizer {
     this.projectId = projectId;
   }
 
+  getRemoteGeneration() {
+    return this.remoteGeneration;
+  }
+
   async pushStoreSnapshot(params)
 
 
@@ -49,7 +53,10 @@ class LayerFsRemoteStoreSynchronizer {
       }
     });
     if (!putRes) {
-      throw new LayerFsStalePushRefusedError(params.basedOnGeneration, this.remoteGeneration + 1);
+      // Refresh local awareness of remote generation if R2 CAS failed due to external writer
+      const latest = await this.bucket.get(r2Key);
+      const actualGen = latest ? Number(latest.customMetadata.generation ?? this.remoteGeneration + 1) : this.remoteGeneration + 1;
+      throw new LayerFsStalePushRefusedError(params.basedOnGeneration, actualGen);
     }
     this.remoteGeneration = nextGen;
     this.lastKnownEtag = putRes.etag;
@@ -60,7 +67,13 @@ class LayerFsRemoteStoreSynchronizer {
     };
   }
 
+  /**
+   * [M55-3] Pulls latest remote SQLite Store metadata and synchronizes `this.remoteGeneration`
+   * and `this.lastKnownEtag` so a subsequent `pushStoreSnapshot({ basedOnGeneration: pulled.remoteGeneration })`
+   * succeeds cleanly without a false Rule D9 conflict.
+   */
   async pullStoreSnapshot()
+
 
 
 
@@ -68,12 +81,18 @@ class LayerFsRemoteStoreSynchronizer {
     const r2Key = `layerfs-stores/${this.projectId}/store.db`;
     const obj = await this.bucket.get(r2Key);
     if (!obj) {
-      return { remoteGeneration: 0, mainHeadCommitId: "C0", sizeBytes: 0 };
+      this.remoteGeneration = 0;
+      this.lastKnownEtag = null;
+      return { remoteGeneration: 0, mainHeadCommitId: "C0", sizeBytes: 0, etag: null };
     }
+    const pulledGen = Number(obj.customMetadata.generation ?? this.remoteGeneration);
+    this.remoteGeneration = pulledGen;
+    this.lastKnownEtag = obj.etag;
     return {
-      remoteGeneration: Number(obj.customMetadata.generation ?? this.remoteGeneration),
+      remoteGeneration: pulledGen,
       mainHeadCommitId: String(obj.customMetadata.mainHeadCommitId ?? "C0"),
-      sizeBytes: obj.size
+      sizeBytes: obj.size,
+      etag: obj.etag
     };
   }
 }exports.LayerFsRemoteStoreSynchronizer = LayerFsRemoteStoreSynchronizer;

@@ -1653,6 +1653,7 @@
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-rectification-audit" data-op="system_wide_m52_rectification">全系统跨模块 Stale/死锁/饥饿 深度整改自检 (M52)</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/risk-elimination-audit" data-op="deep_cross_layer_m53_risk_audit">跨层深水区风险清零自检 (Saga/FinOps/WarmPool/WAL/DrainTTL · M53)</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-runtime-audit" data-op="deep_runtime_m54_audit">深层运行时防惊群/防死锁/反饥饿自检 (Harness/Breaker/Staging/HotCell/Outbox/A2A · M54)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/storage-ha-audit" data-op="storage_ha_m55_audit">存储/分片存活/LayerFS同步/事务回滚自检 (Persistence/Shard/D9/TimeTravel/RPO0 · M55)</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>

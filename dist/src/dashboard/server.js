@@ -67,12 +67,12 @@ var _lease_coordinator = require("../lease_coordinator.js");
 
 
 
-
-
+var _scheduler_v25_persistence = require("../cloudflare/scheduler_v25_persistence.js");
+var _ha_scheduler_shard_coordinator = require("../cloudflare/ha_scheduler_shard_coordinator.js");
 var _budget_controller = require("../finops/budget_controller.js");
 var _escrow = require("../dag/escrow.js");
 var _wal_engine = require("../checkpoint/wal_engine.js");
-
+var _time_travel = require("../checkpoint/time_travel.js");
 
 var _saga_gateway = require("../saga_gateway.js");
 
@@ -5518,6 +5518,241 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           a2aAntiStarvationVerified
         },
         allM54RisksEliminated
+      }
+    };
+  }
+  /**
+   * [M55] Deep Persistence, Shard Last-Brain Survival Guard, LayerFS Rule D9 Pull-State Sync,
+   * Time-Travel CRC32 Verification, Velocity Breaker Recovery & RPO=0 Atomic Rollback Audit:
+   * Verifies all 6 deep storage/HA/transactional invariants:
+   * 1. [V25Persistence-CrossTaskIdem-1] SchedulerV25SingleWritePathStore deduplicates retries with identical (tenant_id, idempotency_key) even when task_id differs, isolates tenants, and preserves full spec_json fields.
+   * 2. [ShardCoordinator-LastBrainSurvival-2] HaSchedulerShardCoordinator refuses to evict the last surviving Brain node (preventing an empty 256-slot hash ring deadlock) and TopologyCasCoordinator deduplicates member lists.
+   * 3. [LayerFsSync-PullToPush-3] LayerFsRemoteStoreSynchronizer updates remoteGeneration and lastKnownEtag inside pullStoreSnapshot() so a cold-started or peer-updated node can pull and immediately push without false Rule D9 409 lockouts.
+   * 4. [VelocityBreaker-Reset-4] SyntacticAndVelocityBreaker prunes expired sliding-window history and supports resetTaskBreaker() so approved/rolled-back tasks can resume cleanly.
+   * 5. [TimeTravel-Crc32AndEpochDedup-5] DeterministicTimeTravelReplayer rejects corrupted WAL frame CRC32 before forking and deduplicates multi-epoch turns by selecting the highest fencingToken.
+   * 6. [RpoZero-AtomicRollbackAndSingleFlight-6] RpoZeroDurabilityEngine rolls back local SQLite transaction when R2 LTX CAS fails, and DurableWorkflowContext coalesces concurrent in-flight stepDo calls.
+   */
+  async executeStorageShardSyncAndTransactionAudit(params)
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行 M55 存储与高可用事务一致性审计" }
+      };
+    }
+
+    // 1. [V25Persistence-CrossTaskIdem-1] Verify cross-task idempotency lookup & tenant isolation
+    const v25Store = new _scheduler_v25_persistence.SchedulerV25SingleWritePathStore();
+    const tFirst = new _models.TaskSpec({
+      task_id: "task-m55-orig",
+      tenant_id: "Northstar",
+      priority: _models.TaskPriority.P1_HIGH,
+      prompt: "audit-m55",
+      idempotency_key: "client-req-m55-001",
+      dependencies: ["dep-a"]
+    });
+    const c1 = v25Store.commitTaskSingleWritePath(tFirst, "body-host-01");
+    // Retry with same idempotency_key and tenant_id, but newly generated task_id
+    const tRetryDiffId = new _models.TaskSpec({
+      task_id: "task-m55-retry-new-id",
+      tenant_id: "Northstar",
+      priority: _models.TaskPriority.P1_HIGH,
+      prompt: "audit-m55",
+      idempotency_key: "client-req-m55-001"
+    });
+    const c2 = v25Store.commitTaskSingleWritePath(tRetryDiffId, "body-host-02");
+    // Different tenant with same idempotency_key string must NOT collide
+    const tOtherTenant = new _models.TaskSpec({
+      task_id: "task-m55-helios",
+      tenant_id: "Helios",
+      priority: _models.TaskPriority.P1_HIGH,
+      prompt: "audit-m55-helios",
+      idempotency_key: "client-req-m55-001"
+    });
+    const c3 = v25Store.commitTaskSingleWritePath(tOtherTenant, "body-host-01");
+    const crossTaskIdemAndTenantIsolationVerified =
+    !c1.deduplicated &&
+    c2.deduplicated &&
+    c2.task.task_id === "task-m55-orig" &&
+    c2.task.dependencies.includes("dep-a") &&
+    !c3.deduplicated;
+
+    // 2. [ShardCoordinator-LastBrainSurvival-2] Verify last surviving Brain shard is never evicted to an empty ring
+    const shardCoord = new _ha_scheduler_shard_coordinator.HaSchedulerShardCoordinator(256, 8);
+    shardCoord.registerBrainShardNode("brain-m55-01");
+    shardCoord.registerBrainShardNode("brain-m55-02");
+    const ev1 = shardCoord.evictUnhealthyBrainShardNode("brain-m55-02");
+    // Attempt to evict the LAST surviving brain node ("brain-m55-01") -> Last-Brain Survival Guard must retain it
+    const evLast = shardCoord.evictUnhealthyBrainShardNode("brain-m55-01");
+    const resolvedAfterLastEvict = shardCoord.resolveBrainForTask("Northstar", "task-any");
+    const lastBrainSurvivalVerified =
+    !ev1.lastBrainSurvivalGuardTriggered &&
+    Boolean(evLast.lastBrainSurvivalGuardTriggered) &&
+    evLast.survivingBrains.length === 1 &&
+    resolvedAfterLastEvict.brainNodeId === "brain-m55-01" &&
+    resolvedAfterLastEvict.epoch >= 2;
+
+    // 3. [LayerFsSync-PullToPush-3] Verify pullStoreSnapshot syncs remoteGeneration & ETag for subsequent push
+    const sharedBucket = new _env.InMemoryR2Bucket();
+    const syncNodeA = new _layerfs_remote_sync.LayerFsRemoteStoreSynchronizer(sharedBucket, "proj-m55");
+    const syncNodeB = new _layerfs_remote_sync.LayerFsRemoteStoreSynchronizer(sharedBucket, "proj-m55");
+    await syncNodeA.pushStoreSnapshot({
+      machineId: "node-a",
+      basedOnGeneration: 0,
+      storeSqliteBytes: new Uint8Array([1, 2, 3]),
+      mainHeadCommitId: "C1"
+    });
+    // Node B pulls generation 1 from R2, then pushes generation 2 based on pulled.remoteGeneration
+    const pulledByB = await syncNodeB.pullStoreSnapshot();
+    const pushedByB = await syncNodeB.pushStoreSnapshot({
+      machineId: "node-b",
+      basedOnGeneration: pulledByB.remoteGeneration,
+      storeSqliteBytes: new Uint8Array([1, 2, 3, 4]),
+      mainHeadCommitId: "C2"
+    });
+    const layerfsPullThenPushVerified = pulledByB.remoteGeneration === 1 && pushedByB.remoteGeneration === 2;
+
+    // 4. [VelocityBreaker-Reset-4] Verify SyntacticAndVelocityBreaker resetTaskBreaker unlocks resumed task
+    const velBreaker = new _velocity_breaker.SyntacticAndVelocityBreaker(3, 120_000);
+    const nowMs = Date.now();
+    velBreaker.recordAndCheckTurn("task-m55-vel", { turnIndex: 1, toolName: "bash", argsHash: "h1", tokensConsumed: 500, timestampMs: nowMs });
+    velBreaker.recordAndCheckTurn("task-m55-vel", { turnIndex: 2, toolName: "bash", argsHash: "h1", tokensConsumed: 500, timestampMs: nowMs + 10 });
+    const trip3 = velBreaker.recordAndCheckTurn("task-m55-vel", { turnIndex: 3, toolName: "bash", argsHash: "h1", tokensConsumed: 500, timestampMs: nowMs + 20 });
+    velBreaker.resetTaskBreaker("task-m55-vel", 3);
+    const afterReset = velBreaker.recordAndCheckTurn("task-m55-vel", { turnIndex: 3, toolName: "bash", argsHash: "h2", tokensConsumed: 500, timestampMs: nowMs + 30 });
+    const velocityResetVerified = trip3.tripped && !afterReset.tripped;
+
+    // 5. [TimeTravel-Crc32AndEpochDedup-5] Verify CRC32 corruption guard & highest-epoch turn deduplication
+    const wal = new _wal_engine.TurnWalEngine();
+    wal.appendTurnDelta({
+      taskId: "task-m55-tt",
+      turnIndex: 1,
+      fencingToken: 1,
+      changedFiles: ["stale_epoch1.ts"],
+      sqliteWalPages: 2,
+      highestSubmittedFencingToken: 1
+    });
+    const validTurn1Epoch2 = wal.appendTurnDelta({
+      taskId: "task-m55-tt",
+      turnIndex: 1,
+      fencingToken: 2,
+      changedFiles: ["canonical_epoch2.ts"],
+      sqliteWalPages: 4,
+      highestSubmittedFencingToken: 2
+    });
+    const replayer = new _time_travel.DeterministicTimeTravelReplayer();
+    const forkClean = replayer.forkTaskAtTurn(
+    tFirst,
+    wal.getTaskWalEntries("task-m55-tt"),
+    1,
+    "task-m55-tt-fork");
+
+    // Corrupt frame CRC32 and verify forkTaskAtTurn rejects it
+    validTurn1Epoch2.frame.crc32Hex = "00000000";
+    let corruptedForkRejected = false;
+    try {
+      replayer.forkTaskAtTurn(tFirst, [validTurn1Epoch2], 1, "task-m55-tt-bad");
+    } catch {
+      corruptedForkRejected = true;
+    }
+    const timeTravelIntegrityAndDedupVerified =
+    forkClean.inheritedFiles.length === 1 &&
+    forkClean.inheritedFiles[0] === "canonical_epoch2.ts" &&
+    forkClean.inheritedFencingToken === 2 &&
+    corruptedForkRejected;
+
+    // 6. [RpoZero-AtomicRollbackAndSingleFlight-6] Verify atomic SQL rollback on LTX CAS conflict & workflow single-flight coalescing
+    const r2Cas = new _env.InMemoryR2Bucket();
+    const sqlCas = this.deps.v25Store.sql;
+    sqlCas.exec("CREATE TABLE IF NOT EXISTS m55_tx_probe (k TEXT PRIMARY KEY, v TEXT)");
+    sqlCas.exec("DELETE FROM m55_tx_probe");
+    const rpoEngine = new _celld_ha_engine.RpoZeroDurabilityEngine(r2Cas, sqlCas);
+    // Pre-populate conflicting LTX key for tx-00000001-f1.ltx
+    await r2Cas.put("ltx/cell-m55/tx-00000001-f1.ltx", new Uint8Array([9, 9]));
+    let casConflictCaught = false;
+    try {
+      await rpoEngine.commitWithSyncLtxFlush(
+      "cell-m55",
+      1,
+      () => {
+        sqlCas.exec("INSERT INTO m55_tx_probe (k, v) VALUES (?, ?)", "k1", "uncommitted_zombie_write");
+      },
+      new Uint8Array([1, 2, 3]),
+      { explicitTxId: 1, sql: sqlCas });
+
+    } catch {
+      casConflictCaught = true;
+    }
+    const rolledBackRow = sqlCas.exec("SELECT * FROM m55_tx_probe WHERE k = ?", "k1").one();
+
+    const wf = new _celld_ha_engine.DurableWorkflowContext(sqlCas, "wf-m55-singleflight");
+    let stepInvocations = 0;
+    const [sf1, sf2] = await Promise.all([
+    wf.stepDo("expensive-step", async () => {
+      stepInvocations += 1;
+      await new Promise((r) => setTimeout(r, 15));
+      return { count: stepInvocations };
+    }),
+    wf.stepDo("expensive-step", async () => {
+      stepInvocations += 1;
+      return { count: stepInvocations };
+    })]);
+
+    const rpoRollbackAndSingleFlightVerified =
+    casConflictCaught && rolledBackRow === null && stepInvocations === 1 && sf1.result.count === 1 && sf2.result.count === 1;
+
+    const allM55RisksEliminated =
+    crossTaskIdemAndTenantIsolationVerified &&
+    lastBrainSurvivalVerified &&
+    layerfsPullThenPushVerified &&
+    velocityResetVerified &&
+    timeTravelIntegrityAndDedupVerified &&
+    rpoRollbackAndSingleFlightVerified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M55 存储与高可用事务一致性审计 (CrossTaskIdem=${crossTaskIdemAndTenantIsolationVerified}, LastBrainGuard=${lastBrainSurvivalVerified}, LayerFsPullSync=${layerfsPullThenPushVerified}, TimeTravelCrc=${timeTravelIntegrityAndDedupVerified}, RpoRollback=${rpoRollbackAndSingleFlightVerified})`,
+    "SystemWide / M55-StorageHaAudit",
+    "ALL_M55_RISKS_ELIMINATED");
+
+
+    return {
+      status: 200,
+      body: {
+        v25PersistenceIdem1: {
+          crossTaskIdemAndTenantIsolationVerified,
+          deduplicatedTaskId: c2.task.task_id
+        },
+        shardLastBrainSurvival2: {
+          lastBrainSurvivalVerified,
+          survivingBrain: resolvedAfterLastEvict.brainNodeId,
+          epoch: resolvedAfterLastEvict.epoch
+        },
+        layerfsPullToPushSync3: {
+          pulledGeneration: pulledByB.remoteGeneration,
+          pushedGeneration: pushedByB.remoteGeneration,
+          layerfsPullThenPushVerified
+        },
+        velocityBreakerReset4: {
+          velocityResetVerified
+        },
+        timeTravelCrcAndDedup5: {
+          inheritedFiles: forkClean.inheritedFiles,
+          inheritedFencingToken: forkClean.inheritedFencingToken,
+          corruptedForkRejected,
+          timeTravelIntegrityAndDedupVerified
+        },
+        rpoZeroAndWorkflow6: {
+          casConflictCaught,
+          sqliteRolledBackCleanly: rolledBackRow === null,
+          concurrentStepInvocations: stepInvocations,
+          rpoRollbackAndSingleFlightVerified
+        },
+        allM55RisksEliminated
       }
     };
   }

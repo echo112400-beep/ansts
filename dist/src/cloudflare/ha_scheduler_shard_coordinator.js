@@ -4,8 +4,8 @@
 
 var _manual_scale_controller = require("../cluster/manual_scale_controller.js");
 var _topology_cas_coordinator = require("../cluster/topology_cas_coordinator.js"); /**
- * @fileoverview M25 High-Availability 256-Slot Scheduler Shard Coordinator with Epoch Lease Fencing
- * and Automatic Unhealthy Brain Shard Eviction & Slot Rebalancing.
+ * @fileoverview M25 & M55-2: High-Availability 256-Slot Scheduler Shard Coordinator with Epoch Lease Fencing,
+ * Automatic Unhealthy Brain Shard Eviction & Last-Brain Survival Guard (preventing empty-ring deadlocks).
  */class HaSchedulerShardCoordinator {ring;
   topologyCas;
   shardEpochs = new Map();
@@ -25,12 +25,32 @@ var _topology_cas_coordinator = require("../cluster/topology_cas_coordinator.js"
     return nextEpoch;
   }
 
+  /**
+   * [M55-2] Evicts an unhealthy Brain shard node and rebalances its slots onto surviving Brain shards.
+   * If `failedBrainNodeId` is the LAST remaining Brain shard in `activeBrains`, triggers the
+   * Last-Brain Survival Guard: retains the last Brain node in the ring (bumping its epoch to fence stale leases)
+   * so the 256-slot hash ring never becomes completely empty/ownerless.
+   */
   evictUnhealthyBrainShardNode(failedBrainNodeId)
 
 
 
 
+
   {
+    if (this.activeBrains.size <= 1 && this.activeBrains.has(failedBrainNodeId)) {
+      const nextEpoch = (this.shardEpochs.get(failedBrainNodeId) ?? 1) + 1;
+      this.shardEpochs.set(failedBrainNodeId, nextEpoch);
+      const casRes = this.topologyCas.forceSyncMembers(Array.from(this.activeBrains));
+      return {
+        evictedNodeId: failedBrainNodeId,
+        survivingBrains: casRes.members,
+        newTopologyGeneration: casRes.generation,
+        bumpedEpochs: { [failedBrainNodeId]: nextEpoch },
+        lastBrainSurvivalGuardTriggered: true
+      };
+    }
+
     this.ring.removeNode(failedBrainNodeId);
     this.activeBrains.delete(failedBrainNodeId);
     const bumpedEpochs = {};
@@ -44,7 +64,8 @@ var _topology_cas_coordinator = require("../cluster/topology_cas_coordinator.js"
       evictedNodeId: failedBrainNodeId,
       survivingBrains: casRes.members,
       newTopologyGeneration: casRes.generation,
-      bumpedEpochs
+      bumpedEpochs,
+      lastBrainSurvivalGuardTriggered: false
     };
   }
 

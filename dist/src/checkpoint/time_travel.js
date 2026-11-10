@@ -1,10 +1,11 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.DeterministicTimeTravelReplayer = void 0;
 
 
-var _models = require("../models.js"); /**
- * @fileoverview M5 TASK-21: Deterministic Time-Travel Debugger & Turn Forking Engine.
- */
 
+var _models = require("../models.js"); /**
+ * @fileoverview M5 TASK-21 & M55-4: Deterministic Time-Travel Debugger & Turn Forking Engine
+ * with WAL Frame CRC32 Integrity Verification & Highest-Epoch Turn Deduplication.
+ */
 
 
 
@@ -24,6 +25,11 @@ class DeterministicTimeTravelReplayer {
   {
     return driver.forkBranch(sourceCommitId, newBranchName);
   }
+
+  /**
+   * [M55-4] Forks a task at `targetTurnIndex` after verifying every WAL frame's CRC32 integrity
+   * and deduplicating multi-epoch turn entries by selecting the highest `(fencingToken, walSeq)` per turn.
+   */
   forkTaskAtTurn(
   originalTask,
   walEntries,
@@ -31,16 +37,41 @@ class DeterministicTimeTravelReplayer {
   newTaskId,
   overriddenPrompt)
   {
-    const validEntries = walEntries.filter((e) => e.turnIndex <= targetTurnIndex);
-    if (validEntries.length === 0) {
+    const candidateEntries = walEntries.filter((e) => e.turnIndex <= targetTurnIndex);
+    if (candidateEntries.length === 0) {
       throw new Error(`Cannot fork task '${originalTask.task_id}' at turn ${targetTurnIndex}: no WAL found`);
     }
+
+    // [M55-4] Deduplicate by turnIndex choosing highest (fencingToken, walSeq) and verify CRC32 integrity
+    const canonicalByTurn = new Map();
+    let maxFencingToken = originalTask.lease_fencing_token;
+    for (const entry of candidateEntries) {
+      if (entry.frame && typeof entry.frame.verifyIntegrity === "function" && !entry.frame.verifyIntegrity()) {
+        throw new Error(
+        `Cannot fork task '${originalTask.task_id}' at turn ${targetTurnIndex}: corrupted WAL frame '${entry.frame.frameId}' (CRC32 mismatch at turn ${entry.turnIndex})`);
+
+      }
+      const existing = canonicalByTurn.get(entry.turnIndex);
+      if (
+      !existing ||
+      entry.fencingToken > existing.fencingToken ||
+      entry.fencingToken === existing.fencingToken && entry.walSeq > existing.walSeq)
+      {
+        canonicalByTurn.set(entry.turnIndex, entry);
+      }
+      if (entry.fencingToken > maxFencingToken) {
+        maxFencingToken = entry.fencingToken;
+      }
+    }
+
+    const orderedTurns = Array.from(canonicalByTurn.values()).sort((a, b) => a.turnIndex - b.turnIndex);
     const inheritedFiles = new Set();
-    for (const e of validEntries) {
+    for (const e of orderedTurns) {
       for (const f of e.changedFiles) {
         inheritedFiles.add(f);
       }
     }
+
     const forkedTask = new _models.TaskSpec({
       task_id: newTaskId,
       tenant_id: originalTask.tenant_id,
@@ -54,12 +85,14 @@ class DeterministicTimeTravelReplayer {
     });
     forkedTask.current_turn = targetTurnIndex;
     forkedTask.state = _models.TaskState.QUEUED;
+    forkedTask.lease_fencing_token = maxFencingToken;
 
     return {
       forkedTask,
       restoredTurnIndex: targetTurnIndex,
       overriddenPrompt: forkedTask.prompt,
-      inheritedFiles: [...inheritedFiles]
+      inheritedFiles: [...inheritedFiles],
+      inheritedFencingToken: maxFencingToken
     };
   }
 }exports.DeterministicTimeTravelReplayer = DeterministicTimeTravelReplayer;

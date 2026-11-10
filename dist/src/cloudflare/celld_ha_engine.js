@@ -1,10 +1,11 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ShardedQueueBrokerPool = exports.SafeEpochGarbageCollector = exports.RpoZeroDurabilityEngine = exports.FleetReplicatedDurabilityEngine = exports.FleetHaAndAutoscalerController = exports.DurableWorkflowContext = void 0;
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M8 TASK-28 ~ TASK-31: RPO=0 LTX Durability Engine, DurableWorkflowContext, Sharded Queue Broker & Safe Epoch GC.
- */
 
+var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+ * @fileoverview M8 TASK-28 ~ TASK-31 & M55-4: RPO=0 LTX Durability Engine (with Atomic SQL Rollback on CAS Conflict),
+ * DurableWorkflowContext (with Single-Flight Concurrent Deduplication & Step Invalidation), Sharded Queue Broker & Safe Epoch GC.
+ */
 
 
 
@@ -15,50 +16,78 @@ var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequir
 
 class RpoZeroDurabilityEngine {
   bucket;
+  sql;
   txCounter = 0;
 
-  constructor(bucket) {
+  constructor(bucket, sql) {
     this.bucket = bucket;
+    this.sql = sql;
   }
 
+  /**
+   * [M55-4] Executes `sqlMutation` inside a transactional boundary and flushes the LTX segment with `If-None-Match: *` CAS.
+   * If the R2 CAS write fails due to a split-brain conflict, automatically rolls back the SQLite transaction (and invokes
+   * optional `onRollback`) so local SQLite never diverges from R2 LTX segments.
+   */
   async commitWithSyncLtxFlush(
   cellId,
   fencingToken,
   sqlMutation,
-  serializedWalBytes)
+  serializedWalBytes,
+  options)
   {
-    sqlMutation();
-    this.txCounter += 1;
-    const txId = this.txCounter;
-    const sha256 = crypto.createHash("sha256").update(serializedWalBytes).digest("hex");
-    const r2Key = `ltx/${cellId}/tx-${String(txId).padStart(8, "0")}-f${fencingToken}.ltx`;
-
-    const putResult = await this.bucket.put(r2Key, serializedWalBytes, {
-      onlyIf: { etagDoesNotMatch: "*" },
-      customMetadata: {
-        cellId,
-        txId: String(txId),
-        fencingToken: String(fencingToken),
-        sha256
-      }
-    });
-    if (!putResult) {
-      throw new Error(`CAS conflict writing LTX segment '${r2Key}': split-brain fenced!`);
+    const targetSql = options?.sql ?? this.sql;
+    if (targetSql) {
+      targetSql.exec("BEGIN TRANSACTION");
     }
-    return {
-      cellId,
-      txId,
-      fencingToken,
-      sha256,
-      r2Key,
-      sizeBytes: serializedWalBytes.byteLength
-    };
+    try {
+      sqlMutation();
+      this.txCounter += 1;
+      const txId = options?.explicitTxId ?? this.txCounter;
+      const sha256 = crypto.createHash("sha256").update(serializedWalBytes).digest("hex");
+      const r2Key = `ltx/${cellId}/tx-${String(txId).padStart(8, "0")}-f${fencingToken}.ltx`;
+
+      const putResult = await this.bucket.put(r2Key, serializedWalBytes, {
+        onlyIf: { etagDoesNotMatch: "*" },
+        customMetadata: {
+          cellId,
+          txId: String(txId),
+          fencingToken: String(fencingToken),
+          sha256
+        }
+      });
+      if (!putResult) {
+        if (targetSql) {
+          targetSql.exec("ROLLBACK TRANSACTION");
+        }
+        options?.onRollback?.();
+        throw new Error(`CAS conflict writing LTX segment '${r2Key}': split-brain fenced!`);
+      }
+      if (targetSql) {
+        targetSql.exec("COMMIT TRANSACTION");
+      }
+      return {
+        cellId,
+        txId,
+        fencingToken,
+        sha256,
+        r2Key,
+        sizeBytes: serializedWalBytes.byteLength
+      };
+    } catch (err) {
+      if (targetSql && !err.message.includes("split-brain fenced")) {
+        targetSql.exec("ROLLBACK TRANSACTION");
+        options?.onRollback?.();
+      }
+      throw err;
+    }
   }
 }exports.RpoZeroDurabilityEngine = RpoZeroDurabilityEngine;
 
 class DurableWorkflowContext {
   sql;
   workflowId;
+  inFlightSteps = new Map();
 
   constructor(sql, workflowId) {
     this.sql = sql;
@@ -68,6 +97,11 @@ class DurableWorkflowContext {
 
   }
 
+  /**
+   * [M55-4] Single-flight memoized workflow step execution:
+   * - Replays completed step outputs from SQLite journal across restarts.
+   * - Deduplicates concurrent in-flight callers for the same `stepName` so `fn()` never executes twice concurrently.
+   */
   async stepDo(stepName, fn) {
     const stepKey = `${this.workflowId}:${stepName}`;
     const existing = this.sql.
@@ -79,15 +113,36 @@ class DurableWorkflowContext {
         replayedFromJournal: true
       };
     }
-    const result = await fn();
-    this.sql.exec(
-    "INSERT OR REPLACE INTO workflow_steps (step_key, workflow_id, output_json, completed_at) VALUES (?, ?, ?, ?)",
-    stepKey,
-    this.workflowId,
-    JSON.stringify(result),
-    Date.now());
 
-    return { result, replayedFromJournal: false };
+    const existingInFlight = this.inFlightSteps.get(stepKey);
+    if (existingInFlight) {
+      const coalescedResult = await existingInFlight;
+      return { result: coalescedResult, replayedFromJournal: true };
+    }
+
+    const promise = (async () => {
+      const res = await fn();
+      this.sql.exec(
+      "INSERT OR REPLACE INTO workflow_steps (step_key, workflow_id, output_json, completed_at) VALUES (?, ?, ?, ?)",
+      stepKey,
+      this.workflowId,
+      JSON.stringify(res),
+      Date.now());
+
+      return res;
+    })();
+    this.inFlightSteps.set(stepKey, promise);
+    try {
+      const result = await promise;
+      return { result, replayedFromJournal: false };
+    } finally {
+      this.inFlightSteps.delete(stepKey);
+    }
+  }
+
+  invalidateStep(stepName) {
+    const stepKey = `${this.workflowId}:${stepName}`;
+    this.sql.exec("DELETE FROM workflow_steps WHERE step_key = ?", stepKey);
   }
 }exports.DurableWorkflowContext = DurableWorkflowContext;
 
@@ -161,7 +216,6 @@ class FleetHaAndAutoscalerController {
     return { healthyNodes: healthy.length, unhealthyNodeIds, scaleAction };
   }
 }
-
 
 /**
  * M16 TASK-76: `CELLD_DURABILITY=fleet` Peer-Replicated Log Pipeline (`CELLD_LOG_PIPELINE=4`),

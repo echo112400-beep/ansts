@@ -2337,6 +2337,18 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M55] Deep Persistence, Shard Last-Brain Survival Guard, LayerFS Rule D9 Pull-State Sync, Time-Travel CRC32 Verification, Velocity Breaker Recovery & RPO=0 Atomic Rollback Audit (`POST /v1beta1/management/system/storage-ha-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/storage-ha-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeStorageShardSyncAndTransactionAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M54] Deep Runtime Resilience, Cold-Start Fencing, Half-Open Stampede Guard, Approval TTL, Hot-Cell Leak Reclamation, Outbox/SSE & A2A Anti-Starvation Audit (`POST /v1beta1/management/system/deep-runtime-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/deep-runtime-audit") {
       const body = await this.readJsonBody(req);

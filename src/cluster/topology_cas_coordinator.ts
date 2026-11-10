@@ -1,5 +1,6 @@
 /**
- * @fileoverview Cluster Topology Compare-And-Swap (CAS) Membership Coordinator with SHA-256 Ring Digest & SQLite Persistence.
+ * @fileoverview M25 & M55-2: Cluster Topology Compare-And-Swap (CAS) Membership Coordinator
+ * with Member Deduplication, SHA-256 Ring Digest & SQLite Persistence.
  */
 import * as crypto from "node:crypto";
 import { SqlStorageLike } from "../cloudflare/env.js";
@@ -20,7 +21,7 @@ export class TopologyCasCoordinator {
         .toArray();
       if (rows.length > 0) {
         this.generation = Number(rows[0].generation ?? 0);
-        this.members = JSON.parse(String(rows[0].members_json ?? "[]")) as string[];
+        this.members = Array.from(new Set(JSON.parse(String(rows[0].members_json ?? "[]")) as string[]));
       }
     }
   }
@@ -63,7 +64,7 @@ export class TopologyCasCoordinator {
       throw new Error(`Topology CAS conflict: expected gen=${expectedGeneration}, actual=${this.generation}`);
     }
     this.generation += 1;
-    this.members = [...nextMembers];
+    this.members = Array.from(new Set(nextMembers));
     const ringDigest = this.persist();
     return { generation: this.generation, members: [...this.members], ringDigest };
   }
@@ -74,7 +75,7 @@ export class TopologyCasCoordinator {
     ringDigest: string;
   } {
     this.generation += 1;
-    this.members = [...nextMembers];
+    this.members = Array.from(new Set(nextMembers));
     const ringDigest = this.persist();
     return { generation: this.generation, members: [...this.members], ringDigest };
   }
