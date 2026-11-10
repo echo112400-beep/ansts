@@ -80,6 +80,7 @@ import { GeoSovereigntyAndLatencyRouter } from "../cluster/geo_routing.js";
 import { EphemeralHeavyExecutorMigrator } from "../runtime/live_migration.js";
 import { EdgeTunnelHaRouter } from "../runtime/edge_tunnel_ha_router.js";
 import { CloudEventsBus } from "../telemetry/cloudevents.js";
+import { SseEventStreamGateway } from "../gateway/sse_stream.js";
 import { TaskPriority, TaskSpec, TaskState } from "../models.js";
 
 export type ManagementScenarioId =
@@ -166,6 +167,7 @@ export interface ManagementPlaneDeps {
   heavyMigrator: EphemeralHeavyExecutorMigrator;
   tunnelRouter: EdgeTunnelHaRouter;
   cloudEventsBus: CloudEventsBus;
+  sseGateway?: SseEventStreamGateway;
   peerBrainUrls: Record<string, string>;
   peerBodyUrls: Record<string, string>;
   s3Endpoint?: string | null;
@@ -488,6 +490,24 @@ export class PlatformManagementPlaneEngine {
       scope,
       outcome
     );
+    if (this.deps.sseGateway) {
+      this.deps.sseGateway.publish({
+        id: auditId,
+        event: "management.audit",
+        taskId: "mgmt-audit-stream",
+        turnIndex: 0,
+        timestampMs: Date.now(),
+        data: { auditId, ts, actor, role, action, scope, outcome },
+      });
+    }
+    this.deps.cloudEventsBus.emitEvent({
+      type: "io.ansts.management.audit",
+      subject: scope,
+      tenantId: scope.includes("/") ? scope.split("/")[1].trim() : "global",
+      llmCostUsd: 0,
+      sandboxCpuCoreSeconds: 0,
+      data: { auditId, actor, role, action, outcome },
+    });
     return { auditId, ts, actor, role, action, scope, outcome };
   }
 
@@ -1506,5 +1526,41 @@ export class PlatformManagementPlaneEngine {
         createdAt,
       },
     };
+  }
+
+  public checkTenantDispatchAdmission(tenantId: string, priority: number, enforceQuotaGate = false): {
+    allowed: boolean;
+    statusCode: 200 | 429;
+    reason?: string;
+    usedSlots?: number;
+    maxSlots?: number;
+  } {
+    this.ensureInitialized();
+    const row = this.deps.v25Store.sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_tenants WHERE tenant_id = ?", tenantId)
+      .one();
+    if (!row) {
+      return { allowed: true, statusCode: 200 };
+    }
+    const maxSlots = Number(row.max_slots ?? 120);
+    const activeCount = Array.from(this.deps.scheduler.allTasks.values()).filter(
+      (t) => t.tenant_id === tenantId && t.state !== TaskState.COMPLETED && t.state !== TaskState.CANCELLED && String(t.state) !== "FENCED_TERMINATED"
+    ).length;
+    const baseUsed = tenantId === "Northstar" ? 86 : tenantId === "Helios" ? 45 : 20;
+    const usedSlots =
+      this.scenario === "quota" && tenantId === "Northstar" && maxSlots <= 120
+        ? maxSlots
+        : baseUsed + activeCount;
+
+    if ((this.scenario === "quota" || enforceQuotaGate) && usedSlots >= maxSlots && priority > 0) {
+      return {
+        allowed: false,
+        statusCode: 429,
+        reason: "TENANT_QUOTA_EXHAUSTED",
+        usedSlots,
+        maxSlots,
+      };
+    }
+    return { allowed: true, statusCode: 200, usedSlots, maxSlots };
   }
 }

@@ -421,6 +421,60 @@
       if (item) item.status = nextStatus;
       return { ok: true, status: 200, data: { approvalId: body.approvalId, status: nextStatus }, fromLiveBackend: false };
     }
+    if (method === 'POST' && endpointPath === '/v1beta1/celld/isolate') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          nodeId: 'celld-gw-01',
+          isolateId: 'dyn-worker-task-isolate-01-t1-8f2a19c3',
+          globalOutboundBlocked: true,
+          coldStartLatencyMs: 0.42,
+          output: { computed: 42, isolateEnv: 'task-isolate-01' },
+          heapStatus: { status: 'HEALTHY', heapUtilizationPct: 31.4, measuredHeapMb: 40.2 }
+        },
+        fromLiveBackend: false
+      };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/celld/facets') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          facetRecord: { facetName: 'facet-task-facet-01-t1-sql_sandbox', status: 'SPAWNED', isolatedSqliteDbName: 'sqlite://facet/facet-task-facet-01-t1-sql_sandbox.db' },
+          sqlBudgetElapsedMs: 0.08,
+          kvShard: { shardId: 14, physicalKey: 'kv-cell-14:idem-ns:task-facet-01:t1', byteLength: 62 },
+          activeFacetsCount: 1
+        },
+        fromLiveBackend: false
+      };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/celld/ltx-compaction') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          taskId: 'task-ns-8841',
+          compactedSnapshot: { snapshotId: 'compact-task-ns-8841-t5', upToTurnIndex: 5, totalSqlitePages: 30, compactionRatio: 1 },
+          l1Compaction: { compactionTriggered: true, batchesMerged: 2, resultingL1Objects: 2 },
+          walTruncation: { shouldTruncateWalAtCheckpoint: true, usePagedRestore: true, estimatedFullHydrationSeconds: 18.75 },
+          uffdRestore: { eagerPagesLoaded: 6, lazyDeferredPages: 24, resumeLatencyMs: 4.4 }
+        },
+        fromLiveBackend: false
+      };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/layerfs/store-sync') {
+      return {
+        ok: true,
+        status: 200,
+        data: {
+          remoteGeneration: 1,
+          r2Key: 'layerfs-stores/ansts-fleet/store.db',
+          etag: '"etag-gen-1"'
+        },
+        fromLiveBackend: false
+      };
+    }
     if (method === 'POST' && endpointPath === '/v1beta1/management/capacity/action') {
       state.loadSheddingActive = true;
       state.verificationRetried = true;
@@ -1158,6 +1212,10 @@
             <button type="button" class="small" data-action="runtime-layerfs-merge">三路分支合并 (/v1/layerfs/merge)</button>
             <button type="button" class="small" data-action="runtime-slsa-attest">生成 SLSA v1.0 + TEE 证明 (/v1beta1/security/attest)</button>
             <button type="button" class="small danger" data-action="runtime-chaos-drill">执行脑裂与 Fencing 混沌演练 (/v1beta1/cluster/chaos-drill)</button>
+            <button type="button" class="small primary" data-action="runtime-celld-isolate">V8 Isolate 沙箱与堆守卫 (/v1beta1/celld/isolate)</button>
+            <button type="button" class="small" data-action="runtime-celld-facets">DO Sub-Actor Facets &amp; 32-Shard KV (/v1beta1/celld/facets)</button>
+            <button type="button" class="small" data-action="runtime-ltx-compaction">L0→L1 LTX 压缩与 UFFD 恢复 (/v1beta1/celld/ltx-compaction)</button>
+            <button type="button" class="small" data-action="runtime-layerfs-d9">LayerFS Rule D9 存储同步 (/v1beta1/layerfs/store-sync)</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>
@@ -1797,6 +1855,55 @@
       state.lastApiOutput = JSON.stringify(res.data, null, 2);
       renderMainContent();
       showToast('后端已生成 SLSA v1.0 Merkle 溯源与 AMD SEV-SNP TEE 证明');
+      return;
+    }
+    if (action === 'runtime-celld-isolate') {
+      const res = await callBackendApi('POST', '/v1beta1/celld/isolate', {
+        taskId: 'task-isolate-01',
+        turnIndex: 1,
+        jsSourceCode: 'globalThis.__result = { computed: (inputPayload.a || 21) * 2, isolateEnv: env.TASK_ID };',
+        allowInternetEgress: false,
+        inputPayload: { a: 21 }
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      renderMainContent();
+      showToast('后端已完成 V8 Isolate 动态沙箱执行与堆压力评估');
+      return;
+    }
+    if (action === 'runtime-celld-facets') {
+      const res = await callBackendApi('POST', '/v1beta1/celld/facets', {
+        action: 'spawnAndShardKv',
+        taskId: 'task-facet-01',
+        turnIndex: 1,
+        toolName: 'sql_sandbox'
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      renderMainContent();
+      showToast('后端已派生 DO Sub-Actor Facet 并写入 32 分片 KV');
+      return;
+    }
+    if (action === 'runtime-ltx-compaction') {
+      const res = await callBackendApi('POST', '/v1beta1/celld/ltx-compaction', {
+        taskId: 'task-ns-8841',
+        l0ObjectCount: 320,
+        txidDistance: 512,
+        totalL0Megabytes: 48
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      renderMainContent();
+      showToast('后端已完成 L0→L1 LTX 段压缩、128 页 WAL 截断与 UFFD 恢复评估');
+      return;
+    }
+    if (action === 'runtime-layerfs-d9') {
+      const pullRes = await callBackendApi('POST', '/v1beta1/layerfs/store-sync', { action: 'pull' });
+      const baseGen = (pullRes.data && pullRes.data.remoteGeneration) || 0;
+      const res = await callBackendApi('POST', '/v1beta1/layerfs/store-sync', {
+        action: 'push',
+        basedOnGeneration: baseGen
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      renderMainContent();
+      showToast('后端已完成 LayerFS Rule D9 远端 SQLite Store 同步 (gen=' + (res.data.remoteGeneration || 1) + ')');
       return;
     }
     if (action === 'runtime-chaos-drill') {

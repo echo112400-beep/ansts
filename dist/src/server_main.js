@@ -49,6 +49,15 @@ var _wal_engine = require("./checkpoint/wal_engine.js");
 var _time_travel = require("./checkpoint/time_travel.js");
 var _live_migration = require("./runtime/live_migration.js");
 
+var _celld_native_optimizations = require("./cloudflare/celld_native_optimizations.js");
+
+
+
+
+
+var _hot_cell_overload_guard = require("./cloudflare/hot_cell_overload_guard.js");
+var _compactor = require("./checkpoint/compactor.js");
+var _layerfs_remote_sync = require("./checkpoint/layerfs_remote_sync.js");
 
 var _lease_coordinator = require("./lease_coordinator.js");
 var _runner = require("./harness/runner.js");
@@ -142,6 +151,13 @@ class AnstsLocalAndComposeServer {
   outboxDispatcher;
   dashboardServer;
   managementPlane;
+  facetSupervisor;
+  dynamicWorkerLoader;
+  kvOptimizer;
+  heapBudgetGuard;
+  hotCellGuard;
+  walCompactor;
+  layerfsStoreSync;
   apiServer = null;
   tickTimer = null;
   tunnelPollTimer = null;
@@ -314,10 +330,21 @@ class AnstsLocalAndComposeServer {
       heavyMigrator: this.heavyMigrator,
       tunnelRouter: this.tunnelRouter,
       cloudEventsBus: this.cloudEventsBus,
+      sseGateway: this.sseGateway,
       peerBrainUrls: this.peerBrainUrls,
       peerBodyUrls: this.peerBodyUrls,
       s3Endpoint: this.s3Endpoint
     });
+    this.facetSupervisor = new _celld_native_optimizations.DurableObjectFacetSupervisor();
+    this.dynamicWorkerLoader = new _celld_native_optimizations.DynamicWorkerSandboxLoader();
+    this.kvOptimizer = new _celld_native_optimizations.CelldKvOptimizerAndGuard(new _env.InMemoryKvNamespace(), 32);
+    this.heapBudgetGuard = new _celld_native_optimizations.V8HeapAndSqlBudgetGuard(96, 128, 5000);
+    this.hotCellGuard = new _hot_cell_overload_guard.HotCellOverloadAndQueueGuard({
+      maxCellConcurrentRequests: 64,
+      maxQueueConcurrentProducers: 256
+    });
+    this.walCompactor = new _compactor.WalCompactorAndPagedRestorer();
+    this.layerfsStoreSync = new _layerfs_remote_sync.LayerFsRemoteStoreSynchronizer(new _env.InMemoryR2Bucket(), "ansts-fleet");
   }
 
   async start(apiPort, dashboardPort) {
@@ -867,6 +894,27 @@ class AnstsLocalAndComposeServer {
       const body = await this.readJsonBody(req);
       const taskId = String(body.taskId ?? `task-${Date.now()}`);
       const tenantId = String(body.tenantId ?? "tenant-default");
+      const taskPriority = Number(body.priority ?? 1);
+      if (body.enforceQuotaGate || this.managementPlane.getScenario() === "quota") {
+        await this.managementPlane.pullManagementStateFromS3();
+        const quotaAdm = this.managementPlane.checkTenantDispatchAdmission(
+        tenantId,
+        taskPriority,
+        Boolean(body.enforceQuotaGate));
+
+        if (!quotaAdm.allowed) {
+          res.writeHead(429, { "content-type": "application/json", "Retry-After": "30" });
+          res.end(
+          JSON.stringify({
+            error: quotaAdm.reason ?? "TENANT_QUOTA_EXHAUSTED",
+            tenantId,
+            usedSlots: quotaAdm.usedSlots,
+            maxSlots: quotaAdm.maxSlots
+          }));
+
+          return;
+        }
+      }
       const promptText = String(body.promptText ?? "");
       const slotResolution = this.shardCoordinator.resolveBrainForTask(tenantId, taskId);
       const ownerBrainId = slotResolution.brainNodeId ?? "brain-node-01";
@@ -2186,6 +2234,223 @@ class AnstsLocalAndComposeServer {
       await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M43-1] denoland/celld v0.6.3 Dynamic Worker V8 Isolate Sandbox + Heap/SQL Budget Guard (`POST /v1beta1/celld/isolate`)
+    if (method === "POST" && pathname === "/v1beta1/celld/isolate") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? "task-isolate-01");
+      const turnIndex = Number(body.turnIndex ?? 1);
+      const jsSourceCode = String(
+      body.jsSourceCode ??
+      "globalThis.__result = { computed: (inputPayload.a || 21) * 2, isolateEnv: env.TASK_ID };");
+
+      const allowInternetEgress = Boolean(body.allowInternetEgress ?? false);
+      const inputPayload = body.inputPayload ?? { a: 21 };
+
+      try {
+        const isolateRes = await this.dynamicWorkerLoader.executeUntrustedCodeInIsolate({
+          taskId,
+          turnIndex,
+          jsSourceCode,
+          allowInternetEgress,
+          inputPayload
+        });
+        const heapStatus = this.heapBudgetGuard.evaluateHeapPressure(
+        body.simulatedHeapMb !== undefined ? Number(body.simulatedHeapMb) : undefined);
+
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ nodeId: this.nodeId, ...isolateRes, heapStatus }));
+      } catch (err) {
+        const msg = err.message;
+        if (msg.includes("DynamicWorker Egress Blocked")) {
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "ISOLATE_EGRESS_BLOCKED", message: msg }));
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
+    // [M43-1] denoland/celld v0.6.3 Durable Object Sub-Actor Facets & 32-Shard KV Optimizer (`POST /v1beta1/celld/facets`)
+    if (method === "POST" && pathname === "/v1beta1/celld/facets") {
+      const body = await this.readJsonBody(req);
+      const action = String(body.action ?? "spawnAndShardKv");
+      const taskId = String(body.taskId ?? "task-facet-01");
+      const turnIndex = Number(body.turnIndex ?? 1);
+      const toolName = String(body.toolName ?? "sql_sandbox");
+
+      if (action === "abortFacet") {
+        const facetName = String(body.facetName ?? `facet-${taskId}-t${turnIndex}-${toolName}`);
+        const aborted = this.facetSupervisor.abortFaultyFacet(facetName, new Error(String(body.reason ?? "tool_timeout")));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ aborted, activeFacets: this.facetSupervisor.listFacets() }));
+        return;
+      }
+
+      const { facetRecord, facetSql } = this.facetSupervisor.spawnToolFacet(
+      taskId,
+      turnIndex,
+      toolName,
+      () => new _env.InMemoryCellSqlStorage());
+
+      const { elapsedMs } = this.heapBudgetGuard.execWithBudget(
+      facetSql,
+      "CREATE TABLE IF NOT EXISTS facet_scratch (k TEXT PRIMARY KEY, v TEXT)");
+
+      const kvShard = await this.kvOptimizer.putSafe(
+      "idem-ns",
+      `${taskId}:t${turnIndex}`,
+      JSON.stringify({ facetName: facetRecord.facetName, status: "OK" }));
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        facetRecord,
+        sqlBudgetElapsedMs: elapsedMs,
+        kvShard,
+        activeFacetsCount: this.facetSupervisor.listFacets().length
+      }));
+
+      return;
+    }
+
+    // [M43-1] denoland/celld v0.6.3 Hot-Cell 64-Fetch Overload Guard & 256-Producer Group-Commit (`POST /v1beta1/celld/overload-guard`)
+    if (method === "POST" && pathname === "/v1beta1/celld/overload-guard") {
+      const body = await this.readJsonBody(req);
+      const cellScope = String(body.cellScope ?? "AnstsSchedulerCell:shard-01");
+      const concurrentRequests = Number(body.concurrentRequests ?? 1);
+      const producerCount = Number(body.producerCount ?? 32);
+
+      let lastDecision = this.hotCellGuard.tryEnterCellFetch(cellScope);
+      let entered = lastDecision.admitted ? 1 : 0;
+      for (let i = 1; i < concurrentRequests; i++) {
+        const d = this.hotCellGuard.tryEnterCellFetch(cellScope);
+        lastDecision = d;
+        if (d.admitted) entered += 1;
+      }
+      for (let i = 0; i < entered; i++) {
+        this.hotCellGuard.leaveCellFetch(cellScope);
+      }
+
+      const queueBatch = this.hotCellGuard.tryAdmitQueueProducerBatch(producerCount);
+      res.writeHead(lastDecision.statusCode, {
+        "content-type": "application/json",
+        ...lastDecision.headers
+      });
+      res.end(
+      JSON.stringify({
+        cellScope,
+        cellAdmission: lastDecision,
+        queueBatch
+      }));
+
+      return;
+    }
+
+    // [M43-1] denoland/celld v0.6.3 L0->L1 Additive LTX Compaction, 128-Page WAL Truncation & UFFD Restore (`POST /v1beta1/celld/ltx-compaction`)
+    if (method === "POST" && pathname === "/v1beta1/celld/ltx-compaction") {
+      const body = await this.readJsonBody(req);
+      const taskId = String(body.taskId ?? "task-ns-8841");
+      this.managementPlane.ensureInitialized();
+      let walEntries = this.walEngine.getTaskWalEntries(taskId);
+      if (walEntries.length === 0) {
+        this.walEngine.appendTurnDelta({
+          taskId,
+          turnIndex: 1,
+          fencingToken: 1,
+          changedFiles: ["src/a.ts", "src/b.ts"],
+          sqliteWalPages: 64,
+          highestSubmittedFencingToken: 1
+        });
+        walEntries = this.walEngine.getTaskWalEntries(taskId);
+      }
+
+      const compactedSnapshot = this.walCompactor.compactLayers(taskId, walEntries);
+      const l1Compaction = this.walCompactor.executeCelldLtxL1Compaction({
+        cellId: `cell-${taskId}`,
+        l0ObjectCount: Number(body.l0ObjectCount ?? 320),
+        txidDistance: Number(body.txidDistance ?? 512),
+        totalL0Megabytes: Number(body.totalL0Megabytes ?? 48)
+      });
+      const walTruncation = this.walCompactor.evaluateWalTruncationAndPaging({
+        dbSizeMb: Number(body.dbSizeMb ?? 3.2),
+        walSizePages: Number(body.walSizePages ?? 160),
+        ltxChainSizeMb: Number(body.ltxChainSizeMb ?? 300)
+      });
+      const uffdRestore = this.walCompactor.restoreViaUserfaultfd(taskId, 0.2);
+
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        taskId,
+        compactedSnapshot,
+        l1Compaction,
+        walTruncation,
+        uffdRestore
+      }));
+
+      return;
+    }
+
+    // [M43-2] LayerFS 2.0 Remote Store Rule D9 Synchronizer (`POST /v1beta1/layerfs/store-sync`)
+    if (method === "POST" && pathname === "/v1beta1/layerfs/store-sync") {
+      const body = await this.readJsonBody(req);
+      const action = String(body.action ?? "push");
+      if (action === "pull") {
+        const pulled = await this.layerfsStoreSync.pullStoreSnapshot();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(pulled));
+        return;
+      }
+      try {
+        const pushed = await this.layerfsStoreSync.pushStoreSnapshot({
+          machineId: String(body.machineId ?? this.nodeId),
+          basedOnGeneration: Number(body.basedOnGeneration ?? 0),
+          storeSqliteBytes: new TextEncoder().encode(JSON.stringify(this.layerfs.exportBranchBundle("main"))),
+          mainHeadCommitId: this.layerfs.getBranchHeadCommit("main").commitId
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(pushed));
+      } catch (err) {
+        if (err instanceof _layerfs_remote_sync.LayerFsStalePushRefusedError || err.name === "LayerFsStalePushRefusedError") {
+          const e = err;
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(
+          JSON.stringify({
+            error: "LAYERFS_RULE_D9_STALE_PUSH_REFUSED",
+            expectedRemoteGeneration: e.expectedRemoteGeneration,
+            actualRemoteGeneration: e.actualRemoteGeneration,
+            message: e.message
+          }));
+
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
+    // [M43-3] Real-Time Management Audit SSE Stream with Last-Event-ID Replay (`GET /v1beta1/management/events/stream`)
+    if (method === "GET" && pathname === "/v1beta1/management/events/stream") {
+      this.managementPlane.ensureInitialized();
+      const lastEventId =
+      req.headers["last-event-id"] ??
+      urlObj.searchParams.get("lastEventId") ??
+      undefined;
+      const subId = `mgmt-sub-${Date.now()}`;
+      const sub = this.sseGateway.subscribe("mgmt-audit-stream", subId, lastEventId);
+      const chunks = [];
+      sub.stream.on("data", (c) => chunks.push(Buffer.from(c)));
+      this.sseGateway.unsubscribe("mgmt-audit-stream", subId);
+      const ssePayload = Buffer.concat(chunks).toString("utf-8");
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache"
+      });
+      res.end(ssePayload);
       return;
     }
 

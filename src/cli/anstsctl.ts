@@ -229,6 +229,41 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "celld-isolate") {
+    const taskId = rest[0] ?? "task-cli-iso";
+    const jsSourceCode = rest[1] ?? "globalThis.__result = { isolateOk: true, val: (inputPayload.x || 7) * 6 };";
+    const resp = await fetch(`${baseUrl}/v1beta1/celld/isolate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ taskId, turnIndex: 1, jsSourceCode, allowInternetEgress: false, inputPayload: { x: 7 } }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "ltx-compact") {
+    const taskId = rest[0] ?? "task-ns-8841";
+    const resp = await fetch(`${baseUrl}/v1beta1/celld/ltx-compaction`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ taskId, l0ObjectCount: 320, txidDistance: 512, totalL0Megabytes: 48 }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "layerfs-store-sync") {
+    const action = rest[0] ?? "push";
+    const basedOnGeneration = Number(rest[1] ?? 0);
+    const resp = await fetch(`${baseUrl}/v1beta1/layerfs/store-sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, basedOnGeneration }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "gc") {
     const resp = await fetch(`${baseUrl}/v1beta1/storage/gc`, { method: "POST" });
     const data = await resp.json();
