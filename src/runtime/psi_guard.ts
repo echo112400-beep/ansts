@@ -1,10 +1,17 @@
 /**
- * @fileoverview M4 TASK-14 & M48-4: Linux PSI (Pressure Stall Information) Memory Guard,
- * Real `/proc/pressure/memory` + `/proc/meminfo` Kernel Probe & Graceful Evictor.
+ * @fileoverview M4 TASK-14, M48-4 & M58-4: Linux PSI (Pressure Stall Information) Memory Guard,
+ * Real `/proc/pressure/memory` + `/proc/meminfo` Kernel Probe, Non-Terminal Victim Filtering & Priority-Scoped Evictor.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
-import { TaskPriority, TaskSpec } from "../models.js";
+import { TaskPriority, TaskSpec, TaskState } from "../models.js";
+
+const TERMINAL_STATES = new Set<TaskState>([
+  TaskState.SUCCEEDED,
+  TaskState.FAILED,
+  TaskState.DEAD_LETTER,
+  TaskState.CANCELLED,
+]);
 
 export interface PsiSample {
   someAvg10Pct: number;
@@ -64,19 +71,25 @@ export class LinuxPsiMemoryGuard {
   }
 
   public evaluateAndDefend(sample: PsiSample, runningTasks: TaskSpec[]): PsiDefenseAction {
+    // [M58-4] Exclude tasks already in terminal states so eviction only targets live active tasks
+    const liveTasks = runningTasks.filter((t) => !TERMINAL_STATES.has(t.state));
     if (sample.fullAvg10Pct >= this.criticalPsiThresholdPct || sample.freeSwapMb < 128) {
-      const candidates = [...runningTasks].sort((a, b) => {
-        if (b.priority !== a.priority) return b.priority - a.priority;
-        return b.resource_profile.act_memory_mb - a.resource_profile.act_memory_mb;
-      });
-      const victims = candidates
+      const evictableCandidates = liveTasks
         .filter((t) => t.priority >= TaskPriority.P1_HIGH)
-        .slice(0, Math.max(1, Math.ceil(candidates.length * 0.25)))
-        .map((t) => t.task_id);
+        .sort((a, b) => {
+          if (b.priority !== a.priority) return b.priority - a.priority;
+          return b.resource_profile.act_memory_mb - a.resource_profile.act_memory_mb;
+        });
+      const victims =
+        evictableCandidates.length > 0
+          ? evictableCandidates
+              .slice(0, Math.max(1, Math.ceil(evictableCandidates.length * 0.25)))
+              .map((t) => t.task_id)
+          : [];
       return { level: "FREEZE_AND_CHECKPOINT", evictedTaskIds: victims };
     }
     if (sample.someAvg10Pct >= this.softPsiThresholdPct) {
-      const p3Victims = runningTasks
+      const p3Victims = liveTasks
         .filter((t) => t.priority === TaskPriority.P3_BATCH)
         .map((t) => t.task_id);
       return { level: "THROTTLE_BATCH", evictedTaskIds: p3Victims };

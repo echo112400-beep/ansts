@@ -84,6 +84,7 @@ var _outbox_webhook = require("./telemetry/outbox_webhook.js");function _getRequ
 
 
 
+
 function parseJsonEnvMap(raw) {
   if (!raw || !raw.trim()) return {};
   try {
@@ -99,6 +100,7 @@ function parseJsonEnvMap(raw) {
 }
 
 class AnstsLocalAndComposeServer {
+  maxBodyBytes;
   nodeId;
   nodeRole;
   storageDir;
@@ -167,6 +169,7 @@ class AnstsLocalAndComposeServer {
 
   constructor(options = {}) {
     this.host = options.host ?? process.env.ANSTS_HOST ?? "0.0.0.0";
+    this.maxBodyBytes = options.maxBodyBytes ?? 4 * 1024 * 1024;
     this.nodeId = options.nodeId ?? process.env.ANSTS_NODE_ID ?? "ansts-dev-node-01";
     this.nodeRole =
     (options.nodeRole ?? process.env.ANSTS_NODE_ROLE) || "gateway";
@@ -366,8 +369,12 @@ class AnstsLocalAndComposeServer {
     const boundApiPort = await new Promise((resolve, reject) => {
       this.apiServer = http.createServer((req, res) => {
         this.handleHttpRequest(req, res).catch((err) => {
-          res.writeHead(500, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: err.message }));
+          const msg = err.message ?? String(err);
+          const status = msg.startsWith("PAYLOAD_TOO_LARGE:") ? 413 : 500;
+          if (!res.headersSent) {
+            res.writeHead(status, { "content-type": "application/json" });
+          }
+          res.end(JSON.stringify({ error: msg }));
         });
       });
       this.apiServer.on("error", reject);
@@ -493,8 +500,20 @@ class AnstsLocalAndComposeServer {
   async readJsonBody(req) {
     return new Promise((resolve, reject) => {
       const chunks = [];
-      req.on("data", (c) => chunks.push(c));
+      let totalBytes = 0;
+      let rejectedTooLarge = false;
+      req.on("data", (c) => {
+        if (rejectedTooLarge) return;
+        totalBytes += c.byteLength;
+        if (totalBytes > this.maxBodyBytes) {
+          rejectedTooLarge = true;
+          reject(new Error(`PAYLOAD_TOO_LARGE: request body exceeded ${this.maxBodyBytes} bytes`));
+          return;
+        }
+        chunks.push(c);
+      });
       req.on("end", () => {
+        if (rejectedTooLarge) return;
         try {
           const raw = Buffer.concat(chunks).toString("utf-8").trim();
           resolve(raw ? JSON.parse(raw) : {});
@@ -2334,6 +2353,18 @@ class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // [M58] Container Fence RFC1918/CGNAT/IPv6 & Start-Cap Guard, Recursive OverlayFS & eBPF LSM Path Hardening, SPIFFE/SLSA Tamper Proofing, Canary Post-Rollback Lock & PSI Victim Filtering, Telemetry/EWMA NaN Guard & Federation RTT Audit (`POST /v1beta1/management/system/container-security-telemetry-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/container-security-telemetry-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeContainerSecurityAndTelemetryAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 

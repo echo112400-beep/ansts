@@ -7,8 +7,8 @@ var childProcess = _interopRequireWildcard(require("node:child_process"));
 var fs = _interopRequireWildcard(require("node:fs"));
 var os = _interopRequireWildcard(require("node:os"));
 var path = _interopRequireWildcard(require("node:path"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M16 TASK-75 & M48-2: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
- * `runsc`/`kata` OCI Runtime Selector, `celld-fence` nftables Private-Range Blocker, Real Subprocess Exec & Bucket Layer Cache.
+ * @fileoverview M16 TASK-75, M48-2 & M58-1: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
+ * `runsc`/`kata` OCI Runtime Selector, Full RFC1918/CGNAT/IPv6 `celld-fence` Blocker, Start-Time `max_instances` Cap Guard & Subprocess Exit-Code Propagation.
  */
 
 
@@ -66,10 +66,16 @@ class CelldContainerHandle {
   enableInternet = false;
   containerWorkDir;
   migratedOrDestroyed = false;
+  onBeforeStart;
 
-  constructor(cellId, config) {
+  constructor(
+  cellId,
+  config,
+  onBeforeStart)
+  {
     this.cellId = cellId;
     this.config = config;
+    this.onBeforeStart = onBeforeStart;
     const safeId = cellId.replace(/[^a-zA-Z0-9._-]/g, "_");
     this.containerWorkDir = path.join(os.tmpdir(), `celld-container-${safeId}`);
   }
@@ -84,6 +90,9 @@ class CelldContainerHandle {
   {
     if (options.hardTimeout !== undefined && options.hardTimeout <= 0) {
       throw new Error("ctx.container.start(): hardTimeout must be > 0");
+    }
+    if (!this.running && this.onBeforeStart) {
+      this.onBeforeStart(this);
     }
     this.running = true;
     this.migratedOrDestroyed = false;
@@ -153,18 +162,23 @@ class CelldContainerHandle {
     }
     fs.mkdirSync(this.containerWorkDir, { recursive: true });
     let rawStdout = "";
+    let exitCode = 0;
     if (cmd.length > 0) {
       try {
         rawStdout = childProcess.
         execFileSync(cmd[0], cmd.slice(1), { cwd: this.containerWorkDir, stdio: "pipe", timeout: 5_000 }).
         toString("utf-8").
         trim();
-      } catch {
-        rawStdout = "";
+      } catch (err) {
+        const e = err;
+        if (typeof e.status === "number") {
+          exitCode = e.status;
+        }
+        rawStdout = e.stdout ? e.stdout.toString("utf-8").trim() : "";
       }
     }
     return {
-      exitCode: 0,
+      exitCode,
       stdout: rawStdout ?
       `${rawStdout} (Executed [${cmd.join(" ")}] in container for ${this.cellId})` :
       `Executed [${cmd.join(" ")}] in container for ${this.cellId}`,
@@ -192,32 +206,63 @@ class CelldNativeContainerSandboxManager {
     this.maxInstancesByClass.set(config.class_name, config.max_instances ?? 64);
   }
 
+  assertClassCapacityAvailable(className, fallbackMax, excludeCellId) {
+    const runningCount = Array.from(this.handles.values()).filter(
+    (h) => h.cellId !== excludeCellId && h.config.class_name === className && h.running).
+    length;
+    const cap = this.maxInstancesByClass.get(className) ?? fallbackMax ?? 64;
+    if (runningCount >= cap) {
+      throw new Error(`container_start_failed: fleet running count (${runningCount}) reached max_instances (${cap})`);
+    }
+  }
+
   getOrCreateContainerHandle(cellId, config) {
     let handle = this.handles.get(cellId);
     if (!handle) {
-      const runningCount = Array.from(this.handles.values()).filter(
-      (h) => h.config.class_name === config.class_name && h.running).
-      length;
-      const cap = this.maxInstancesByClass.get(config.class_name) ?? config.max_instances ?? 64;
-      if (runningCount >= cap) {
-        throw new Error(`container_start_failed: fleet running count (${runningCount}) reached max_instances (${cap})`);
-      }
-      handle = new CelldContainerHandle(cellId, config);
+      this.assertClassCapacityAvailable(config.class_name, config.max_instances);
+      handle = new CelldContainerHandle(cellId, config, (h) => {
+        this.assertClassCapacityAvailable(h.config.class_name, h.config.max_instances, h.cellId);
+      });
       this.handles.set(cellId, handle);
     }
     return handle;
   }
 
   static assertCelldFenceAllowsTarget(hostname, enableInternet) {
-    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "container.bridge.local") {
+    const cleanHost = hostname.trim().replace(/^\[|\]$/g, "").toLowerCase();
+    if (cleanHost === "localhost" || cleanHost === "127.0.0.1" || cleanHost === "container.bridge.local") {
       return;
     }
     if (!enableInternet) {
       throw new Error(`celld-fence blocked outbound traffic to '${hostname}' (enableInternet: false)`);
     }
-    const blockedPrefixes = ["10.", "192.168.", "169.254.", "100.64.", "172.16.", "172.17.", "172.18.", "fe80:", "fc00:", "fd00:"];
-    if (blockedPrefixes.some((p) => hostname.toLowerCase().startsWith(p))) {
+    // Check IPv6 link-local (fe80::/10), ULA (fc00::/7 -> fc00:/fd00:), unspecified (::), loopback (::1), or IPv4-mapped IPv6 (::ffff:...)
+    if (
+    cleanHost === "::" ||
+    cleanHost === "::1" ||
+    cleanHost === "0.0.0.0" ||
+    cleanHost.startsWith("fe80:") ||
+    cleanHost.startsWith("fc00:") ||
+    cleanHost.startsWith("fd00:") ||
+    cleanHost.startsWith("::ffff:"))
+    {
       throw new Error(`celld-fence nftables blocked private/link-local range access to '${hostname}'`);
+    }
+    // Check IPv4 private/reserved ranges: 10.0.0.0/8, 192.168.0.0/16, 169.254.0.0/16 (IMDS), 172.16.0.0/12 (172.16..31.*), 100.64.0.0/10 (100.64..127.*)
+    const ipv4Match = cleanHost.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4Match) {
+      const o1 = Number(ipv4Match[1]);
+      const o2 = Number(ipv4Match[2]);
+      const isPrivateOrReserved =
+      o1 === 0 ||
+      o1 === 10 ||
+      o1 === 192 && o2 === 168 ||
+      o1 === 169 && o2 === 254 ||
+      o1 === 172 && o2 >= 16 && o2 <= 31 ||
+      o1 === 100 && o2 >= 64 && o2 <= 127;
+      if (isPrivateOrReserved) {
+        throw new Error(`celld-fence nftables blocked private/link-local range access to '${hostname}'`);
+      }
     }
   }
 }exports.CelldNativeContainerSandboxManager = CelldNativeContainerSandboxManager;

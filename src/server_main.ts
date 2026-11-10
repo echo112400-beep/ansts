@@ -82,6 +82,7 @@ export interface AnstsServiceRuntimeOptions {
   s3Endpoint?: string;
   primaryGatewayUrl?: string;
   secondaryGatewayUrl?: string;
+  maxBodyBytes?: number;
 }
 
 function parseJsonEnvMap(raw: string | undefined): Record<string, string> {
@@ -99,6 +100,7 @@ function parseJsonEnvMap(raw: string | undefined): Record<string, string> {
 }
 
 export class AnstsLocalAndComposeServer {
+  public readonly maxBodyBytes: number;
   public readonly nodeId: string;
   public readonly nodeRole: "brain" | "body" | "gateway";
   public readonly storageDir: string;
@@ -167,6 +169,7 @@ export class AnstsLocalAndComposeServer {
 
   constructor(options: AnstsServiceRuntimeOptions = {}) {
     this.host = options.host ?? process.env.ANSTS_HOST ?? "0.0.0.0";
+    this.maxBodyBytes = options.maxBodyBytes ?? 4 * 1024 * 1024;
     this.nodeId = options.nodeId ?? process.env.ANSTS_NODE_ID ?? "ansts-dev-node-01";
     this.nodeRole =
       (options.nodeRole ?? (process.env.ANSTS_NODE_ROLE as "brain" | "body" | "gateway")) || "gateway";
@@ -366,8 +369,12 @@ export class AnstsLocalAndComposeServer {
     const boundApiPort = await new Promise<number>((resolve, reject) => {
       this.apiServer = http.createServer((req, res) => {
         this.handleHttpRequest(req, res).catch((err: unknown) => {
-          res.writeHead(500, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: (err as Error).message }));
+          const msg = (err as Error).message ?? String(err);
+          const status = msg.startsWith("PAYLOAD_TOO_LARGE:") ? 413 : 500;
+          if (!res.headersSent) {
+            res.writeHead(status, { "content-type": "application/json" });
+          }
+          res.end(JSON.stringify({ error: msg }));
         });
       });
       this.apiServer.on("error", reject);
@@ -493,8 +500,20 @@ export class AnstsLocalAndComposeServer {
   private async readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
-      req.on("data", (c: Buffer) => chunks.push(c));
+      let totalBytes = 0;
+      let rejectedTooLarge = false;
+      req.on("data", (c: Buffer) => {
+        if (rejectedTooLarge) return;
+        totalBytes += c.byteLength;
+        if (totalBytes > this.maxBodyBytes) {
+          rejectedTooLarge = true;
+          reject(new Error(`PAYLOAD_TOO_LARGE: request body exceeded ${this.maxBodyBytes} bytes`));
+          return;
+        }
+        chunks.push(c);
+      });
       req.on("end", () => {
+        if (rejectedTooLarge) return;
         try {
           const raw = Buffer.concat(chunks).toString("utf-8").trim();
           resolve(raw ? (JSON.parse(raw) as Record<string, unknown>) : {});
@@ -2334,6 +2353,18 @@ export class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // [M58] Container Fence RFC1918/CGNAT/IPv6 & Start-Cap Guard, Recursive OverlayFS & eBPF LSM Path Hardening, SPIFFE/SLSA Tamper Proofing, Canary Post-Rollback Lock & PSI Victim Filtering, Telemetry/EWMA NaN Guard & Federation RTT Audit (`POST /v1beta1/management/system/container-security-telemetry-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/container-security-telemetry-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeContainerSecurityAndTelemetryAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 

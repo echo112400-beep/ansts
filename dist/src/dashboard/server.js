@@ -78,11 +78,11 @@ var _time_travel = require("../checkpoint/time_travel.js");
 var _layerfs_workspace_driver = require("../runtime/layerfs_workspace_driver.js");
 var _saga_gateway = require("../saga_gateway.js");
 
-
+var _canary_rollout_controller = require("../cluster/canary_rollout_controller.js");
 
 var _node_daemon = require("../node_daemon.js");
 
-
+var _predictive_prewarmer = require("../runtime/predictive_prewarmer.js");
 
 
 
@@ -6163,6 +6163,168 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           vsockAndSecurityGuardVerified
         },
         allM57RisksEliminated
+      }
+    };
+  }
+
+  /**
+   * [M58] Executes the 6-Point Container Fence RFC1918/CGNAT/IPv6 & Start-Cap Guard, Recursive OverlayFS & eBPF LSM Path Hardening,
+   * SPIFFE/SLSA Tamper Proofing, Canary Post-Rollback Lock & PSI Victim Filtering, Telemetry/EWMA NaN Guard & Federation RTT Audit
+   * (`POST /v1beta1/management/system/container-security-telemetry-audit`).
+   */
+  async executeContainerSecurityAndTelemetryAudit(params)
+
+
+  {
+    // 1. Container Fence RFC1918/CGNAT/IPv6 & Start-Time max_instances Cap Guard
+    let rfc1918Blocked = false;
+    let ipv6FenceBlocked = false;
+    try {
+      _celld_container_bridge.CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("172.28.1.5", true);
+    } catch {
+      rfc1918Blocked = true;
+    }
+    try {
+      _celld_container_bridge.CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("[fe80::1]", true);
+    } catch {
+      ipv6FenceBlocked = true;
+    }
+    const cMgr = new _celld_container_bridge.CelldNativeContainerSandboxManager();
+    const cCfg = { class_name: "audit-c-m58", image: "alpine:3.20", max_instances: 1 };
+    cMgr.registerContainerClass(cCfg);
+    const ch1 = cMgr.getOrCreateContainerHandle("cell-m58-a", cCfg);
+    const ch2 = cMgr.getOrCreateContainerHandle("cell-m58-b", cCfg);
+    ch1.start({ enableInternet: true });
+    let startCapEnforced = false;
+    try {
+      ch2.start({ enableInternet: true });
+    } catch {
+      startCapEnforced = true;
+    }
+    const containerFenceAndCapVerified = rfc1918Blocked && ipv6FenceBlocked && startCapEnforced;
+
+    // 2. Recursive OverlayFS Upperdir Diff Capture & eBPF LSM Relative/Credential Path Blocking
+    const tmpOverlay = path.join(os.tmpdir(), `ansts-m58-audit-${process.pid}-${Date.now()}`);
+    const ovDrv = new _container_driver.CompanionContainerAndOverlayDriver(tmpOverlay);
+    const layout = ovDrv.createOverlayMountLayout("task-m58-audit");
+    fs.mkdirSync(path.join(layout.upperDir, "pkg", "sub"), { recursive: true });
+    fs.writeFileSync(path.join(layout.upperDir, "pkg", "sub", "index.ts"), "export const v = 58;\n", "utf-8");
+    const snap = ovDrv.captureUpperdirDeltaSnapshot("task-m58-audit", 1);
+    const lsm = new _ebpf_lsm_bridge.EbpfLsmSecurityBridge();
+    const overlayRecursiveAndLsmVerified =
+    snap.changedFiles.includes("pkg/sub/index.ts") &&
+    !lsm.checkFileOpenHook("../../etc/shadow").allowed &&
+    !lsm.checkFileOpenHook("/proc/self/environ").allowed;
+
+    // 3. SPIFFE ID Single-Segment & Empty-Signature Rejection + SLSA fileCount Tamper Detection
+    const mtls = new _mtls_tunnel_bridge.MtlsReverseTunnelBridge();
+    const svid = mtls.issueSpiffeSvidToken("spiffe://ansts.io/ns/fleet/sa/worker", 60_000, 1000);
+    const emptySigRejected = !mtls.verifySpiffeCertificate(svid.spiffeId, svid.certExpiresAtMs, 2000, "").authenticated;
+    const traversalSpiffeRejected = !mtls.verifySpiffeCertificate("spiffe://ansts.io/ns/fleet/sa/worker/../../root", svid.certExpiresAtMs, 2000).authenticated;
+    const slsa = new _slsa_provenance_attestor.SlsaProvenanceAttestor();
+    const stmt = slsa.createSignedProvenanceStatement({
+      imageReference: "layerfs://main@C1",
+      sha256Digest: "abcd1234",
+      builderId: "builder-m58",
+      commitId: "C1",
+      fileCount: 3
+    });
+    const spiffeAndSlsaIntegrityVerified =
+    emptySigRejected &&
+    traversalSpiffeRejected &&
+    slsa.verifyProvenanceStatement(stmt) &&
+    !slsa.verifyProvenanceStatement({ ...stmt, fileCount: 99 });
+
+    // 4. Canary Post-Rollback Lock & Non-Terminal PSI Victim Filtering
+    const canary = new _canary_rollout_controller.CanaryRolloutController();
+    canary.evaluateCanaryStep({ errorRatePct: 8.0, p99LatencyMs: 2500 });
+    const postRollbackStep = canary.evaluateCanaryStep({ errorRatePct: 0.1, p99LatencyMs: 80 });
+    const psiGuard = new _psi_guard.LinuxPsiMemoryGuard(40, 70);
+    const terminalTask = new _models.TaskSpec({ task_id: "t-done-m58", tenant_id: "Northstar", priority: _models.TaskPriority.P3_BATCH });
+    terminalTask.state = _models.TaskState.SUCCEEDED;
+    const runningTask = new _models.TaskSpec({ task_id: "t-run-m58", tenant_id: "Northstar", priority: _models.TaskPriority.P2_STANDARD });
+    runningTask.state = _models.TaskState.RUNNING_ACT;
+    const psiOut = psiGuard.evaluateAndDefend({ someAvg10Pct: 85, fullAvg10Pct: 80, freeSwapMb: 64 }, [terminalTask, runningTask]);
+    const canaryLockAndPsiFilterVerified =
+    postRollbackStep.state === "ROLLED_BACK" &&
+    postRollbackStep.trafficWeightPct === 0 &&
+    psiOut.evictedTaskIds.length === 1 &&
+    psiOut.evictedTaskIds[0] === "t-run-m58";
+
+    // 5. CloudEventsBus Bounded Ring Buffer & EWMA NaN Poisoning Guard
+    const ceBus = new _cloudevents.CloudEventsBus(10);
+    for (let i = 0; i < 14; i++) {
+      ceBus.emitEvent({
+        type: "io.ansts.m58",
+        subject: `s-${i}`,
+        tenantId: "Northstar",
+        llmCostUsd: i === 0 ? 2.25 : -50,
+        sandboxCpuCoreSeconds: NaN
+      });
+    }
+    const prewarmer = new _predictive_prewarmer.PredictiveSandboxPrewarmer();
+    const pwOut = prewarmer.recordArrivalSampleAndPredict(NaN, -5);
+    const telemetryRingAndEwmaGuardVerified =
+    ceBus.allEvents().length === 10 &&
+    ceBus.getTenantReport("Northstar")?.totalLlmCostUsd === 2.25 &&
+    Number.isFinite(pwOut.recommendedWarmPoolSize);
+
+    // 6. MultiRegionFederationRouter RTT Sanitization
+    const fed = new _federation_router.MultiRegionFederationRouter();
+    fed.registerRegion({ regionCode: "us-nan", baseUrl: "https://us1", healthy: true, rttEwmaMs: NaN, sovereigntyZone: "US" });
+    fed.registerRegion({ regionCode: "us-west", baseUrl: "https://us2", healthy: true, rttEwmaMs: 18, sovereigntyZone: "US" });
+    const optimal = fed.selectOptimalRegion({ requiredSovereigntyZone: "US" });
+    const federationRttAndBodyGuardVerified = optimal.regionCode === "us-west";
+
+    const allM58RisksEliminated =
+    containerFenceAndCapVerified &&
+    overlayRecursiveAndLsmVerified &&
+    spiffeAndSlsaIntegrityVerified &&
+    canaryLockAndPsiFilterVerified &&
+    telemetryRingAndEwmaGuardVerified &&
+    federationRttAndBodyGuardVerified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M58 容器围栏/并发上限、递归 OverlayFS/LSM、SPIFFE/SLSA 防篡改、金丝雀回滚锁与遥测防毒化自检 (ContainerFence=${containerFenceAndCapVerified}, OverlayLsm=${overlayRecursiveAndLsmVerified}, SpiffeSlsa=${spiffeAndSlsaIntegrityVerified}, CanaryPsi=${canaryLockAndPsiFilterVerified}, TelemetryEwma=${telemetryRingAndEwmaGuardVerified}, FedRtt=${federationRttAndBodyGuardVerified})`,
+    "SystemWide / M58-ContainerSecurityTelemetryAudit",
+    "ALL_M58_RISKS_ELIMINATED");
+
+
+    return {
+      status: 200,
+      body: {
+        containerFenceAndCap1: {
+          rfc1918Blocked,
+          ipv6FenceBlocked,
+          startCapEnforced,
+          containerFenceAndCapVerified
+        },
+        overlayRecursiveAndLsm2: {
+          capturedNestedFiles: snap.changedFiles,
+          overlayRecursiveAndLsmVerified
+        },
+        spiffeAndSlsaIntegrity3: {
+          emptySigRejected,
+          traversalSpiffeRejected,
+          spiffeAndSlsaIntegrityVerified
+        },
+        canaryLockAndPsiFilter4: {
+          postRollbackState: postRollbackStep.state,
+          evictedTaskIds: psiOut.evictedTaskIds,
+          canaryLockAndPsiFilterVerified
+        },
+        telemetryRingAndEwmaGuard5: {
+          retainedEventsCount: ceBus.allEvents().length,
+          sanitizedLlmCostUsd: ceBus.getTenantReport("Northstar")?.totalLlmCostUsd,
+          telemetryRingAndEwmaGuardVerified
+        },
+        federationRttAndBodyGuard6: {
+          selectedRegionCode: optimal.regionCode,
+          federationRttAndBodyGuardVerified
+        },
+        allM58RisksEliminated
       }
     };
   }

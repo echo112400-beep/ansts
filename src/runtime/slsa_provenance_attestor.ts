@@ -1,6 +1,6 @@
 /**
- * @fileoverview M25 & M36 SLSA v1.0 In-Toto Build, Sandbox Image & LayerFS Commit Tree Provenance Attestor.
- * Supports both HMAC-SHA256 and asymmetric Ed25519 signatures (`node:crypto`).
+ * @fileoverview M25, M36 & M58-3: SLSA v1.0 In-Toto Build, Sandbox Image & LayerFS Commit Tree Provenance Attestor.
+ * Binds `fileCount` into the signed canonical statement body and verifies both HMAC-SHA256 and Ed25519 signatures.
  */
 import * as crypto from "node:crypto";
 import { LayerFsWorkspaceDriver } from "./layerfs_workspace_driver.js";
@@ -32,6 +32,16 @@ export class SlsaProvenanceAttestor {
     this.publicKeyDerHex = kp.publicKey.export({ type: "spki", format: "der" }).toString("hex");
   }
 
+  private static buildCanonicalBody(params: {
+    imageReference: string;
+    subjectDigest: string;
+    builderId: string;
+    commitId?: string;
+    fileCount?: number;
+  }): string {
+    return `${params.imageReference}:${params.subjectDigest}:${params.builderId}:${params.commitId ?? ""}:${params.fileCount !== undefined ? String(params.fileCount) : ""}`;
+  }
+
   public createSignedProvenanceStatement(params: {
     imageReference: string;
     sha256Digest: string;
@@ -39,7 +49,13 @@ export class SlsaProvenanceAttestor {
     commitId?: string;
     fileCount?: number;
   }): SlsaProvenanceStatement {
-    const body = `${params.imageReference}:${params.sha256Digest}:${params.builderId}:${params.commitId ?? ""}`;
+    const body = SlsaProvenanceAttestor.buildCanonicalBody({
+      imageReference: params.imageReference,
+      subjectDigest: params.sha256Digest,
+      builderId: params.builderId,
+      commitId: params.commitId,
+      fileCount: params.fileCount,
+    });
     const signatureHex = crypto.createHmac("sha256", this.signingKey).update(body, "utf-8").digest("hex");
     const ed25519SignatureHex = crypto.sign(null, Buffer.from(body, "utf-8"), this.privateKey).toString("hex");
     return {
@@ -57,12 +73,21 @@ export class SlsaProvenanceAttestor {
   }
 
   public verifyProvenanceStatement(stmt: SlsaProvenanceStatement): boolean {
-    const body = `${stmt.imageReference}:${stmt.subjectDigest}:${stmt.builderId}:${stmt.commitId ?? ""}`;
+    const body = SlsaProvenanceAttestor.buildCanonicalBody({
+      imageReference: stmt.imageReference,
+      subjectDigest: stmt.subjectDigest,
+      builderId: stmt.builderId,
+      commitId: stmt.commitId,
+      fileCount: stmt.fileCount,
+    });
     const expected = crypto.createHmac("sha256", this.signingKey).update(body, "utf-8").digest("hex");
     if (expected !== stmt.signatureHex) {
       return false;
     }
-    if (stmt.ed25519SignatureHex) {
+    if (stmt.ed25519SignatureHex !== undefined) {
+      if (stmt.ed25519SignatureHex.trim().length === 0) {
+        return false;
+      }
       try {
         const ok = crypto.verify(
           null,

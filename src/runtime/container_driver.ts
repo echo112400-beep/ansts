@@ -1,5 +1,6 @@
 /**
- * @fileoverview M11 TASK-39: Companion Sandbox Container & OverlayFS Upperdir Tarball Diff Driver.
+ * @fileoverview M11 TASK-39 & M58-2: Companion Sandbox Container & OverlayFS Upperdir Tarball Diff Driver
+ * with Recursive Subdirectory Walk & TaskId Path-Traversal Sanitization.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -13,13 +14,22 @@ export class CompanionContainerAndOverlayDriver {
     fs.mkdirSync(this.rootWorkspaceDir, { recursive: true });
   }
 
+  private static sanitizeTaskId(taskId: string): string {
+    const safe = taskId.trim().replace(/[^a-zA-Z0-9._-]/g, "_");
+    if (!safe || safe === "." || safe === "..") {
+      throw new Error(`Invalid taskId '${taskId}' for OverlayFS mount layout`);
+    }
+    return safe;
+  }
+
   public createOverlayMountLayout(taskId: string): {
     lowerDir: string;
     upperDir: string;
     workDir: string;
     mergedDir: string;
   } {
-    const base = path.join(this.rootWorkspaceDir, taskId);
+    const safeTaskId = CompanionContainerAndOverlayDriver.sanitizeTaskId(taskId);
+    const base = path.join(this.rootWorkspaceDir, safeTaskId);
     const lowerDir = path.join(base, "lower");
     const upperDir = path.join(base, "upper");
     const workDir = path.join(base, "work");
@@ -30,20 +40,28 @@ export class CompanionContainerAndOverlayDriver {
     return { lowerDir, upperDir, workDir, mergedDir };
   }
 
+  private static collectFilesRecursively(rootDir: string, currentDir: string, out: Record<string, string>): void {
+    if (!fs.existsSync(currentDir)) return;
+    const entries = fs.readdirSync(currentDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        CompanionContainerAndOverlayDriver.collectFilesRecursively(rootDir, fullPath, out);
+      } else if (entry.isFile()) {
+        const relPath = path.relative(rootDir, fullPath).split(path.sep).join("/");
+        out[relPath] = fs.readFileSync(fullPath, "utf-8");
+      }
+    }
+  }
+
   public captureUpperdirDeltaSnapshot(taskId: string, turnIndex: number): {
     changedFiles: string[];
     serializedArchiveBytes: Uint8Array;
     sha256: string;
   } {
     const { upperDir } = this.createOverlayMountLayout(taskId);
-    const entries = fs.existsSync(upperDir) ? fs.readdirSync(upperDir) : [];
     const bundle: Record<string, string> = {};
-    for (const fname of entries) {
-      const full = path.join(upperDir, fname);
-      if (fs.statSync(full).isFile()) {
-        bundle[fname] = fs.readFileSync(full, "utf-8");
-      }
-    }
+    CompanionContainerAndOverlayDriver.collectFilesRecursively(upperDir, upperDir, bundle);
     const rawBytes = new TextEncoder().encode(
       JSON.stringify({ taskId, turnIndex, files: bundle })
     );

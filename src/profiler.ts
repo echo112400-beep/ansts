@@ -1,5 +1,6 @@
 /**
- * @fileoverview M2 TASK-05B: Bayesian EWMA Task Resource Profiler for Think/Act Right-Sizing.
+ * @fileoverview M2 TASK-05B & M58-5: Bayesian EWMA Task Resource Profiler for Think/Act Right-Sizing
+ * with Finite Positive Sample Guard to prevent EWMA NaN Poisoning.
  */
 import { ResourceProfile, TaskSpec } from "./models.js";
 
@@ -9,7 +10,7 @@ export class TaskResourceProfiler {
   private readonly alpha: number;
 
   constructor(alpha = 0.35) {
-    this.alpha = alpha;
+    this.alpha = Number.isFinite(alpha) ? Math.max(0.05, Math.min(0.95, alpha)) : 0.35;
   }
 
   public recommendProfile(task: TaskSpec): ResourceProfile {
@@ -26,6 +27,14 @@ export class TaskResourceProfiler {
   }
 
   public recordExecutionMetrics(task: TaskSpec, observedPeakCpu: number, observedPeakMemoryMb: number): void {
+    if (
+      !Number.isFinite(observedPeakCpu) ||
+      observedPeakCpu <= 0 ||
+      !Number.isFinite(observedPeakMemoryMb) ||
+      observedPeakMemoryMb <= 0
+    ) {
+      return;
+    }
     const existing = this.historyByTenant.get(task.tenant_id);
     if (!existing) {
       this.historyByTenant.set(task.tenant_id, {

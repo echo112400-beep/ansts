@@ -1,5 +1,6 @@
 /**
- * @fileoverview M11 TASK-38: Real Linux cgroup v2 (`cpu.max`, `memory.high`, `cgroup.freeze`) & `/proc/pressure/memory` Driver.
+ * @fileoverview M11 TASK-38 & M58-2: Real Linux cgroup v2 (`cpu.max`, `memory.high`, `cgroup.freeze`) & `/proc/pressure/memory` Driver
+ * with TaskId Path-Traversal Sanitization & Finite Resource Validation.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -13,7 +14,11 @@ export class LinuxCgroupV2AndPsiDriver {
   }
 
   public ensureTaskCgroup(taskId: string): string {
-    const dir = path.join(this.cgroupRootDir, `ansts-${taskId}`);
+    const safeId = taskId.trim().replace(/[^a-zA-Z0-9._-]/g, "_");
+    if (!safeId || safeId === "." || safeId === "..") {
+      throw new Error(`Invalid taskId '${taskId}' for cgroup v2 directory`);
+    }
+    const dir = path.join(this.cgroupRootDir, `ansts-${safeId}`);
     fs.mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -25,6 +30,9 @@ export class LinuxCgroupV2AndPsiDriver {
     memoryHighMb: number,
     memoryMaxMb: number
   ): { cpuMaxContent: string; memoryHighBytes: string; memoryMaxBytes: string } {
+    if (!Number.isFinite(cpuCores) || cpuCores <= 0 || !Number.isFinite(memoryHighMb) || memoryHighMb <= 0 || !Number.isFinite(memoryMaxMb) || memoryMaxMb < memoryHighMb) {
+      throw new Error(`Invalid cgroup v2 phase limits: cpu=${cpuCores}, memHighMb=${memoryHighMb}, memMaxMb=${memoryMaxMb}`);
+    }
     const dir = this.ensureTaskCgroup(taskId);
     const quotaUs = Math.round(cpuCores * 100_000);
     const cpuMaxContent = `${quotaUs} 100000`;
