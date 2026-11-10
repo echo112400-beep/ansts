@@ -1,5 +1,6 @@
 /**
- * @fileoverview M13 TASK-62: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller.
+ * @fileoverview M13 TASK-62 & M53-4: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller
+ * with Drain-Token Lease TTL Auto-Expiration to prevent rolling-shutdown deadlocks.
  */
 import * as crypto from "node:crypto";
 
@@ -162,10 +163,10 @@ export class ManualFleetScaleController {
   }
 }
 
-
 /**
- * M16 TASK-78: Real-Time `GET /state` & `fleet/capacity-v1.json` Autoscaler Evaluator
- * and Paced Drain-Token Shutdown Coordinator (`CELLD_SHUTDOWN_TOTAL_MS=40000`, `handoff=preserve`).
+ * M16 TASK-78 & M53-4: Real-Time `GET /state` & `fleet/capacity-v1.json` Autoscaler Evaluator
+ * and Paced Drain-Token Shutdown Coordinator (`CELLD_SHUTDOWN_TOTAL_MS=40000`, `handoff=preserve`)
+ * with Lease-TTL Auto-Reclamation if a draining node crashes mid-shutdown.
  */
 export interface CelldInternalStateSample {
   nodeId: string;
@@ -183,6 +184,7 @@ export interface CelldInternalStateSample {
 
 export class CelldStateAwareFleetAutoscaler {
   private activeDrainTokenHolder: string | null = null;
+  private drainTokenAcquiredAtMs: number | null = null;
   public readonly shutdownTotalMs: number;
   public readonly drainTokenWaitMs: number;
   public readonly handoffNoProgressMs: number;
@@ -236,8 +238,10 @@ export class CelldStateAwareFleetAutoscaler {
     nodeId: string;
     handoffMode?: "release_to_peers" | "preserve";
     systemdTimeoutStopSec: number;
+    nowMs?: number;
   }): {
     claimedDrainToken: boolean;
+    expiredStaleHolder: string | null;
     ownershipPreservedForSameNodeRestart: boolean;
     maxConcurrentReleases: number;
     drainTokenWaitMs: number;
@@ -248,12 +252,29 @@ export class CelldStateAwareFleetAutoscaler {
         `systemd TimeoutStopSec (${params.systemdTimeoutStopSec}s) must exceed CELLD_SHUTDOWN_TOTAL_MS (${this.shutdownTotalMs / 1000}s)`
       );
     }
-    const claimedDrainToken = this.activeDrainTokenHolder === null || this.activeDrainTokenHolder === params.nodeId;
+    const nowMs = params.nowMs ?? Date.now();
+    let expiredStaleHolder: string | null = null;
+    // [M53-4] Auto-expire drain token if previous holder crashed mid-shutdown and exceeded shutdownTotalMs TTL
+    if (
+      this.activeDrainTokenHolder !== null &&
+      this.activeDrainTokenHolder !== params.nodeId &&
+      this.drainTokenAcquiredAtMs !== null &&
+      nowMs - this.drainTokenAcquiredAtMs >= this.shutdownTotalMs
+    ) {
+      expiredStaleHolder = this.activeDrainTokenHolder;
+      this.activeDrainTokenHolder = null;
+      this.drainTokenAcquiredAtMs = null;
+    }
+
+    const claimedDrainToken =
+      this.activeDrainTokenHolder === null || this.activeDrainTokenHolder === params.nodeId;
     if (claimedDrainToken) {
       this.activeDrainTokenHolder = params.nodeId;
+      this.drainTokenAcquiredAtMs = nowMs;
     }
     return {
       claimedDrainToken,
+      expiredStaleHolder,
       ownershipPreservedForSameNodeRestart: params.handoffMode === "preserve",
       maxConcurrentReleases: 128,
       drainTokenWaitMs: this.drainTokenWaitMs,
@@ -264,6 +285,7 @@ export class CelldStateAwareFleetAutoscaler {
   public releaseDrainToken(nodeId: string): void {
     if (this.activeDrainTokenHolder === nodeId) {
       this.activeDrainTokenHolder = null;
+      this.drainTokenAcquiredAtMs = null;
     }
   }
 }

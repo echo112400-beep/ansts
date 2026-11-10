@@ -1,13 +1,14 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.VirtualHashSlotRingManager = exports.ManualFleetScaleController = exports.CelldStateAwareFleetAutoscaler = void 0;
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M13 TASK-62: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller.
+ * @fileoverview M13 TASK-62 & M53-4: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller
+ * with Drain-Token Lease TTL Auto-Expiration to prevent rolling-shutdown deadlocks.
  */ /**
  * Consistent Hash Virtual Slot Ring Manager (`VirtualHashSlotRingManager`) for Non-K8s Bare-Metal Manual Scale-Out/In.
  * Maps keys onto a ring of `totalVirtualSlots` (default 1024) with configurable virtual nodes per physical node.
- */
-class VirtualHashSlotRingManager {
+ */class VirtualHashSlotRingManager {
   totalVirtualSlots;
   vnodesPerNode;
   ring = [];
@@ -162,10 +163,10 @@ class ManualFleetScaleController {
   }
 }
 
-
 /**
- * M16 TASK-78: Real-Time `GET /state` & `fleet/capacity-v1.json` Autoscaler Evaluator
- * and Paced Drain-Token Shutdown Coordinator (`CELLD_SHUTDOWN_TOTAL_MS=40000`, `handoff=preserve`).
+ * M16 TASK-78 & M53-4: Real-Time `GET /state` & `fleet/capacity-v1.json` Autoscaler Evaluator
+ * and Paced Drain-Token Shutdown Coordinator (`CELLD_SHUTDOWN_TOTAL_MS=40000`, `handoff=preserve`)
+ * with Lease-TTL Auto-Reclamation if a draining node crashes mid-shutdown.
  */exports.ManualFleetScaleController = ManualFleetScaleController;
 
 
@@ -183,6 +184,7 @@ class ManualFleetScaleController {
 
 class CelldStateAwareFleetAutoscaler {
   activeDrainTokenHolder = null;
+  drainTokenAcquiredAtMs = null;
   shutdownTotalMs;
   drainTokenWaitMs;
   handoffNoProgressMs;
@@ -242,18 +244,37 @@ class CelldStateAwareFleetAutoscaler {
 
 
 
+
+
   {
     if (params.systemdTimeoutStopSec <= this.shutdownTotalMs / 1000) {
       throw new Error(
       `systemd TimeoutStopSec (${params.systemdTimeoutStopSec}s) must exceed CELLD_SHUTDOWN_TOTAL_MS (${this.shutdownTotalMs / 1000}s)`);
 
     }
-    const claimedDrainToken = this.activeDrainTokenHolder === null || this.activeDrainTokenHolder === params.nodeId;
+    const nowMs = params.nowMs ?? Date.now();
+    let expiredStaleHolder = null;
+    // [M53-4] Auto-expire drain token if previous holder crashed mid-shutdown and exceeded shutdownTotalMs TTL
+    if (
+    this.activeDrainTokenHolder !== null &&
+    this.activeDrainTokenHolder !== params.nodeId &&
+    this.drainTokenAcquiredAtMs !== null &&
+    nowMs - this.drainTokenAcquiredAtMs >= this.shutdownTotalMs)
+    {
+      expiredStaleHolder = this.activeDrainTokenHolder;
+      this.activeDrainTokenHolder = null;
+      this.drainTokenAcquiredAtMs = null;
+    }
+
+    const claimedDrainToken =
+    this.activeDrainTokenHolder === null || this.activeDrainTokenHolder === params.nodeId;
     if (claimedDrainToken) {
       this.activeDrainTokenHolder = params.nodeId;
+      this.drainTokenAcquiredAtMs = nowMs;
     }
     return {
       claimedDrainToken,
+      expiredStaleHolder,
       ownershipPreservedForSameNodeRestart: params.handoffMode === "preserve",
       maxConcurrentReleases: 128,
       drainTokenWaitMs: this.drainTokenWaitMs,
@@ -264,6 +285,7 @@ class CelldStateAwareFleetAutoscaler {
   releaseDrainToken(nodeId) {
     if (this.activeDrainTokenHolder === nodeId) {
       this.activeDrainTokenHolder = null;
+      this.drainTokenAcquiredAtMs = null;
     }
   }
 }exports.CelldStateAwareFleetAutoscaler = CelldStateAwareFleetAutoscaler;

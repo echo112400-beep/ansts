@@ -1,9 +1,10 @@
 /**
- * @fileoverview M3 TASK-11: Unified Idempotent Tool Proxy & Saga Transaction Gateway.
+ * @fileoverview M3 TASK-11 & M53-1: Unified Idempotent Tool Proxy & Saga Transaction Gateway
+ * with Post-Rollback Idempotency Cache Invalidation.
  */
 import * as crypto from "node:crypto";
 import { ToolCallEffectClass, ToolExecutionLog } from "./models.js";
-import { SagaCompensatorEngine } from "./saga/compensator.js";
+import { SagaCompensatorEngine, SagaStepRecord } from "./saga/compensator.js";
 import { StagingCommitAndApprovalGate } from "./saga/staging.js";
 
 export type ToolHandler = (args: Record<string, unknown>) => Record<string, unknown>;
@@ -20,6 +21,12 @@ export class SagaToolGateway {
   ) {
     this.compensator = compensator;
     this.stagingGate = stagingGate;
+    this.compensator.setOnStepCompensated((step) => {
+      if (step.idempotencyKey) {
+        this.executionJournal.delete(step.idempotencyKey);
+      }
+      this.invalidateTaskTurnsFrom(step.taskId, step.turnIndex);
+    });
   }
 
   public registerTool(
@@ -44,6 +51,82 @@ export class SagaToolGateway {
     }
     const payload = `${taskId}:${turnIndex}:${toolName}:${JSON.stringify(sortedObj)}`;
     return crypto.createHash("sha256").update(payload, "utf-8").digest("hex");
+  }
+
+  /**
+   * [M53-1] Purges stale idempotency journal records for `taskId` at or after `fromTurnInclusive`
+   * when a task is rolled back or time-travel forked.
+   */
+  public invalidateTaskTurnsFrom(taskId: string, fromTurnInclusive = 0): number {
+    let invalidated = 0;
+    for (const [k, log] of this.executionJournal.entries()) {
+      if (log.task_id === taskId && log.turn_index >= fromTurnInclusive) {
+        this.executionJournal.delete(k);
+        invalidated += 1;
+      }
+    }
+    return invalidated;
+  }
+
+  /**
+   * [M53-1] Inline tool execution helper that registers or invokes a tool with idempotency caching and Saga registration.
+   */
+  public executeTool(params: {
+    taskId: string;
+    turnIndex: number;
+    toolName: string;
+    effectClass: ToolCallEffectClass;
+    args: Record<string, unknown>;
+    actionFn: () => Record<string, unknown>;
+    compensationFn?: () => void;
+  }): Record<string, unknown> {
+    this.registerTool(
+      params.toolName,
+      params.effectClass,
+      () => params.actionFn(),
+      params.compensationFn
+        ? () => {
+            params.compensationFn!();
+            return { compensated: true };
+          }
+        : undefined
+    );
+    const [result] = this.invokeTool(params.taskId, params.turnIndex, params.toolName, params.args);
+    return result;
+  }
+
+  /**
+   * [M53-1] Rolls back all Saga steps for `taskId` at or after `upToTurnInclusive` in LIFO order,
+   * isolates per-step compensation errors, and invalidates corresponding `executionJournal` idempotency keys.
+   */
+  public rollbackAndInvalidateTask(
+    taskId: string,
+    upToTurnInclusive = 0
+  ): {
+    rolledBackSteps: SagaStepRecord[];
+    invalidatedIdemKeys: string[];
+    compensationErrors: Array<{ stepId: string; turnIndex: number; error: string }>;
+  } {
+    const invalidatedIdemKeys: string[] = [];
+    for (const [k, log] of this.executionJournal.entries()) {
+      if (log.task_id === taskId && log.turn_index >= upToTurnInclusive) {
+        invalidatedIdemKeys.push(k);
+      }
+    }
+    const rolledBackSteps = this.compensator.rollbackTask(taskId, upToTurnInclusive);
+    this.invalidateTaskTurnsFrom(taskId, upToTurnInclusive);
+    const compensationErrors = rolledBackSteps
+      .filter((s) => Boolean(s.compensationError))
+      .map((s) => ({
+        stepId: s.stepId,
+        turnIndex: s.turnIndex,
+        error: s.compensationError!,
+      }));
+    return {
+      rolledBackSteps,
+      invalidatedIdemKeys,
+      compensationErrors,
+    };
   }
 
   public invokeTool(
@@ -86,6 +169,7 @@ export class SagaToolGateway {
         taskId,
         turnIndex,
         toolName,
+        idempotencyKey: idemKey,
         forwardPayload: { args, result },
         compensateHandler,
       });

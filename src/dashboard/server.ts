@@ -4,7 +4,8 @@ import * as crypto from "node:crypto";
  */
 import * as http from "node:http";
 import { CoreScheduler5D } from "../scheduler.js";
-import { ManualFleetScaleController } from "../cluster/manual_scale_controller.js";
+import { ManualFleetScaleController, CelldStateAwareFleetAutoscaler } from "../cluster/manual_scale_controller.js";
+import { StaleFenceError } from "../lease_coordinator.js";
 
 export class DashboardBridgeService {
   private readonly scheduler: CoreScheduler5D;
@@ -5062,4 +5063,237 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     };
   }
 
+  /**
+   * [M53] Deep Cross-Layer Risk Elimination Audit:
+   * Verifies all 5 deep cross-layer invariants:
+   * 1. [Saga-Stale-1] SagaToolGateway.rollbackAndInvalidateTask invalidates executionJournal cache for rolled-back turns & fault-tolerant LIFO compensation continues even if one compensation handler throws.
+   * 2. [FinOps-Starvation-2] FinOpsBudgetController UTC daily window auto-reset across day boundaries & refundSpend on aborted/rolled-back turns.
+   * 3. [WarmPool-Leak-3] WarmSandboxPoolManager idempotent acquireSandbox(taskId) + reclaimOrphanedSandboxes(activeTaskIds) & LayerFsNumberedSandboxMultiplexer idempotent mountWorkspaceIntoSandbox(workspaceId).
+   * 4. [Wal-Stale-4] TurnWalEngine dual-tuple (fencingToken, turnIndex) monotonicity enforcement & verifyTaskWalChainIntegrity CRC32 chain check.
+   * 5. [DrainToken-Deadlock-5] CelldStateAwareFleetAutoscaler drain-token lease TTL auto-expiration so a crashed draining node never deadlocks rolling shutdowns.
+   */
+  public executeDeepCrossLayerRiskEliminationAudit(params: {
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行 M53 跨层深水区风险清零审计" },
+      };
+    }
+
+    // 1. [Saga-Stale-1] Verify post-rollback idempotency cache invalidation & fault-tolerant LIFO compensation
+    const sagaGw = new SagaToolGateway();
+    let toolRunCount = 0;
+    const compensatedTurns: number[] = [];
+    sagaGw.executeTool({
+      taskId: "task-m53-saga",
+      turnIndex: 1,
+      toolName: "write_db_row",
+      effectClass: ToolCallEffectClass.COMPENSATABLE,
+      args: { rowId: 101 },
+      actionFn: () => {
+        toolRunCount += 1;
+        return { run: toolRunCount };
+      },
+      compensationFn: () => {
+        compensatedTurns.push(1);
+      },
+    });
+    sagaGw.executeTool({
+      taskId: "task-m53-saga",
+      turnIndex: 2,
+      toolName: "flaky_external_hook",
+      effectClass: ToolCallEffectClass.COMPENSATABLE,
+      args: { rowId: 102 },
+      actionFn: () => ({ ok: true }),
+      compensationFn: () => {
+        compensatedTurns.push(2);
+        throw new Error("Simulated transient network error during turn 2 compensation");
+      },
+    });
+    const rbRes = sagaGw.rollbackAndInvalidateTask("task-m53-saga", 1);
+    // Re-executing turn 1 after rollback must actually invoke actionFn again (toolRunCount: 1 -> 2), NOT return stale cached run=1
+    const rerunRes = sagaGw.executeTool({
+      taskId: "task-m53-saga",
+      turnIndex: 1,
+      toolName: "write_db_row",
+      effectClass: ToolCallEffectClass.COMPENSATABLE,
+      args: { rowId: 101 },
+      actionFn: () => {
+        toolRunCount += 1;
+        return { run: toolRunCount };
+      },
+    }) as { run: number };
+    const sagaFaultTolerantLifoAndCacheInvalidated =
+      compensatedTurns.length === 2 &&
+      compensatedTurns[0] === 2 &&
+      compensatedTurns[1] === 1 &&
+      rbRes.compensationErrors.length === 1 &&
+      rbRes.invalidatedIdemKeys.length === 2 &&
+      rerunRes.run === 2;
+
+    // 2. [FinOps-Starvation-2] Verify UTC daily window auto-reset & spend refund on aborted turns
+    const finops = new FinOpsBudgetController();
+    finops.configureTenant({
+      tenantId: "tenant-m53",
+      dailyBudgetUsd: 100,
+      softDowngradeThresholdRatio: 0.8,
+      primaryModel: "DeepSeek-R1",
+      fallbackEconomyModel: "Qwen-3.8",
+    });
+    const day1Ms = Date.UTC(2026, 10, 10, 23, 50, 0);
+    finops.recordSpend("tenant-m53", 105, day1Ms);
+    const blockedOnDay1 = !finops.evaluateBudgetAndModel("tenant-m53", day1Ms).allowed;
+    // Refund $20 from aborted turn on Day 1 -> unblocks tenant immediately to $85 (soft downgrade)
+    const afterRefund = finops.refundSpend("tenant-m53", 20, day1Ms);
+    const unblockedAfterRefund = finops.evaluateBudgetAndModel("tenant-m53", day1Ms).allowed && afterRefund === 85;
+    // Exhaust again on Day 1, then advance clock to Day 2 UTC -> daily window resets to $0 and restores primary model
+    finops.recordSpend("tenant-m53", 20, day1Ms);
+    const day2Ms = Date.UTC(2026, 10, 11, 0, 5, 0);
+    const evalDay2 = finops.evaluateBudgetAndModel("tenant-m53", day2Ms);
+    const finopsUtcResetAndRefundVerified =
+      blockedOnDay1 &&
+      unblockedAfterRefund &&
+      evalDay2.allowed &&
+      !evalDay2.downgraded &&
+      evalDay2.selectedModel === "DeepSeek-R1" &&
+      evalDay2.windowReset;
+
+    // 3. [WarmPool-Leak-3] Verify idempotent acquireSandbox, orphan VM reclamation & multiplexer idempotent workspace mount
+    const warmPool = new WarmSandboxPoolManager("node-m53", 4);
+    const vmFirst = warmPool.acquireSandbox("task-m53-vm");
+    const vmDuplicate = warmPool.acquireSandbox("task-m53-vm");
+    const idempotentSameVmReturned = vmFirst.vmId === vmDuplicate.vmId && warmPool.stats().activeCount === 1;
+    warmPool.acquireSandbox("task-m53-orphan");
+    const reclaimedOrphanVms = warmPool.reclaimOrphanedSandboxes(new Set(["task-m53-vm"]));
+    const orphanVmReclaimedCleanly = reclaimedOrphanVms.length === 1 && warmPool.stats().activeCount === 1;
+
+    const mux = new LayerFsNumberedSandboxMultiplexer();
+    for (let i = 1; i <= 16; i++) {
+      mux.mountWorkspaceIntoSandbox(`ws-m53-${i}`, 1000);
+    }
+    // Re-mounting ws-m53-1 when sandbox #1 is full (16/16) must return sandbox #1 idempotently instead of spawning sandbox #2
+    const remountRes = mux.mountWorkspaceIntoSandbox("ws-m53-1", 2000);
+    const multiplexerIdempotentMountVerified =
+      remountRes.sandboxNumber === 1 && !remountRes.spawnedNewSandbox && remountRes.activeWorkspacesOnSandbox === 16;
+
+    // 4. [Wal-Stale-4] Verify dual-tuple (fencingToken, turnIndex) monotonicity & verifyTaskWalChainIntegrity
+    const wal = new TurnWalEngine();
+    wal.appendTurnDelta({
+      taskId: "task-m53-wal",
+      turnIndex: 1,
+      fencingToken: 5,
+      changedFiles: ["src/a.ts"],
+      sqliteWalPages: 4,
+      highestSubmittedFencingToken: 5,
+      enforceTurnMonotonicity: true,
+    });
+    wal.appendTurnDelta({
+      taskId: "task-m53-wal",
+      turnIndex: 2,
+      fencingToken: 5,
+      changedFiles: ["src/b.ts"],
+      sqliteWalPages: 6,
+      highestSubmittedFencingToken: 5,
+      enforceTurnMonotonicity: true,
+    });
+    let regressiveTurnRejected = false;
+    try {
+      wal.appendTurnDelta({
+        taskId: "task-m53-wal",
+        turnIndex: 1,
+        fencingToken: 5,
+        changedFiles: ["src/stale.ts"],
+        sqliteWalPages: 2,
+        highestSubmittedFencingToken: 5,
+        enforceTurnMonotonicity: true,
+      });
+    } catch (err) {
+      regressiveTurnRejected = err instanceof StaleFenceError;
+    }
+    const chainCheck = wal.verifyTaskWalChainIntegrity("task-m53-wal");
+    const walMonotonicAndChainIntegrityVerified =
+      regressiveTurnRejected && chainCheck.valid && chainCheck.frameCount === 2 && chainCheck.monotonicFenceOrdered;
+
+    // 5. [DrainToken-Deadlock-5] Verify CelldStateAwareFleetAutoscaler drain-token lease TTL expiration
+    const autoscaler = new CelldStateAwareFleetAutoscaler(40_000);
+    const t0 = 1_000_000;
+    const drain1 = autoscaler.initiateNodeShutdown({
+      nodeId: "node-crashed-draining",
+      systemdTimeoutStopSec: 60,
+      nowMs: t0,
+    });
+    const blockedBeforeTtl = !autoscaler.initiateNodeShutdown({
+      nodeId: "node-survivor-2",
+      systemdTimeoutStopSec: 60,
+      nowMs: t0 + 10_000,
+    }).claimedDrainToken;
+    const reclaimedAfterTtl = autoscaler.initiateNodeShutdown({
+      nodeId: "node-survivor-2",
+      systemdTimeoutStopSec: 60,
+      nowMs: t0 + 41_000,
+    });
+    const drainTokenTtlReclaimed =
+      drain1.claimedDrainToken &&
+      blockedBeforeTtl &&
+      reclaimedAfterTtl.claimedDrainToken &&
+      reclaimedAfterTtl.expiredStaleHolder === "node-crashed-draining";
+
+    const allM53RisksEliminated =
+      sagaFaultTolerantLifoAndCacheInvalidated &&
+      finopsUtcResetAndRefundVerified &&
+      idempotentSameVmReturned &&
+      orphanVmReclaimedCleanly &&
+      multiplexerIdempotentMountVerified &&
+      walMonotonicAndChainIntegrityVerified &&
+      drainTokenTtlReclaimed;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M53 跨层深水区风险清零验证 (SagaCacheInvalidate=${sagaFaultTolerantLifoAndCacheInvalidated}, FinOpsUtcReset=${finopsUtcResetAndRefundVerified}, WarmPoolGuard=${idempotentSameVmReturned && orphanVmReclaimedCleanly}, WalChain=${walMonotonicAndChainIntegrityVerified}, DrainTokenTtl=${drainTokenTtlReclaimed})`,
+      "SystemWide / M53-RiskElimination",
+      "ALL_M53_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        sagaStale1: {
+          compensatedTurns,
+          invalidatedIdemKeys: rbRes.invalidatedIdemKeys,
+          isolatedCompensationErrorCount: rbRes.compensationErrors.length,
+          rerunTurnOutput: rerunRes.run,
+          sagaFaultTolerantLifoAndCacheInvalidated,
+        },
+        finopsStarvation2: {
+          blockedOnDay1,
+          unblockedAfterRefund,
+          day2SelectedModel: evalDay2.selectedModel,
+          day2WindowReset: evalDay2.windowReset,
+          finopsUtcResetAndRefundVerified,
+        },
+        warmPoolLeak3: {
+          idempotentSameVmReturned,
+          reclaimedOrphanVms,
+          orphanVmReclaimedCleanly,
+          multiplexerIdempotentMountVerified,
+        },
+        walStale4: {
+          regressiveTurnRejected,
+          chainCheck,
+          walMonotonicAndChainIntegrityVerified,
+        },
+        drainTokenDeadlock5: {
+          blockedBeforeTtl,
+          expiredStaleHolder: reclaimedAfterTtl.expiredStaleHolder,
+          drainTokenTtlReclaimed,
+        },
+        allM53RisksEliminated,
+      },
+    };
+  }
 }

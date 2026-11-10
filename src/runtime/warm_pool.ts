@@ -1,5 +1,6 @@
 /**
- * @fileoverview M4 TASK-12: Pre-warmed Firecracker / Kata MicroVM Snapshot Pool Manager.
+ * @fileoverview M4 TASK-12 & M53-3: Pre-warmed Firecracker / Kata MicroVM Snapshot Pool Manager
+ * with Idempotent Task Sandbox Re-Allocation & Orphan VM Reclamation.
  */
 export interface MicroVmInstance {
   vmId: string;
@@ -39,7 +40,21 @@ export class WarmSandboxPoolManager {
     return created;
   }
 
+  /**
+   * [M53-3] Idempotent sandbox allocation:
+   * - If `taskId` already holds an ALLOCATED MicroVM with the same `templateHash`, return it idempotently without leaking a VM.
+   * - If `taskId` holds an ALLOCATED MicroVM with a different `templateHash`, destroy the previous VM before allocating the new one.
+   */
   public acquireSandbox(taskId: string, templateHash = "ubuntu24-py312-node22-v1"): MicroVmInstance {
+    const existing = this.activeVms.get(taskId);
+    if (existing && existing.state === "ALLOCATED") {
+      if (existing.templateHash === templateHash) {
+        return existing;
+      }
+      existing.state = "DESTROYED";
+      this.activeVms.delete(taskId);
+    }
+
     const idx = this.warmPool.findIndex((vm) => vm.templateHash === templateHash);
     let vm: MicroVmInstance;
     if (idx >= 0) {
@@ -62,6 +77,10 @@ export class WarmSandboxPoolManager {
     return vm;
   }
 
+  public getActiveVm(taskId: string): MicroVmInstance | undefined {
+    return this.activeVms.get(taskId);
+  }
+
   public releaseSandbox(taskId: string): boolean {
     const vm = this.activeVms.get(taskId);
     if (!vm) return false;
@@ -71,16 +90,31 @@ export class WarmSandboxPoolManager {
     return true;
   }
 
+  /**
+   * [M53-3] Reclaim orphaned MicroVMs whose owning task is no longer active in the scheduler/lease table.
+   */
+  public reclaimOrphanedSandboxes(activeTaskIds: Set<string>): string[] {
+    const reclaimedVmIds: string[] = [];
+    for (const [taskId, vm] of Array.from(this.activeVms.entries())) {
+      if (!activeTaskIds.has(taskId)) {
+        vm.state = "DESTROYED";
+        this.activeVms.delete(taskId);
+        reclaimedVmIds.push(vm.vmId);
+        this.replenishPool(vm.templateHash);
+      }
+    }
+    return reclaimedVmIds;
+  }
+
   public stats(): { warmCount: number; activeCount: number } {
     return { warmCount: this.warmPool.length, activeCount: this.activeVms.size };
   }
 }
 
-
 /**
- * M17 TASK-87: LayerFS Numbered Self-Closing Sandbox Multiplexer
- * (Each Sandbox mounts up to 16 concurrent Workspaces, starts a new Sandbox only when existing ones hold 16,
- * and auto-closes after 120 seconds of inactivity).
+ * M17 TASK-87 & M53-3: LayerFS Numbered Self-Closing Sandbox Multiplexer
+ * (Each Sandbox mounts up to 16 concurrent Workspaces, prevents duplicate multi-sandbox mounts for the same workspaceId,
+ * starts a new Sandbox only when existing ones hold 16, and auto-closes after 120 seconds of inactivity).
  */
 export interface NumberedLayerFsSandbox {
   sandboxNumber: number;
@@ -100,6 +134,18 @@ export class LayerFsNumberedSandboxMultiplexer {
     activeWorkspacesOnSandbox: number;
     spawnedNewSandbox: boolean;
   } {
+    // [M53-3] First check if workspaceId is already mounted in any open sandbox (idempotent re-mount guard)
+    for (const sb of this.sandboxes.values()) {
+      if (!sb.closed && sb.activeWorkspaceIds.has(workspaceId)) {
+        sb.lastActiveAtMs = nowMs;
+        return {
+          sandboxNumber: sb.sandboxNumber,
+          activeWorkspacesOnSandbox: sb.activeWorkspaceIds.size,
+          spawnedNewSandbox: false,
+        };
+      }
+    }
+
     for (const sb of this.sandboxes.values()) {
       if (
         !sb.closed &&

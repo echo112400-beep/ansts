@@ -2337,6 +2337,18 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M53] Deep Cross-Layer Risk Elimination Audit (`POST /v1beta1/management/system/risk-elimination-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/risk-elimination-audit") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeDeepCrossLayerRiskEliminationAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M52] System-Wide Stale, Deadlock, Starvation & State-Consistency Rectification Audit (`POST /v1beta1/management/system/deep-rectification-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/deep-rectification-audit") {
       const body = await this.readJsonBody(req);

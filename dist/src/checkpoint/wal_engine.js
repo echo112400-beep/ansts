@@ -1,12 +1,13 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TurnWalEngine = void 0;
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var _models = require("../models.js");
 var _lease_coordinator = require("../lease_coordinator.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M5 TASK-19: Turn-Level Incremental OverlayFS Snapshot & SQLite WAL Writer (`TurnWalEngine` & `TurnWalFrame`).
+ * @fileoverview M5 TASK-19 & M53-4: Turn-Level Incremental OverlayFS Snapshot & SQLite WAL Writer (`TurnWalEngine` & `TurnWalFrame`)
+ * with Dual-Tuple `(fencingToken, turnIndex)` Monotonicity & Full Chain Integrity Verification.
  */
-
 
 
 
@@ -28,6 +29,7 @@ class TurnWalEngine {
 
 
 
+
   {
     if (params.fencingToken < params.highestSubmittedFencingToken) {
       throw new _lease_coordinator.StaleFenceError(
@@ -36,6 +38,26 @@ class TurnWalEngine {
       params.highestSubmittedFencingToken);
 
     }
+
+    const list = this.logsByTask.get(params.taskId) ?? [];
+    if (list.length > 0) {
+      const lastEntry = list[list.length - 1];
+      if (params.fencingToken < lastEntry.fencingToken) {
+        throw new _lease_coordinator.StaleFenceError(params.taskId, params.fencingToken, lastEntry.fencingToken);
+      }
+      if (
+      (params.enforceTurnMonotonicity ?? false) &&
+      params.fencingToken === lastEntry.fencingToken &&
+      params.turnIndex <= lastEntry.turnIndex)
+      {
+        throw new _lease_coordinator.StaleFenceError(
+        params.taskId,
+        params.fencingToken,
+        lastEntry.fencingToken);
+
+      }
+    }
+
     this.globalSeq += 1;
     const raw = `${params.taskId}:${params.turnIndex}:${params.fencingToken}:${params.changedFiles.join(",")}`;
     const checksumSha256 = crypto.createHash("sha256").update(raw, "utf-8").digest("hex");
@@ -69,7 +91,6 @@ class TurnWalEngine {
       checkpoint,
       frame
     };
-    const list = this.logsByTask.get(params.taskId) ?? [];
     list.push(entry);
     this.logsByTask.set(params.taskId, list);
     return entry;
@@ -81,5 +102,42 @@ class TurnWalEngine {
 
   getTaskWalFrames(taskId) {
     return (this.logsByTask.get(taskId) ?? []).map((e) => e.frame);
+  }
+
+  /**
+   * [M53-4] Verify full WAL chain CRC32 integrity and `(fencingToken, turnIndex)` monotonicity for a task.
+   */
+  verifyTaskWalChainIntegrity(taskId)
+
+
+
+
+  {
+    const entries = this.logsByTask.get(taskId) ?? [];
+    const corruptedFrameIds = [];
+    let monotonicFenceOrdered = true;
+
+    for (let i = 0; i < entries.length; i++) {
+      const cur = entries[i];
+      if (!cur.frame.verifyIntegrity()) {
+        corruptedFrameIds.push(cur.frame.frameId);
+      }
+      if (i > 0) {
+        const prev = entries[i - 1];
+        if (
+        cur.fencingToken < prev.fencingToken ||
+        cur.fencingToken === prev.fencingToken && cur.turnIndex < prev.turnIndex)
+        {
+          monotonicFenceOrdered = false;
+        }
+      }
+    }
+
+    return {
+      valid: corruptedFrameIds.length === 0 && monotonicFenceOrdered,
+      frameCount: entries.length,
+      corruptedFrameIds,
+      monotonicFenceOrdered
+    };
   }
 }exports.TurnWalEngine = TurnWalEngine;
