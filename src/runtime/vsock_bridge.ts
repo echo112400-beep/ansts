@@ -1,6 +1,6 @@
 /**
- * @fileoverview M4 TASK-15 & M47-1: Zero-Trust virtio-vsock Host-Guest RPC Channel,
- * Egress Policy Filter, Real Sandboxed File I/O & Real Subprocess Command Execution.
+ * @fileoverview M4 TASK-15, M47-1 & M59-5: Zero-Trust virtio-vsock Host-Guest RPC Channel,
+ * HTTP/HTTPS Egress Scheme & Allowlist Filter, Real Sandboxed File I/O & Hardened Subprocess Command Execution.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -55,10 +55,13 @@ export class ZeroTrustVsockBridge {
     if (msg.method === "HTTP_EGRESS") {
       const urlStr = String(msg.payload.url ?? "");
       const parsed = new URL(urlStr);
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        throw new EgressPolicyViolationError(`${parsed.protocol}//${parsed.hostname}`);
+      }
       if (!this.allowedDomains.has(parsed.hostname)) {
         throw new EgressPolicyViolationError(parsed.hostname);
       }
-      return { status: 200, hostname: parsed.hostname, proxiedViaVsock: true };
+      return { status: 200, hostname: parsed.hostname, protocol: parsed.protocol, proxiedViaVsock: true };
     }
 
     if (msg.method === "WRITE_FILE") {
@@ -98,8 +101,14 @@ export class ZeroTrustVsockBridge {
 
     if (msg.method === "EXEC_CMD") {
       const command = String(msg.payload.command ?? "");
-      const deniedPatterns = ["rm -rf /", "mkfs", ":(){ :|:& };:", "/etc/shadow", "docker.sock"];
-      if (deniedPatterns.some((p) => command.includes(p))) {
+      const deniedRegexes = [
+        /rm\s+(?:-[a-zA-Z]+\s+)*(?:--no-preserve-root\s+)?-?[rR][fF]?\s+\/(?:\*|\s|$)|rm\s+-rf\s+--no-preserve-root/i,
+        /\bmkfs\b/i,
+        /:\(\)\s*\{\s*:\|:&\s*\};:/,
+        /\/etc\/shadow|\/etc\/sudoers|\/proc\/kcore|\/proc\/self\/environ|docker\.sock/,
+        /169\.254\.169\.254|metadata\.google\.internal/i,
+      ];
+      if (deniedRegexes.some((rx) => rx.test(command))) {
         throw new Error(`ZeroTrustVsockBridge blocked unsafe command: '${command}'`);
       }
       const { vmDir } = this.resolveSafeVmPath(msg.vmId, ".");

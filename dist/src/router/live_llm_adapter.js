@@ -1,6 +1,8 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.LiveOpenAiCompatibleSseAdapter = void 0; /**
- * @fileoverview M10 TASK-37: Live OpenAI/Anthropic/vLLM Streaming SSE Parser & Precise TTFT/TPOT Meter.
+ * @fileoverview M10 TASK-37 & M59-3: Live OpenAI/Anthropic/vLLM Streaming SSE Parser & Precise TTFT/TPOT Meter
+ * with Malformed JSON Frame Resilience, Clock-Skew Non-Negative TPOT & Empty-Chunk Usage Preservation.
  */
+
 
 
 
@@ -19,6 +21,7 @@ class LiveOpenAiCompatibleSseAdapter {
   {
     let assembled = "";
     let chunksReceived = 0;
+    let malformedFramesSkipped = 0;
     let promptTokens = 0;
     let completionTokens = 0;
     let cachedPromptTokens = 0;
@@ -28,8 +31,14 @@ class LiveOpenAiCompatibleSseAdapter {
       for (const line of lines) {
         if (!line.startsWith("data:")) continue;
         const dataStr = line.slice(5).trim();
-        if (dataStr === "[DONE]") continue;
-        const parsed = JSON.parse(dataStr);
+        if (!dataStr || dataStr === "[DONE]") continue;
+        let parsed;
+        try {
+          parsed = JSON.parse(dataStr);
+        } catch {
+          malformedFramesSkipped += 1;
+          continue;
+        }
         chunksReceived += 1;
         const choices = parsed.choices;
         if (choices && choices[0]?.delta?.content) {
@@ -50,16 +59,20 @@ class LiveOpenAiCompatibleSseAdapter {
       }
     }
 
-    const firstChunkMs = chunkTimestampsMs[0] ?? requestStartMs + 45;
-    const lastChunkMs = chunkTimestampsMs[chunkTimestampsMs.length - 1] ?? firstChunkMs + 100;
+    const validTimestamps = chunkTimestampsMs.filter((t) => Number.isFinite(t));
+    const firstChunkMs = validTimestamps[0] ?? requestStartMs + 45;
+    const lastChunkMs =
+    validTimestamps.length > 0 ? Math.max(firstChunkMs, validTimestamps[validTimestamps.length - 1]) : firstChunkMs + 100;
     const ttftMs = Math.max(1, firstChunkMs - requestStartMs);
     const tokenCount = Math.max(1, completionTokens || chunksReceived);
-    const tpotMs = tokenCount > 1 ? Number(((lastChunkMs - firstChunkMs) / (tokenCount - 1)).toFixed(2)) : 0;
+    const tpotMs =
+    tokenCount > 1 ? Math.max(0, Number(((lastChunkMs - firstChunkMs) / (tokenCount - 1)).toFixed(2))) : 0;
 
     return {
       ttftMs,
       tpotMs,
       chunksReceived,
+      malformedFramesSkipped,
       assembledContent: assembled,
       promptTokens,
       completionTokens: completionTokens || chunksReceived,
@@ -83,9 +96,10 @@ class LiveOpenAiCompatibleSseAdapter {
     const stepMs = params.perTokenStepMs ?? 6;
     const frames = [];
     const timestamps = [];
+    const effectiveTokens = params.tokens.length > 0 ? params.tokens : [""];
 
-    params.tokens.forEach((tok, idx) => {
-      const isLast = idx === params.tokens.length - 1;
+    effectiveTokens.forEach((tok, idx) => {
+      const isLast = idx === effectiveTokens.length - 1;
       const frameObj = {
         id: `chatcmpl-${params.modelName}-${idx}`,
         object: "chat.completion.chunk",

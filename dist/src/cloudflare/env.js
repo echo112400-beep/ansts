@@ -130,8 +130,10 @@ var path = _interopRequireWildcard(require("node:path"));function _getRequireWil
 
 
 
+
 class InMemoryCellSqlStorage {
   tables = new Map();
+  primaryKeysByTable = new Map();
   txSnapshot = null;
   storageFilePath;
 
@@ -148,6 +150,12 @@ class InMemoryCellSqlStorage {
       const raw = JSON.parse(fs.readFileSync(this.storageFilePath, "utf-8"));
 
 
+
+      if (raw.primaryKeysByTable) {
+        for (const [tblName, pkCols] of Object.entries(raw.primaryKeysByTable)) {
+          if (Array.isArray(pkCols)) this.primaryKeysByTable.set(tblName, pkCols);
+        }
+      }
       if (raw.tables) {
         for (const [tblName, rowsObj] of Object.entries(raw.tables)) {
           const rowMap = new Map();
@@ -174,8 +182,15 @@ class InMemoryCellSqlStorage {
         }
         serialized[tblName] = rowsObj;
       }
+      const pkSerialized = {};
+      for (const [tblName, pkCols] of this.primaryKeysByTable.entries()) {
+        pkSerialized[tblName] = pkCols;
+      }
       const tmpPath = this.storageFilePath + ".tmp";
-      fs.writeFileSync(tmpPath, JSON.stringify({ updatedAtMs: Date.now(), tables: serialized }));
+      fs.writeFileSync(
+      tmpPath,
+      JSON.stringify({ updatedAtMs: Date.now(), primaryKeysByTable: pkSerialized, tables: serialized }));
+
       fs.renameSync(tmpPath, this.storageFilePath);
     } catch {
 
@@ -213,11 +228,23 @@ class InMemoryCellSqlStorage {
     }
 
     if (upper.startsWith("CREATE TABLE") || upper.startsWith("CREATE INDEX") || upper.startsWith("PRAGMA")) {
-      const m = q.match(/CREATE TABLE(?: IF NOT EXISTS)?\s+([a-zA-Z0-9_]+)/i);
+      const m = q.match(/CREATE TABLE(?: IF NOT EXISTS)?\s+([a-zA-Z0-9_]+)\s*\((.+)\)/i);
       if (m) {
         const tbl = m[1];
+        const bodyDef = m[2];
         if (!this.tables.has(tbl)) {
           this.tables.set(tbl, new Map());
+        }
+        // [M59-1] Parse composite PRIMARY KEY (col1, col2, ...) if present so multi-column PK rows never overwrite one another
+        const compositePkMatch = bodyDef.match(/PRIMARY\s+KEY\s*\(([^)]+)\)/i);
+        if (compositePkMatch) {
+          const pkCols = compositePkMatch[1].split(",").map((c) => c.trim());
+          this.primaryKeysByTable.set(tbl, pkCols);
+        } else {
+          const inlinePkMatch = bodyDef.match(/([a-zA-Z0-9_]+)\s+[a-zA-Z0-9_]+\s+PRIMARY\s+KEY/i);
+          if (inlinePkMatch) {
+            this.primaryKeysByTable.set(tbl, [inlinePkMatch[1].trim()]);
+          }
         }
       }
       return { toArray: () => [], one: () => null };
@@ -237,7 +264,11 @@ class InMemoryCellSqlStorage {
         cols.forEach((col, i) => {
           row[col] = bindings[i];
         });
-        const pk = String(bindings[0] ?? `${tbl.size + 1}`);
+        const pkCols = this.primaryKeysByTable.get(tblName);
+        const pk =
+        pkCols && pkCols.length > 0 && pkCols.every((c) => c in row) ?
+        pkCols.map((c) => String(row[c])).join("::") :
+        String(bindings[0] ?? `${tbl.size + 1}`);
         tbl.set(pk, row);
         this.flushToDisk();
       }
@@ -245,19 +276,24 @@ class InMemoryCellSqlStorage {
     }
 
     if (upper.startsWith("UPDATE ")) {
-      const m = q.match(/UPDATE\s+([a-zA-Z0-9_]+)\s+SET\s+(.+?)\s+WHERE\s+([a-zA-Z0-9_]+)\s*=\s*\?/i);
+      const m = q.match(/UPDATE\s+([a-zA-Z0-9_]+)\s+SET\s+(.+?)\s+WHERE\s+(.+)$/i);
       if (m) {
-        const tbl = this.tables.get(m[1]);
+        const tblName = m[1];
+        const tbl = this.tables.get(tblName);
         const setClause = m[2];
-        const pkValue = String(bindings[bindings.length - 1]);
-        if (tbl && tbl.has(pkValue)) {
-          const existing = tbl.get(pkValue);
+        const whereClause = m[3];
+        if (tbl) {
           const setCols = setClause.split(",").map((part) => part.split("=")[0].trim());
-          setCols.forEach((c, idx) => {
-            if (idx < bindings.length - 1) {
-              existing[c] = bindings[idx];
+          const whereCols = whereClause.split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
+          const whereBindings = bindings.slice(setCols.length);
+          for (const existing of tbl.values()) {
+            const matched = whereCols.every((col, idx) => String(existing[col]) === String(whereBindings[idx]));
+            if (matched) {
+              setCols.forEach((c, idx) => {
+                existing[c] = bindings[idx];
+              });
             }
-          });
+          }
         }
       }
       this.flushToDisk();
@@ -278,6 +314,8 @@ class InMemoryCellSqlStorage {
           } else {
             tbl.clear();
           }
+          // [M59-1] Flush DELETE mutations to disk so deleted rows never resurrect on restart
+          this.flushToDisk();
         }
       }
       return { toArray: () => [], one: () => null };
@@ -291,8 +329,10 @@ class InMemoryCellSqlStorage {
         let rows = Array.from(tbl.values());
 
         const mWhere = q.match(/WHERE\s+(.+?)(?:\s+ORDER BY|\s+LIMIT|$)/i);
+        let whereBindingsConsumed = 0;
         if (mWhere && bindings.length > 0) {
           const condCols = mWhere[1].split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
+          whereBindingsConsumed = condCols.length;
           rows = rows.filter((r) =>
           condCols.every((col, idx) => String(r[col]) === String(bindings[idx])));
 
@@ -309,6 +349,16 @@ class InMemoryCellSqlStorage {
             const cmp = va > vb ? 1 : -1;
             return desc ? -cmp : cmp;
           });
+        }
+
+        // [M59-1] Enforce LIMIT N (literal or bound parameter `?`)
+        const mLimit = q.match(/LIMIT\s+(\?|\d+)/i);
+        if (mLimit) {
+          const rawLim =
+          mLimit[1] === "?" ? Number(bindings[whereBindingsConsumed] ?? rows.length) : Number(mLimit[1]);
+          if (Number.isFinite(rawLim) && rawLim >= 0) {
+            rows = rows.slice(0, Math.floor(rawLim));
+          }
         }
 
         if (upper.includes("COUNT(*)")) {
@@ -356,12 +406,29 @@ class MockDurableObjectState {
 
 class InMemoryKvNamespace {
   store = new Map();
-  async get(key) {
-    return this.store.get(key) ?? null;
+
+  async get(key, nowMs = Date.now()) {
+    const entry = this.store.get(key);
+    if (!entry) return null;
+    if (entry.expiresAtMs !== null && nowMs >= entry.expiresAtMs) {
+      this.store.delete(key);
+      return null;
+    }
+    return entry.value;
   }
-  async put(key, value) {
-    this.store.set(key, value);
+
+  async put(
+  key,
+  value,
+  options)
+  {
+    const nowMs = options?.nowMs ?? Date.now();
+    const ttlSec = options?.expirationTtl;
+    const expiresAtMs =
+    ttlSec !== undefined && Number.isFinite(ttlSec) && ttlSec > 0 ? nowMs + ttlSec * 1000 : null;
+    this.store.set(key, { value, expiresAtMs });
   }
+
   async delete(key) {
     this.store.delete(key);
   }

@@ -2356,6 +2356,18 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M59] SQLite Composite-PK/DELETE-Flush/LIMIT Engine Hardening, KV TTL Expiration, SSE Malformed-Frame/Clock-Skew Resilience, UFFD Page Cache Invalidation, Vsock Scheme/IMDS Guard & LTX/Facet Metadata Hygiene Audit (`POST /v1beta1/management/system/sql-kv-sse-uffd-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/sql-kv-sse-uffd-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeSqlKvSseUffdAndLtxAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M58] Container Fence RFC1918/CGNAT/IPv6 & Start-Cap Guard, Recursive OverlayFS & eBPF LSM Path Hardening, SPIFFE/SLSA Tamper Proofing, Canary Post-Rollback Lock & PSI Victim Filtering, Telemetry/EWMA NaN Guard & Federation RTT Audit (`POST /v1beta1/management/system/container-security-telemetry-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/container-security-telemetry-audit") {
       const body = await this.readJsonBody(req);

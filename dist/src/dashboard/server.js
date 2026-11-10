@@ -1,4 +1,6 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var _zero_trust_security_guard = require("../runtime/zero_trust_security_guard.js");
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var _s3_ltx_driver = require("../checkpoint/s3_ltx_driver.js");
+var _env = require("../cloudflare/env.js");
+var _zero_trust_security_guard = require("../runtime/zero_trust_security_guard.js");
 var _layerfs_store_engine = require("../checkpoint/layerfs_store_engine.js");
 var crypto = _interopRequireWildcard(require("node:crypto"));
 
@@ -115,7 +117,7 @@ var _celld_admin_client = require("../cloudflare/celld_admin_client.js");
 var _unified_state_store = require("../checkpoint/unified_state_store.js");
 var _celld_container_bridge = require("../cloudflare/celld_container_bridge.js");
 var _celld_ha_engine = require("../cloudflare/celld_ha_engine.js");
-var _env = require("../cloudflare/env.js");
+
 var _sandbox_branch_forker = require("../runtime/sandbox_branch_forker.js");
 var _layerfs_branch_coordinator = require("../dag/layerfs_branch_coordinator.js");
 var _psi_guard = require("../runtime/psi_guard.js");
@@ -6325,6 +6327,149 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           federationRttAndBodyGuardVerified
         },
         allM58RisksEliminated
+      }
+    };
+  }
+
+  /**
+   * [M59] Executes the 6-Point SQLite Composite-PK/DELETE-Flush/LIMIT Engine, KV TTL Expiration,
+   * SSE Malformed-Frame/Clock-Skew Resilience, UFFD Page Cache Invalidation, Vsock Scheme/IMDS Guard & LTX/Facet Hygiene Audit
+   * (`POST /v1beta1/management/system/sql-kv-sse-uffd-audit`).
+   */
+  async executeSqlKvSseUffdAndLtxAudit(params)
+
+
+  {
+    // 1. SQLite Composite PRIMARY KEY, DELETE FROM disk flush & SELECT LIMIT
+    const sqlPath = path.join(os.tmpdir(), `ansts-m59-sql-${process.pid}-${Date.now()}.json`);
+    const dSql1 = new _env.DurableDiskCellSqlStorage(sqlPath);
+    dSql1.exec(
+    "CREATE TABLE IF NOT EXISTS harness_turns (task_id TEXT, turn_index INTEGER, ltx_key TEXT, PRIMARY KEY (task_id, turn_index))");
+
+    dSql1.exec("INSERT INTO harness_turns (task_id, turn_index, ltx_key) VALUES (?, ?, ?)", "t-m59", 1, "k1");
+    dSql1.exec("INSERT INTO harness_turns (task_id, turn_index, ltx_key) VALUES (?, ?, ?)", "t-m59", 2, "k2");
+    dSql1.exec("INSERT INTO harness_turns (task_id, turn_index, ltx_key) VALUES (?, ?, ?)", "t-m59", 3, "k3");
+    const countBeforeDelete = dSql1.exec("SELECT * FROM harness_turns WHERE task_id = ?", "t-m59").toArray().length;
+    const limitTwoCount = dSql1.exec("SELECT * FROM harness_turns WHERE task_id = ? LIMIT 2", "t-m59").toArray().length;
+    dSql1.exec("DELETE FROM harness_turns WHERE task_id = ? AND turn_index = ?", "t-m59", 2);
+    const dSql2 = new _env.DurableDiskCellSqlStorage(sqlPath);
+    const countAfterRestart = dSql2.exec("SELECT * FROM harness_turns WHERE task_id = ?", "t-m59").toArray().length;
+    const sqlCompositePkAndFlushVerified =
+    countBeforeDelete === 3 && limitTwoCount === 2 && countAfterRestart === 2;
+
+    // 2. KV expirationTtl enforcement
+    const kv = new _env.InMemoryKvNamespace();
+    await kv.put("m59-k", "v-alive", { expirationTtl: 5, nowMs: 1000 });
+    const aliveVal = await kv.get("m59-k", 3000);
+    const expiredVal = await kv.get("m59-k", 7000);
+    const kvTtlExpirationVerified = aliveVal === "v-alive" && expiredVal === null;
+
+    // 3. SSE malformed JSON frame skip & clock-skew non-negative TPOT
+    const sse = new _live_llm_adapter.LiveOpenAiCompatibleSseAdapter();
+    const sseSummary = sse.parseSseTranscript(
+    [
+    "data: {corrupted\n\n",
+    'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n',
+    "data: [DONE]\n\n"],
+
+    1000,
+    [1050, 1010]);
+
+    const sseMalformedAndSkewVerified =
+    sseSummary.assembledContent === "OK" &&
+    sseSummary.malformedFramesSkipped === 1 &&
+    sseSummary.tpotMs >= 0;
+
+    // 4. UFFD page cache invalidation on re-staging
+    const uffd = new _uffd_lazy_restorer.UffdLazyPageFaultRestorer();
+    const dig1 = uffd.stageRemoteSnapshotPage(0, new Uint8Array(4096).fill(1));
+    uffd.handlePageFault(0);
+    const dig2 = uffd.stageRemoteSnapshotPage(0, new Uint8Array(4096).fill(2));
+    const fault2 = uffd.handlePageFault(0);
+    const uffdCacheInvalidationVerified = dig1 !== dig2 && fault2.sha256Digest === dig2 && fault2.fetchedFromRemote;
+
+    // 5. Vsock HTTP/HTTPS scheme check & command regex hardening
+    const vsock = new _vsock_bridge.ZeroTrustVsockBridge(["api.openai.com"]);
+    let ftpBlocked = false;
+    let noPreserveRootBlocked = false;
+    try {
+      vsock.sendRequest({ requestId: "r1", vmId: "vm-m59", method: "HTTP_EGRESS", payload: { url: "ftp://api.openai.com/x" } });
+    } catch {
+      ftpBlocked = true;
+    }
+    try {
+      vsock.sendRequest({ requestId: "r2", vmId: "vm-m59", method: "EXEC_CMD", payload: { command: "rm -rf --no-preserve-root /", executeRealSubprocess: false } });
+    } catch {
+      noPreserveRootBlocked = true;
+    }
+    const vsockSchemeAndCmdGuardVerified = ftpBlocked && noPreserveRootBlocked;
+
+    // 6. Facet terminal history pruning & S3 LTX txId/cellId validation
+    const fSup = new _celld_native_optimizations.DurableObjectFacetSupervisor(8);
+    for (let i = 1; i <= 12; i++) {
+      const { facetRecord } = fSup.spawnToolFacet("t-m59", i, "sql", () => new _env.InMemoryCellSqlStorage());
+      await fSup.deleteCompletedFacet(facetRecord.facetName);
+    }
+    const ltxDrv = new _s3_ltx_driver.RustFsS3LtxDriver(new _env.InMemoryR2Bucket());
+    let negTxRejected = false;
+    try {
+      await ltxDrv.putImmutableLtxSegment({ cellId: "c1", txId: -1, fencingToken: 1, ltxBytes: new Uint8Array([1]) });
+    } catch {
+      negTxRejected = true;
+    }
+    const facetPruneAndLtxGuardVerified = fSup.listFacets().length <= 8 && negTxRejected;
+
+    const allM59RisksEliminated =
+    sqlCompositePkAndFlushVerified &&
+    kvTtlExpirationVerified &&
+    sseMalformedAndSkewVerified &&
+    uffdCacheInvalidationVerified &&
+    vsockSchemeAndCmdGuardVerified &&
+    facetPruneAndLtxGuardVerified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M59 SQLite 复合主键/DELETE 落盘/LIMIT、KV TTL 淘汰、SSE 容错、UFFD 缓存失效与 Vsock/LTX 校验自检 (SqlComposite=${sqlCompositePkAndFlushVerified}, KvTtl=${kvTtlExpirationVerified}, SseResilience=${sseMalformedAndSkewVerified}, UffdInvalidate=${uffdCacheInvalidationVerified}, VsockGuard=${vsockSchemeAndCmdGuardVerified}, FacetLtx=${facetPruneAndLtxGuardVerified})`,
+    "SystemWide / M59-SqlKvSseUffdAudit",
+    "ALL_M59_RISKS_ELIMINATED");
+
+
+    return {
+      status: 200,
+      body: {
+        sqlCompositePkAndFlush1: {
+          countBeforeDelete,
+          limitTwoCount,
+          countAfterRestart,
+          sqlCompositePkAndFlushVerified
+        },
+        kvTtlExpiration2: {
+          aliveVal,
+          expiredVal,
+          kvTtlExpirationVerified
+        },
+        sseMalformedAndSkew3: {
+          malformedFramesSkipped: sseSummary.malformedFramesSkipped,
+          tpotMs: sseSummary.tpotMs,
+          sseMalformedAndSkewVerified
+        },
+        uffdCacheInvalidation4: {
+          dig1,
+          dig2,
+          uffdCacheInvalidationVerified
+        },
+        vsockSchemeAndCmdGuard5: {
+          ftpBlocked,
+          noPreserveRootBlocked,
+          vsockSchemeAndCmdGuardVerified
+        },
+        facetPruneAndLtxGuard6: {
+          retainedFacets: fSup.listFacets().length,
+          negTxRejected,
+          facetPruneAndLtxGuardVerified
+        },
+        allM59RisksEliminated
       }
     };
   }

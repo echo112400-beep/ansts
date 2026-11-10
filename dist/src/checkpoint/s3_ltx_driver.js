@@ -1,10 +1,11 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.S3CasPreconditionFailedError = exports.RustFsS3LtxDriver = void 0;
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M10 TASK-35: RustFS / AWS S3 SigV4 CAS (`If-None-Match: *`) LTX Snapshot Driver.
- */
-class S3CasPreconditionFailedError extends Error {
+ * @fileoverview M10 TASK-35 & M59-6: RustFS / AWS S3 SigV4 CAS (`If-None-Match: *`) LTX Snapshot Driver
+ * with Strict Integer `txId`/`fencingToken` & Path-Safe `cellId` Validation.
+ */class S3CasPreconditionFailedError extends Error {
   objectKey;
   constructor(objectKey) {
     super(`HTTP 412 Precondition Failed: S3 CAS object '${objectKey}' already exists (Split-Brain prevented)`);
@@ -53,7 +54,17 @@ class RustFsS3LtxDriver {
 
 
   {
-    const key = `cells/${params.cellId}/ltx/${String(params.txId).padStart(10, "0")}-f${params.fencingToken}.ltx`;
+    const safeCellId = params.cellId.trim();
+    if (!safeCellId || !/^[a-zA-Z0-9._:-]+$/.test(safeCellId) || safeCellId.includes("..")) {
+      throw new Error(`Invalid LTX cellId '${params.cellId}'`);
+    }
+    if (!Number.isInteger(params.txId) || params.txId < 0) {
+      throw new Error(`Invalid LTX txId '${params.txId}': must be a non-negative integer`);
+    }
+    if (!Number.isInteger(params.fencingToken) || params.fencingToken < 1) {
+      throw new Error(`Invalid LTX fencingToken '${params.fencingToken}': must be a positive integer`);
+    }
+    const key = `cells/${safeCellId}/ltx/${String(params.txId).padStart(10, "0")}-f${params.fencingToken}.ltx`;
     const sha256 = crypto.createHash("sha256").update(params.ltxBytes).digest("hex");
     const authHeader = this.buildSigV4AuthorizationHeader({
       method: "PUT",
@@ -65,7 +76,7 @@ class RustFsS3LtxDriver {
     const res = await this.bucket.put(key, params.ltxBytes, {
       onlyIf: { etagDoesNotMatch: "*" },
       customMetadata: {
-        cellId: params.cellId,
+        cellId: safeCellId,
         txId: String(params.txId),
         fencingToken: String(params.fencingToken),
         sha256

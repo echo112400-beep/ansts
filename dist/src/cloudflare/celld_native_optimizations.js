@@ -5,9 +5,9 @@
 
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var vm = _interopRequireWildcard(require("node:vm"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M15 TASK-67 ~ TASK-70 & M56-4: denoland/celld Native Durable Object Facets (`ctx.facets`),
+ * @fileoverview M15 TASK-67 ~ TASK-70, M56-4 & M59-2/M59-6: denoland/celld Native Durable Object Facets (`ctx.facets`),
  * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution & Bounded Spec Cache),
- * KV Single-Writer Sharding & V8 128MB Heap/SQL Real Wall-Clock Budget Guard.
+ * KV Single-Writer Sharding with TTL Validation & V8 128MB Heap/SQL Real Wall-Clock Budget Guard.
  */
 
 
@@ -25,6 +25,22 @@ var vm = _interopRequireWildcard(require("node:vm"));function _getRequireWildcar
 class DurableObjectFacetSupervisor {
   activeFacets = new Map();
   facetSqlStores = new Map();
+  maxRetainedFacetRecords;
+
+  constructor(maxRetainedFacetRecords = 512) {
+    this.maxRetainedFacetRecords = Math.max(8, maxRetainedFacetRecords);
+  }
+
+  pruneTerminalFacetHistory() {
+    if (this.activeFacets.size <= this.maxRetainedFacetRecords) return;
+    for (const [name, rec] of this.activeFacets.entries()) {
+      if (this.activeFacets.size <= this.maxRetainedFacetRecords) break;
+      if (rec.status === "ABORTED" || rec.status === "DELETED" || rec.status === "COMPLETED") {
+        this.activeFacets.delete(name);
+        this.facetSqlStores.delete(name);
+      }
+    }
+  }
 
   spawnToolFacet(
   taskId,
@@ -44,12 +60,13 @@ class DurableObjectFacetSupervisor {
     const sql = sqlFactory();
     this.activeFacets.set(facetName, record);
     this.facetSqlStores.set(facetName, sql);
+    this.pruneTerminalFacetHistory();
     return { facetRecord: record, facetSql: sql };
   }
 
   /**
-   * [M56-4] Aborts a faulty facet and immediately releases its `facetSqlStores` handle
-   * so aborted facets never leak SQLite store instances in memory.
+   * [M56-4 & M59-6] Aborts a faulty facet, immediately releases its `facetSqlStores` handle,
+   * and bounds terminal facet metadata history.
    */
   abortFaultyFacet(facetName, error) {
     const rec = this.activeFacets.get(facetName);
@@ -59,6 +76,7 @@ class DurableObjectFacetSupervisor {
     rec.status = "ABORTED";
     rec.abortReason = error.message;
     this.facetSqlStores.delete(facetName);
+    this.pruneTerminalFacetHistory();
     return rec;
   }
 
@@ -67,6 +85,7 @@ class DurableObjectFacetSupervisor {
     if (!rec) return false;
     rec.status = "DELETED";
     this.facetSqlStores.delete(facetName);
+    this.pruneTerminalFacetHistory();
     return true;
   }
 
@@ -204,7 +223,7 @@ class CelldKvOptimizerAndGuard {
 
   constructor(kv, shardCount = 32) {
     this.kv = kv;
-    this.shardCount = shardCount;
+    this.shardCount = Number.isInteger(shardCount) && shardCount > 0 ? shardCount : 32;
   }
 
   computeShardedKey(logicalNamespace, key) {
@@ -227,6 +246,9 @@ class CelldKvOptimizerAndGuard {
       throw new Error(
       `KV value size (${byteLength} bytes) exceeds celld 25 MiB limit (${CelldKvOptimizerAndGuard.MAX_KV_VALUE_BYTES})`);
 
+    }
+    if (expirationTtl !== undefined && (!Number.isFinite(expirationTtl) || expirationTtl <= 0)) {
+      throw new Error(`KV expirationTtl must be a positive number of seconds (got ${expirationTtl})`);
     }
     const { shardId, physicalKey } = this.computeShardedKey(logicalNamespace, key);
     await this.kv.put(physicalKey, value, expirationTtl ? { expirationTtl } : undefined);
@@ -256,7 +278,9 @@ class V8HeapAndSqlBudgetGuard {
 
   {
     const measuredHeapMb =
-    currentHeapUsedMb ?? Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(2));
+    currentHeapUsedMb !== undefined && Number.isFinite(currentHeapUsedMb) && currentHeapUsedMb >= 0 ?
+    currentHeapUsedMb :
+    Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(2));
     const pct = Number((measuredHeapMb / this.hardHeapLimitMb * 100).toFixed(1));
     if (measuredHeapMb >= this.hardHeapLimitMb * 0.92) {
       return { status: "REJECT_NEW_STREAMS", heapUtilizationPct: pct, measuredHeapMb };
