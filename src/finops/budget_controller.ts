@@ -1,7 +1,9 @@
 /**
- * @fileoverview M12 TASK-44 & M53-2: Real-Time Tenant Token Budget Quota Enforcer,
- * UTC Daily Window Auto-Reset & Spend Refund Controller.
+ * @fileoverview M12 TASK-44, M53-2 & M61-2: Real-Time Tenant Token Budget Quota Enforcer,
+ * UTC Daily Window Auto-Reset, Spend Refund Controller, Idempotent Spend/Refund Guard & SQLite Persistence.
  */
+import { SqlStorageLike } from "../cloudflare/env.js";
+
 export interface TenantBudgetPolicy {
   tenantId: string;
   dailyBudgetUsd: number;
@@ -14,6 +16,69 @@ export class FinOpsBudgetController {
   private readonly policies: Map<string, TenantBudgetPolicy> = new Map();
   private readonly spendByTenantUsd: Map<string, number> = new Map();
   private readonly activeUtcDayByTenant: Map<string, string> = new Map();
+  private readonly seenLedgerIdempotencyKeys: Set<string> = new Set();
+  private sql?: SqlStorageLike;
+
+  constructor(sql?: SqlStorageLike) {
+    if (sql) {
+      this.bindSqlStorage(sql);
+    }
+  }
+
+  /**
+   * [M61-2] Binds SQLite storage (`persisted_finops_ledgers`) so tenant budget policies, daily spend,
+   * active UTC day windows, and idempotency tokens survive restarts.
+   */
+  public bindSqlStorage(sql: SqlStorageLike): number {
+    this.sql = sql;
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS persisted_finops_ledgers (tenant_id TEXT PRIMARY KEY, payload_json TEXT)"
+    );
+    const rows = this.sql
+      .exec<Record<string, unknown>>("SELECT * FROM persisted_finops_ledgers")
+      .toArray();
+    let restored = 0;
+    for (const r of rows) {
+      const tenantId = String(r.tenant_id ?? "");
+      const parsed = JSON.parse(String(r.payload_json ?? "{}")) as Record<string, unknown>;
+      if (!tenantId) continue;
+      if (parsed.policy && typeof parsed.policy === "object") {
+        this.policies.set(tenantId, parsed.policy as TenantBudgetPolicy);
+      }
+      if (parsed.spendUsd !== undefined) {
+        this.spendByTenantUsd.set(tenantId, Number(parsed.spendUsd ?? 0));
+      }
+      if (parsed.activeUtcDay) {
+        this.activeUtcDayByTenant.set(tenantId, String(parsed.activeUtcDay));
+      }
+      if (Array.isArray(parsed.seenIdemKeys)) {
+        for (const k of parsed.seenIdemKeys) {
+          this.seenLedgerIdempotencyKeys.add(String(k));
+        }
+      }
+      restored += 1;
+    }
+    return restored;
+  }
+
+  private persistTenantLedger(tenantId: string): void {
+    if (!this.sql) return;
+    const prefix = `${tenantId}::`;
+    const tenantIdemKeys = Array.from(this.seenLedgerIdempotencyKeys).filter((k) =>
+      k.startsWith(prefix)
+    );
+    this.sql.exec(
+      "INSERT OR REPLACE INTO persisted_finops_ledgers (tenant_id, payload_json) VALUES (?, ?)",
+      tenantId,
+      JSON.stringify({
+        tenantId,
+        policy: this.policies.get(tenantId),
+        spendUsd: this.spendByTenantUsd.get(tenantId) ?? 0,
+        activeUtcDay: this.activeUtcDayByTenant.get(tenantId),
+        seenIdemKeys: tenantIdemKeys,
+      })
+    );
+  }
 
   private static resolveUtcDayKey(dayOrTime?: string | number): string {
     if (typeof dayOrTime === "string" && dayOrTime.length > 0) {
@@ -29,6 +94,7 @@ export class FinOpsBudgetController {
     if (prevDay && prevDay !== utcDayKey) {
       this.spendByTenantUsd.set(tenantId, 0);
       this.activeUtcDayByTenant.set(tenantId, utcDayKey);
+      this.persistTenantLedger(tenantId);
       return true;
     }
     if (!prevDay) {
@@ -39,6 +105,7 @@ export class FinOpsBudgetController {
 
   public setPolicy(policy: TenantBudgetPolicy): void {
     this.policies.set(policy.tenantId, policy);
+    this.persistTenantLedger(policy.tenantId);
   }
 
   public configureTenant(params: {
@@ -58,21 +125,54 @@ export class FinOpsBudgetController {
     });
   }
 
-  public recordSpend(tenantId: string, costUsd: number, dayOrTime?: string | number): number {
+  /**
+   * [M61-2] Idempotent spend recording: when `idempotencyKey` is provided, duplicate retries
+   * return the current spend without double-charging the tenant's daily budget.
+   */
+  public recordSpend(
+    tenantId: string,
+    costUsd: number,
+    dayOrTime?: string | number,
+    idempotencyKey?: string
+  ): number {
     this.ensureUtcDayWindow(tenantId, dayOrTime);
-    const next = Number(((this.spendByTenantUsd.get(tenantId) ?? 0) + costUsd).toFixed(6));
+    if (idempotencyKey) {
+      const scoped = `${tenantId}::spend::${idempotencyKey}`;
+      if (this.seenLedgerIdempotencyKeys.has(scoped)) {
+        return this.spendByTenantUsd.get(tenantId) ?? 0;
+      }
+      this.seenLedgerIdempotencyKeys.add(scoped);
+    }
+    const safeCost = Number.isFinite(costUsd) && costUsd > 0 ? costUsd : 0;
+    const next = Number(((this.spendByTenantUsd.get(tenantId) ?? 0) + safeCost).toFixed(6));
     this.spendByTenantUsd.set(tenantId, next);
+    this.persistTenantLedger(tenantId);
     return next;
   }
 
   /**
-   * [M53-2] Refunds reserved or rolled-back spend so aborted turns never permanently exhaust tenant budget.
+   * [M53-2 & M61-2] Idempotent spend refund: when `idempotencyKey` is provided, duplicate refund
+   * retries do not deduct the refund amount a second time.
    */
-  public refundSpend(tenantId: string, refundUsd: number, dayOrTime?: string | number): number {
+  public refundSpend(
+    tenantId: string,
+    refundUsd: number,
+    dayOrTime?: string | number,
+    idempotencyKey?: string
+  ): number {
     this.ensureUtcDayWindow(tenantId, dayOrTime);
+    if (idempotencyKey) {
+      const scoped = `${tenantId}::refund::${idempotencyKey}`;
+      if (this.seenLedgerIdempotencyKeys.has(scoped)) {
+        return this.spendByTenantUsd.get(tenantId) ?? 0;
+      }
+      this.seenLedgerIdempotencyKeys.add(scoped);
+    }
     const curr = this.spendByTenantUsd.get(tenantId) ?? 0;
-    const next = Number(Math.max(0, curr - Math.max(0, refundUsd)).toFixed(6));
+    const safeRefund = Number.isFinite(refundUsd) && refundUsd > 0 ? refundUsd : 0;
+    const next = Number(Math.max(0, curr - safeRefund).toFixed(6));
     this.spendByTenantUsd.set(tenantId, next);
+    this.persistTenantLedger(tenantId);
     return next;
   }
 

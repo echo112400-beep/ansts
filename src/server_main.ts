@@ -2356,6 +2356,18 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M61] Full-Subsystem Persistence, Idempotent CAS/Push Retry, Breakpoint State Rollback & Coalescing Duplicate Arbitration Audit (`POST /v1beta1/management/system/subsystem-persistence-idempotency-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/subsystem-persistence-idempotency-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeSubsystemPersistenceIdempotencyAndCoalesceAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M60] End-to-End Full-Link Persistence, Tenant-Scoped & Deep-Canonical Idempotency, Deterministic Breakpoint Crash-Recovery & Coalescing Duplicate Inspection Audit (`POST /v1beta1/management/system/persistence-idempotency-recovery-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/persistence-idempotency-recovery-audit") {
       const body = await this.readJsonBody(req);

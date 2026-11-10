@@ -1,10 +1,12 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.AgentTaskHarnessCell = void 0; /**
- * @fileoverview M7 TASK-27 & M54-1: AgentTaskHarnessCell (Per-Task Stateful Actor with R2/RustFS LTX Snapshot Sync
- * & Cold-Start SQLite Fencing Watermark Rehydration).
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.AgentTaskHarnessCell = void 0;
+
+
+
+
+var _saga_gateway = require("../saga_gateway.js"); /**
+ * @fileoverview M7 TASK-27, M54-1 & M61-4: AgentTaskHarnessCell (Per-Task Stateful Actor with R2/RustFS LTX Snapshot Sync,
+ * Cold-Start SQLite Fencing Watermark Rehydration, Idempotent Turn Checkpoint Retry & R2-to-SQLite Breakpoint Reconciliation).
  */
-
-
-
 
 
 
@@ -53,6 +55,59 @@ class AgentTaskHarnessCell {
     };
   }
 
+  /**
+   * [M61-4] Reconciles any committed R2 LTX turn snapshots (`cells/${taskId}/turn-*.ltx`) that were written
+   * before an abrupt crash interrupted the subsequent SQLite `INSERT INTO harness_turns`, restoring RPO=0 breakpoint parity.
+   */
+  async reconcileBreakpointFromR2AndSql()
+
+
+
+  {
+    const prefix = `cells/${this.taskId}/`;
+    const listed = await this.r2Bucket.list({ prefix });
+    let reconciledTurnsCount = 0;
+    for (const objInfo of listed.objects) {
+      const body = await this.r2Bucket.get(objInfo.key);
+      if (!body) continue;
+      try {
+        const parsed = JSON.parse(await body.text());
+
+
+
+
+
+
+        const tIdx = Number(parsed.turnIndex ?? body.customMetadata.turnIndex ?? 0);
+        const fTok = Number(parsed.fencingToken ?? body.customMetadata.fencingToken ?? 0);
+        if (tIdx <= 0 || fTok <= 0) continue;
+
+        const existingSql = this.ctx.storage.sql.
+        exec("SELECT * FROM harness_turns WHERE turn_index = ?", tIdx).
+        one();
+        if (!existingSql || Number(existingSql.fencing_token ?? 0) < fTok) {
+          this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO harness_turns (turn_index, fencing_token, tool_name, output_json, r2_key) VALUES (?, ?, ?, ?, ?)",
+          tIdx,
+          fTok,
+          String(parsed.toolName ?? "reconciled_r2_turn"),
+          JSON.stringify(parsed.toolOutput ?? {}),
+          objInfo.key);
+
+          reconciledTurnsCount += 1;
+        }
+      } catch {
+
+        // ignore malformed object
+      }}
+    const watermarks = this.rehydrateWatermarksFromSql();
+    return {
+      reconciledTurnsCount,
+      highestTurnIndex: watermarks.highestTurnIndex,
+      highestFencingToken: watermarks.highestFencingToken
+    };
+  }
+
   getHighestFencingToken() {
     return this.highestFencingToken;
   }
@@ -69,6 +124,32 @@ class AgentTaskHarnessCell {
       `Stale fencing token ${params.fencingToken} < highest ${this.highestFencingToken} in AgentTaskHarnessCell`);
 
     }
+
+    // [M61-4] Check if this exact (turnIndex, fencingToken, toolName, canonical toolOutput) was already committed
+    const existingRow = this.ctx.storage.sql.
+    exec("SELECT * FROM harness_turns WHERE turn_index = ?", params.turnIndex).
+    one();
+    if (
+    existingRow &&
+    Number(existingRow.fencing_token) === params.fencingToken &&
+    String(existingRow.tool_name) === params.toolName)
+    {
+      const existingOut = JSON.parse(String(existingRow.output_json ?? "{}"));
+      if (
+      JSON.stringify(_saga_gateway.SagaToolGateway.canonicalizeValue(existingOut)) ===
+      JSON.stringify(_saga_gateway.SagaToolGateway.canonicalizeValue(params.toolOutput)))
+      {
+        return {
+          turnIndex: params.turnIndex,
+          fencingToken: params.fencingToken,
+          toolName: params.toolName,
+          toolOutput: existingOut,
+          r2SnapshotKey: String(existingRow.r2_key),
+          deduplicated: true
+        };
+      }
+    }
+
     if (
     (params.enforceTurnMonotonicity ?? false) &&
     params.fencingToken === this.highestFencingToken &&
@@ -88,6 +169,7 @@ class AgentTaskHarnessCell {
       taskId: this.taskId,
       turnIndex: params.turnIndex,
       fencingToken: params.fencingToken,
+      toolName: params.toolName,
       toolOutput: params.toolOutput
     });
 
@@ -113,7 +195,8 @@ class AgentTaskHarnessCell {
       fencingToken: params.fencingToken,
       toolName: params.toolName,
       toolOutput: params.toolOutput,
-      r2SnapshotKey: r2Key
+      r2SnapshotKey: r2Key,
+      deduplicated: false
     };
   }
 

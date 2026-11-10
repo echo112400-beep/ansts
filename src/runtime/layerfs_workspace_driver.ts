@@ -1,7 +1,8 @@
 /**
- * @fileoverview M17 TASK-84: LayerFS Dual-Path Execution Driver
+ * @fileoverview M17 TASK-84 & M61-5: LayerFS Dual-Path Execution Driver
  * - Fast Path (`@layerfs/agent` + `@layerfs/backend`): In-process file tool ops (`read`, `write`, `edit`, `grep`) -> atomic Commit (0 container boot)
  * - Sandbox Path (`@layerfs/runtime`): Real Ephemeral Workspace (`mount -> real child_process exec -> scan diff -> commit -> unmount`)
+ * - [M61-5] Step-Level Idempotent Commit Deduplication & Branch Breakpoint Rollback (`rollbackBranchToCommitOrStep`).
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -11,6 +12,13 @@ import { LayerFsContentStoreEngine } from "../checkpoint/layerfs_store_engine.js
 
 export type LayerFsToolCategory = "FILE_FAST_PATH" | "BASH_SANDBOX_MOUNT";
 
+export interface LayerFsWorkspaceFileEntry {
+  content: string;
+  mode: number;
+  objectId: string;
+  lastStepId: string;
+}
+
 export interface LayerFsCommitRecord {
   commitId: string;
   parentCommitId: string | null;
@@ -18,7 +26,7 @@ export interface LayerFsCommitRecord {
   agentId: string;
   stepId: string;
   toolCategory: LayerFsToolCategory;
-  filesTree: Map<string, { content: string; mode: number; objectId: string; lastStepId: string }>;
+  filesTree: Map<string, LayerFsWorkspaceFileEntry>;
   lineBlameMap: Map<string, string[]>;
   includesIgnoredDependencies: boolean;
   mountLatencyMs: number;
@@ -37,7 +45,7 @@ export class LayerFsWorkspaceDriver {
 
   private initMainRoot(): void {
     const rootCommitId = "C0";
-    const filesTree = new Map<string, { content: string; mode: number; objectId: string; lastStepId: string }>();
+    const filesTree = new Map<string, LayerFsWorkspaceFileEntry>();
     const pkgJson = '{"name":"workspace-app","dependencies":{"react":"^19.0.0"}}';
     const nodeModReact = "module.exports = { version: '19.0.0' };";
     const obj1 = this.storeEngine.putFileObject("package.json", pkgJson).object;
@@ -90,6 +98,35 @@ export class LayerFsWorkspaceDriver {
       headCommitId: headId,
       copiedFilesCount: 0,
     };
+  }
+
+  /**
+   * [M61-5] Rolls back a branch head to a historical `commitId` or `stepId` breakpoint so uncommitted
+   * or rolled-back turns leave zero orphan workspace mutations on the branch.
+   */
+  public rollbackBranchToCommitOrStep(
+    branchName: string,
+    targetCommitOrStepId: string
+  ): { branchName: string; restoredCommitId: string; restoredStepId: string } {
+    const headId = this.branchHeads.get(branchName);
+    if (!headId) {
+      throw new Error(`Branch '${branchName}' not found`);
+    }
+    let cur = this.commits.get(headId);
+    while (cur) {
+      if (cur.commitId === targetCommitOrStepId || cur.stepId === targetCommitOrStepId) {
+        this.branchHeads.set(branchName, cur.commitId);
+        return {
+          branchName,
+          restoredCommitId: cur.commitId,
+          restoredStepId: cur.stepId,
+        };
+      }
+      cur = cur.parentCommitId ? this.commits.get(cur.parentCommitId) : undefined;
+    }
+    throw new Error(
+      `Cannot rollback branch '${branchName}': target commit or step '${targetCommitOrStepId}' not found in ancestry`
+    );
   }
 
   public executeInProcessFileTool(params: {
@@ -239,7 +276,6 @@ export class LayerFsWorkspaceDriver {
             const mode = st.mode & 0o777;
             const baseSt = baselineStats.get(rel);
             const prev = parentCommit.filesTree.get(rel);
-            // Fast-path: skip reading file bytes if mtime (1700000000s), size, and mode are unchanged
             if (prev && baseSt && Math.floor(st.mtimeMs / 1000) === 1700000000 && st.size === baseSt.size && mode === baseSt.mode) {
               continue;
             }
