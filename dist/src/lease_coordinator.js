@@ -45,6 +45,10 @@ class LeaseCoordinator {
   /**
    * [M52-1] Restores monotonic fencing watermark on cell/node cold-start so rehydrated tasks never regress fencing tokens.
    */
+  rehydrateFencingWatermark(taskId, token) {
+    this.seedHighestFencingToken(taskId, token);
+  }
+
   seedHighestFencingToken(taskId, token) {
     const curr = this.highestTokenByTask.get(taskId) ?? 0;
     if (token > curr) {

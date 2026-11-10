@@ -1,4 +1,5 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var crypto = _interopRequireWildcard(require("node:crypto"));
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var _layerfs_store_engine = require("../checkpoint/layerfs_store_engine.js");
+var crypto = _interopRequireWildcard(require("node:crypto"));
 
 
 
@@ -73,7 +74,7 @@ var _budget_controller = require("../finops/budget_controller.js");
 var _escrow = require("../dag/escrow.js");
 var _wal_engine = require("../checkpoint/wal_engine.js");
 var _time_travel = require("../checkpoint/time_travel.js");
-
+var _layerfs_workspace_driver = require("../runtime/layerfs_workspace_driver.js");
 var _saga_gateway = require("../saga_gateway.js");
 
 
@@ -96,6 +97,7 @@ var _runner = require("../harness/runner.js");
 var _phase_controller = require("../runtime/phase_controller.js");
 var _mcp_registry = require("../saga/mcp_registry.js");
 var _celld_native_optimizations = require("../cloudflare/celld_native_optimizations.js");
+var _backpressure = require("../gateway/backpressure.js");
 var _cognitive_router = require("../cognitive_router.js");
 var _models = require("../models.js");
 var os = _interopRequireWildcard(require("node:os"));
@@ -5753,6 +5755,208 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           rpoRollbackAndSingleFlightVerified
         },
         allM55RisksEliminated
+      }
+    };
+  }
+  /**
+   * [M56] Unified Cold-Start Lease/Fencing Rehydration, LayerFS 3-Way Merge Deletion & Base-Object Pinning,
+   * P0 Emergency Ingress Headroom, CelldAdmin Epoch Guard & Facet/Isolate Memory Leak Elimination Audit:
+   * Verifies all 6 deep invariants:
+   * 1. [UnifiedPersistence-ColdStart-1] UnifiedComponentPersistenceStore rehydrates leaseCoordinator fencing watermarks and converts interrupted LEASED/RUNNING_* tasks back to QUEUED so they re-dispatch with monotonic fencing tokens.
+   * 2. [LayerFsMerge-DeletionAndConflict-2] LayerFsWorkspaceDriver detects file deletions (rm/delete) and LayerFsMultiAgentBranchCoordinator propagates clean deletions and catches delete/modify conflicts.
+   * 3. [LayerFsStore-PinAndCycleGuard-3] LayerFsContentStoreEngine refuses to delete a base object while a PREFIX/DELTA object still references it, and guards reconstructObjectContent against cyclic baseObjectId chains.
+   * 4. [IngressBackpressure-P0Headroom-4] IngressBackpressureController reserves +10% emergency burst headroom for P0_EMERGENCY tasks when globalQueueDepth reaches maxGlobalQueueDepth.
+   * 5. [CelldAdmin-NonRegressiveEpoch-5] CelldAdminClient rehydrates placements from SQLite on cold start and preserves existing epochFencingToken on re-registration.
+   * 6. [FacetAndIsolate-LeakGuard-6] DurableObjectFacetSupervisor frees SQLite stores on abortFaultyFacet and DynamicWorkerSandboxLoader bounds loadedSpecs via FIFO eviction.
+   */
+  async executeKernelStorageMergeAndBackpressureAudit(params)
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行 M56 内核存储与紧急准入审计" }
+      };
+    }
+
+    // 1. [UnifiedPersistence-ColdStart-1] Verify UnifiedComponentPersistenceStore rehydrates fencing watermark & requeues interrupted LEASED task
+    const sql = this.deps.v25Store.sql;
+    sql.exec("DELETE FROM persisted_tasks");
+    sql.exec("DELETE FROM persisted_leases");
+    const unified = new _unified_state_store.UnifiedComponentPersistenceStore(sql);
+    const sched1 = new _scheduler.CoreScheduler5D();
+    sched1.registerOrUpdateNode(new _models.NodeHeartbeat({ node_id: "node-m56", total_cpu_cores: 16, free_cpu_cores: 16 }));
+    const taskInterrupted = new _models.TaskSpec({ task_id: "task-m56-1", tenant_id: "Northstar", priority: _models.TaskPriority.P1_HIGH });
+    sched1.submitTask(taskInterrupted);
+    sched1.scheduleTick(1000);
+    // Simulate several lease renewals so fencing token is 5 while state is LEASED
+    taskInterrupted.lease_fencing_token = 5;
+    unified.snapshotSchedulerState(sched1);
+
+    const sched2 = new _scheduler.CoreScheduler5D();
+    sched2.registerOrUpdateNode(new _models.NodeHeartbeat({ node_id: "node-m56", total_cpu_cores: 16, free_cpu_cores: 16 }));
+    unified.rehydrateSchedulerFromSql(sched2);
+    const rehydratedSpec = sched2.allTasks.get("task-m56-1");
+    const convertedToQueued = rehydratedSpec?.state === _models.TaskState.QUEUED;
+    const placements2 = sched2.scheduleTick(1010);
+    const newFence = placements2.find((p) => p[0] === "task-m56-1")?.[2] ?? 0;
+    const unifiedColdStartRehydrationVerified = convertedToQueued && newFence === 6;
+
+    // 2. [LayerFsMerge-DeletionAndConflict-2] Verify file deletion tracking & 3-way merge deletion propagation + delete/modify conflict
+    const lfsDriver = new _layerfs_workspace_driver.LayerFsWorkspaceDriver();
+    lfsDriver.executeInProcessFileTool({
+      branchName: "main",
+      agentId: "agent-init",
+      stepId: "step-seed",
+      operation: "write",
+      filePath: "src/obsolete.ts",
+      newContent: "export const legacy = true;\n"
+    });
+    const baseCommitId = lfsDriver.getBranchHeadCommit("main").commitId;
+    lfsDriver.forkBranch("main", "branch-del");
+    lfsDriver.forkBranch("main", "branch-target");
+    lfsDriver.executeInProcessFileTool({
+      branchName: "branch-del",
+      agentId: "agent-del",
+      stepId: "step-del",
+      operation: "delete",
+      filePath: "src/obsolete.ts"
+    });
+    const merger = new _layerfs_branch_coordinator.LayerFsMultiAgentBranchCoordinator(lfsDriver);
+    const mergeCleanDel = merger.mergeBranchIntoTarget("branch-del", "branch-target", baseCommitId);
+    const targetHeadAfterDel = lfsDriver.getBranchHeadCommit("branch-target");
+    const cleanDeletionPropagated =
+    mergeCleanDel.deletedFiles.includes("src/obsolete.ts") && !targetHeadAfterDel.filesTree.has("src/obsolete.ts");
+
+    // Verify delete/modify conflict is caught when target modified the file that source deleted
+    lfsDriver.forkBranch(baseCommitId, "branch-del-2");
+    lfsDriver.forkBranch(baseCommitId, "branch-mod-2");
+    lfsDriver.executeInProcessFileTool({
+      branchName: "branch-del-2",
+      agentId: "agent-del",
+      stepId: "step-del-2",
+      operation: "delete",
+      filePath: "src/obsolete.ts"
+    });
+    lfsDriver.executeInProcessFileTool({
+      branchName: "branch-mod-2",
+      agentId: "agent-mod",
+      stepId: "step-mod-2",
+      operation: "write",
+      filePath: "src/obsolete.ts",
+      newContent: "export const legacy = false; // modified\n"
+    });
+    let deleteModifyConflictCaught = false;
+    try {
+      merger.mergeBranchIntoTarget("branch-del-2", "branch-mod-2", baseCommitId);
+    } catch {
+      deleteModifyConflictCaught = true;
+    }
+    const layerfsDeletionAndConflictVerified = cleanDeletionPropagated && deleteModifyConflictCaught;
+
+    // 3. [LayerFsStore-PinAndCycleGuard-3] Verify base object cannot be deleted while referenced by a PREFIX/DELTA object
+    const storeEngine = new _layerfs_store_engine.LayerFsContentStoreEngine();
+    const baseText = "const sharedHeader = \"0123456789abcdef0123456789abcdef\";\nexport const v = 1;\n";
+    const derivedText = "const sharedHeader = \"0123456789abcdef0123456789abcdef\";\nexport const v = 2;\n";
+    const baseObj = storeEngine.putFileObject("a.ts", baseText).object;
+    const derivedObj = storeEngine.putFileObject("a.ts", derivedText, baseText).object;
+    const freedWhilePinned = storeEngine.deleteObjectById(baseObj.objectId);
+    const reconstructedWhilePinned = storeEngine.reconstructObjectContent(derivedObj.objectId);
+    const storePinGuardVerified = freedWhilePinned === 0 && reconstructedWhilePinned === derivedText;
+
+    // 4. [IngressBackpressure-P0Headroom-4] Verify P0_EMERGENCY is admitted via +10% emergency burst headroom when P2 is blocked at maxGlobalQueueDepth
+    const bp = new _backpressure.IngressBackpressureController({ maxGlobalQueueDepth: 1000, p0EmergencyReserveRatio: 0.1 });
+    const p2AtFull = bp.evaluateAdmission({
+      priority: _models.TaskPriority.P2_STANDARD,
+      globalQueueDepth: 1000,
+      tenantActiveTasks: 10,
+      clusterPsiPressurePct: 20
+    });
+    const p0AtFull = bp.evaluateAdmission({
+      priority: _models.TaskPriority.P0_EMERGENCY,
+      globalQueueDepth: 1000,
+      tenantActiveTasks: 10,
+      clusterPsiPressurePct: 20
+    });
+    const ingressP0HeadroomVerified = !p2AtFull.allowed && p0AtFull.allowed && Boolean(p0AtFull.usedEmergencyHeadroom);
+
+    // 5. [CelldAdmin-NonRegressiveEpoch-5] Verify CelldAdminClient cold-start SQLite hydration & non-regressive registerCell
+    sql.exec("DELETE FROM celld_admin_placements");
+    const admin1 = new _celld_admin_client.CelldAdminClient(sql, new _env.InMemoryR2Bucket());
+    admin1.registerCell("cell-m56", "node-01");
+    await admin1.migrateCellToNode("cell-m56", "node-02"); // epoch -> 2
+    await admin1.migrateCellToNode("cell-m56", "node-03"); // epoch -> 3
+    const admin2 = new _celld_admin_client.CelldAdminClient(sql, new _env.InMemoryR2Bucket());
+    const rehydratedPlacement = admin2.getCellPlacement("cell-m56");
+    const reregistered = admin2.registerCell("cell-m56", "node-03");
+    const celldAdminNonRegressiveVerified =
+    rehydratedPlacement?.epochFencingToken === 3 && reregistered.epochFencingToken === 3;
+
+    // 6. [FacetAndIsolate-LeakGuard-6] Verify aborted Facet releases SQLite store & DynamicWorkerSandboxLoader caps spec cache
+    const facetSup = new _celld_native_optimizations.DurableObjectFacetSupervisor();
+    const spawned = facetSup.spawnToolFacet("task-m56", 1, "sql_tool", () => sql);
+    const countBeforeAbort = facetSup.getActiveSqlStoreCount();
+    facetSup.abortFaultyFacet(spawned.facetRecord.facetName, new Error("Simulated facet failure"));
+    const countAfterAbort = facetSup.getActiveSqlStoreCount();
+
+    const dynLoader = new _celld_native_optimizations.DynamicWorkerSandboxLoader(undefined, 2);
+    await dynLoader.executeUntrustedCodeInIsolate({ taskId: "t1", turnIndex: 1, jsSourceCode: "globalThis.__result = { n: 1 };" });
+    await dynLoader.executeUntrustedCodeInIsolate({ taskId: "t1", turnIndex: 2, jsSourceCode: "globalThis.__result = { n: 2 };" });
+    await dynLoader.executeUntrustedCodeInIsolate({ taskId: "t1", turnIndex: 3, jsSourceCode: "globalThis.__result = { n: 3 };" });
+    const facetAndIsolateLeakGuardVerified =
+    countBeforeAbort === 1 && countAfterAbort === 0 && dynLoader.getCachedSpecCount() === 2;
+
+    const allM56RisksEliminated =
+    unifiedColdStartRehydrationVerified &&
+    layerfsDeletionAndConflictVerified &&
+    storePinGuardVerified &&
+    ingressP0HeadroomVerified &&
+    celldAdminNonRegressiveVerified &&
+    facetAndIsolateLeakGuardVerified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M56 内核存储、三路合并删改冲突与 P0 紧急准入自检 (UnifiedColdStart=${unifiedColdStartRehydrationVerified}, LayerFsDeletion=${layerfsDeletionAndConflictVerified}, StorePin=${storePinGuardVerified}, P0Headroom=${ingressP0HeadroomVerified}, CelldAdminEpoch=${celldAdminNonRegressiveVerified}, FacetLeakGuard=${facetAndIsolateLeakGuardVerified})`,
+    "SystemWide / M56-KernelStorageAudit",
+    "ALL_M56_RISKS_ELIMINATED");
+
+
+    return {
+      status: 200,
+      body: {
+        unifiedColdStart1: {
+          convertedToQueued,
+          newFence,
+          unifiedColdStartRehydrationVerified
+        },
+        layerfsDeletionAndConflict2: {
+          cleanDeletionPropagated,
+          deleteModifyConflictCaught,
+          layerfsDeletionAndConflictVerified
+        },
+        layerfsStorePinGuard3: {
+          freedWhilePinned,
+          storePinGuardVerified
+        },
+        ingressP0Headroom4: {
+          p2BlockedAtFull: !p2AtFull.allowed,
+          p0AdmittedViaEmergencyHeadroom: p0AtFull.allowed,
+          ingressP0HeadroomVerified
+        },
+        celldAdminEpochGuard5: {
+          rehydratedEpoch: rehydratedPlacement?.epochFencingToken,
+          reregisteredEpoch: reregistered.epochFencingToken,
+          celldAdminNonRegressiveVerified
+        },
+        facetAndIsolateLeakGuard6: {
+          sqlStoresAfterAbort: countAfterAbort,
+          cachedSpecsCount: dynLoader.getCachedSpecCount(),
+          facetAndIsolateLeakGuardVerified
+        },
+        allM56RisksEliminated
       }
     };
   }

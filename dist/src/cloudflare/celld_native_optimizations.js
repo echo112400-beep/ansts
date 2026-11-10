@@ -5,8 +5,8 @@
 
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var vm = _interopRequireWildcard(require("node:vm"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M15 TASK-67 ~ TASK-70: denoland/celld Native Durable Object Facets (`ctx.facets`),
- * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution),
+ * @fileoverview M15 TASK-67 ~ TASK-70 & M56-4: denoland/celld Native Durable Object Facets (`ctx.facets`),
+ * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution & Bounded Spec Cache),
  * KV Single-Writer Sharding & V8 128MB Heap/SQL Real Wall-Clock Budget Guard.
  */
 
@@ -47,6 +47,10 @@ class DurableObjectFacetSupervisor {
     return { facetRecord: record, facetSql: sql };
   }
 
+  /**
+   * [M56-4] Aborts a faulty facet and immediately releases its `facetSqlStores` handle
+   * so aborted facets never leak SQLite store instances in memory.
+   */
   abortFaultyFacet(facetName, error) {
     const rec = this.activeFacets.get(facetName);
     if (!rec) {
@@ -54,6 +58,7 @@ class DurableObjectFacetSupervisor {
     }
     rec.status = "ABORTED";
     rec.abortReason = error.message;
+    this.facetSqlStores.delete(facetName);
     return rec;
   }
 
@@ -65,6 +70,10 @@ class DurableObjectFacetSupervisor {
     return true;
   }
 
+  getActiveSqlStoreCount() {
+    return this.facetSqlStores.size;
+  }
+
   listFacets() {
     return Array.from(this.activeFacets.values());
   }
@@ -73,9 +82,11 @@ class DurableObjectFacetSupervisor {
 class DynamicWorkerSandboxLoader {
   loader;
   loadedSpecs = new Map();
+  maxCachedSpecs;
 
-  constructor(loader) {
+  constructor(loader, maxCachedSpecs = 256) {
     this.loader = loader;
+    this.maxCachedSpecs = Math.max(1, maxCachedSpecs);
   }
 
   async executeUntrustedCodeInIsolate(params)
@@ -104,7 +115,15 @@ class DynamicWorkerSandboxLoader {
       env: { TASK_ID: params.taskId, TURN_INDEX: String(params.turnIndex) },
       globalOutbound: globalOutboundBlocked ? null : undefined
     };
+    if (this.loadedSpecs.has(isolateId)) {
+      this.loadedSpecs.delete(isolateId);
+    }
     this.loadedSpecs.set(isolateId, spec);
+    while (this.loadedSpecs.size > this.maxCachedSpecs) {
+      const oldestKey = this.loadedSpecs.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.loadedSpecs.delete(oldestKey);
+    }
 
     if (this.loader) {
       const stub = this.loader.get(isolateId, async () => spec);
@@ -171,6 +190,10 @@ class DynamicWorkerSandboxLoader {
 
   getLoadedSpec(isolateId) {
     return this.loadedSpecs.get(isolateId);
+  }
+
+  getCachedSpecCount() {
+    return this.loadedSpecs.size;
   }
 }exports.DynamicWorkerSandboxLoader = DynamicWorkerSandboxLoader;
 

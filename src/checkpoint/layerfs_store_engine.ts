@@ -1,6 +1,6 @@
 /**
- * @fileoverview M17 TASK-83: LayerFS Content-Addressed Store Engine (`layerfs/object/v2` Domain-Separated Digest,
- * Real `node:zlib` Deflate Compression, Lossless `FULL`/`PREFIX`/`DELTA` Reconstruction & 8 KiB B-Tree Pages).
+ * @fileoverview M17 TASK-83 & M56-3: LayerFS Content-Addressed Store Engine (`layerfs/object/v2` Domain-Separated Digest,
+ * Real `node:zlib` Deflate Compression, Cycle-Safe `FULL`/`PREFIX`/`DELTA` Reconstruction, Reference-Pinned Deletion & 8 KiB B-Tree Pages).
  */
 import * as crypto from "node:crypto";
 import * as zlib from "node:zlib";
@@ -77,28 +77,30 @@ export class LayerFsContentStoreEngine {
     if (previousContent && previousContent.length > 0) {
       const prevBuf = Buffer.from(previousContent, "utf-8");
       const baseId = LayerFsContentStoreEngine.computeCanonicalObjectId(prevBuf);
-      if (!this.objects.has(baseId)) {
-        this.putFileObject(filePath, previousContent, undefined, mode);
-      }
-      baseObjectId = baseId;
+      if (baseId !== objectId) {
+        if (!this.objects.has(baseId)) {
+          this.putFileObject(filePath, previousContent, undefined, mode);
+        }
+        baseObjectId = baseId;
 
-      let commonPrefix = 0;
-      const maxCheck = Math.min(contentBuf.length, prevBuf.length);
-      while (commonPrefix < maxCheck && contentBuf[commonPrefix] === prevBuf[commonPrefix]) {
-        commonPrefix += 1;
-      }
+        let commonPrefix = 0;
+        const maxCheck = Math.min(contentBuf.length, prevBuf.length);
+        while (commonPrefix < maxCheck && contentBuf[commonPrefix] === prevBuf[commonPrefix]) {
+          commonPrefix += 1;
+        }
 
-      if (commonPrefix >= 32) {
-        encoding = "PREFIX";
-        sharedPrefixByteLength = commonPrefix;
-        payloadToCompress = contentBuf.subarray(commonPrefix);
-      } else {
-        encoding = "DELTA";
-        const deltaEnvelope = JSON.stringify({
-          baseLen: prevBuf.length,
-          newText: content,
-        });
-        payloadToCompress = Buffer.from(deltaEnvelope, "utf-8");
+        if (commonPrefix >= 32) {
+          encoding = "PREFIX";
+          sharedPrefixByteLength = commonPrefix;
+          payloadToCompress = contentBuf.subarray(commonPrefix);
+        } else {
+          encoding = "DELTA";
+          const deltaEnvelope = JSON.stringify({
+            baseLen: prevBuf.length,
+            newText: content,
+          });
+          payloadToCompress = Buffer.from(deltaEnvelope, "utf-8");
+        }
       }
     }
 
@@ -121,7 +123,14 @@ export class LayerFsContentStoreEngine {
     return { object: stored, deduplicated: false };
   }
 
-  public reconstructObjectContent(objectId: string): string {
+  /**
+   * [M56-3] Cycle-safe object content reconstruction with visited-set loop detection.
+   */
+  public reconstructObjectContent(objectId: string, visited: Set<string> = new Set()): string {
+    if (visited.has(objectId)) {
+      throw new Error(`Cyclic LayerFS baseObjectId chain detected at '${objectId}'`);
+    }
+    visited.add(objectId);
     const obj = this.objects.get(objectId);
     if (!obj) {
       throw new Error(`LayerFS object '${objectId}' not found in Store`);
@@ -133,7 +142,7 @@ export class LayerFsContentStoreEngine {
     if (!obj.baseObjectId) {
       throw new Error(`Corrupt ${obj.encoding} object '${objectId}': missing baseObjectId`);
     }
-    const baseText = this.reconstructObjectContent(obj.baseObjectId);
+    const baseText = this.reconstructObjectContent(obj.baseObjectId, visited);
     if (obj.encoding === "PREFIX") {
       const baseBuf = Buffer.from(baseText, "utf-8");
       const prefixSlice = baseBuf.subarray(0, obj.sharedPrefixByteLength ?? 0);
@@ -222,9 +231,19 @@ export class LayerFsContentStoreEngine {
     return this.objects.get(objectId)?.baseObjectId;
   }
 
+  /**
+   * [M56-3] Reference-pinned object deletion:
+   * Refuses to delete `objectId` (`return 0`) if any other stored `PREFIX`/`DELTA` object still
+   * depends on `objectId` as its `baseObjectId`, preventing broken delta chains during GC sweeps.
+   */
   public deleteObjectById(objectId: string): number {
     const obj = this.objects.get(objectId);
     if (!obj) return 0;
+    for (const [otherId, otherObj] of this.objects.entries()) {
+      if (otherId !== objectId && otherObj.baseObjectId === objectId) {
+        return 0;
+      }
+    }
     const freed = obj.compressedBytes;
     this.storedCompressedBytes = Math.max(0, this.storedCompressedBytes - freed);
     this.objects.delete(objectId);

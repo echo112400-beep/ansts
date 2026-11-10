@@ -2337,6 +2337,18 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M56] Unified Cold-Start Lease/Fencing Rehydration, LayerFS 3-Way Merge Deletion & Base-Object Pinning, P0 Emergency Ingress Headroom, CelldAdmin Epoch Guard & Facet/Isolate Memory Leak Elimination Audit (`POST /v1beta1/management/system/kernel-storage-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/kernel-storage-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeKernelStorageMergeAndBackpressureAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M55] Deep Persistence, Shard Last-Brain Survival Guard, LayerFS Rule D9 Pull-State Sync, Time-Travel CRC32 Verification, Velocity Breaker Recovery & RPO=0 Atomic Rollback Audit (`POST /v1beta1/management/system/storage-ha-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/storage-ha-audit") {
       const body = await this.readJsonBody(req);

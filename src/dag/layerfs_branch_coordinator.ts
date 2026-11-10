@@ -1,6 +1,6 @@
 /**
- * @fileoverview M17 TASK-85: Multi-Agent Branch Coordination (`Layer -> Branch -> Merge -> Publish`),
- * Byte-Identity Merge, Mode Preservation, `.lww` (Last-Write-Wins) Rules & Explicit Conflict Refusal.
+ * @fileoverview M17 TASK-85 & M56-2: Multi-Agent Branch Coordination (`Layer -> Branch -> Merge -> Publish`),
+ * Byte-Identity Merge, Mode Preservation, `.lww` (Last-Write-Wins) Rules, Clean File Deletion Propagation & Delete/Modify Conflict Refusal.
  */
 import { LayerFsCommitRecord, LayerFsWorkspaceDriver } from "../runtime/layerfs_workspace_driver.js";
 
@@ -37,6 +37,7 @@ export class LayerFsMultiAgentBranchCoordinator {
     autoResolvedByByteIdentity: string[];
     autoResolvedByLww: string[];
     modeMergedFiles: string[];
+    deletedFiles: string[];
   } {
     const base = this.driver.getCommit(baseCommitId);
     if (!base) {
@@ -46,6 +47,7 @@ export class LayerFsMultiAgentBranchCoordinator {
     const targetHead = this.driver.getBranchHeadCommit(targetBranch);
 
     const allPaths = new Set<string>([
+      ...base.filesTree.keys(),
       ...sourceHead.filesTree.keys(),
       ...targetHead.filesTree.keys(),
     ]);
@@ -54,6 +56,7 @@ export class LayerFsMultiAgentBranchCoordinator {
     const autoResolvedByByteIdentity: string[] = [];
     const autoResolvedByLww: string[] = [];
     const modeMergedFiles: string[] = [];
+    const deletedFiles: string[] = [];
 
     const mergedTree = new Map(targetHead.filesTree);
     const mergedBlame = new Map(targetHead.lineBlameMap);
@@ -63,10 +66,48 @@ export class LayerFsMultiAgentBranchCoordinator {
       const srcFile = sourceHead.filesTree.get(filePath);
       const tgtFile = targetHead.filesTree.get(filePath);
 
+      const srcDeleted = Boolean(baseFile && !srcFile);
+      const tgtDeleted = Boolean(baseFile && !tgtFile);
       const srcChangedContent = srcFile?.content !== baseFile?.content;
       const tgtChangedContent = tgtFile?.content !== baseFile?.content;
-      const srcChangedMode = srcFile && baseFile && srcFile.mode !== baseFile.mode;
-      const tgtChangedMode = tgtFile && baseFile && tgtFile.mode !== baseFile.mode;
+      const srcChangedMode = Boolean(srcFile && baseFile && srcFile.mode !== baseFile.mode);
+      const tgtChangedMode = Boolean(tgtFile && baseFile && tgtFile.mode !== baseFile.mode);
+
+      // [M56-2] Handle file deletions and delete/modify conflicts in 3-way merge
+      if (srcDeleted && tgtDeleted) {
+        mergedTree.delete(filePath);
+        mergedBlame.delete(filePath);
+        deletedFiles.push(filePath);
+        continue;
+      }
+      if (srcDeleted) {
+        if (!tgtChangedContent && !tgtChangedMode) {
+          mergedTree.delete(filePath);
+          mergedBlame.delete(filePath);
+          deletedFiles.push(filePath);
+        } else if (this.isLwwPath(filePath)) {
+          autoResolvedByLww.push(filePath);
+          mergedTree.delete(filePath);
+          mergedBlame.delete(filePath);
+          deletedFiles.push(filePath);
+        } else {
+          conflicts.push(filePath);
+        }
+        continue;
+      }
+      if (tgtDeleted) {
+        if (!srcChangedContent && !srcChangedMode) {
+          mergedTree.delete(filePath);
+          mergedBlame.delete(filePath);
+          deletedFiles.push(filePath);
+        } else if (this.isLwwPath(filePath) && srcFile) {
+          autoResolvedByLww.push(filePath);
+          mergedTree.set(filePath, { ...srcFile });
+        } else {
+          conflicts.push(filePath);
+        }
+        continue;
+      }
 
       if (!srcChangedContent && !srcChangedMode) {
         continue;
@@ -129,6 +170,7 @@ export class LayerFsMultiAgentBranchCoordinator {
       autoResolvedByByteIdentity,
       autoResolvedByLww,
       modeMergedFiles,
+      deletedFiles,
     };
   }
 }

@@ -1,5 +1,6 @@
 /**
- * @fileoverview M10 TASK-36 & M47-2: denoland/celld Admin API Client (Cell Freeze, Migrate, SQLite Placement & R2 LTX Rehydrate).
+ * @fileoverview M10 TASK-36, M47-2 & M56-4: denoland/celld Admin API Client
+ * with Cold-Start SQLite Placement Rehydration & Non-Regressive Epoch Fencing Preservation.
  */
 import * as crypto from "node:crypto";
 import { InMemoryCellSqlStorage, InMemoryR2Bucket, R2BucketLike, SqlStorageLike } from "./env.js";
@@ -24,15 +25,40 @@ export class CelldAdminClient {
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS celld_admin_placements (cell_id TEXT PRIMARY KEY, host_node_id TEXT, epoch_token INTEGER, state TEXT, last_ltx_txid INTEGER, migration_sha256 TEXT)"
     );
+    this.rehydratePlacementsFromSql();
   }
 
+  private rehydratePlacementsFromSql(): void {
+    const rows = this.sql.exec<Record<string, unknown>>("SELECT * FROM celld_admin_placements").toArray();
+    for (const row of rows) {
+      const cellId = String(row.cell_id ?? "");
+      if (!cellId) continue;
+      this.placements.set(cellId, {
+        cellId,
+        hostNodeId: String(row.host_node_id ?? ""),
+        epochFencingToken: Number(row.epoch_token ?? 1),
+        state: (row.state as "ACTIVE" | "FROZEN" | "MIGRATING") ?? "ACTIVE",
+        lastLtxTxId: Number(row.last_ltx_txid ?? 1),
+        lastMigrationSha256: row.migration_sha256 ? String(row.migration_sha256) : undefined,
+      });
+    }
+  }
+
+  /**
+   * [M56-4] Non-regressive cell registration: preserves existing `epochFencingToken` if `cellId`
+   * was already registered or migrated earlier, preventing epoch rollback on re-registration.
+   */
   public registerCell(cellId: string, hostNodeId: string, lastLtxTxId = 1): CellPlacementRecord {
+    const existing = this.getCellPlacement(cellId);
+    const preservedEpoch = existing ? Math.max(1, existing.epochFencingToken) : 1;
+    const preservedTxId = existing ? Math.max(lastLtxTxId, existing.lastLtxTxId) : lastLtxTxId;
     const rec: CellPlacementRecord = {
       cellId,
       hostNodeId,
-      epochFencingToken: 1,
+      epochFencingToken: preservedEpoch,
       state: "ACTIVE",
-      lastLtxTxId,
+      lastLtxTxId: preservedTxId,
+      lastMigrationSha256: existing?.lastMigrationSha256,
     };
     this.placements.set(cellId, rec);
     this.sql.exec(
@@ -42,7 +68,7 @@ export class CelldAdminClient {
       rec.epochFencingToken,
       rec.state,
       rec.lastLtxTxId,
-      ""
+      rec.lastMigrationSha256 ?? ""
     );
     return rec;
   }
@@ -58,21 +84,9 @@ export class CelldAdminClient {
     ltxMigrationKey: string;
     migrationSha256: string;
   }> {
-    let rec = this.placements.get(cellId);
+    let rec = this.getCellPlacement(cellId);
     if (!rec) {
-      const row = this.sql
-        .exec<Record<string, unknown>>("SELECT * FROM celld_admin_placements WHERE cell_id = ?", cellId)
-        .one();
-      if (!row) {
-        throw new Error(`Cell '${cellId}' is not registered in CelldAdminClient`);
-      }
-      rec = {
-        cellId: String(row.cell_id),
-        hostNodeId: String(row.host_node_id),
-        epochFencingToken: Number(row.epoch_token ?? 1),
-        state: "ACTIVE",
-        lastLtxTxId: Number(row.last_ltx_txid ?? 1),
-      };
+      throw new Error(`Cell '${cellId}' is not registered in CelldAdminClient`);
     }
     const previousNodeId = rec.hostNodeId;
     rec.state = "FROZEN";
@@ -122,6 +136,21 @@ export class CelldAdminClient {
   }
 
   public getCellPlacement(cellId: string): CellPlacementRecord | undefined {
-    return this.placements.get(cellId);
+    const mem = this.placements.get(cellId);
+    if (mem) return mem;
+    const row = this.sql
+      .exec<Record<string, unknown>>("SELECT * FROM celld_admin_placements WHERE cell_id = ?", cellId)
+      .one();
+    if (!row) return undefined;
+    const hydrated: CellPlacementRecord = {
+      cellId: String(row.cell_id),
+      hostNodeId: String(row.host_node_id),
+      epochFencingToken: Number(row.epoch_token ?? 1),
+      state: (row.state as "ACTIVE" | "FROZEN" | "MIGRATING") ?? "ACTIVE",
+      lastLtxTxId: Number(row.last_ltx_txid ?? 1),
+      lastMigrationSha256: row.migration_sha256 ? String(row.migration_sha256) : undefined,
+    };
+    this.placements.set(cellId, hydrated);
+    return hydrated;
   }
 }

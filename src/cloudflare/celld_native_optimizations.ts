@@ -1,6 +1,6 @@
 /**
- * @fileoverview M15 TASK-67 ~ TASK-70: denoland/celld Native Durable Object Facets (`ctx.facets`),
- * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution),
+ * @fileoverview M15 TASK-67 ~ TASK-70 & M56-4: denoland/celld Native Durable Object Facets (`ctx.facets`),
+ * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution & Bounded Spec Cache),
  * KV Single-Writer Sharding & V8 128MB Heap/SQL Real Wall-Clock Budget Guard.
  */
 import * as crypto from "node:crypto";
@@ -47,6 +47,10 @@ export class DurableObjectFacetSupervisor {
     return { facetRecord: record, facetSql: sql };
   }
 
+  /**
+   * [M56-4] Aborts a faulty facet and immediately releases its `facetSqlStores` handle
+   * so aborted facets never leak SQLite store instances in memory.
+   */
   public abortFaultyFacet(facetName: string, error: Error): FacetLifecycleRecord {
     const rec = this.activeFacets.get(facetName);
     if (!rec) {
@@ -54,6 +58,7 @@ export class DurableObjectFacetSupervisor {
     }
     rec.status = "ABORTED";
     rec.abortReason = error.message;
+    this.facetSqlStores.delete(facetName);
     return rec;
   }
 
@@ -65,6 +70,10 @@ export class DurableObjectFacetSupervisor {
     return true;
   }
 
+  public getActiveSqlStoreCount(): number {
+    return this.facetSqlStores.size;
+  }
+
   public listFacets(): FacetLifecycleRecord[] {
     return Array.from(this.activeFacets.values());
   }
@@ -73,9 +82,11 @@ export class DurableObjectFacetSupervisor {
 export class DynamicWorkerSandboxLoader {
   private readonly loader?: DynamicWorkerLoaderBindingLike;
   private readonly loadedSpecs: Map<string, DynamicWorkerLoaderModuleSpec> = new Map();
+  private readonly maxCachedSpecs: number;
 
-  constructor(loader?: DynamicWorkerLoaderBindingLike) {
+  constructor(loader?: DynamicWorkerLoaderBindingLike, maxCachedSpecs = 256) {
     this.loader = loader;
+    this.maxCachedSpecs = Math.max(1, maxCachedSpecs);
   }
 
   public async executeUntrustedCodeInIsolate(params: {
@@ -104,7 +115,15 @@ export class DynamicWorkerSandboxLoader {
       env: { TASK_ID: params.taskId, TURN_INDEX: String(params.turnIndex) },
       globalOutbound: globalOutboundBlocked ? null : undefined,
     };
+    if (this.loadedSpecs.has(isolateId)) {
+      this.loadedSpecs.delete(isolateId);
+    }
     this.loadedSpecs.set(isolateId, spec);
+    while (this.loadedSpecs.size > this.maxCachedSpecs) {
+      const oldestKey = this.loadedSpecs.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.loadedSpecs.delete(oldestKey);
+    }
 
     if (this.loader) {
       const stub = this.loader.get(isolateId, async () => spec);
@@ -171,6 +190,10 @@ export class DynamicWorkerSandboxLoader {
 
   public getLoadedSpec(isolateId: string): DynamicWorkerLoaderModuleSpec | undefined {
     return this.loadedSpecs.get(isolateId);
+  }
+
+  public getCachedSpecCount(): number {
+    return this.loadedSpecs.size;
   }
 }
 

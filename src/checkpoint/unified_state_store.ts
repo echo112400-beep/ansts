@@ -1,5 +1,6 @@
 /**
- * @fileoverview M14 TASK-63 ~ TASK-66 & M48-1: Unified 8-Table Component Persistence Store & Cold-Start Rehydration Engine.
+ * @fileoverview M14 TASK-63 ~ TASK-66, M48-1 & M56-1: Unified 8-Table Component Persistence Store & Cold-Start Rehydration Engine
+ * with Monotonic Fencing Watermark Rehydration & Interrupted In-Flight Task Recovery.
  */
 import { SqlStorageLike } from "../cloudflare/env.js";
 import { CoreScheduler5D } from "../scheduler.js";
@@ -53,7 +54,25 @@ export class UnifiedComponentPersistenceStore {
     return { tasksSaved, leasesSaved: Math.max(tasksSaved, leasesSaved) };
   }
 
-  public rehydrateSchedulerFromSql(targetScheduler: CoreScheduler5D): number {
+  /**
+   * [M56-1] Rehydrates tasks and fencing watermarks from `persisted_tasks` and `persisted_leases`.
+   * Any task that was interrupted mid-flight (`LEASED`, `RUNNING_THINK`, `RUNNING_ACT`) is safely
+   * transitioned back to `QUEUED` and enqueued so it is re-dispatched with a higher monotonic fencing token.
+   */
+  public rehydrateSchedulerFromSql(
+    targetScheduler: CoreScheduler5D,
+    options?: { requeueInterruptedLeases?: boolean }
+  ): number {
+    const requeueInterrupted = options?.requeueInterruptedLeases ?? true;
+    const leaseRows = this.sql.exec<Record<string, unknown>>("SELECT * FROM persisted_leases").toArray();
+    for (const lr of leaseRows) {
+      const taskId = String(lr.task_id ?? "");
+      const ft = Number(lr.fencing_token ?? 0);
+      if (taskId && ft > 0) {
+        targetScheduler.leaseCoordinator.rehydrateFencingWatermark(taskId, ft);
+      }
+    }
+
     const rows = this.sql.exec<Record<string, unknown>>("SELECT * FROM persisted_tasks").toArray();
     let restored = 0;
     for (const r of rows) {
@@ -66,10 +85,32 @@ export class UnifiedComponentPersistenceStore {
         max_turns: Number(raw.max_turns ?? 30),
         timeout_seconds: Number(raw.timeout_seconds ?? 1800),
         dependencies: Array.isArray(raw.dependencies) ? raw.dependencies.map(String) : [],
+        idempotency_key: raw.idempotency_key ? String(raw.idempotency_key) : undefined,
+        parent_task_id: raw.parent_task_id ? String(raw.parent_task_id) : undefined,
+        expected_SubAgent_count:
+          raw.expected_SubAgent_count !== undefined ? Number(raw.expected_SubAgent_count) : undefined,
       });
+      if (raw.current_turn !== undefined) {
+        spec.current_turn = Number(raw.current_turn);
+      }
       spec.state = (raw.state as TaskState) ?? TaskState.QUEUED;
       spec.lease_fencing_token = Number(raw.lease_fencing_token ?? 0);
       spec.assigned_node_id = raw.assigned_node_id ? String(raw.assigned_node_id) : undefined;
+
+      if (spec.lease_fencing_token > 0) {
+        targetScheduler.leaseCoordinator.rehydrateFencingWatermark(spec.task_id, spec.lease_fencing_token);
+      }
+
+      if (
+        requeueInterrupted &&
+        (spec.state === TaskState.LEASED ||
+          spec.state === TaskState.RUNNING_THINK ||
+          spec.state === TaskState.RUNNING_ACT)
+      ) {
+        spec.state = TaskState.QUEUED;
+        spec.assigned_node_id = undefined;
+      }
+
       targetScheduler.allTasks.set(spec.task_id, spec);
       if (spec.state === TaskState.QUEUED) {
         targetScheduler.queueManager.enqueue(spec);

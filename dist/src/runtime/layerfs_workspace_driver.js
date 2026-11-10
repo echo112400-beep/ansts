@@ -121,6 +121,22 @@ class LayerFsWorkspaceDriver {
       };
     }
 
+    if (params.operation === "delete") {
+      if (!parentCommit.filesTree.has(params.filePath)) {
+        return { commitId: headId, committedNewSnapshot: false, containerSpawned: false };
+      }
+      const nextCommit = this.createChildCommit({
+        parentCommit,
+        branchName: params.branchName,
+        agentId: params.agentId,
+        stepId: params.stepId,
+        toolCategory: "FILE_FAST_PATH",
+        mountLatencyMs: 0,
+        mutations: [],
+        deletions: [params.filePath]
+      });
+      return { commitId: nextCommit.commitId, committedNewSnapshot: true, containerSpawned: false };
+    }
     const content = params.newContent ?? "";
     const prevEntry = parentCommit.filesTree.get(params.filePath);
     if (prevEntry && prevEntry.content === content && (params.mode === undefined || prevEntry.mode === params.mode)) {
@@ -210,6 +226,7 @@ class LayerFsWorkspaceDriver {
       }
 
       const discoveredMutations = [];
+      const seenFilesOnDisk = new Set();
       const scanDir = (dir) => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           const full = path.join(dir, entry.name);
@@ -217,6 +234,7 @@ class LayerFsWorkspaceDriver {
             scanDir(full);
           } else if (entry.isFile()) {
             const rel = path.relative(mountDir, full).split(path.sep).join("/");
+            seenFilesOnDisk.add(rel);
             const st = fs.statSync(full);
             const mode = st.mode & 0o777;
             const baseSt = baselineStats.get(rel);
@@ -233,8 +251,14 @@ class LayerFsWorkspaceDriver {
         }
       };
       scanDir(mountDir);
+      const discoveredDeletions = [];
+      for (const existingPath of parentCommit.filesTree.keys()) {
+        if (!seenFilesOnDisk.has(existingPath)) {
+          discoveredDeletions.push(existingPath);
+        }
+      }
 
-      if (discoveredMutations.length === 0) {
+      if (discoveredMutations.length === 0 && discoveredDeletions.length === 0) {
         return {
           commitId: headId,
           committedNewSnapshot: false,
@@ -252,7 +276,8 @@ class LayerFsWorkspaceDriver {
         stepId: params.stepId,
         toolCategory: "BASH_SANDBOX_MOUNT",
         mountLatencyMs,
-        mutations: discoveredMutations
+        mutations: discoveredMutations,
+        deletions: discoveredDeletions
       });
 
       return {
@@ -276,6 +301,7 @@ class LayerFsWorkspaceDriver {
 
 
 
+
   {
     this.commitSeq += 1;
     const commitId = `C${this.commitSeq}`;
@@ -285,6 +311,10 @@ class LayerFsWorkspaceDriver {
       lineBlameMap.set(k, [...v]);
     }
 
+    for (const delPath of params.deletions ?? []) {
+      filesTree.delete(delPath);
+      lineBlameMap.delete(delPath);
+    }
     const changedForBtree = [];
     for (const mut of params.mutations) {
       const prev = filesTree.get(mut.filePath);

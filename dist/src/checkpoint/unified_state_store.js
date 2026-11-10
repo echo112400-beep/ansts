@@ -3,10 +3,11 @@
 
 
 
+
 var _models = require("../models.js"); /**
- * @fileoverview M14 TASK-63 ~ TASK-66 & M48-1: Unified 8-Table Component Persistence Store & Cold-Start Rehydration Engine.
- */class UnifiedComponentPersistenceStore {
-  sql;
+ * @fileoverview M14 TASK-63 ~ TASK-66, M48-1 & M56-1: Unified 8-Table Component Persistence Store & Cold-Start Rehydration Engine
+ * with Monotonic Fencing Watermark Rehydration & Interrupted In-Flight Task Recovery.
+ */class UnifiedComponentPersistenceStore {sql;
 
   constructor(sql) {
     this.sql = sql;
@@ -53,7 +54,25 @@ var _models = require("../models.js"); /**
     return { tasksSaved, leasesSaved: Math.max(tasksSaved, leasesSaved) };
   }
 
-  rehydrateSchedulerFromSql(targetScheduler) {
+  /**
+   * [M56-1] Rehydrates tasks and fencing watermarks from `persisted_tasks` and `persisted_leases`.
+   * Any task that was interrupted mid-flight (`LEASED`, `RUNNING_THINK`, `RUNNING_ACT`) is safely
+   * transitioned back to `QUEUED` and enqueued so it is re-dispatched with a higher monotonic fencing token.
+   */
+  rehydrateSchedulerFromSql(
+  targetScheduler,
+  options)
+  {
+    const requeueInterrupted = options?.requeueInterruptedLeases ?? true;
+    const leaseRows = this.sql.exec("SELECT * FROM persisted_leases").toArray();
+    for (const lr of leaseRows) {
+      const taskId = String(lr.task_id ?? "");
+      const ft = Number(lr.fencing_token ?? 0);
+      if (taskId && ft > 0) {
+        targetScheduler.leaseCoordinator.rehydrateFencingWatermark(taskId, ft);
+      }
+    }
+
     const rows = this.sql.exec("SELECT * FROM persisted_tasks").toArray();
     let restored = 0;
     for (const r of rows) {
@@ -65,11 +84,33 @@ var _models = require("../models.js"); /**
         prompt: String(raw.prompt ?? ""),
         max_turns: Number(raw.max_turns ?? 30),
         timeout_seconds: Number(raw.timeout_seconds ?? 1800),
-        dependencies: Array.isArray(raw.dependencies) ? raw.dependencies.map(String) : []
+        dependencies: Array.isArray(raw.dependencies) ? raw.dependencies.map(String) : [],
+        idempotency_key: raw.idempotency_key ? String(raw.idempotency_key) : undefined,
+        parent_task_id: raw.parent_task_id ? String(raw.parent_task_id) : undefined,
+        expected_SubAgent_count:
+        raw.expected_SubAgent_count !== undefined ? Number(raw.expected_SubAgent_count) : undefined
       });
+      if (raw.current_turn !== undefined) {
+        spec.current_turn = Number(raw.current_turn);
+      }
       spec.state = raw.state ?? _models.TaskState.QUEUED;
       spec.lease_fencing_token = Number(raw.lease_fencing_token ?? 0);
       spec.assigned_node_id = raw.assigned_node_id ? String(raw.assigned_node_id) : undefined;
+
+      if (spec.lease_fencing_token > 0) {
+        targetScheduler.leaseCoordinator.rehydrateFencingWatermark(spec.task_id, spec.lease_fencing_token);
+      }
+
+      if (
+      requeueInterrupted && (
+      spec.state === _models.TaskState.LEASED ||
+      spec.state === _models.TaskState.RUNNING_THINK ||
+      spec.state === _models.TaskState.RUNNING_ACT))
+      {
+        spec.state = _models.TaskState.QUEUED;
+        spec.assigned_node_id = undefined;
+      }
+
       targetScheduler.allTasks.set(spec.task_id, spec);
       if (spec.state === _models.TaskState.QUEUED) {
         targetScheduler.queueManager.enqueue(spec);
