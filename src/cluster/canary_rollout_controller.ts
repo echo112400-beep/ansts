@@ -25,4 +25,14 @@ export class CanaryRolloutController {
     }
     return { state: this.state, trafficWeightPct: this.trafficWeightPct };
   }
+
+  public getStatus(): { state: "CANARY_ACTIVE" | "PROMOTED" | "ROLLED_BACK"; trafficWeightPct: number } {
+    return { state: this.state, trafficWeightPct: this.trafficWeightPct };
+  }
+
+  public resetCanary(initialWeightPct = 5): { state: "CANARY_ACTIVE" | "PROMOTED" | "ROLLED_BACK"; trafficWeightPct: number } {
+    this.state = "CANARY_ACTIVE";
+    this.trafficWeightPct = initialWeightPct;
+    return this.getStatus();
+  }
 }

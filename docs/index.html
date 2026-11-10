@@ -1010,6 +1010,11 @@ dialog#dialog::backdrop {
         compliant: true,
         breaches: []
       },
+      canary: { state: 'CANARY_ACTIVE', trafficWeightPct: 5 },
+      taskFilterSearch: '',
+      taskFilterState: 'ALL',
+      auditFilterQuery: '',
+      auditFilterRole: 'ALL',
       slotDistribution: { 'brain-node-01': 85, 'brain-node-02': 86, 'brain-node-03': 85 },
       batchReport: null,
       nodes: [
@@ -1121,6 +1126,7 @@ dialog#dialog::backdrop {
       state.loadSheddingActive = Boolean(d.loadSheddingActive);
       state.verificationRetried = Boolean(d.verificationRetried);
       if (d.sla) state.sla = d.sla;
+      if (d.canary) state.canary = d.canary;
       if (d.slotDistribution) state.slotDistribution = d.slotDistribution;
       state.batchReport = d.batchReport || null;
       state.nodes = d.nodes || state.nodes;
@@ -1376,6 +1382,61 @@ dialog#dialog::backdrop {
         },
         fromLiveBackend: false
       };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/nodes/scale') {
+      if (body.action === 'decommission') {
+        state.nodes = state.nodes.filter((n) => n.id !== body.nodeId);
+        return { ok: true, status: 200, data: { decommissioned: true, nodeId: body.nodeId }, fromLiveBackend: false };
+      }
+      const newNode = {
+        id: body.nodeId || 'body-host-04',
+        role: body.role === 'brain' ? 'Brain Shard (' + body.nodeId + ')' : 'Body LayerFS (' + body.nodeId + ')',
+        region: body.region || 'us-west-2',
+        slots: body.role === 'brain' ? 64 : 0,
+        cpuPct: 38.5,
+        psiPct: 1.8,
+        status: 'READY',
+        activeLeases: 12,
+        pinnedP0Tasks: [],
+        tunnelGw: 'celld-gw-01 (PRIMARY)'
+      };
+      state.nodes.push(newNode);
+      if (body.role === 'brain') {
+        state.slotDistribution = { 'brain-node-01': 64, 'brain-node-02': 64, 'brain-node-03': 64, [body.nodeId.replace('celld-brain-', 'brain-node-')]: 64 };
+      }
+      return { ok: true, status: 201, data: newNode, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/tenants/finops-escrow') {
+      const t = state.tenants.find((x) => x.id === body.tenantId) || state.tenants[0];
+      if (body.action === 'reserve_escrow') {
+        t.escrowReserved += Number(body.escrowDeltaSlots || 4);
+        return { ok: true, status: 200, data: { tenantId: t.id, escrowReserved: t.escrowReserved }, fromLiveBackend: false };
+      }
+      const delta = Number(body.spendDeltaUsd || 220);
+      t.spentUsd = (t.spentUsd || 0) + delta;
+      const ratio = t.spentUsd / Math.max(1, t.dailyBudgetUsd);
+      t.modelPolicy = ratio >= 1.0 ? '402 HARD_BLOCK (日预算已耗尽)' : ratio >= 0.8 ? '已触发 80% 软降级 → Qwen-3.8 Economy' : 'DeepSeek-R1 → Qwen-3.8 (80%)';
+      return { ok: true, status: 200, data: { tenantId: t.id, spentUsd: t.spentUsd, modelPolicy: t.modelPolicy }, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/tasks/step') {
+      const tk = state.tasks.find((x) => x.id === body.taskId) || state.tasks[0];
+      tk.turn += 1;
+      return { ok: true, status: 200, data: { taskId: tk.id, turnIndex: tk.turn, crc32Hex: 'c91f00' + tk.turn, commitId: 'C' + (tk.turn - 1) }, fromLiveBackend: false };
+    }
+    if (method === 'POST' && endpointPath === '/v1beta1/management/canary') {
+      if (body.action === 'toggle_region') {
+        return { ok: true, status: 200, data: { updated: true, regionId: body.regionId }, fromLiveBackend: false };
+      }
+      if (!state.canary) state.canary = { state: 'CANARY_ACTIVE', trafficWeightPct: 5 };
+      if (body.action === 'reset_canary') {
+        state.canary = { state: 'CANARY_ACTIVE', trafficWeightPct: 5 };
+      } else if (body.action === 'inject_anomaly') {
+        state.canary = { state: 'ROLLED_BACK', trafficWeightPct: 0 };
+      } else {
+        const nextW = Math.min(100, state.canary.trafficWeightPct * 2 + 15);
+        state.canary = { state: nextW >= 100 ? 'PROMOTED' : 'CANARY_ACTIVE', trafficWeightPct: nextW };
+      }
+      return { ok: true, status: 200, data: state.canary, fromLiveBackend: false };
     }
     if (method === 'POST' && endpointPath === '/v1beta1/management/capacity/action') {
       state.loadSheddingActive = true;
@@ -1725,6 +1786,23 @@ dialog#dialog::backdrop {
         </div>
       </section>
 
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">渐进式金丝雀发布控制器 (CanaryRolloutController · POST /v1beta1/management/canary)</h2>
+            <p class="panel-subtitle">按 5% → 25% → 65% → 100% 阶梯推进控制面新版本流量，当错误率 &gt; 1% 或 P99 &gt; 1500ms 时自动触发零停机回滚。</p>
+          </div>
+          <div class="btn-row">
+            <span class="status-pill ${state.canary?.state === 'ROLLED_BACK' ? 'danger' : state.canary?.state === 'PROMOTED' ? 'ok' : 'warn'}">
+              ${state.canary?.state || 'CANARY_ACTIVE'} · 流量权重 ${state.canary?.trafficWeightPct ?? 5}%
+            </span>
+            <button type="button" class="small primary" data-action="canary-action" data-op="promote_step" ${!canMutateTarget('all', 'all', true).ok ? 'disabled' : ''}>推进金丝雀流量 (+Step)</button>
+            <button type="button" class="small danger" data-action="canary-action" data-op="inject_anomaly" ${!canMutateTarget('all', 'all', true).ok ? 'disabled' : ''}>注入异常触发自动回滚</button>
+            <button type="button" class="small" data-action="canary-action" data-op="reset_canary" ${!canMutateTarget('all', 'all', true).ok ? 'disabled' : ''}>重置 (5%)</button>
+          </div>
+        </div>
+      </div>
+
       <div class="split-grid">
         <div class="panel">
           <div class="panel-header">
@@ -1826,6 +1904,7 @@ dialog#dialog::backdrop {
           </div>
           <div class="btn-row">
             <button type="button" data-action="run-batch-node-op" data-op="prewarm" ${!perm.ok ? 'disabled' : ''}>批量预热沙箱池</button>
+            <button type="button" data-action="open-scale-node-dialog" ${!perm.ok ? 'disabled' : ''}>+ 扩容裸金属/容器节点 (/v1beta1/management/nodes/scale)</button>
             <button type="button" class="primary" data-action="run-batch-node-op" data-op="drain" ${!perm.ok ? 'disabled' : ''}>批量执行节点维护排水</button>
           </div>
         </div>
@@ -1935,9 +2014,11 @@ dialog#dialog::backdrop {
                     <td>${t.modelPolicy}</td>
                     <td class="mono">v${t.configVersion} <span class="muted">(${t.updatedBy || 'chen'})</span></td>
                     <td>
-                      <button type="button" class="small primary" data-action="open-quota-dialog" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''}>
-                        编辑配额与预算
-                      </button>
+                      <div class="btn-row">
+                        <button type="button" class="small primary" data-action="open-quota-dialog" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''}>编辑配额</button>
+                        <button type="button" class="small" data-action="tenant-finops-step" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''} title="累加计费流水测试 80% 软降级与 100% 熔断">+计费步进</button>
+                        <button type="button" class="small" data-action="tenant-escrow-step" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''} title="增加 DAG 子任务并发担保槽位">+DAG预留</button>
+                      </div>
                     </td>
                   </tr>
                 `;
@@ -1959,7 +2040,15 @@ dialog#dialog::backdrop {
             <p class="panel-subtitle">对接 <code>POST /v1beta1/management/tasks/cancel</code> 与 <code>POST /v1beta1/management/tasks/time-travel</code>，支持派发新任务、推进 Fencing Token 与零拷贝回合分叉。</p>
           </div>
           <div class="btn-row">
-            <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务 (/v1beta1/tasks/dispatch)</button>
+            <input id="mgmt-task-search" type="text" value="${state.taskFilterSearch || ''}" placeholder="搜索任务 ID / 租户 / 分支..." style="width:180px;" />
+            <select id="mgmt-task-state-filter">
+              <option value="ALL" ${state.taskFilterState === 'ALL' ? 'selected' : ''}>所有状态</option>
+              <option value="RUNNING_ACT" ${state.taskFilterState === 'RUNNING_ACT' ? 'selected' : ''}>RUNNING_ACT</option>
+              <option value="LEASED" ${state.taskFilterState === 'LEASED' ? 'selected' : ''}>LEASED</option>
+              <option value="CANCEL_UNCONFIRMED" ${state.taskFilterState === 'CANCEL_UNCONFIRMED' ? 'selected' : ''}>CANCEL_UNCONFIRMED</option>
+              <option value="FENCED_TERMINATED" ${state.taskFilterState === 'FENCED_TERMINATED' ? 'selected' : ''}>FENCED_TERMINATED</option>
+            </select>
+            <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
         <div class="table-wrap">
@@ -1977,7 +2066,12 @@ dialog#dialog::backdrop {
               </tr>
             </thead>
             <tbody>
-              ${state.tasks.map((t) => {
+              ${state.tasks.filter((t) => {
+                if (state.taskFilterState && state.taskFilterState !== 'ALL' && t.state !== state.taskFilterState) return false;
+                const q = (state.taskFilterSearch || '').toLowerCase().trim();
+                if (!q) return true;
+                return String(t.id).toLowerCase().includes(q) || String(t.tenant).toLowerCase().includes(q) || String(t.branch).toLowerCase().includes(q);
+              }).map((t) => {
                 const perm = canMutateTarget(t.region, t.tenant, false);
                 const isUnconfirmed = t.state === 'CANCEL_UNCONFIRMED';
                 const isFenced = t.state === 'FENCED_TERMINATED';
@@ -1993,9 +2087,8 @@ dialog#dialog::backdrop {
                     <td><span class="status-pill ${pillCls}">${t.state}</span></td>
                     <td>
                       <div class="btn-row">
-                        <button type="button" class="small" data-action="open-turn-history-dialog" data-task="${t.id}">
-                          回合历史 / 分叉
-                        </button>
+                        <button type="button" class="small primary" data-action="step-task-turn" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>+推进回合</button>
+                        <button type="button" class="small" data-action="open-turn-history-dialog" data-task="${t.id}">回合历史 / 分叉</button>
                         <button type="button" class="small" data-action="graceful-stop-task" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>
                           请求停止
                         </button>
@@ -2068,6 +2161,48 @@ dialog#dialog::backdrop {
                   </tr>
                 `;
               }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">不可篡改变更审计日志检索与合规导出 (GET /v1beta1/management/audits)</h2>
+            <p class="panel-subtitle">支持按操作人、RBAC 角色或动作关键字实时检索 SQLite <code>v25_mgmt_audit_logs</code> 并导出合规 JSON 报告。</p>
+          </div>
+          <div class="btn-row">
+            <input id="mgmt-audit-search" type="text" value="${state.auditFilterQuery || ''}" placeholder="检索审计动作 / 作用域 / 结果..." style="width:200px;" />
+            <select id="mgmt-audit-role">
+              <option value="ALL" ${state.auditFilterRole === 'ALL' ? 'selected' : ''}>全部角色</option>
+              <option value="SRE_ADMIN" ${state.auditFilterRole === 'SRE_ADMIN' ? 'selected' : ''}>SRE_ADMIN</option>
+              <option value="OPERATOR" ${state.auditFilterRole === 'OPERATOR' ? 'selected' : ''}>OPERATOR</option>
+            </select>
+            <button type="button" class="small" data-action="export-audit-json">导出合规审计报告 (JSON)</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr><th>时间戳</th><th>操作员</th><th>RBAC 角色</th><th>作用域</th><th>变更动作详情</th><th>执行结果</th></tr>
+            </thead>
+            <tbody>
+              ${state.auditLogs.filter((l) => {
+                if (state.auditFilterRole && state.auditFilterRole !== 'ALL' && l.role !== state.auditFilterRole) return false;
+                const q = (state.auditFilterQuery || '').toLowerCase().trim();
+                if (!q) return true;
+                return String(l.action).toLowerCase().includes(q) || String(l.scope).toLowerCase().includes(q) || String(l.actor).toLowerCase().includes(q) || String(l.outcome).toLowerCase().includes(q);
+              }).map((log) => `
+                <tr>
+                  <td class="mono">${log.ts}</td>
+                  <td><strong>${log.actor}</strong></td>
+                  <td class="mono">${log.role || 'SRE_ADMIN'}</td>
+                  <td class="mono">${log.scope}</td>
+                  <td>${log.action}</td>
+                  <td><span class="status-pill ok">${log.outcome}</span></td>
+                </tr>
+              `).join('')}
             </tbody>
           </table>
         </div>
@@ -2408,6 +2543,42 @@ dialog#dialog::backdrop {
     );
   }
 
+  function openScaleOutNodeDialog() {
+    const p = getPrincipal();
+    const nextIdx = state.nodes.length + 1;
+    openDialog(
+      '扩容裸金属 / 容器节点 (POST /v1beta1/management/nodes/scale)',
+      '<div class="form-field"><label for="dlg-scale-id">新节点 ID (Node ID)</label>' +
+      '<input id="dlg-scale-id" type="text" value="body-host-0' + nextIdx + '" class="mono" /></div>' +
+      '<div class="form-field"><label for="dlg-scale-role">节点角色</label><select id="dlg-scale-role">' +
+      '<option value="body" selected>Body LayerFS 沙箱宿主 (Worker)</option>' +
+      '<option value="brain">celld Brain 调度分片节点 (加入 256-Slot 哈希环)</option>' +
+      '</select></div>' +
+      '<div class="form-field"><label for="dlg-scale-region">部署区域</label><select id="dlg-scale-region">' +
+      '<option value="us-west-2" selected>US West · us-west-2</option>' +
+      '<option value="eu-central-1">EU Central · eu-central-1</option>' +
+      '<option value="ap-northeast-1">AP Northeast · ap-northeast-1</option>' +
+      '</select></div>',
+      '调用后端扩容节点',
+      async () => {
+        const nodeId = document.getElementById('dlg-scale-id').value.trim();
+        const role = document.getElementById('dlg-scale-role').value;
+        const region = document.getElementById('dlg-scale-region').value;
+        await callBackendApi('POST', '/v1beta1/management/nodes/scale', {
+          action: 'scale_out',
+          nodeId,
+          role,
+          region,
+          actor: p.id,
+          actorRole: p.role
+        });
+        closeDialog();
+        await fetchBackendState();
+        showToast('后端已完成节点 ' + nodeId + ' 扩容并同步集群拓扑');
+      }
+    );
+  }
+
   function openCreateApprovalDialog() {
     const p = getPrincipal();
     openDialog(
@@ -2685,6 +2856,73 @@ dialog#dialog::backdrop {
       await openTurnHistoryDialog(target.getAttribute('data-task') || 'task-ns-8841');
       return;
     }
+    if (action === 'open-scale-node-dialog') {
+      openScaleOutNodeDialog();
+      return;
+    }
+    if (action === 'canary-action') {
+      const op = target.getAttribute('data-op') || 'promote_step';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/canary', {
+        action: op,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast('金丝雀发布状态已更新：' + (res.data.state || 'CANARY_ACTIVE') + ' (' + (res.data.trafficWeightPct ?? 0) + '%)');
+      return;
+    }
+    if (action === 'tenant-finops-step') {
+      const tenantId = target.getAttribute('data-tenant') || 'Northstar';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/tenants/finops-escrow', {
+        action: 'record_spend',
+        tenantId,
+        spendDeltaUsd: 220,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast('租户 ' + tenantId + ' 账单已累加 (+$220) → ' + (res.data.modelPolicy || 'OK'));
+      return;
+    }
+    if (action === 'tenant-escrow-step') {
+      const tenantId = target.getAttribute('data-tenant') || 'Northstar';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/tenants/finops-escrow', {
+        action: 'reserve_escrow',
+        tenantId,
+        escrowDeltaSlots: 4,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast('租户 ' + tenantId + ' DAG 子任务预留槽已增至 ' + res.data.escrowReserved + ' 槽');
+      return;
+    }
+    if (action === 'step-task-turn') {
+      const taskId = target.getAttribute('data-task') || 'task-ns-8841';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/tasks/step', {
+        taskId,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast('任务 ' + taskId + ' 已推进至 Turn #' + res.data.turnIndex + ' (CRC32=0x' + res.data.crc32Hex + ')');
+      return;
+    }
+    if (action === 'export-audit-json') {
+      const res = await callBackendApi('GET', '/v1beta1/management/audits?q=' + encodeURIComponent(state.auditFilterQuery || '') + '&role=' + encodeURIComponent(state.auditFilterRole || 'ALL'));
+      const payloadStr = JSON.stringify(res.data || { total: state.auditLogs.length, audits: state.auditLogs }, null, 2);
+      openDialog(
+        '合规审计报告导出预览 (GET /v1beta1/management/audits)',
+        '<pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11px;max-height:300px;overflow:auto;">' + payloadStr + '</pre>',
+        '完成导出',
+        () => closeDialog()
+      );
+      return;
+    }
     if (action === 'open-create-approval-dialog') {
       openCreateApprovalDialog();
       return;
@@ -2923,6 +3161,30 @@ dialog#dialog::backdrop {
       });
     }
 
+    document.addEventListener('input', (e) => {
+      if (e.target && e.target.id === 'mgmt-task-search') {
+        state.taskFilterSearch = e.target.value;
+        renderMainContent();
+        const el = document.getElementById('mgmt-task-search');
+        if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+      }
+      if (e.target && e.target.id === 'mgmt-audit-search') {
+        state.auditFilterQuery = e.target.value;
+        renderMainContent();
+        const el = document.getElementById('mgmt-audit-search');
+        if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+      }
+    });
+    document.addEventListener('change', (e) => {
+      if (e.target && e.target.id === 'mgmt-task-state-filter') {
+        state.taskFilterState = e.target.value;
+        renderMainContent();
+      }
+      if (e.target && e.target.id === 'mgmt-audit-role') {
+        state.auditFilterRole = e.target.value;
+        renderMainContent();
+      }
+    });
     document.addEventListener('click', (e) => {
       const link = e.target.closest('a[href="console-management-design.md"]');
       if (link) {

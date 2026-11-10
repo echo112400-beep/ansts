@@ -74,6 +74,9 @@ import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel.js";
 import { LayerFsWorkspaceDriver } from "../runtime/layerfs_workspace_driver.js";
 import { SagaToolGateway } from "../saga_gateway.js";
 import { CapacitySlaEnforcer } from "../cluster/capacity_sla_enforcer.js";
+import { CanaryRolloutController } from "../cluster/canary_rollout_controller.js";
+import { CrossRegionAsyncReplicator } from "../cluster/cross_region_replicator.js";
+import { NodeDaemon } from "../node_daemon.js";
 import { PriorityLoadShedder } from "../cluster/priority_load_shedder.js";
 import { PredictiveSandboxPrewarmer } from "../runtime/predictive_prewarmer.js";
 import { GeoSovereigntyAndLatencyRouter } from "../cluster/geo_routing.js";
@@ -161,6 +164,8 @@ export interface ManagementPlaneDeps {
   layerfs: LayerFsWorkspaceDriver;
   sagaGateway: SagaToolGateway;
   slaEnforcer: CapacitySlaEnforcer;
+  canaryController?: CanaryRolloutController;
+  crossRegionReplicator?: CrossRegionAsyncReplicator;
   loadShedder: PriorityLoadShedder;
   prewarmer: PredictiveSandboxPrewarmer;
   geoRouter: GeoSovereigntyAndLatencyRouter;
@@ -216,15 +221,40 @@ export class PlatformManagementPlaneEngine {
     if (existingTenants.length === 0) {
       this.seedInitialState();
     } else {
-      // Sync FinOps policies from persisted SQLite rows
+      // Sync FinOps policies and rehydrate in-memory TurnWalEngine from persisted SQLite rows
       for (const r of existingTenants) {
+        const bUsd = Number(r.daily_budget_usd ?? 1000);
+        const sUsd = Number(r.spent_usd ?? 0);
         this.deps.finopsController.setPolicy({
           tenantId: String(r.tenant_id),
-          dailyBudgetUsd: Number(r.daily_budget_usd ?? 1000),
+          dailyBudgetUsd: bUsd,
           softDowngradeThresholdRatio: 0.8,
           preferredModel: "DeepSeek-R1",
           fallbackEconomyModel: "Qwen-3.8",
         });
+        if (sUsd > 0) this.deps.finopsController.recordSpend(String(r.tenant_id), sUsd);
+      }
+      const defaultTurnCounts: Record<string, number> = {
+        "task-ns-8841": 5,
+        "task-ns-8842": 3,
+        "task-hl-3019": 4,
+        "task-vg-1044": 2,
+      };
+      for (const pt of this.deps.v25Store.listPersistedTasks()) {
+        this.deps.scheduler.allTasks.set(pt.task_id, pt);
+        const targetTurns = defaultTurnCounts[pt.task_id] ?? 1;
+        if (this.deps.walEngine.getTaskWalEntries(pt.task_id).length === 0) {
+          for (let ti = 1; ti <= targetTurns; ti++) {
+            this.deps.walEngine.appendTurnDelta({
+              taskId: pt.task_id,
+              turnIndex: ti,
+              fencingToken: Math.max(1, pt.lease_fencing_token),
+              changedFiles: [`src/${pt.task_id}-turn${ti}.ts`],
+              sqliteWalPages: 4 + ti,
+              highestSubmittedFencingToken: Math.max(1, pt.lease_fencing_token),
+            });
+          }
+        }
       }
     }
   }
@@ -278,6 +308,10 @@ export class PlatformManagementPlaneEngine {
         preferredModel: "DeepSeek-R1",
         fallbackEconomyModel: "Qwen-3.8",
       });
+      const curSpent = this.deps.finopsController.evaluateBudgetAndModel(t.id).utilizationRatio * t.budget;
+      if (curSpent === 0 && t.spent > 0) {
+        this.deps.finopsController.recordSpend(t.id, t.spent);
+      }
     }
 
     const initialNodes = [
@@ -798,6 +832,7 @@ export class PlatformManagementPlaneEngine {
         compliant: slaEvaluation.compliant,
         breaches: slaEvaluation.breaches,
       },
+      canary: this.deps.canaryController ? this.deps.canaryController.getStatus() : { state: "CANARY_ACTIVE", trafficWeightPct: 5 },
       batchReport: this.lastBatchReport,
       regions: this.deps.geoRouter.listRegions(),
       nodes,
@@ -1203,8 +1238,35 @@ export class PlatformManagementPlaneEngine {
         params.approver,
         params.approvalId
       );
-      if (params.decision === "approve" && String(row.type) === "QUOTA_EMERGENCY_BOOST") {
-        sql.exec("UPDATE v25_mgmt_tenants SET max_slots = ? WHERE tenant_id = ?", 180, "Northstar");
+      if (params.decision === "approve") {
+        const ticketType = String(row.type);
+        const targetStr = String(row.target ?? "");
+        const targetTenant = String(row.tenant && row.tenant !== "all" ? row.tenant : "Northstar");
+        if (ticketType === "QUOTA_EMERGENCY_BOOST") {
+          const matchSlots = targetStr.match(/→\s*(\d+)/) || targetStr.match(/(\d+)\s*并发/);
+          const boostedSlots = matchSlots ? Number(matchSlots[1]) : 180;
+          const tRow = sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_tenants WHERE tenant_id = ?", targetTenant).one();
+          const nextVer = (tRow ? Number(tRow.config_version ?? 14) : 14) + 1;
+          sql.exec(
+            "UPDATE v25_mgmt_tenants SET max_slots = ?, config_version = ?, updated_by = ? WHERE tenant_id = ?",
+            boostedSlots,
+            nextVer,
+            params.approver,
+            targetTenant
+          );
+        } else if (ticketType === "SAGA_HIGH_RISK_TOOL") {
+          this.deps.sagaGateway.invokeTool("task-ns-8841", 1, "shell_exec", { cmd: targetStr });
+        } else if (ticketType === "BRAIN_SHARD_DRAIN") {
+          const matchNode = targetStr.match(/(celld-brain-\d+|body-host-\d+)/);
+          const drainNodeId = matchNode ? matchNode[1] : "celld-brain-02";
+          this.executeBatchNodeOperation({
+            operation: "drain",
+            nodeIds: [drainNodeId],
+            forceMigrateLeases: true,
+            actor: params.approver,
+            role: params.role,
+          });
+        }
       }
     }
 
@@ -1562,5 +1624,359 @@ export class PlatformManagementPlaneEngine {
       };
     }
     return { allowed: true, statusCode: 200, usedSlots, maxSlots };
+  }
+
+  public scaleOutOrDecommissionNode(params: {
+    action: "scale_out" | "decommission";
+    nodeId: string;
+    region: string;
+    role: "brain" | "body";
+    ipAddress?: string;
+    actor: string;
+    actorRole: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.actorRole === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行节点扩缩容" },
+      };
+    }
+    const sql = this.deps.v25Store.sql;
+    if (params.action === "decommission") {
+      this.executeBatchNodeOperation({
+        operation: "drain",
+        nodeIds: [params.nodeId],
+        forceMigrateLeases: true,
+        actor: params.actor,
+        role: params.actorRole,
+      });
+      sql.exec("DELETE FROM v25_mgmt_node_overrides WHERE node_id = ?", params.nodeId);
+      if (params.nodeId.startsWith("celld-brain-")) {
+        const brainKey = params.nodeId.replace("celld-brain-", "brain-node-");
+        this.deps.shardCoordinator.evictUnhealthyBrainShardNode(brainKey);
+      }
+      this.appendAudit(
+        params.actor,
+        params.actorRole,
+        `下线并移除节点 ${params.nodeId} (已迁移全部活跃租约)`,
+        `${params.region} / ${params.nodeId}`,
+        "DECOMMISSIONED"
+      );
+      return { status: 200, body: { action: "decommission", nodeId: params.nodeId, decommissioned: true } };
+    }
+
+    const ip = params.ipAddress ?? `10.240.0.${Math.floor(50 + Math.random() * 150)}`;
+    const roleLabel =
+      params.role === "brain"
+        ? `Brain Shard (${params.nodeId})`
+        : `Body LayerFS (${params.nodeId})`;
+    const scaleRes = this.deps.fleetController.scaleOutNode(
+      params.nodeId,
+      ip,
+      params.role === "brain" ? "control-plane" : "worker"
+    );
+    const daemon = new NodeDaemon(params.nodeId, 32, 65536, 8);
+    this.deps.scheduler.registerOrUpdateNode(daemon.emitHeartbeat(0));
+
+    sql.exec(
+      "INSERT OR REPLACE INTO v25_mgmt_node_overrides (node_id, region, role_label, status, cpu_pct, psi_pct) VALUES (?, ?, ?, ?, ?, ?)",
+      params.nodeId,
+      params.region,
+      roleLabel,
+      "READY",
+      38.5,
+      1.8
+    );
+
+    let newEpoch = 1;
+    if (params.role === "brain" || params.nodeId.startsWith("celld-brain-")) {
+      const brainKey = params.nodeId.replace("celld-brain-", "brain-node-");
+      newEpoch = this.deps.shardCoordinator.registerBrainShardNode(brainKey);
+    }
+
+    this.appendAudit(
+      params.actor,
+      params.actorRole,
+      `扩容新节点 ${params.nodeId} (${roleLabel}, IP=${ip}) 并加入集群拓扑`,
+      `${params.region} / ${params.nodeId}`,
+      `READY (epoch:${newEpoch})`
+    );
+
+    return {
+      status: 201,
+      body: {
+        action: "scale_out",
+        nodeId: params.nodeId,
+        region: params.region,
+        role: params.role,
+        ipAddress: ip,
+        rebalancedCells: scaleRes.rebalancedCells,
+        epoch: newEpoch,
+      },
+    };
+  }
+
+  public mutateTenantFinOpsOrEscrow(params: {
+    action: "record_spend" | "reserve_escrow";
+    tenantId: string;
+    spendDeltaUsd?: number;
+    escrowDeltaSlots?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权变更 FinOps 账单或 DAG 预留槽位" },
+      };
+    }
+    const sql = this.deps.v25Store.sql;
+    const row = sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_tenants WHERE tenant_id = ?", params.tenantId)
+      .one();
+    if (!row) {
+      return { status: 404, body: { error: "TENANT_NOT_FOUND", tenantId: params.tenantId } };
+    }
+
+    if (params.action === "reserve_escrow") {
+      const delta = Number(params.escrowDeltaSlots ?? 4);
+      const nextEscrow = Number(row.escrow_reserved ?? 8) + delta;
+      sql.exec("UPDATE v25_mgmt_tenants SET escrow_reserved = ? WHERE tenant_id = ?", nextEscrow, params.tenantId);
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `为租户 ${params.tenantId} 增加 DAG 子任务并发担保预留 (+${delta} 槽 → 共 ${nextEscrow} 槽)`,
+        `${row.region} / ${params.tenantId}`,
+        `Escrow=${nextEscrow}`
+      );
+      return {
+        status: 200,
+        body: { tenantId: params.tenantId, escrowReserved: nextEscrow },
+      };
+    }
+
+    // action === "record_spend"
+    const deltaUsd = Number(params.spendDeltaUsd ?? 220);
+    const curSpent = Number(row.spent_usd ?? 0);
+    const budgetUsd = Number(row.daily_budget_usd ?? 1200);
+    const nextSpent = Number((curSpent + deltaUsd).toFixed(2));
+    this.deps.finopsController.recordSpend(params.tenantId, deltaUsd);
+    const evalRes = this.deps.finopsController.evaluateBudgetAndModel(params.tenantId);
+    const ratio = nextSpent / Math.max(1, budgetUsd);
+    const nextPolicy =
+      ratio >= 1.0
+        ? "402 HARD_BLOCK (日预算已耗尽)"
+        : ratio >= 0.8
+        ? "已触发 80% 软降级 → Qwen-3.8 Economy"
+        : "DeepSeek-R1 → Qwen-3.8 (80%)";
+
+    sql.exec(
+      "UPDATE v25_mgmt_tenants SET spent_usd = ?, model_policy = ? WHERE tenant_id = ?",
+      nextSpent,
+      nextPolicy,
+      params.tenantId
+    );
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `租户 ${params.tenantId} 计费流水累加 +${deltaUsd} (当前 ${nextSpent} / ${budgetUsd})`,
+      `${row.region} / ${params.tenantId}`,
+      ratio >= 1.0 ? "402 预算熔断" : ratio >= 0.8 ? "自动软降级 (Qwen-3.8)" : "计量正常"
+    );
+
+    return {
+      status: 200,
+      body: {
+        tenantId: params.tenantId,
+        spentUsd: nextSpent,
+        dailyBudgetUsd: budgetUsd,
+        utilizationRatio: Number(ratio.toFixed(3)),
+        downgraded: evalRes.downgraded || ratio >= 0.8,
+        allowed: evalRes.allowed && ratio < 1.0,
+        modelPolicy: nextPolicy,
+      },
+    };
+  }
+
+  public executeTaskTurnStep(params: {
+    taskId: string;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权推进任务回合" },
+      };
+    }
+    const task =
+      this.deps.scheduler.allTasks.get(params.taskId) ?? this.deps.v25Store.getPersistedTask(params.taskId);
+    if (!task) {
+      return { status: 404, body: { error: "TASK_NOT_FOUND", taskId: params.taskId } };
+    }
+    const existingWal = this.deps.walEngine.getTaskWalEntries(params.taskId);
+    const nextTurnIndex = existingWal.length + 1;
+    const changedFile = `src/${params.taskId}-turn${nextTurnIndex}.ts`;
+    const walEntry = this.deps.walEngine.appendTurnDelta({
+      taskId: params.taskId,
+      turnIndex: nextTurnIndex,
+      fencingToken: task.lease_fencing_token,
+      changedFiles: [changedFile],
+      sqliteWalPages: 4 + nextTurnIndex,
+      highestSubmittedFencingToken: task.lease_fencing_token,
+    });
+
+    const branchName =
+      params.taskId === "task-ns-8841"
+        ? "feat-ns-auth"
+        : params.taskId === "task-ns-8842"
+        ? "fix-ns-ledger"
+        : params.taskId === "task-hl-3019"
+        ? "gdpr-audit-eu"
+        : `task-${params.taskId}`;
+    try {
+      this.deps.layerfs.getBranchHeadCommit(branchName);
+    } catch {
+      this.deps.layerfs.forkBranch("main", branchName);
+    }
+    const lfsCommit = this.deps.layerfs.executeInProcessFileTool({
+      branchName,
+      agentId: params.actor,
+      stepId: `step-${params.taskId}-t${nextTurnIndex}`,
+      operation: "write",
+      filePath: changedFile,
+      newContent: `export const turn = ${nextTurnIndex};
+export const crc32 = "${walEntry.frame.crc32Hex}";
+`,
+    });
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `推进任务 ${params.taskId} 至 Turn #${nextTurnIndex} (WAL CRC32=0x${walEntry.frame.crc32Hex}, LayerFS Commit=${lfsCommit.commitId})`,
+      `us-west-2 / ${task.tenant_id}`,
+      `Turn #${nextTurnIndex} 已提交`
+    );
+
+    return {
+      status: 200,
+      body: {
+        taskId: params.taskId,
+        turnIndex: nextTurnIndex,
+        crc32Hex: walEntry.frame.crc32Hex,
+        commitId: lfsCommit.commitId,
+        branchName,
+      },
+    };
+  }
+
+  public evaluateCanaryOrGeoRegion(params: {
+    action: "promote_step" | "inject_anomaly" | "reset_canary" | "toggle_region";
+    regionId?: string;
+    capacityAvailable?: boolean;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权操作金丝雀发布或区域容灾切换" },
+      };
+    }
+
+    if (params.action === "toggle_region") {
+      const regId = params.regionId ?? "eu-central-1";
+      const avail = params.capacityAvailable ?? true;
+      const updated = this.deps.geoRouter.setRegionAvailability(regId, avail);
+      const rep = this.deps.crossRegionReplicator
+        ? this.deps.crossRegionReplicator.replicateLtxObject("eu-west-1", `ltx/failover-${regId}.ltx`)
+        : null;
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `切换区域 ${regId} 容量可用状态为 ${avail ? "ONLINE" : "DRAINED"} 并触发跨区 LTX 同步`,
+        `${regId} / GeoRouter`,
+        avail ? "ONLINE" : "FAILOVER_ACTIVE"
+      );
+      return {
+        status: 200,
+        body: { updated, regions: this.deps.geoRouter.listRegions(), replication: rep },
+      };
+    }
+
+    if (!this.deps.canaryController) {
+      return { status: 200, body: { state: "CANARY_ACTIVE", trafficWeightPct: 25 } };
+    }
+
+    let canaryRes: { state: string; trafficWeightPct: number };
+    if (params.action === "reset_canary") {
+      canaryRes = this.deps.canaryController.resetCanary(5);
+    } else if (params.action === "inject_anomaly") {
+      canaryRes = this.deps.canaryController.evaluateCanaryStep({
+        errorRatePct: 4.5,
+        p99LatencyMs: 1850,
+      });
+    } else {
+      canaryRes = this.deps.canaryController.evaluateCanaryStep({
+        errorRatePct: 0.1,
+        p99LatencyMs: 68,
+      });
+    }
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行金丝雀发布控制 [${params.action}] → 状态: ${canaryRes.state} (权重: ${canaryRes.trafficWeightPct}%)`,
+      "Global / CanaryController",
+      `${canaryRes.state} (${canaryRes.trafficWeightPct}%)`
+    );
+
+    return {
+      status: 200,
+      body: canaryRes,
+    };
+  }
+
+  public queryAuditLogs(filters: {
+    q?: string;
+    actor?: string;
+    role?: string;
+  }): { total: number; audits: ManagementAuditRecord[] } {
+    this.ensureInitialized();
+    const rows = this.deps.v25Store.sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_audit_logs")
+      .toArray()
+      .map((l) => ({
+        auditId: String(l.audit_id),
+        ts: String(l.ts),
+        actor: String(l.actor),
+        role: String(l.role),
+        action: String(l.action),
+        scope: String(l.scope),
+        outcome: String(l.outcome),
+      }))
+      .reverse();
+
+    const q = (filters.q ?? "").toLowerCase().trim();
+    const actor = filters.actor && filters.actor !== "ALL" ? filters.actor : null;
+    const role = filters.role && filters.role !== "ALL" ? filters.role : null;
+
+    const filtered = rows.filter((r) => {
+      if (actor && r.actor !== actor) return false;
+      if (role && r.role !== role) return false;
+      if (!q) return true;
+      return (
+        r.action.toLowerCase().includes(q) ||
+        r.scope.toLowerCase().includes(q) ||
+        r.outcome.toLowerCase().includes(q) ||
+        r.actor.toLowerCase().includes(q)
+      );
+    });
+
+    return { total: filtered.length, audits: filtered };
   }
 }

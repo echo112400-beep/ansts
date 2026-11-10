@@ -324,6 +324,8 @@ export class AnstsLocalAndComposeServer {
       layerfs: this.layerfs,
       sagaGateway: this.sagaGateway,
       slaEnforcer: this.slaEnforcer,
+      canaryController: this.canaryController,
+      crossRegionReplicator: this.crossRegionReplicator,
       loadShedder: this.loadShedder,
       prewarmer: this.prewarmer,
       geoRouter: this.geoRouter,
@@ -2221,6 +2223,86 @@ export class AnstsLocalAndComposeServer {
       }
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/nodes/scale") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.scaleOutOrDecommissionNode({
+        action: (body.action ?? "scale_out") as "scale_out" | "decommission",
+        nodeId: String(body.nodeId ?? "body-host-04"),
+        region: String(body.region ?? "us-west-2"),
+        role: (body.role === "brain" ? "brain" : "body") as "brain" | "body",
+        ipAddress: body.ipAddress ? String(body.ipAddress) : undefined,
+        actor: String(body.actor ?? "chen"),
+        actorRole: String(body.actorRole ?? "SRE_ADMIN"),
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/tenants/finops-escrow") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.mutateTenantFinOpsOrEscrow({
+        action: (body.action ?? "record_spend") as "record_spend" | "reserve_escrow",
+        tenantId: String(body.tenantId ?? "Northstar"),
+        spendDeltaUsd: body.spendDeltaUsd !== undefined ? Number(body.spendDeltaUsd) : undefined,
+        escrowDeltaSlots: body.escrowDeltaSlots !== undefined ? Number(body.escrowDeltaSlots) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/tasks/step") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeTaskTurnStep({
+        taskId: String(body.taskId ?? "task-ns-8841"),
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/canary") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.evaluateCanaryOrGeoRegion({
+        action: (body.action ?? "promote_step") as "promote_step" | "inject_anomaly" | "reset_canary" | "toggle_region",
+        regionId: body.regionId ? String(body.regionId) : undefined,
+        capacityAvailable: body.capacityAvailable !== undefined ? Boolean(body.capacityAvailable) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    if (method === "GET" && pathname === "/v1beta1/management/audits") {
+      const result = this.managementPlane.queryAuditLogs({
+        q: urlObj.searchParams.get("q") ?? undefined,
+        actor: urlObj.searchParams.get("actor") ?? undefined,
+        role: urlObj.searchParams.get("role") ?? undefined,
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(result));
       return;
     }
 

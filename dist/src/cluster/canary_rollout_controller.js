@@ -25,4 +25,14 @@ class CanaryRolloutController {
     }
     return { state: this.state, trafficWeightPct: this.trafficWeightPct };
   }
+
+  getStatus() {
+    return { state: this.state, trafficWeightPct: this.trafficWeightPct };
+  }
+
+  resetCanary(initialWeightPct = 5) {
+    this.state = "CANARY_ACTIVE";
+    this.trafficWeightPct = initialWeightPct;
+    return this.getStatus();
+  }
 }exports.CanaryRolloutController = CanaryRolloutController;
