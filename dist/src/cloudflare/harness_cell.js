@@ -1,5 +1,6 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.AgentTaskHarnessCell = void 0; /**
- * @fileoverview M7 TASK-27: AgentTaskHarnessCell (Per-Task Stateful Actor with R2/RustFS LTX Snapshot Sync).
+ * @fileoverview M7 TASK-27 & M54-1: AgentTaskHarnessCell (Per-Task Stateful Actor with R2/RustFS LTX Snapshot Sync
+ * & Cold-Start SQLite Fencing Watermark Rehydration).
  */
 
 
@@ -16,6 +17,7 @@ class AgentTaskHarnessCell {
   r2Bucket;
   taskId;
   highestFencingToken = 0;
+  highestTurnIndex = 0;
 
   constructor(ctx, r2Bucket, taskId = "task-default") {
     this.ctx = ctx;
@@ -24,9 +26,39 @@ class AgentTaskHarnessCell {
     this.ctx.storage.sql.exec(
     "CREATE TABLE IF NOT EXISTS harness_turns (turn_index INTEGER PRIMARY KEY, fencing_token INTEGER, tool_name TEXT, output_json TEXT, r2_key TEXT)");
 
+    this.rehydrateWatermarksFromSql();
+  }
+
+  /**
+   * [M54-1] Rehydrate `highestFencingToken` and `highestTurnIndex` from persisted `harness_turns` rows
+   * on Cell cold-start or live migration so zombie workers holding stale fencing tokens cannot overwrite turns.
+   */
+  rehydrateWatermarksFromSql() {
+    const rows = this.ctx.storage.sql.
+    exec("SELECT * FROM harness_turns").
+    toArray();
+    for (const r of rows) {
+      const fToken = Number(r.fencing_token ?? 0);
+      const tIdx = Number(r.turn_index ?? 0);
+      if (fToken > this.highestFencingToken) {
+        this.highestFencingToken = fToken;
+      }
+      if (tIdx > this.highestTurnIndex) {
+        this.highestTurnIndex = tIdx;
+      }
+    }
+    return {
+      highestFencingToken: this.highestFencingToken,
+      highestTurnIndex: this.highestTurnIndex
+    };
+  }
+
+  getHighestFencingToken() {
+    return this.highestFencingToken;
   }
 
   async executeAndCheckpointTurn(params)
+
 
 
 
@@ -37,7 +69,19 @@ class AgentTaskHarnessCell {
       `Stale fencing token ${params.fencingToken} < highest ${this.highestFencingToken} in AgentTaskHarnessCell`);
 
     }
+    if (
+    (params.enforceTurnMonotonicity ?? false) &&
+    params.fencingToken === this.highestFencingToken &&
+    params.turnIndex <= this.highestTurnIndex)
+    {
+      throw new Error(
+      `Stale or duplicate turnIndex ${params.turnIndex} <= highestTurnIndex ${this.highestTurnIndex} under fencing token ${params.fencingToken}`);
+
+    }
     this.highestFencingToken = params.fencingToken;
+    if (params.turnIndex > this.highestTurnIndex) {
+      this.highestTurnIndex = params.turnIndex;
+    }
 
     const r2Key = `cells/${this.taskId}/turn-${params.turnIndex}-f${params.fencingToken}.ltx`;
     const payloadStr = JSON.stringify({
@@ -99,12 +143,14 @@ class AgentTaskHarnessCell {
     const rows = this.ctx.storage.sql.
     exec("SELECT * FROM harness_turns").
     toArray();
-    return rows.map((r) => ({
+    return rows.
+    map((r) => ({
       turnIndex: Number(r.turn_index),
       fencingToken: Number(r.fencing_token),
       toolName: String(r.tool_name),
       toolOutput: JSON.parse(String(r.output_json ?? "{}")),
       r2SnapshotKey: String(r.r2_key)
-    }));
+    })).
+    sort((a, b) => a.turnIndex - b.turnIndex);
   }
 }exports.AgentTaskHarnessCell = AgentTaskHarnessCell;

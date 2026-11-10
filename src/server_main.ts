@@ -2337,6 +2337,18 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M54] Deep Runtime Resilience, Cold-Start Fencing, Half-Open Stampede Guard, Approval TTL, Hot-Cell Leak Reclamation, Outbox/SSE & A2A Anti-Starvation Audit (`POST /v1beta1/management/system/deep-runtime-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/deep-runtime-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDeepRuntimeResilienceAndAntiStarvationAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M53] Deep Cross-Layer Risk Elimination Audit (`POST /v1beta1/management/system/risk-elimination-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/risk-elimination-audit") {
       const body = await this.readJsonBody(req);

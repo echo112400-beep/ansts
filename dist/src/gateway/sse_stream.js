@@ -1,10 +1,11 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.SseEventStreamGateway = exports.ClientStreamSubscription = void 0;
 
 
-var _nodeStream = require("node:stream"); /**
- * @fileoverview M1 TASK-03: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer.
- */
 
+var _nodeStream = require("node:stream"); /**
+ * @fileoverview M1 TASK-03 & M54-4: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer
+ * with Evicted `Last-Event-ID` Fallback Replay & Completed Task Stream Garbage Collection.
+ */
 
 
 
@@ -17,6 +18,7 @@ class ClientStreamSubscription {
   taskId;
   stream;
   closed = false;
+  replayGapDetected = false;
 
   constructor(subscriptionId, taskId) {
     this.subscriptionId = subscriptionId;
@@ -60,12 +62,24 @@ class SseEventStreamGateway {
     taskSubs.set(subscriptionId, sub);
 
     const history = this.historyByTask.get(taskId) ?? [];
-    let shouldReplay = !replayFromEventId;
-    for (const evt of history) {
-      if (shouldReplay) {
+    if (!replayFromEventId) {
+      for (const evt of history) {
         sub.writeSse(evt);
-      } else if (evt.id === replayFromEventId) {
-        shouldReplay = true;
+      }
+      return sub;
+    }
+
+    const matchIdx = history.findIndex((evt) => evt.id === replayFromEventId);
+    if (matchIdx >= 0) {
+      for (let i = matchIdx + 1; i < history.length; i++) {
+        sub.writeSse(history[i]);
+      }
+    } else if (history.length > 0) {
+      // [M54-4] If replayFromEventId was already evicted from the ring buffer, fall back to replaying
+      // the retained history window rather than silently dropping all buffered events!
+      sub.replayGapDetected = true;
+      for (const evt of history) {
+        sub.writeSse(evt);
       }
     }
     return sub;
@@ -92,7 +106,30 @@ class SseEventStreamGateway {
     if (sub) {
       sub.close();
       taskSubs?.delete(subscriptionId);
+      if (taskSubs && taskSubs.size === 0) {
+        this.subscriptionsByTask.delete(taskId);
+      }
     }
+  }
+
+  /**
+   * [M54-4] Garbage-collects SSE history and closed subscriptions for terminated/completed tasks
+   * to prevent unbounded memory growth across long-running gateways.
+   */
+  gcCompletedTaskStreams(activeTaskIds) {
+    let cleanedTasks = 0;
+    for (const taskId of Array.from(this.historyByTask.keys())) {
+      if (!activeTaskIds.has(taskId)) {
+        const subs = this.subscriptionsByTask.get(taskId);
+        if (subs) {
+          for (const s of subs.values()) s.close();
+          this.subscriptionsByTask.delete(taskId);
+        }
+        this.historyByTask.delete(taskId);
+        cleanedTasks += 1;
+      }
+    }
+    return cleanedTasks;
   }
 
   publish(envelope) {
