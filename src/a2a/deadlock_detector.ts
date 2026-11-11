@@ -1,5 +1,6 @@
 /**
- * @fileoverview M23 & M52-3: A2A Wait-For Graph (WFG) Cycle & Priority-Aware Distributed Deadlock Resolver.
+ * @fileoverview M23, M52-3 & M63-4: A2A Wait-For Graph (WFG) Cycle & Priority-Aware Distributed Deadlock Resolver
+ * with Iterative Multi-Cycle Resolution & Self-Wait Edge Detection.
  */
 export class A2aWaitForGraphDeadlockDetector {
   private readonly edges: Map<string, Set<string>> = new Map();
@@ -61,29 +62,50 @@ export class A2aWaitForGraphDeadlockDetector {
   }
 
   /**
-   * [M52-3] Automatically selects the lowest-priority agent in a detected Wait-For Graph cycle
-   * and aborts only its outgoing wait edges to break the deadlock cleanly.
+   * [M52-3 & M63-4] Iteratively selects the lowest-priority agent in each detected Wait-For Graph cycle
+   * and aborts its outgoing wait edges until ALL disjoint/overlapping cycles in the graph are resolved.
    */
   public resolveCycleWithLowestPriorityVictim(
     agentPriorityScores: Record<string, number> = {}
-  ): { resolved: boolean; victimAgentId: string | null; cyclePath: string[] } {
-    const { hasDeadlock, cyclePath } = this.detectCycle();
-    if (!hasDeadlock || cyclePath.length === 0) {
-      return { resolved: false, victimAgentId: null, cyclePath: [] };
+  ): {
+    resolved: boolean;
+    victimAgentId: string | null;
+    evictedVictims: string[];
+    cyclePath: string[];
+  } {
+    const firstCheck = this.detectCycle();
+    if (!firstCheck.hasDeadlock || firstCheck.cyclePath.length === 0) {
+      return { resolved: false, victimAgentId: null, evictedVictims: [], cyclePath: [] };
     }
-    const uniqueAgents = Array.from(new Set(cyclePath));
-    uniqueAgents.sort((a, b) => {
-      const pa = agentPriorityScores[a] ?? 50;
-      const pb = agentPriorityScores[b] ?? 50;
-      if (pa !== pb) return pa - pb;
-      return b.localeCompare(a);
-    });
-    const victimAgentId = uniqueAgents[0];
-    this.edges.delete(victimAgentId);
+
+    const firstCyclePath = firstCheck.cyclePath;
+    const evictedVictims: string[] = [];
+    const maxIterations = Math.max(1, this.edges.size + 1);
+    let iter = 0;
+
+    while (iter < maxIterations) {
+      iter += 1;
+      const current = this.detectCycle();
+      if (!current.hasDeadlock || current.cyclePath.length === 0) {
+        break;
+      }
+      const uniqueAgents = Array.from(new Set(current.cyclePath));
+      uniqueAgents.sort((a, b) => {
+        const pa = agentPriorityScores[a] ?? 50;
+        const pb = agentPriorityScores[b] ?? 50;
+        if (pa !== pb) return pa - pb;
+        return b.localeCompare(a);
+      });
+      const victim = uniqueAgents[0];
+      this.edges.delete(victim);
+      evictedVictims.push(victim);
+    }
+
     return {
       resolved: !this.detectCycle().hasDeadlock,
-      victimAgentId,
-      cyclePath,
+      victimAgentId: evictedVictims[0] ?? null,
+      evictedVictims,
+      cyclePath: firstCyclePath,
     };
   }
 }

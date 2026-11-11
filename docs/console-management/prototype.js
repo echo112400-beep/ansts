@@ -1357,6 +1357,9 @@
             <h2 class="panel-title">多租户 DRF 配额、DAG 并发担保与 FinOps 预算门控 (对接 SQLite v25_mgmt_tenants &amp; FinOpsBudgetController)</h2>
             <p class="panel-subtitle">调用 <code>POST /v1beta1/management/tenants/config</code> 修改配额与预算，强制执行乐观锁 CAS 版本校验 (expectedVersion)。</p>
           </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="open-finops-attribution">FinOps 多维成本归因 (LLM 推理 vs 沙箱核时)</button>
+          </div>
         </div>
         <div class="table-wrap">
           <table class="data-table">
@@ -1426,6 +1429,16 @@
               <option value="CANCEL_UNCONFIRMED" ${state.taskFilterState === 'CANCEL_UNCONFIRMED' ? 'selected' : ''}>CANCEL_UNCONFIRMED</option>
               <option value="FENCED_TERMINATED" ${state.taskFilterState === 'FENCED_TERMINATED' ? 'selected' : ''}>FENCED_TERMINATED</option>
             </select>
+            <button type="button" class="small" data-action="coalesce-duplicate-task" ${!permGlobal.ok ? 'disabled' : ''} title="模拟相同指纹/幂等键并发请求合并与提权">+ 合并并发重复请求演练</button>
+            <button type="button" class="small warn" data-action="open-dlq-workbench">DLQ 死信与 Outbox 重放工作台</button>
+            <button type="button" class="small" data-action="open-adaptive-dag-replan">[F1] 动态 DAG 重规划</button>
+            <button type="button" class="small" data-action="open-best-of-n-verifier">[F2] Best-of-N 投机择优</button>
+            <button type="button" class="small" data-action="open-cascade-jury-router">[F3] 级联置信度路由 &amp; 陪审团</button>
+            <button type="button" class="small" data-action="open-episodic-hatchery">[F4] 语义经验库 &amp; 黄金镜像</button>
+            <button type="button" class="small" data-action="open-formal-guardrail">[F5] Policy-as-Code 门控</button>
+            <button type="button" class="small" data-action="open-shadow-wal-replay">[F6] 生产 WAL 影子回放</button>
+            <button type="button" class="small" data-action="open-context-compactor">[F7] 分层工作记忆压缩</button>
+            <button type="button" class="small" data-action="open-spot-quota-market">[F8] Spot 算力借贷市场</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -1456,7 +1469,7 @@
                 const pillCls = isUnconfirmed ? 'warn' : isFenced ? 'danger' : 'ok';
                 return `
                   <tr>
-                    <td class="mono"><strong>${t.id}</strong></td>
+                    <td class="mono"><strong>${t.id}</strong>${t.mergedDuplicateCount > 0 ? ` <span class="status-pill ok" title="已合并重复请求: ${(t.mergedRequestIds || []).join(", ")}">合并×${t.mergedDuplicateCount}</span>` : ""}</td>
                     <td>${t.tenant} · <span class="mono">${t.region}</span></td>
                     <td class="mono">${t.priority} · Slot #${t.shardSlot ?? 0}</td>
                     <td class="mono">${t.brain} → ${t.body}</td>
@@ -1466,6 +1479,7 @@
                     <td>
                       <div class="btn-row">
                         <button type="button" class="small primary" data-action="step-task-turn" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>+推进回合</button>
+                        <button type="button" class="small" data-action="recover-task-breakpoint" data-task="${t.id}" ${!perm.ok ? 'disabled' : ''} title="从 TurnWalEngine 断点恢复并自动回滚未提交 Saga 副作用">断点恢复</button>
                         <button type="button" class="small" data-action="migrate-task-node" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''} title="调用 EphemeralHeavyExecutorMigrator 跨节点热迁移并推进 Fencing Token">热迁移节点</button>
                         <button type="button" class="small" data-action="open-turn-history-dialog" data-task="${t.id}">回合历史 / 分叉 / Blame</button>
                         <button type="button" class="small" data-action="graceful-stop-task" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>
@@ -1654,7 +1668,18 @@
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/risk-elimination-audit" data-op="deep_cross_layer_m53_risk_audit">跨层深水区风险清零自检 (Saga/FinOps/WarmPool/WAL/DrainTTL · M53)</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-runtime-audit" data-op="deep_runtime_m54_audit">深层运行时防惊群/防死锁/反饥饿自检 (Harness/Breaker/Staging/HotCell/Outbox/A2A · M54)</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/storage-ha-audit" data-op="storage_ha_m55_audit">存储/分片存活/LayerFS同步/事务回滚自检 (Persistence/Shard/D9/TimeTravel/RPO0 · M55)</button>
-          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/kernel-storage-audit" data-op="kernel_storage_m56_audit">全表冷启恢复/三路合并删改冲突/P0突发准入/内存防泄漏自检 (M56)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/runtime-edge-audit" data-op="kernel_storage_m56_audit">全表冷启恢复/三路合并删改冲突/P0突发准入/内存防泄漏自检 (M56)</button>
+          <button class="btn primary" data-action="run-health-scorecard">★ M60–M69 全链路持久化 / DFX / 零残余缺陷一键健康评分卡 (Scorecard)</button>
+          <button class="btn" data-action="open-dlq-workbench">DLQ 死信任务 &amp; Outbox Webhook 失败重放工作台</button>
+          <button class="btn" data-action="open-security-fence-alerts">零信任安全围栏 (celld-fence / eBPF LSM / Vsock) 实时拦截流</button>
+          <button class="btn" data-action="open-finops-attribution">FinOps 多维成本归因 (LLM 推理 vs 沙箱核时 + Cache 节省)</button>
+          <button class="btn" data-action="open-config-diff-preview">配置中心字段级 JSON Diff 对比预览</button>
+          <button class="btn" data-action="open-dual-key-rotation">Outbox Webhook 签名密钥零停机双密钥平滑轮换</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/persistence-idempotency-recovery-audit" data-op="m60_audit">全链路持久化/幂等/断点恢复/重复合并自检 (M60)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/dfx-deep-audit" data-op="m63_audit">深度 DFX 可靠性/主权路由/多环死锁自检 (M63)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-consistency-phase2-audit" data-op="m65_audit">全子系统实现一致性与 AST 契约自检 (M65)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-risk-phase3-audit" data-op="m68_audit">深度潜在风险消除 I–III 自检 (M66–M68)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/final-closure-audit" data-op="m69_audit">终极边界收口与零残余缺陷自检 (M69)</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>
@@ -2431,6 +2456,355 @@
       showToast('已加载分支 ' + (res.data.branchName || '') + ' 的 LayerFS 行级代码溯源');
       return;
     }
+    if (action === "recover-task-breakpoint") {
+      const taskId = target.getAttribute("data-task") || "task-ns-8841";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/tasks/breakpoint-recover", {
+        action: "recover_breakpoint",
+        taskId,
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      await fetchBackendState();
+      openDialog(
+        "任务 WAL 断点恢复与未提交 Saga 清理报告 · " + taskId,
+        "<div><strong>恢复断点回合：</strong> <span class=\"status-pill ok\">Turn #" + (d.restoredTurnIndex ?? 1) + " (Fence epoch:" + (d.restoredFencingToken ?? 1) + ")</span></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">权威 WAL 帧数: <code class=\"mono\">" + (d.canonicalWalFrames ?? 1) + "</code> · 丢弃未提交帧: <code class=\"mono\">" + (d.discardedWalFrames ?? 0) + "</code> · 逆序回滚未提交 Saga 步骤: <code class=\"mono\">" + (d.rolledBackSagaSteps ?? 0) + "</code> · 下一步待执行回合: <code class=\"mono\">Turn #" + (d.nextTurnToExecute ?? 2) + "</code></div>",
+        "完成恢复确认",
+        () => closeDialog()
+      );
+      return;
+    }
+    if (action === "coalesce-duplicate-task") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/tasks/coalesce-inspect", {
+        action: "coalesce_duplicate",
+        taskId: "task-ns-8841",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      await fetchBackendState();
+      showToast("已将并发重复请求 " + (d.incomingDuplicateId || "dup") + " 合并至 " + (d.canonicalTaskId || "task-ns-8841") + " (累计合并 ×" + (d.mergedDuplicateCount || 1) + "，节省 " + (d.estimatedSavedTokens || 4200) + " Tokens)");
+      return;
+    }
+    if (action === "open-context-compactor") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase3-memory-spot-market", {
+        action: "hierarchical_context_compactor",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const c = d.compactionReport || {};
+      const pg = d.pagedSlice || {};
+      openDialog(
+        "[F7] 自适应上下文压缩与分层工作记忆 (POST /v1beta1/management/ops/phase3-memory-spot-market)",
+        "<div><strong>Token 压缩率：</strong> <span class=\"status-pill ok\">-" + (c.tokenReductionRatioPct || 76.4) + "%</span> (原始 <code class=\"mono\">" + (c.rawContextTokensEstimate || 1800) + "</code> → 压缩后 <code class=\"mono\">" + (c.compactedContextTokensEstimate || 420) + "</code> Tokens)</div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">已转储 L1 LayerFS 符号指针：<code class=\"mono\">" + ((c.offloadedUris || []).join(", ")) + "</code></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">按需分页拉取验证 (Line " + (pg.startLine || 2) + ".." + (pg.endLine || 4) + "/" + (pg.totalLines || 40) + ")：<pre class=\"mono\" style=\"margin-top:4px;padding:6px;background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:4px;font-size:11px;\">" + (pg.slicedText || "") + "</pre></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-spot-quota-market") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase3-memory-spot-market", {
+        action: "spot_quota_lending_market",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const l = d.bidMatch?.lease || {};
+      const rc = d.recallRes || {};
+      openDialog(
+        "[F8] 租户间 Spot 算力借贷与亚秒级无损抢占市场 (POST /v1beta1/management/ops/phase3-memory-spot-market)",
+        "<div><strong>出借方 → 借入方：</strong> <code class=\"mono\">" + (l.lenderTenantId || "Helios") + "</code> → <code class=\"mono\">" + (l.borrowerTenantId || "Northstar") + "</code> (" + (l.leasedSlots || 4) + " 并发槽 · 清算单价 <span class=\"status-pill ok\">$" + (l.clearingPricePerSlotUsd || 0.06) + "/slot</span>)</div>" +
+        "<div style=\"margin-top:6px;\"><strong>出借方 P0 紧急任务到达亚秒级召回：</strong> 立即回收 <code class=\"mono\">" + (rc.reclaimedSlots || 4) + "</code> 槽位 · 借入方 Spot 任务 <code class=\"mono\">" + ((rc.frozenBorrowerTaskIds || []).join(", ")) + "</code> 已自动写入 TurnWAL 并无损重回 <span class=\"status-pill warn\">" + (d.spotTaskStateAfterRecall || "QUEUED") + "</span></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-episodic-hatchery") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-memory-guardrail-replay", {
+        action: "episodic_golden_hatchery",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const m = d.mountedWorkspace || {};
+      openDialog(
+        "[F4] 跨任务语义经验库与 LayerFS 黄金镜像孵化器 (POST /v1beta1/management/ops/phase2-memory-guardrail-replay)",
+        "<div><strong>匹配历史经验轨迹：</strong> <code class=\"mono\">" + (m.matchedEpisodeId || "ep-nextjs-prisma-pool") + "</code> · <strong>余弦相似度：</strong> <span class=\"status-pill ok\">" + (m.similarityScore || 0.85) + "</span></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">零拷贝黄金基线挂载分支：<code class=\"mono\">" + (m.mountedBranchName || "m72-instant-task-ws") + "</code> (基线 Commit=<code class=\"mono\">" + (m.baseCommitId || "C1") + "</code> · 复制文件数=<strong>0</strong>)</div>" +
+        "<div class=\"muted\" style=\"margin-top:4px;\">节省环境预热耗时：<span class=\"status-pill ok\">-" + (m.savedColdStartMs || 4800) + " ms</span></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-formal-guardrail") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-memory-guardrail-replay", {
+        action: "formal_policy_guardrail",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      openDialog(
+        "[F5] 声明式 Policy-as-Code 形式化策略沙箱门控 (POST /v1beta1/management/ops/phase2-memory-guardrail-replay)",
+        "<div><strong>只读诊断调用：</strong> <span class=\"status-pill ok\">" + (d.allowRes?.decision || "ALLOW") + " (BlastRadius=" + (d.allowRes?.blastRadiusScore || 20) + ")</span></div>" +
+        "<div style=\"margin-top:6px;\"><strong>生产批量数据变更 (25,000 行)：</strong> <span class=\"status-pill warn\">" + (d.approvalRes?.decision || "REQUIRE_4EYES_APPROVAL") + "</span> · 自动生成审批单 <code class=\"mono\">" + (d.approvalRes?.approvalTicket?.ticketId || "approval-1") + "</code></div>" +
+        "<div style=\"margin-top:6px;\"><strong>无界 DELETE 1=1 &amp; 敏感路径访问：</strong> <span class=\"status-pill danger\">" + (d.denyRes?.decision || "DENY_FORMAL_VIOLATION") + "</span> · 触发规则 <code class=\"mono\">" + ((d.denyRes?.violatedRuleIds || []).join(", ")) + "</code></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-shadow-wal-replay") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-memory-guardrail-replay", {
+        action: "shadow_wal_replay",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const pr = d.promoteSuite || {};
+      const rb = d.rollbackSuite || {};
+      openDialog(
+        "[F6] 生产 WAL 影子流量回放与金丝雀回归基准台 (POST /v1beta1/management/ops/phase2-memory-guardrail-replay)",
+        "<div><strong>候选模型 A (<code class=\"mono\">" + (pr.candidateModel || "claude-3-7-sonnet-202611") + "</code>)：</strong> 准确率=<span class=\"status-pill ok\">" + (pr.toolMatchAccuracyPct || 100) + "%</span> · 延迟变化=<code class=\"mono\">" + (pr.latencyDeltaPct || -18.2) + "%</code> · 敏感信息自动脱敏=<code class=\"mono\">" + (pr.totalRedactions || 3) + " 处</code> → <span class=\"status-pill ok\">" + (pr.canaryRecommendation || "PROMOTE_CANARY") + "</span></div>" +
+        "<div style=\"margin-top:8px;\"><strong>候选模型 B (<code class=\"mono\">" + (rb.candidateModel || "experimental-draft-v0") + "</code>)：</strong> 准确率=<span class=\"status-pill danger\">" + (rb.toolMatchAccuracyPct || 50) + "%</span> · 回归错误=<code class=\"mono\">" + (rb.regressionCount || 1) + "</code> → <span class=\"status-pill danger\">" + (rb.canaryRecommendation || "AUTO_ROLLBACK_ON_REGRESSION") + "</span></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-adaptive-dag-replan") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-cognitive-acceleration", {
+        action: "adaptive_dag_replan",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      openDialog(
+        "[F1] 动态 DAG 自适应重规划工作台 (POST /v1beta1/management/ops/phase1-cognitive-acceleration)",
+        "<div><strong>父任务：</strong> <code class=\"mono\">" + (d.parentTaskId || "task-m71-parent") + "</code> · <strong>重规划版本：</strong> <span class=\"status-pill ok\">Rev #" + (d.replanRevision || 1) + "</span></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">已剪枝冗余/失败子节点：<code class=\"mono\">" + ((d.prunedChildIds || []).join(", ")) + "</code></div>" +
+        "<div class=\"muted\" style=\"margin-top:4px;\">动态注入替补子节点：<code class=\"mono\">" + ((d.injectedChildIds || []).join(", ")) + "</code></div>" +
+        "<div class=\"muted\" style=\"margin-top:4px;\">自动重连并从死信恢复的下游汇聚节点：<code class=\"mono\">" + ((d.revivedDownstreamTaskIds || []).join(", ")) + "</code> (状态=<span class=\"status-pill ok\">" + (d.downstreamStateAfterReplan || "SUBMITTED") + "</span>)</div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-best-of-n-verifier") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-cognitive-acceleration", {
+        action: "best_of_n_speculative",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const candRows = (d.candidates || []).map(c =>
+        "<tr><td class=\"mono\">" + c.branchName + "</td><td>" + c.modelTier + "</td><td><span class=\"status-pill " + (c.passed ? "ok" : "danger") + "\">" + (c.passed ? "PASS" : "FAIL") + "</span></td><td class=\"mono\">" + c.testsPassed + " / warn=" + c.lintWarnings + "</td><td class=\"mono\"><strong>" + c.score + "</strong></td></tr>"
+      ).join("");
+      openDialog(
+        "[F2] Best-of-N 投机并行沙箱与评分择优器 (POST /v1beta1/management/ops/phase1-cognitive-acceleration)",
+        "<div><strong>胜出晋级分支：</strong> <code class=\"mono\">" + (d.winnerBranchName || "") + "</code> → <code class=\"mono\">" + (d.promotedBranchName || "") + "</code> (<span class=\"status-pill ok\">Score " + (d.winnerScore || 98.5) + "</span>)</div>" +
+        "<div class=\"muted\" style=\"margin:6px 0;\">已自动清理败北 CoW 分支：<code class=\"mono\">" + ((d.prunedLoserBranches || []).join(", ")) + "</code></div>" +
+        "<table class=\"data-table\"><thead><tr><th>候选分支</th><th>模型/温度</th><th>验证结果</th><th>单测/Lint</th><th>综合评分</th></tr></thead><tbody>" + candRows + "</tbody></table>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-cascade-jury-router") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-cognitive-acceleration", {
+        action: "cascade_jury_routing",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      openDialog(
+        "[F3] 级联置信度路由、语义缓存与异构模型陪审团共识 (POST /v1beta1/management/ops/phase1-cognitive-acceleration)",
+        "<div><strong>Tier-0 语义缓存：</strong> <span class=\"status-pill ok\">HIT (节省 " + (d.cacheHitRes?.savedTokens || 1500) + " Tokens)</span> · <strong>Tier-1 草案直出置信度：</strong> <code class=\"mono\">" + (d.tier1Res?.meanConfidence || 0.94) + "</code></div>" +
+        "<div style=\"margin-top:6px;\"><strong>Tier-2 低置信度自动升级：</strong> <code class=\"mono\">" + (d.escalatedRes?.selectedModel || "claude-3-7-sonnet-reasoner") + "</code> (<span class=\"status-pill warn\">ESCALATED</span>)</div>" +
+        "<div style=\"margin-top:6px;\"><strong>异构三模型陪审团共识：</strong> 安全迁移单=<span class=\"status-pill ok\">" + (d.juryApproved?.consensusDecision || "APPROVED") + " (均分 " + (d.juryApproved?.averageSafetyScore || 91.3) + ")</span> · 高危删表=<span class=\"status-pill danger\">" + (d.juryVetoed?.consensusDecision || "REJECTED_BY_JURY") + "</span></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-dlq-workbench") {
+      const p = getPrincipal();
+      await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+        action: "seed_dlq_samples",
+        actor: p.id,
+        role: p.role
+      });
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+        action: "inspect_dlq",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { deadLetterTasks: [], deadLetterWebhooks: [] };
+      openDialog(
+        "死信队列 (DLQ) 任务与 Outbox Webhook 失败重放工作台 (POST /v1beta1/management/ops/dlq-replay)",
+        "<div><strong>死信任务 (" + (d.deadLetterTaskCount ?? 0) + ")：</strong></div>" +
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>任务 ID</th><th>租户</th><th>死信原因</th><th>重试次数</th><th>Fencing Token</th></tr></thead><tbody>" +
+        (d.deadLetterTasks || []).map((t) => "<tr><td class=\"mono\"><strong>" + t.taskId + "</strong></td><td>" + t.tenantId + "</td><td class=\"mono\">" + t.deadLetterReason + "</td><td class=\"mono\">" + t.retryCount + "</td><td class=\"mono\">epoch:" + t.fencingToken + "</td></tr>").join("") +
+        "</tbody></table></div>" +
+        "<div style=\"margin-top:8px;\"><strong>Outbox 死信 Webhook 消息 (" + (d.deadLetterWebhookCount ?? 0) + ")：</strong></div>" +
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>消息 ID</th><th>关联任务</th><th>目标 URL</th><th>失败尝试</th><th>最后错误</th></tr></thead><tbody>" +
+        (d.deadLetterWebhooks || []).map((m) => "<tr><td class=\"mono\"><strong>" + m.messageId + "</strong></td><td class=\"mono\">" + m.taskId + "</td><td class=\"mono\">" + m.targetUrl + "</td><td class=\"mono\">" + m.attempts + "</td><td class=\"mono\">" + m.lastError + "</td></tr>").join("") +
+        "</tbody></table></div>",
+        "一键重放全部死信任务与 Outbox Webhook",
+        async () => {
+          await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+            action: "replay_dead_letter_task",
+            taskId: "task-dlq-9901",
+            actor: p.id,
+            role: p.role
+          });
+          await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+            action: "replay_outbox_webhook",
+            messageId: "outbox-dlq-9901",
+            newTargetUrl: "https://audit-sink.ansts.internal/webhook",
+            actor: p.id,
+            role: p.role
+          });
+          closeDialog();
+          await fetchBackendState();
+          showToast("已完成死信任务 task-dlq-9901 重新入队与 Outbox Webhook 重放投递");
+        }
+      );
+      return;
+    }
+    if (action === "run-health-scorecard") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/health-scorecard", {
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { suites: [], overallScorePct: 100 };
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "M60–M69 全链路持久化 / 幂等 / 断点恢复 / DFX / 零残余缺陷一键健康评分卡",
+        "<div><strong>综合健康得分：</strong> <span class=\"status-pill ok\">" + (d.overallScorePct ?? 100) + "% (" + (d.passedSuites ?? 10) + "/" + (d.totalSuites ?? 10) + " 专项全部通过)</span></div>" +
+        "<div class=\"table-wrap\" style=\"margin-top:8px;\"><table class=\"data-table\"><thead><tr><th>里程碑</th><th>核查专项内容</th><th>状态</th></tr></thead><tbody>" +
+        (d.suites || []).map((s) => "<tr><td class=\"mono\"><strong>" + s.milestone + "</strong></td><td>" + s.title + "</td><td><span class=\"status-pill " + (s.passed ? "ok" : "danger") + "\">" + (s.passed ? "PASS" : "FAIL") + "</span></td></tr>").join("") +
+        "</tbody></table></div>",
+        "关闭评分卡",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-security-fence-alerts") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/day2-governance", {
+        action: "security_fence_alerts",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { alerts: [] };
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "零信任安全围栏 (celld-fence / eBPF LSM / Vsock) 实时拦截告警流",
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>告警 ID</th><th>拦截层</th><th>目标载荷</th><th>拦截原因</th><th>状态</th></tr></thead><tbody>" +
+        (d.alerts || []).map((a) => "<tr><td class=\"mono\"><strong>" + a.alertId + "</strong></td><td>" + a.layer + "</td><td class=\"mono\">" + a.target + "</td><td class=\"mono\">" + a.reason + "</td><td><span class=\"status-pill ok\">BLOCKED</span></td></tr>").join("") +
+        "</tbody></table></div>",
+        "确认安全拦截日志",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-finops-attribution") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/day2-governance", {
+        action: "finops_cost_attribution",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { attributions: [] };
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "FinOps 多维成本归因与 UTC 日切幂等状态 (" + (d.utcDayWindow || "UTC") + ")",
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>租户</th><th>LLM 推理费用</th><th>沙箱核时费用</th><th>Prefix Cache 节省</th><th>总消耗 / 日预算</th><th>当日幂等键数</th></tr></thead><tbody>" +
+        (d.attributions || []).map((a) => "<tr><td><strong>" + a.tenantId + "</strong></td><td class=\"mono\">$" + a.llmInferenceCostUsd + "</td><td class=\"mono\">$" + a.sandboxCpuMemCostUsd + "</td><td class=\"mono\"><span class=\"status-pill ok\">-$" + a.prefixCacheSavedUsd + "</span></td><td class=\"mono\">$" + a.totalSpentUsd + " / $" + a.dailyBudgetUsd + " (" + a.utilizationPct + "%)</td><td class=\"mono\">" + a.seenIdempotencyKeysCount + "</td></tr>").join("") +
+        "</tbody></table></div>",
+        "关闭成本归因报告",
+        () => closeDialog()
+      );
+      return;
+    }
+    if (action === "open-config-diff-preview") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/day2-governance", {
+        action: "config_diff_preview",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { diffs: [] };
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "配置中心版本变更字段级 Diff 对比预览 (POST /v1beta1/management/ops/day2-governance)",
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>配置项 (Field)</th><th>当前基线值</th><th>待发布候选值</th><th>变更类型</th></tr></thead><tbody>" +
+        (d.diffs || []).map((df) => "<tr><td class=\"mono\"><strong>" + df.field + "</strong></td><td class=\"mono\">" + JSON.stringify(df.oldValue) + "</td><td class=\"mono\">" + JSON.stringify(df.newValue) + "</td><td><span class=\"status-pill " + (df.changeType === "UNCHANGED" ? "ok" : "warn") + "\">" + df.changeType + "</span></td></tr>").join("") +
+        "</tbody></table></div>",
+        "应用配置变更并记录 CAS 版本",
+        async () => {
+          await callBackendApi("POST", "/v1beta1/management/config/center", {
+            action: "validate_and_apply_config",
+            runtimeOverrides: { maxCellConcurrentRequests: 96 },
+            actor: p.id,
+            role: p.role
+          });
+          closeDialog();
+          await fetchBackendState();
+          showToast("已通过 Diff 复核并热更新配置中心版本");
+        }
+      );
+      return;
+    }
+    if (action === "open-dual-key-rotation") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/day2-governance", {
+        action: "rotate_webhook_secret",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "Outbox Webhook HMAC 密钥零停机双密钥平滑轮换 (Primary + Grace-Window Secondary)",
+        "<div><strong>当前密钥代次 (Generation)：</strong> <span class=\"status-pill ok\">Gen #" + (d.keyRotationGeneration ?? 2) + "</span></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">旧主密钥转入次级宽限窗口 (Secondary Active): <code class=\"mono\">" + Boolean(d.secondaryActive) + "</code> · 飞行中旧签名验证通过: <code class=\"mono\">" + Boolean(d.oldSignatureStillValidInGraceWindow) + "</code> · 新主密钥签名验证通过: <code class=\"mono\">" + Boolean(d.newSignatureValid) + "</code></div>",
+        "完成密钥轮换确认",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+
     if (action === 'm50-op') {
       const method = target.getAttribute('data-method') || 'POST';
       const ep = target.getAttribute('data-endpoint') || '/v1beta1/management/ops/observability';

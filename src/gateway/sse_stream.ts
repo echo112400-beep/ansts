@@ -1,6 +1,7 @@
 /**
- * @fileoverview M1 TASK-03 & M54-4: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer
- * with Evicted `Last-Event-ID` Fallback Replay & Completed Task Stream Garbage Collection.
+ * @fileoverview M1 TASK-03, M54-4, M60-3 & M66-2: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer
+ * with Evicted `Last-Event-ID` Fallback Replay, Completed Task Stream GC (Across History + Orphan Subscriptions),
+ * Idempotent `envelope.id` Deduplication & CRLF Frame-Injection Sanitization.
  */
 import { PassThrough } from "node:stream";
 
@@ -26,11 +27,17 @@ export class ClientStreamSubscription {
     this.stream = new PassThrough();
   }
 
+  /**
+   * [M66-2] Strips `\r` and `\n` characters from `id` and `event` headers before framing
+   * to prevent SSE header/frame injection attacks.
+   */
   public writeSse(envelope: SseEventEnvelope): void {
     if (this.closed) return;
+    const safeId = String(envelope.id ?? "").replace(/[\r\n]+/g, "");
+    const safeEvent = String(envelope.event ?? "message").replace(/[\r\n]+/g, "");
     const frame =
-      `id: ${envelope.id}\n` +
-      `event: ${envelope.event}\n` +
+      `id: ${safeId}\n` +
+      `event: ${safeEvent}\n` +
       `data: ${JSON.stringify(envelope)}\n\n`;
     this.stream.write(frame);
   }
@@ -46,10 +53,13 @@ export class ClientStreamSubscription {
 export class SseEventStreamGateway {
   private readonly subscriptionsByTask: Map<string, Map<string, ClientStreamSubscription>> = new Map();
   private readonly historyByTask: Map<string, SseEventEnvelope[]> = new Map();
+  private readonly seenEventIdsByTask: Map<string, Set<string>> = new Map();
   private readonly maxHistoryPerTask: number;
 
   constructor(maxHistoryPerTask = 100) {
-    this.maxHistoryPerTask = maxHistoryPerTask;
+    const rawMax = Number(maxHistoryPerTask);
+    this.maxHistoryPerTask =
+      Number.isFinite(rawMax) && rawMax > 0 ? Math.max(1, Math.floor(rawMax)) : 100;
   }
 
   public subscribe(taskId: string, subscriptionId: string, replayFromEventId?: string): ClientStreamSubscription {
@@ -113,12 +123,18 @@ export class SseEventStreamGateway {
   }
 
   /**
-   * [M54-4] Garbage-collects SSE history and closed subscriptions for terminated/completed tasks
-   * to prevent unbounded memory growth across long-running gateways.
+   * [M54-4 & M66-2] Garbage-collects SSE history, deduplication sets, and open subscriptions across
+   * the union of `historyByTask`, `subscriptionsByTask`, and `seenEventIdsByTask` so tasks that
+   * terminated with zero published events never leak open `PassThrough` streams.
    */
   public gcCompletedTaskStreams(activeTaskIds: Set<string>): number {
     let cleanedTasks = 0;
-    for (const taskId of Array.from(this.historyByTask.keys())) {
+    const candidateTaskIds = new Set<string>([
+      ...this.historyByTask.keys(),
+      ...this.subscriptionsByTask.keys(),
+      ...this.seenEventIdsByTask.keys(),
+    ]);
+    for (const taskId of candidateTaskIds) {
       if (!activeTaskIds.has(taskId)) {
         const subs = this.subscriptionsByTask.get(taskId);
         if (subs) {
@@ -126,13 +142,30 @@ export class SseEventStreamGateway {
           this.subscriptionsByTask.delete(taskId);
         }
         this.historyByTask.delete(taskId);
+        this.seenEventIdsByTask.delete(taskId);
         cleanedTasks += 1;
       }
     }
     return cleanedTasks;
   }
 
+  /**
+   * [M60-3] Idempotent event publication: suppresses duplicate `envelope.id` publications for the same
+   * `taskId` so retried turn emitters never duplicate history entries or double-stream frames to clients.
+   */
   public publish(envelope: SseEventEnvelope): number {
+    let seenSet = this.seenEventIdsByTask.get(envelope.taskId);
+    if (!seenSet) {
+      seenSet = new Set();
+      this.seenEventIdsByTask.set(envelope.taskId, seenSet);
+    }
+    if (envelope.id && seenSet.has(envelope.id)) {
+      return 0;
+    }
+    if (envelope.id) {
+      seenSet.add(envelope.id);
+    }
+
     let history = this.historyByTask.get(envelope.taskId);
     if (!history) {
       history = [];
@@ -140,7 +173,10 @@ export class SseEventStreamGateway {
     }
     history.push(envelope);
     if (history.length > this.maxHistoryPerTask) {
-      history.shift();
+      const evicted = history.shift();
+      if (evicted?.id && seenSet.size > this.maxHistoryPerTask * 4) {
+        seenSet.delete(evicted.id);
+      }
     }
     const taskSubs = this.subscriptionsByTask.get(envelope.taskId);
     if (!taskSubs) return 0;
@@ -152,5 +188,20 @@ export class SseEventStreamGateway {
       }
     }
     return delivered;
+  }
+
+  public getTaskHistory(taskId: string): SseEventEnvelope[] {
+    return [...(this.historyByTask.get(taskId) ?? [])];
+  }
+
+  public getActiveSubscriptionCount(taskId?: string): number {
+    if (taskId !== undefined) {
+      return this.subscriptionsByTask.get(taskId)?.size ?? 0;
+    }
+    let total = 0;
+    for (const m of this.subscriptionsByTask.values()) {
+      total += m.size;
+    }
+    return total;
   }
 }

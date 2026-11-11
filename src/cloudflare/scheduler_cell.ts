@@ -1,10 +1,21 @@
 /**
- * @fileoverview M7 TASK-26 & M52-1: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
- * Monotonic Fencing Watermark Rehydration, Interrupted-Lease Recovery & Active-Lease Alarm Renewal).
+ * @fileoverview M7 TASK-26, M52-1, M60-1, M64-1/M64-2 & M69-2: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
+ * Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, Active-Only Content-Fingerprint Rehydration,
+ * Interrupted-Lease Node Capacity Reclamation, 100% TaskSpec Field Fidelity, Alarm Renewal & Worker Prefix-Aware Route Matching).
  */
 import { DurableObjectStateLike } from "./env.js";
 import { CoreScheduler5D } from "../scheduler.js";
-import { NodeHeartbeat, TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { NodeHeartbeat, ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
+
+const ACTIVE_FINGERPRINT_STATES = new Set<TaskState>([
+  TaskState.SUBMITTED,
+  TaskState.QUEUED,
+  TaskState.LEASED,
+  TaskState.RUNNING_THINK,
+  TaskState.RUNNING_ACT,
+  TaskState.WAITING_SUB_AGENT,
+  TaskState.SUSPENDED_APPROVAL,
+]);
 
 export class AnstsSchedulerCell {
   private readonly ctx: DurableObjectStateLike;
@@ -45,8 +56,10 @@ export class AnstsSchedulerCell {
   }
 
   /**
-   * [M52-1] Rehydrates registered nodes, monotonic fencing token watermarks, and interrupted LEASED tasks
-   * (converting orphaned LEASED tasks back to QUEUED on cell migration/restart so they never hang).
+   * [M52-1, M60-1, M64-2 & M69-2] Rehydrates registered nodes, monotonic fencing token watermarks, tenant-scoped `idempotencyIndex`,
+   * active-only `contentFingerprintIndex`, full `TaskSpec` fields (`resource_profile`, `parent_task_id`, `expected_SubAgent_count`, `prefix_Cache_hash`),
+   * `current_turn` breakpoint progress, and interrupted LEASED tasks (refunding pre-crash node CPU/memory/`running_tasks` so rehydrated nodes
+   * never suffer permanent phantom capacity loss).
    */
   public rehydrateFromSql(): number {
     const nodeRows = this.ctx.storage.sql
@@ -81,6 +94,10 @@ export class AnstsSchedulerCell {
     for (const r of rows) {
       if (!r.payload_json) continue;
       const parsed = JSON.parse(String(r.payload_json)) as Record<string, unknown>;
+      const rawProfile =
+        parsed.resource_profile && typeof parsed.resource_profile === "object"
+          ? (parsed.resource_profile as Partial<ResourceProfile>)
+          : undefined;
       const spec = new TaskSpec({
         task_id: String(r.task_id),
         tenant_id: String(r.tenant_id),
@@ -88,13 +105,41 @@ export class AnstsSchedulerCell {
         prompt: String(parsed.prompt ?? ""),
         max_turns: Number(parsed.max_turns ?? 30),
         timeout_seconds: Number(parsed.timeout_seconds ?? 1800),
+        resource_profile: rawProfile,
         dependencies: Array.isArray(parsed.dependencies) ? parsed.dependencies.map(String) : [],
+        idempotency_key: parsed.idempotency_key ? String(parsed.idempotency_key) : undefined,
+        parent_task_id: parsed.parent_task_id ? String(parsed.parent_task_id) : undefined,
+        expected_SubAgent_count:
+          parsed.expected_SubAgent_count !== undefined ? Number(parsed.expected_SubAgent_count) : 0,
+        prefix_Cache_hash: parsed.prefix_Cache_hash ? String(parsed.prefix_Cache_hash) : "",
+        content_fingerprint: parsed.content_fingerprint ? String(parsed.content_fingerprint) : undefined,
+        merged_duplicate_count:
+          parsed.merged_duplicate_count !== undefined ? Number(parsed.merged_duplicate_count) : 0,
+        merged_request_ids: Array.isArray(parsed.merged_request_ids)
+          ? parsed.merged_request_ids.map(String)
+          : [],
+        merged_idempotency_keys: Array.isArray(parsed.merged_idempotency_keys)
+          ? parsed.merged_idempotency_keys.map(String)
+          : undefined,
       });
+      if (parsed.current_turn !== undefined) {
+        spec.current_turn = Number(parsed.current_turn);
+      }
+      if (parsed.last_preempted_at !== undefined) {
+        spec.last_preempted_at = Number(parsed.last_preempted_at);
+      }
+      if (parsed.created_at !== undefined) {
+        spec.created_at = Number(parsed.created_at);
+      }
       spec.state = (r.state as TaskState) ?? TaskState.QUEUED;
       spec.lease_fencing_token = Number(r.fencing_token ?? 0);
       spec.retry_count = Number(parsed.retry_count ?? 0);
       spec.preempted_count = Number(parsed.preempted_count ?? 0);
+      spec.dead_letter_reason = parsed.dead_letter_reason ? String(parsed.dead_letter_reason) : undefined;
       spec.assigned_node_id = r.assigned_node_id ? String(r.assigned_node_id) : undefined;
+      if (!spec.content_fingerprint) {
+        spec.content_fingerprint = CoreScheduler5D.computeTaskContentFingerprint(spec);
+      }
 
       if (spec.lease_fencing_token > 0) {
         this.scheduler.leaseCoordinator.seedHighestFencingToken(spec.task_id, spec.lease_fencing_token);
@@ -106,12 +151,42 @@ export class AnstsSchedulerCell {
         spec.state === TaskState.RUNNING_ACT
       ) {
         if (!this.scheduler.leaseCoordinator.getLease(spec.task_id)) {
+          if (spec.assigned_node_id) {
+            const oldNode = this.scheduler.nodes.get(spec.assigned_node_id);
+            if (oldNode) {
+              oldNode.free_cpu_cores = Math.min(
+                oldNode.total_cpu_cores,
+                oldNode.free_cpu_cores + spec.resource_profile.think_cpu_cores
+              );
+              oldNode.free_memory_mb = Math.min(
+                oldNode.total_memory_mb,
+                oldNode.free_memory_mb + Math.floor(spec.resource_profile.act_memory_mb * 0.25)
+              );
+              oldNode.running_tasks = Math.max(0, oldNode.running_tasks - 1);
+            }
+          }
           spec.state = TaskState.QUEUED;
           spec.assigned_node_id = undefined;
         }
       }
 
       this.scheduler.allTasks.set(spec.task_id, spec);
+      if (spec.idempotency_key) {
+        this.scheduler.idempotencyIndex.set(
+          CoreScheduler5D.scopeIdempotencyKey(spec.tenant_id, spec.idempotency_key),
+          spec.task_id
+        );
+      }
+      for (const mKey of spec.merged_idempotency_keys) {
+        this.scheduler.idempotencyIndex.set(
+          CoreScheduler5D.scopeIdempotencyKey(spec.tenant_id, mKey),
+          spec.task_id
+        );
+      }
+      if (ACTIVE_FINGERPRINT_STATES.has(spec.state)) {
+        this.scheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+      }
+
       if (spec.state === TaskState.QUEUED) {
         this.scheduler.queueManager.enqueue(spec);
       } else if (spec.state === TaskState.COMPLETED) {
@@ -136,17 +211,29 @@ export class AnstsSchedulerCell {
       JSON.stringify({
         prompt: task.prompt,
         max_turns: task.max_turns,
+        current_turn: task.current_turn,
         timeout_seconds: task.timeout_seconds,
+        resource_profile: task.resource_profile,
         dependencies: task.dependencies,
+        idempotency_key: task.idempotency_key,
+        parent_task_id: task.parent_task_id,
+        expected_SubAgent_count: task.expected_SubAgent_count,
+        prefix_Cache_hash: task.prefix_Cache_hash,
+        content_fingerprint: task.content_fingerprint,
+        merged_duplicate_count: task.merged_duplicate_count,
+        merged_request_ids: task.merged_request_ids,
+        merged_idempotency_keys: task.merged_idempotency_keys,
         retry_count: task.retry_count,
         preempted_count: task.preempted_count,
+        last_preempted_at: task.last_preempted_at,
         dead_letter_reason: task.dead_letter_reason,
+        created_at: task.created_at,
       })
     );
   }
 
-  public async submitTask(task: TaskSpec): Promise<TaskSpec> {
-    const submitted = this.scheduler.submitTask(task);
+  public async submitTask(task: TaskSpec, options?: { mergeDuplicateInFlight?: boolean }): Promise<TaskSpec> {
+    const submitted = this.scheduler.submitTask(task, options);
     this.persistTask(submitted);
     const currentAlarm = await this.ctx.storage.getAlarm();
     if (!currentAlarm) {
@@ -186,29 +273,91 @@ export class AnstsSchedulerCell {
     return { placements, recoveredIds };
   }
 
+  /**
+   * [M64-1] Supports both direct Cell paths (`/submit`, `/schedule-tick`, `/register-node`, `/tasks`)
+   * and Worker-forwarded prefixed paths (`/v1/scheduler/submit`, `/v1/scheduler/schedule-tick`, etc.).
+   */
   public async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === "POST" && url.pathname === "/submit") {
+    const normalizedPath = url.pathname.replace(/^\/v1\/scheduler(?=\/|$)/, "") || "/";
+
+    if (request.method === "POST" && normalizedPath === "/submit") {
       const body = (await request.json()) as Record<string, unknown>;
       const spec = new TaskSpec({
-        task_id: String(body.task_id),
+        task_id: String(body.task_id ?? `task-${Date.now()}`),
         tenant_id: String(body.tenant_id ?? "default"),
         priority: Number(body.priority ?? TaskPriority.P2_STANDARD) as TaskPriority,
         prompt: String(body.prompt ?? ""),
+        max_turns: body.max_turns !== undefined ? Number(body.max_turns) : undefined,
+        timeout_seconds: body.timeout_seconds !== undefined ? Number(body.timeout_seconds) : undefined,
+        resource_profile:
+          body.resource_profile && typeof body.resource_profile === "object"
+            ? (body.resource_profile as Partial<ResourceProfile>)
+            : undefined,
+        dependencies: Array.isArray(body.dependencies) ? body.dependencies.map(String) : undefined,
+        idempotency_key: body.idempotency_key ? String(body.idempotency_key) : undefined,
+        parent_task_id: body.parent_task_id ? String(body.parent_task_id) : undefined,
+        expected_SubAgent_count:
+          body.expected_SubAgent_count !== undefined ? Number(body.expected_SubAgent_count) : undefined,
+        prefix_Cache_hash: body.prefix_Cache_hash ? String(body.prefix_Cache_hash) : undefined,
       });
-      const submitted = await this.submitTask(spec);
-      return new Response(JSON.stringify({ task_id: submitted.task_id, state: submitted.state }), {
-        status: 202,
+      const submitted = await this.submitTask(spec, {
+        mergeDuplicateInFlight: Boolean(body.merge_duplicate ?? body.deduplicate_by_fingerprint ?? false),
+      });
+      return new Response(
+        JSON.stringify({
+          task_id: submitted.task_id,
+          tenant_id: submitted.tenant_id,
+          state: submitted.state,
+          priority: submitted.priority,
+          merged_duplicate_count: submitted.merged_duplicate_count,
+        }),
+        {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        }
+      );
+    }
+
+    if (request.method === "POST" && normalizedPath === "/register-node") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const hb = new NodeHeartbeat({
+        node_id: String(body.node_id ?? "body-node-01"),
+        total_cpu_cores: Number(body.total_cpu_cores ?? 32),
+        free_cpu_cores: Number(body.free_cpu_cores ?? 32),
+        total_memory_mb: Number(body.total_memory_mb ?? 65536),
+        free_memory_mb: Number(body.free_memory_mb ?? 65536),
+        warm_pool_ready: Number(body.warm_pool_ready ?? 8),
+        psi_memory_some_avg10: Number(body.psi_memory_some_avg10 ?? 1.0),
+        running_tasks: Number(body.running_tasks ?? 0),
+        healthy: body.healthy !== undefined ? Boolean(body.healthy) : true,
+      });
+      this.registerNode(hb);
+      return new Response(JSON.stringify({ registered: true, node_id: hb.node_id }), {
+        status: 200,
         headers: { "content-type": "application/json" },
       });
     }
-    if (request.method === "POST" && url.pathname === "/schedule-tick") {
+
+    if (request.method === "POST" && normalizedPath === "/schedule-tick") {
       const res = await this.alarm();
       return new Response(JSON.stringify(res), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
     }
-    return new Response(JSON.stringify({ cellId: this.ctx.id.toString() }), { status: 200 });
+
+    if (request.method === "GET" && normalizedPath === "/tasks") {
+      const tasks = Array.from(this.scheduler.allTasks.values());
+      return new Response(JSON.stringify({ cellId: this.ctx.id.toString(), totalTasks: tasks.length, tasks }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    return new Response(JSON.stringify({ cellId: this.ctx.id.toString(), totalTasks: this.scheduler.allTasks.size }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   }
 }

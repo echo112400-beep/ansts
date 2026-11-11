@@ -18,7 +18,10 @@ import { OtelAndPrometheusExporter } from "./telemetry/otel_prometheus.js";
 import { LayerFsWorkspaceDriver } from "./runtime/layerfs_workspace_driver.js";
 import { ManualFleetScaleController } from "./cluster/manual_scale_controller.js";
 import { CognitiveRouter } from "./cognitive_router.js";
-import { LlmEndpointMetrics, TaskSpec, ToolCallEffectClass } from "./models.js";
+import { LlmEndpointMetrics, TaskSpec, TaskState, ToolCallEffectClass } from "./models.js";
+import { TunnelGatewayCell } from "./cloudflare/tunnel_gateway_cell.js";
+import { SagaCompensatorEngine } from "./saga/compensator.js";
+import { StagingCommitAndApprovalGate } from "./saga/staging.js";
 import { SagaToolGateway } from "./saga_gateway.js";
 import { HaSchedulerShardCoordinator } from "./cloudflare/ha_scheduler_shard_coordinator.js";
 import { SchedulerV25SingleWritePathStore } from "./cloudflare/scheduler_v25_persistence.js";
@@ -80,8 +83,12 @@ export interface AnstsServiceRuntimeOptions {
   peerBodyUrls?: Record<string, string>;
   storageDir?: string;
   s3Endpoint?: string;
+  s3AccessKeyId?: string;
+  s3SecretAccessKey?: string;
+  s3Region?: string;
   primaryGatewayUrl?: string;
   secondaryGatewayUrl?: string;
+  maxBodyBytes?: number;
 }
 
 function parseJsonEnvMap(raw: string | undefined): Record<string, string> {
@@ -99,10 +106,14 @@ function parseJsonEnvMap(raw: string | undefined): Record<string, string> {
 }
 
 export class AnstsLocalAndComposeServer {
+  public readonly maxBodyBytes: number;
   public readonly nodeId: string;
   public readonly nodeRole: "brain" | "body" | "gateway";
   public readonly storageDir: string;
   public readonly s3Endpoint: string | null;
+  public readonly s3AccessKeyId: string | null;
+  public readonly s3SecretAccessKey: string | null;
+  public readonly s3Region: string;
   public readonly primaryGatewayUrl: string | null;
   public readonly secondaryGatewayUrl: string | null;
   public readonly peerBrainUrls: Record<string, string>;
@@ -162,11 +173,16 @@ export class AnstsLocalAndComposeServer {
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tunnelPollTimer: ReturnType<typeof setInterval> | null = null;
   private readonly host: string;
+  private readonly defaultApiPort: number;
+  private readonly defaultDashboardPort: number;
   private readonly tickIntervalMs: number;
   private draining = false;
 
   constructor(options: AnstsServiceRuntimeOptions = {}) {
     this.host = options.host ?? process.env.ANSTS_HOST ?? "0.0.0.0";
+    this.defaultApiPort = options.apiPort ?? Number(process.env.ANSTS_LISTEN_PORT ?? process.env.ANSTS_PORT ?? 8080);
+    this.defaultDashboardPort = options.dashboardPort ?? Number(process.env.ANSTS_DASHBOARD_PORT ?? 0);
+    this.maxBodyBytes = options.maxBodyBytes ?? 4 * 1024 * 1024;
     this.nodeId = options.nodeId ?? process.env.ANSTS_NODE_ID ?? "ansts-dev-node-01";
     this.nodeRole =
       (options.nodeRole ?? (process.env.ANSTS_NODE_ROLE as "brain" | "body" | "gateway")) || "gateway";
@@ -175,6 +191,11 @@ export class AnstsLocalAndComposeServer {
       process.env.ANSTS_STORAGE_DIR ??
       `/tmp/ansts/${this.nodeId}-${process.pid}`;
     this.s3Endpoint = options.s3Endpoint ?? process.env.S3_ENDPOINT ?? null;
+    this.s3AccessKeyId =
+      options.s3AccessKeyId ?? process.env.AWS_ACCESS_KEY_ID ?? process.env.RUSTFS_ACCESS_KEY ?? null;
+    this.s3SecretAccessKey =
+      options.s3SecretAccessKey ?? process.env.AWS_SECRET_ACCESS_KEY ?? process.env.RUSTFS_SECRET_KEY ?? null;
+    this.s3Region = options.s3Region ?? process.env.AWS_REGION ?? "us-east-1";
     this.primaryGatewayUrl = options.primaryGatewayUrl ?? process.env.ANSTS_PRIMARY_GATEWAY_URL ?? null;
     this.secondaryGatewayUrl = options.secondaryGatewayUrl ?? process.env.ANSTS_SECONDARY_GATEWAY_URL ?? null;
     this.peerBrainUrls = options.peerBrainUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BRAIN_URLS);
@@ -187,19 +208,23 @@ export class AnstsLocalAndComposeServer {
     this.metrics = new OtelAndPrometheusExporter();
     this.layerfs = new LayerFsWorkspaceDriver();
     this.fleetController = new ManualFleetScaleController();
-    this.router = new CognitiveRouter();
-    this.sagaGateway = new SagaToolGateway();
-
-    // Ensure storageDir exists and bind DurableDiskCellSqlStorage for RPO=0 persistence
+    // Ensure storageDir exists and bind DurableDiskCellSqlStorage for RPO=0 persistence across all subsystems
     try {
       fs.mkdirSync(this.storageDir, { recursive: true });
     } catch {
       // ignore if read-only in restricted environments
     }
     const sqlFilePath = path.join(this.storageDir, "v25_scheduler.sql.json");
-    this.v25Store = new SchedulerV25SingleWritePathStore(new DurableDiskCellSqlStorage(sqlFilePath));
-    this.tunnelRouter = new EdgeTunnelHaRouter();
-    this.blackboard = new SharedBlackboardAndGitArbiter();
+    const durableSql = new DurableDiskCellSqlStorage(sqlFilePath);
+    this.v25Store = new SchedulerV25SingleWritePathStore(durableSql);
+    this.router = new CognitiveRouter(0.3, durableSql);
+    this.sagaGateway = new SagaToolGateway(
+      new SagaCompensatorEngine(durableSql),
+      new StagingCommitAndApprovalGate(durableSql),
+      durableSql
+    );
+    this.tunnelRouter = new EdgeTunnelHaRouter(new TunnelGatewayCell(durableSql));
+    this.blackboard = new SharedBlackboardAndGitArbiter(durableSql);
     this.deadlockDetector = new A2aWaitForGraphDeadlockDetector();
     this.bisectCoordinator = new ParallelCowGitBisectCoordinator();
     this.gcSweeper = new DistributedCasGcSweeper();
@@ -208,59 +233,67 @@ export class AnstsLocalAndComposeServer {
     this.teeBridge = new ConfidentialTeeAttestationBridge();
     this.securityGuard = new ZeroTrustSandboxSecurityGuard();
     this.mtlsBridge = new MtlsReverseTunnelBridge();
-    this.slaEnforcer = new CapacitySlaEnforcer();
+    this.slaEnforcer = new CapacitySlaEnforcer({ sql: durableSql });
     this.loadShedder = new PriorityLoadShedder();
-    this.canaryController = new CanaryRolloutController();
-    this.prewarmer = new PredictiveSandboxPrewarmer();
-    this.geoRouter = new GeoSovereigntyAndLatencyRouter();
-    this.geoRouter.registerGeoRegion({ regionId: "eu-central-1", jurisdiction: "GDPR_EU", latencyMs: 18, capacityAvailable: true });
-    this.geoRouter.registerGeoRegion({ regionId: "eu-west-1", jurisdiction: "GDPR_EU", latencyMs: 26, capacityAvailable: true });
-    this.geoRouter.registerGeoRegion({ regionId: "us-west-2", jurisdiction: "US_FED", latencyMs: 12, capacityAvailable: true });
-    this.geoRouter.registerGeoRegion({ regionId: "ap-southeast-1", jurisdiction: "APAC_SG", latencyMs: 31, capacityAvailable: true });
+    this.canaryController = new CanaryRolloutController(durableSql);
+    this.prewarmer = new PredictiveSandboxPrewarmer(0.4, durableSql);
+    this.geoRouter = new GeoSovereigntyAndLatencyRouter(durableSql);
+    if (this.geoRouter.listRegions().length === 0) {
+      this.geoRouter.registerGeoRegion({ regionId: "eu-central-1", jurisdiction: "GDPR_EU", latencyMs: 18, capacityAvailable: true });
+      this.geoRouter.registerGeoRegion({ regionId: "eu-west-1", jurisdiction: "GDPR_EU", latencyMs: 26, capacityAvailable: true });
+      this.geoRouter.registerGeoRegion({ regionId: "us-west-2", jurisdiction: "US_FED", latencyMs: 12, capacityAvailable: true });
+      this.geoRouter.registerGeoRegion({ regionId: "ap-southeast-1", jurisdiction: "APAC_SG", latencyMs: 31, capacityAvailable: true });
+    }
     this.crossRegionReplicator = new CrossRegionAsyncReplicator();
     this.chaosDrillRunner = new AutomatedChaosDrillRunner();
     this.chaosProxy = new NetworkChaosFaultInjectionProxy();
     this.preflightGate = new SandboxPreflightReadinessGate();
     this.branchForker = new CoWSandboxBranchForker(this.layerfs);
-    this.finopsController = new FinOpsBudgetController();
-    this.mcpRegistry = new McpDynamicToolRegistry();
-    this.walEngine = new TurnWalEngine();
+    this.finopsController = new FinOpsBudgetController(durableSql);
+    this.mcpRegistry = new McpDynamicToolRegistry(durableSql, this.sagaGateway);
+    this.walEngine = new TurnWalEngine(durableSql);
     this.timeTravelReplayer = new DeterministicTimeTravelReplayer();
     this.heavyMigrator = new EphemeralHeavyExecutorMigrator(new InMemoryR2Bucket());
-    this.velocityBreaker = new SyntacticAndVelocityBreaker();
+    this.velocityBreaker = new SyntacticAndVelocityBreaker(3, 120_000, durableSql);
     this.harnessRunner = new AgentHarnessRunner(this.router, this.sagaGateway, this.velocityBreaker);
-    this.dagEscrow = new DagEscrowCoordinator();
+    this.dagEscrow = new DagEscrowCoordinator(durableSql);
     this.phaseController = new CgroupPhaseController();
     this.psiGuard = new LinuxPsiMemoryGuard();
-    this.cloudEventsBus = new CloudEventsBus();
-    this.outboxDispatcher = new TransactionalOutboxDispatcher();
+    this.cloudEventsBus = new CloudEventsBus(1000, durableSql);
+    this.outboxDispatcher = new TransactionalOutboxDispatcher(undefined, 4, durableSql);
 
     const brainNodes =
       Object.keys(this.peerBrainUrls).length > 0
         ? Object.keys(this.peerBrainUrls)
         : ["brain-node-01", "brain-node-02", "brain-node-03"];
-    this.shardCoordinator = new HaSchedulerShardCoordinator(256, 8);
-    for (const bId of brainNodes) {
-      this.shardCoordinator.registerBrainShardNode(bId);
+    this.shardCoordinator = new HaSchedulerShardCoordinator(256, 8, durableSql);
+    if (this.shardCoordinator.topologyCas.getMembers().length === 0) {
+      for (const bId of brainNodes) {
+        this.shardCoordinator.registerBrainShardNode(bId);
+      }
     }
 
-    // Register default LLM endpoints & Saga tools
-    this.router.registerEndpoint(
-      new LlmEndpointMetrics({
-        endpoint_id: "ep-deepseek-r1",
-        provider: "deepseek",
-        model_name: "DeepSeek",
-        ttft_ewma_ms: 180,
-      })
-    );
-    this.router.registerEndpoint(
-      new LlmEndpointMetrics({
-        endpoint_id: "ep-qwen-38",
-        provider: "qwen",
-        model_name: "Qwen-3.8",
-        ttft_ewma_ms: 150,
-      })
-    );
+    // Register default LLM endpoints (only if not already rehydrated from SQLite) & Saga tools
+    if (!this.router.getEndpoint("ep-deepseek-r1")) {
+      this.router.registerEndpoint(
+        new LlmEndpointMetrics({
+          endpoint_id: "ep-deepseek-r1",
+          provider: "deepseek",
+          model_name: "DeepSeek",
+          ttft_ewma_ms: 180,
+        })
+      );
+    }
+    if (!this.router.getEndpoint("ep-qwen-38")) {
+      this.router.registerEndpoint(
+        new LlmEndpointMetrics({
+          endpoint_id: "ep-qwen-38",
+          provider: "qwen",
+          model_name: "Qwen-3.8",
+          ttft_ewma_ms: 150,
+        })
+      );
+    }
     this.sagaGateway.registerTool(
       "shell_exec",
       ToolCallEffectClass.IDEMPOTENT_WRITE,
@@ -304,9 +337,38 @@ export class AnstsLocalAndComposeServer {
       }
     }
 
-    // Rehydrate in-memory scheduler index from durable v25Store on cold start
+    // [M64-4] Rehydrate full in-memory scheduler state (tasks, fencing watermarks, idempotency, fingerprint, queue) from durable v25Store on cold start
     for (const persistedTask of this.v25Store.listPersistedTasks()) {
+      if (persistedTask.lease_fencing_token > 0) {
+        this.scheduler.leaseCoordinator.rehydrateFencingWatermark(
+          persistedTask.task_id,
+          persistedTask.lease_fencing_token
+        );
+      }
       this.scheduler.allTasks.set(persistedTask.task_id, persistedTask);
+      if (persistedTask.idempotency_key) {
+        this.scheduler.idempotencyIndex.set(
+          CoreScheduler5D.scopeIdempotencyKey(persistedTask.tenant_id, persistedTask.idempotency_key),
+          persistedTask.task_id
+        );
+      }
+      for (const mKey of persistedTask.merged_idempotency_keys) {
+        this.scheduler.idempotencyIndex.set(
+          CoreScheduler5D.scopeIdempotencyKey(persistedTask.tenant_id, mKey),
+          persistedTask.task_id
+        );
+      }
+      if (!persistedTask.content_fingerprint) {
+        persistedTask.content_fingerprint = CoreScheduler5D.computeTaskContentFingerprint(persistedTask);
+      }
+      this.scheduler.contentFingerprintIndex.set(persistedTask.content_fingerprint, persistedTask.task_id);
+      if (persistedTask.state === TaskState.QUEUED) {
+        this.scheduler.queueManager.enqueue(persistedTask);
+      } else if (persistedTask.state === TaskState.COMPLETED) {
+        this.scheduler.completedIds.add(persistedTask.task_id);
+      } else if (persistedTask.state === TaskState.DEAD_LETTER) {
+        this.scheduler.deadLetterIds.add(persistedTask.task_id);
+      }
     }
 
     const bridge = new DashboardBridgeService(this.scheduler, this.fleetController);
@@ -347,6 +409,9 @@ export class AnstsLocalAndComposeServer {
       peerBrainUrls: this.peerBrainUrls,
       peerBodyUrls: this.peerBodyUrls,
       s3Endpoint: this.s3Endpoint,
+      s3AccessKeyId: this.s3AccessKeyId,
+      s3SecretAccessKey: this.s3SecretAccessKey,
+      s3Region: this.s3Region,
     });
     this.dynamicWorkerLoader = new DynamicWorkerSandboxLoader();
     this.kvOptimizer = new CelldKvOptimizerAndGuard(new InMemoryKvNamespace(), 32);
@@ -355,19 +420,23 @@ export class AnstsLocalAndComposeServer {
       maxCellConcurrentRequests: 64,
       maxQueueConcurrentProducers: 256,
     });
-    this.walCompactor = new WalCompactorAndPagedRestorer();
-    this.layerfsStoreSync = new LayerFsRemoteStoreSynchronizer(new InMemoryR2Bucket(), "ansts-fleet");
+    this.walCompactor = new WalCompactorAndPagedRestorer(4096, durableSql);
+    this.layerfsStoreSync = new LayerFsRemoteStoreSynchronizer(new InMemoryR2Bucket(), "ansts-fleet", durableSql);
   }
 
   public async start(apiPort?: number, dashboardPort?: number): Promise<{ apiPort: number; dashboardPort: number }> {
-    const targetApiPort = apiPort ?? Number(process.env.ANSTS_LISTEN_PORT ?? process.env.ANSTS_PORT ?? 8080);
-    const targetDashPort = dashboardPort ?? Number(process.env.ANSTS_DASHBOARD_PORT ?? 0);
+    const targetApiPort = apiPort ?? this.defaultApiPort;
+    const targetDashPort = dashboardPort ?? this.defaultDashboardPort;
 
     const boundApiPort = await new Promise<number>((resolve, reject) => {
       this.apiServer = http.createServer((req, res) => {
         this.handleHttpRequest(req, res).catch((err: unknown) => {
-          res.writeHead(500, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: (err as Error).message }));
+          const msg = (err as Error).message ?? String(err);
+          const status = msg.startsWith("PAYLOAD_TOO_LARGE:") ? 413 : 500;
+          if (!res.headersSent) {
+            res.writeHead(status, { "content-type": "application/json" });
+          }
+          res.end(JSON.stringify({ error: msg }));
         });
       });
       this.apiServer.on("error", reject);
@@ -391,14 +460,34 @@ export class AnstsLocalAndComposeServer {
 
     this.tickTimer = setInterval(() => {
       if (!this.draining) {
-        this.scheduler.reconcileOrphanedLeases();
-        this.scheduler.scheduleTick();
+        const recovered = this.scheduler.reconcileOrphanedLeases();
+        const placements = this.scheduler.scheduleTick();
+        if (recovered.length > 0 || placements.length > 0) {
+          for (const t of this.scheduler.allTasks.values()) {
+            this.syncTaskToV25Store(t);
+          }
+        }
         this.metrics.setGauge("ansts_queued_tasks", this.scheduler.queueManager.totalQueued());
         this.metrics.setGauge("ansts_Registered_nodes", this.scheduler.nodes.size);
       }
     }, this.tickIntervalMs);
 
     return { apiPort: boundApiPort, dashboardPort: boundDashPort };
+  }
+
+  private syncTaskToV25Store(task: TaskSpec): void {
+    const idemKey = task.idempotency_key ?? `idem:${task.tenant_id}:${task.task_id}`;
+    this.v25Store.sql.exec(
+      "INSERT OR REPLACE INTO v25_scheduler_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, idem_key, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      task.task_id,
+      task.tenant_id,
+      task.priority,
+      task.state,
+      task.lease_fencing_token,
+      task.assigned_node_id ?? "",
+      idemKey,
+      JSON.stringify(task)
+    );
   }
 
   private async registerOutboundReverseTunnels(): Promise<void> {
@@ -493,8 +582,20 @@ export class AnstsLocalAndComposeServer {
   private async readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
-      req.on("data", (c: Buffer) => chunks.push(c));
+      let totalBytes = 0;
+      let rejectedTooLarge = false;
+      req.on("data", (c: Buffer) => {
+        if (rejectedTooLarge) return;
+        totalBytes += c.byteLength;
+        if (totalBytes > this.maxBodyBytes) {
+          rejectedTooLarge = true;
+          reject(new Error(`PAYLOAD_TOO_LARGE: request body exceeded ${this.maxBodyBytes} bytes`));
+          return;
+        }
+        chunks.push(c);
+      });
       req.on("end", () => {
+        if (rejectedTooLarge) return;
         try {
           const raw = Buffer.concat(chunks).toString("utf-8").trim();
           resolve(raw ? (JSON.parse(raw) as Record<string, unknown>) : {});
@@ -574,6 +675,38 @@ export class AnstsLocalAndComposeServer {
       try {
         const body = await this.readJsonBody(req);
         const spec = TaskSpecValidator.validateAndNormalize(body);
+        const mergeDuplicateInFlight = Boolean(
+          body.merge_duplicate ?? body.deduplicate_by_fingerprint ?? false
+        );
+        // [M64-4] Pre-check duplicate/mergeable task BEFORE backpressure rejection (consistent with ApiGatewayServer)
+        const dupCheck = this.scheduler.inspectAndMergeDuplicateTask(spec, {
+          mergeDuplicateInFlight,
+        });
+        if (dupCheck.deduplicated) {
+          const canonical = dupCheck.canonicalTask;
+          this.v25Store.commitTaskSingleWritePath(spec, canonical.assigned_node_id, {
+            mergeDuplicateInFlight,
+          });
+          res.writeHead(202, {
+            "content-type": "application/json",
+            "X-Ansts-Deduplicated": dupCheck.mergedBy,
+          });
+          res.end(
+            JSON.stringify({
+              task_id: canonical.task_id,
+              state: canonical.state,
+              assigned_node_id: canonical.assigned_node_id ?? null,
+              lease_fencing_token: canonical.lease_fencing_token,
+              deduplicated: true,
+              merged_by: dupCheck.mergedBy,
+              priority_promoted: dupCheck.priorityPromoted,
+              merged_duplicate_count: canonical.merged_duplicate_count,
+              placements: [],
+            })
+          );
+          return;
+        }
+
         const decision = this.backpressure.evaluateAdmission({
           priority: spec.priority,
           globalQueueDepth: this.scheduler.queueManager.totalQueued(),
@@ -591,9 +724,11 @@ export class AnstsLocalAndComposeServer {
         // Strict Single-Write-Path: check existing persisted task first, then schedule and commit atomically
         const existingPersisted = this.v25Store.getPersistedTask(spec.task_id);
         if (!existingPersisted) {
-          const submitted = this.scheduler.submitTask(spec);
+          const submitted = this.scheduler.submitTask(spec, { mergeDuplicateInFlight });
           const placements = this.scheduler.scheduleTick();
-          this.v25Store.commitTaskSingleWritePath(submitted, submitted.assigned_node_id);
+          this.v25Store.commitTaskSingleWritePath(submitted, submitted.assigned_node_id, {
+            mergeDuplicateInFlight,
+          });
           if (this.s3Endpoint) {
             await this.v25Store.flushLtxSnapshotToS3(this.s3Endpoint, this.nodeId);
           }
@@ -605,12 +740,16 @@ export class AnstsLocalAndComposeServer {
               state: submitted.state,
               assigned_node_id: submitted.assigned_node_id ?? null,
               lease_fencing_token: submitted.lease_fencing_token,
+              deduplicated: false,
+              merged_duplicate_count: submitted.merged_duplicate_count,
               placements,
             })
           );
           return;
         }
-        const preCommitted = this.v25Store.commitTaskSingleWritePath(spec);
+        const preCommitted = this.v25Store.commitTaskSingleWritePath(spec, undefined, {
+          mergeDuplicateInFlight,
+        });
         res.writeHead(202, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
@@ -619,6 +758,7 @@ export class AnstsLocalAndComposeServer {
             assigned_node_id: preCommitted.task.assigned_node_id ?? null,
             lease_fencing_token: preCommitted.fencingToken,
             deduplicated: true,
+            merged_duplicate_count: preCommitted.task.merged_duplicate_count,
             placements: [],
           })
         );
@@ -1705,12 +1845,14 @@ export class AnstsLocalAndComposeServer {
           args,
         });
         const ticket = this.sagaGateway.stagingGate.requestHumanApproval(task, toolName, args);
+        this.syncTaskToV25Store(task);
         res.writeHead(202, { "content-type": "application/json" });
         res.end(JSON.stringify({ status: "PENDING_APPROVAL", stagedEffectId: staged.effectId, ticket }));
         return;
       }
 
       const [output, deduplicated] = this.sagaGateway.invokeTool(taskId, turnIndex, toolName, args);
+      this.syncTaskToV25Store(task);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "EXECUTED", taskId, turnIndex, toolName, deduplicated, output }));
       return;
@@ -1734,31 +1876,36 @@ export class AnstsLocalAndComposeServer {
         this.scheduler.allTasks.set(taskId, task);
       }
       const ticket = this.sagaGateway.stagingGate.resolveApproval(ticketId, approved, decidedBy, task);
-      let committedEffects: Array<{ effectId: string; output: Record<string, unknown> }> = [];
+      let committedEffects: Array<{ effectId: string; turnIndex: number; output: Record<string, unknown> }> = [];
       if (approved) {
-        committedEffects = this.sagaGateway.stagingGate.commitStagedEffects(taskId, (tName, tArgs) => {
-          return this.sagaGateway.invokeTool(taskId, 1, tName, tArgs)[0];
-        });
+        committedEffects = this.sagaGateway.stagingGate.commitStagedEffects(
+          taskId,
+          (tName, tArgs, tTurnIndex) => {
+            return this.sagaGateway.invokeTool(taskId, tTurnIndex, tName, tArgs)[0];
+          }
+        );
       } else {
         this.sagaGateway.stagingGate.abortStagedEffects(taskId);
       }
+      this.syncTaskToV25Store(task);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ticket, taskState: task.state, committedEffects }));
       return;
     }
 
-    // [M38-2] Reverse-Order LIFO Saga Compensation Rollback (`POST /v1beta1/saga/rollback`)
+    // [M38-2 & M64-3] Reverse-Order LIFO Saga Compensation Rollback & Idempotency Journal Invalidation (`POST /v1beta1/saga/rollback`)
     if (method === "POST" && pathname === "/v1beta1/saga/rollback") {
       const body = await this.readJsonBody(req);
       const taskId = String(body.taskId ?? "task-saga-01");
       const upToTurnInclusive = Number(body.upToTurnInclusive ?? 0);
-      const rolledBackSteps = this.sagaGateway.compensator.rollbackTask(taskId, upToTurnInclusive);
+      const rb = this.sagaGateway.rollbackAndInvalidateTask(taskId, upToTurnInclusive);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           taskId,
-          rolledBackCount: rolledBackSteps.length,
-          rolledBackSteps: rolledBackSteps.map((s) => ({
+          rolledBackCount: rb.rolledBackSteps.length,
+          invalidatedIdemKeysCount: rb.invalidatedIdemKeys.length,
+          rolledBackSteps: rb.rolledBackSteps.map((s) => ({
             stepId: s.stepId,
             turnIndex: s.turnIndex,
             toolName: s.toolName,
@@ -1888,6 +2035,20 @@ export class AnstsLocalAndComposeServer {
           estimatedTokens
         );
         const actCgroup = this.phaseController.applyActPhase(taskId, task.resource_profile);
+        this.syncTaskToV25Store(task);
+        try {
+          const fTok = Math.max(1, task.lease_fencing_token);
+          this.walEngine.appendTurnDelta({
+            taskId,
+            turnIndex: turnSummary.turnIndex,
+            fencingToken: fTok,
+            changedFiles: [`harness/${taskId}-turn-${turnSummary.turnIndex}.json`],
+            sqliteWalPages: 4,
+            highestSubmittedFencingToken: fTok,
+          });
+        } catch {
+          // ignore if WAL already has this turn
+        }
 
         let psiDefense = null;
         if (body.psiSample) {
@@ -1928,6 +2089,7 @@ export class AnstsLocalAndComposeServer {
       } catch (err) {
         const msg = (err as Error).message;
         if (msg.includes("Velocity breaker tripped")) {
+          this.syncTaskToV25Store(task);
           res.writeHead(429, { "content-type": "application/json" });
           res.end(
             JSON.stringify({
@@ -1968,6 +2130,7 @@ export class AnstsLocalAndComposeServer {
           Number(body.maxTenantQuota ?? 10),
           Number(body.currentTenantUsed ?? 1)
         );
+        this.syncTaskToV25Store(parentTask);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
@@ -1993,6 +2156,8 @@ export class AnstsLocalAndComposeServer {
         try {
           const out = this.dagEscrow.registerChildSubAgent(parentTask, childTask);
           this.scheduler.allTasks.set(childId, childTask);
+          this.syncTaskToV25Store(parentTask);
+          this.syncTaskToV25Store(childTask);
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ ...out, parentState: parentTask.state, childTaskId: childId }));
         } catch (err) {
@@ -2009,8 +2174,19 @@ export class AnstsLocalAndComposeServer {
       if (action === "completeChild") {
         const childId = String(body.childTaskId ?? "task-child-01");
         const allChildrenDone = this.dagEscrow.completeChildSubAgent(parentTask, childId);
+        this.syncTaskToV25Store(parentTask);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ allChildrenDone, parentState: parentTask.state }));
+        return;
+      }
+
+      if (action === "failChild") {
+        const childId = String(body.childTaskId ?? "task-child-01");
+        const abortParent = body.abortParentOnChildFailure !== undefined ? Boolean(body.abortParentOnChildFailure) : true;
+        const failRes = this.dagEscrow.failOrCancelChildSubAgent(parentTask, childId, abortParent);
+        this.syncTaskToV25Store(parentTask);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(failRes));
         return;
       }
     }
@@ -2334,6 +2510,301 @@ export class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // [M70-1] DLQ Dead-Letter Task & Outbox Webhook Replay Workbench (`POST /v1beta1/management/ops/dlq-replay`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/dlq-replay") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeDlqAndOutboxReplayWorkbench({
+        action: (body.action ?? "inspect_dlq") as
+          | "inspect_dlq"
+          | "replay_dead_letter_task"
+          | "replay_outbox_webhook"
+          | "seed_dlq_samples",
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        messageId: body.messageId ? String(body.messageId) : undefined,
+        newTargetUrl: body.newTargetUrl ? String(body.newTargetUrl) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M70-2] Task Breakpoint Crash-Recovery & Duplicate Coalescing Inspector (`POST /v1beta1/management/tasks/breakpoint-recover` & `/coalesce-inspect`)
+    if (
+      method === "POST" &&
+      (pathname === "/v1beta1/management/tasks/breakpoint-recover" ||
+        pathname === "/v1beta1/management/tasks/coalesce-inspect")
+    ) {
+      const body = await this.readJsonBody(req);
+      const defaultAction =
+        pathname === "/v1beta1/management/tasks/coalesce-inspect"
+          ? "coalesce_duplicate"
+          : "recover_breakpoint";
+      const result = this.managementPlane.executeTaskBreakpointRecoveryAndCoalesce({
+        action: (body.action ?? defaultAction) as "recover_breakpoint" | "coalesce_duplicate",
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        tenantId: body.tenantId ? String(body.tenantId) : undefined,
+        prompt: body.prompt ? String(body.prompt) : undefined,
+        priority: body.priority !== undefined ? Number(body.priority) : undefined,
+        idempotencyKey: body.idempotencyKey ? String(body.idempotencyKey) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M70-3] M57-M69 One-Click Full-Link Health Scorecard (`POST /v1beta1/management/ops/health-scorecard`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/health-scorecard") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeFullLinkHealthScorecard({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M70-4] Day-2 Governance Suite (`POST /v1beta1/management/ops/day2-governance`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/phase3-memory-spot-market") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.executePhase3MemoryAndSpotMarketSuite({
+        action: body.action as
+          | "hierarchical_context_compactor"
+          | "spot_quota_lending_market"
+          | "run_all_phase3_suite"
+          | undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/ops/phase2-memory-guardrail-replay") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.executePhase2MemoryGuardrailReplaySuite({
+        action: body.action as
+          | "episodic_golden_hatchery"
+          | "formal_policy_guardrail"
+          | "shadow_wal_replay"
+          | "run_all_phase2_suite"
+          | undefined,
+        queryText: typeof body.queryText === "string" ? body.queryText : undefined,
+        repoSignature: typeof body.repoSignature === "string" ? body.repoSignature : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/ops/phase1-cognitive-acceleration") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.executePhase1CognitiveAccelerationSuite({
+        action: body.action as
+          | "adaptive_dag_replan"
+          | "best_of_n_speculative"
+          | "cascade_jury_routing"
+          | "run_all_phase1_suite"
+          | undefined,
+        parentTaskId: typeof body.parentTaskId === "string" ? body.parentTaskId : undefined,
+        sourceBranch: typeof body.sourceBranch === "string" ? body.sourceBranch : undefined,
+        promptText: typeof body.promptText === "string" ? body.promptText : undefined,
+        confidenceThreshold:
+          typeof body.confidenceThreshold === "number" ? body.confidenceThreshold : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/ops/day2-governance") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeDay2GovernanceOperation({
+        action: (body.action ?? "security_fence_alerts") as
+          | "security_fence_alerts"
+          | "finops_cost_attribution"
+          | "config_diff_preview"
+          | "rotate_webhook_secret",
+        tenantId: body.tenantId ? String(body.tenantId) : undefined,
+        candidateOverrides:
+          body.candidateOverrides && typeof body.candidateOverrides === "object"
+            ? (body.candidateOverrides as Record<string, unknown>)
+            : undefined,
+        newWebhookSecret: body.newWebhookSecret ? String(body.newWebhookSecret) : undefined,
+        graceWindowSec: body.graceWindowSec !== undefined ? Number(body.graceWindowSec) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M69] Final Deep Edge-Case Sweep & Zero-Residual-Defect Closure Audit (`POST /v1beta1/management/system/final-closure-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/final-closure-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeFinalZeroDefectClosureAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M68] Deep Potential Risk Identification & Elimination Phase III Audit (`POST /v1beta1/management/system/deep-risk-phase3-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/deep-risk-phase3-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDeepPotentialRiskPhase3Audit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M67] Deep Potential Risk Identification & Elimination Phase II Audit (`POST /v1beta1/management/system/deep-risk-phase2-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/deep-risk-phase2-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDeepPotentialRiskPhase2Audit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M66] Deep Potential Risk Identification & Elimination Audit (`POST /v1beta1/management/system/potential-risks-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/potential-risks-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executePotentialRisksEliminationAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M65] Deep Implementation Consistency Phase II Audit (`POST /v1beta1/management/system/deep-consistency-phase2-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/deep-consistency-phase2-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDeepConsistencyPhase2Audit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M64] End-to-End Implementation Consistency & Authentic Feature Wiring Audit (`POST /v1beta1/management/system/implementation-consistency-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/implementation-consistency-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeImplementationConsistencyAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M63] Deep DFX Hardening Phase II Audit (`POST /v1beta1/management/system/dfx-deep-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/dfx-deep-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDfxDeepModuleHardeningAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M62] DFX Full-Spectrum Resiliency, Diagnosability, Testability & Operability Hardening Audit (`POST /v1beta1/management/system/dfx-hardening-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/dfx-hardening-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDfxHardeningAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M61] Full-Subsystem Persistence, Idempotent CAS/Push Retry, Breakpoint State Rollback & Coalescing Duplicate Arbitration Audit (`POST /v1beta1/management/system/subsystem-persistence-idempotency-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/subsystem-persistence-idempotency-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeSubsystemPersistenceIdempotencyAndCoalesceAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M60] End-to-End Full-Link Persistence, Tenant-Scoped & Deep-Canonical Idempotency, Deterministic Breakpoint Crash-Recovery & Coalescing Duplicate Inspection Audit (`POST /v1beta1/management/system/persistence-idempotency-recovery-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/persistence-idempotency-recovery-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeFullLinkPersistenceIdempotencyBreakpointAndCoalesceAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M59] SQLite Composite-PK/DELETE-Flush/LIMIT Engine Hardening, KV TTL Expiration, SSE Malformed-Frame/Clock-Skew Resilience, UFFD Page Cache Invalidation, Vsock Scheme/IMDS Guard & LTX/Facet Metadata Hygiene Audit (`POST /v1beta1/management/system/sql-kv-sse-uffd-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/sql-kv-sse-uffd-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeSqlKvSseUffdAndLtxAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M58] Container Fence RFC1918/CGNAT/IPv6 & Start-Cap Guard, Recursive OverlayFS & eBPF LSM Path Hardening, SPIFFE/SLSA Tamper Proofing, Canary Post-Rollback Lock & PSI Victim Filtering, Telemetry/EWMA NaN Guard & Federation RTT Audit (`POST /v1beta1/management/system/container-security-telemetry-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/container-security-telemetry-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeContainerSecurityAndTelemetryAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M57] Runtime Edge, Router Cooldown/Quota, Leaf-First CAS GC, Role-Isolated Scale/Drain, NodeDaemon Turn Monotonicity, Validator NaN/DRF Guard & Vsock Framing Audit (`POST /v1beta1/management/system/runtime-edge-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/runtime-edge-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeRuntimeEdgeAndGatewayAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 

@@ -1,7 +1,9 @@
 /**
- * @fileoverview M17 TASK-84: LayerFS Dual-Path Execution Driver
+ * @fileoverview M17 TASK-84, M61-5 & M66-3: LayerFS Dual-Path Execution Driver
  * - Fast Path (`@layerfs/agent` + `@layerfs/backend`): In-process file tool ops (`read`, `write`, `edit`, `grep`) -> atomic Commit (0 container boot)
  * - Sandbox Path (`@layerfs/runtime`): Real Ephemeral Workspace (`mount -> real child_process exec -> scan diff -> commit -> unmount`)
+ * - [M61-5] Step-Level Idempotent Commit Deduplication & Branch Breakpoint Rollback (`rollbackBranchToCommitOrStep`).
+ * - [M66-3] Workspace Path-Traversal Sanitization (`normalizeSafeWorkspacePath`) & Unreachable Commit/B-Tree GC (`gcUnreachableCommits`).
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -11,6 +13,13 @@ import { LayerFsContentStoreEngine } from "../checkpoint/layerfs_store_engine.js
 
 export type LayerFsToolCategory = "FILE_FAST_PATH" | "BASH_SANDBOX_MOUNT";
 
+export interface LayerFsWorkspaceFileEntry {
+  content: string;
+  mode: number;
+  objectId: string;
+  lastStepId: string;
+}
+
 export interface LayerFsCommitRecord {
   commitId: string;
   parentCommitId: string | null;
@@ -18,7 +27,7 @@ export interface LayerFsCommitRecord {
   agentId: string;
   stepId: string;
   toolCategory: LayerFsToolCategory;
-  filesTree: Map<string, { content: string; mode: number; objectId: string; lastStepId: string }>;
+  filesTree: Map<string, LayerFsWorkspaceFileEntry>;
   lineBlameMap: Map<string, string[]>;
   includesIgnoredDependencies: boolean;
   mountLatencyMs: number;
@@ -35,9 +44,38 @@ export class LayerFsWorkspaceDriver {
     this.initMainRoot();
   }
 
+  /**
+   * [M66-3] Normalizes and validates workspace-relative file paths, rejecting `..` path traversal,
+   * leading `/` or drive roots, and null bytes so file operations cannot escape `mountDir`.
+   */
+  public static normalizeSafeWorkspacePath(rawPath: string): string {
+    if (typeof rawPath !== "string" || rawPath.trim().length === 0 || rawPath.includes("\0")) {
+      throw new Error(`Unsafe workspace filePath rejected: '${rawPath}'`);
+    }
+    const slashed = rawPath.replace(/\\/g, "/").trim();
+    if (slashed.startsWith("/") || /^[a-zA-Z]:/.test(slashed)) {
+      throw new Error(`Unsafe workspace filePath rejected (absolute path): '${rawPath}'`);
+    }
+    const segments = slashed.split("/");
+    if (segments.some((seg) => seg === "..")) {
+      throw new Error(`Unsafe workspace filePath rejected (directory traversal): '${rawPath}'`);
+    }
+    const normalized = path.posix.normalize(slashed).replace(/^(\.\/)+/, "");
+    if (
+      !normalized ||
+      normalized === "." ||
+      normalized === ".." ||
+      normalized.startsWith("../") ||
+      normalized.startsWith("/")
+    ) {
+      throw new Error(`Unsafe workspace filePath rejected: '${rawPath}'`);
+    }
+    return normalized;
+  }
+
   private initMainRoot(): void {
     const rootCommitId = "C0";
-    const filesTree = new Map<string, { content: string; mode: number; objectId: string; lastStepId: string }>();
+    const filesTree = new Map<string, LayerFsWorkspaceFileEntry>();
     const pkgJson = '{"name":"workspace-app","dependencies":{"react":"^19.0.0"}}';
     const nodeModReact = "module.exports = { version: '19.0.0' };";
     const obj1 = this.storeEngine.putFileObject("package.json", pkgJson).object;
@@ -92,6 +130,35 @@ export class LayerFsWorkspaceDriver {
     };
   }
 
+  /**
+   * [M61-5] Rolls back a branch head to a historical `commitId` or `stepId` breakpoint so uncommitted
+   * or rolled-back turns leave zero orphan workspace mutations on the branch.
+   */
+  public rollbackBranchToCommitOrStep(
+    branchName: string,
+    targetCommitOrStepId: string
+  ): { branchName: string; restoredCommitId: string; restoredStepId: string } {
+    const headId = this.branchHeads.get(branchName);
+    if (!headId) {
+      throw new Error(`Branch '${branchName}' not found`);
+    }
+    let cur = this.commits.get(headId);
+    while (cur) {
+      if (cur.commitId === targetCommitOrStepId || cur.stepId === targetCommitOrStepId) {
+        this.branchHeads.set(branchName, cur.commitId);
+        return {
+          branchName,
+          restoredCommitId: cur.commitId,
+          restoredStepId: cur.stepId,
+        };
+      }
+      cur = cur.parentCommitId ? this.commits.get(cur.parentCommitId) : undefined;
+    }
+    throw new Error(
+      `Cannot rollback branch '${branchName}': target commit or step '${targetCommitOrStepId}' not found in ancestry`
+    );
+  }
+
   public executeInProcessFileTool(params: {
     branchName: string;
     agentId: string;
@@ -106,13 +173,14 @@ export class LayerFsWorkspaceDriver {
     containerSpawned: false;
     readResult?: string;
   } {
+    const safeFilePath = LayerFsWorkspaceDriver.normalizeSafeWorkspacePath(params.filePath);
     const headId = this.branchHeads.get(params.branchName);
     if (!headId) {
       throw new Error(`Branch '${params.branchName}' not found`);
     }
     const parentCommit = this.commits.get(headId)!;
     if (params.operation === "read" || params.operation === "grep") {
-      const entry = parentCommit.filesTree.get(params.filePath);
+      const entry = parentCommit.filesTree.get(safeFilePath);
       return {
         commitId: headId,
         committedNewSnapshot: false,
@@ -122,7 +190,7 @@ export class LayerFsWorkspaceDriver {
     }
 
     if (params.operation === "delete") {
-      if (!parentCommit.filesTree.has(params.filePath)) {
+      if (!parentCommit.filesTree.has(safeFilePath)) {
         return { commitId: headId, committedNewSnapshot: false, containerSpawned: false };
       }
       const nextCommit = this.createChildCommit({
@@ -133,12 +201,12 @@ export class LayerFsWorkspaceDriver {
         toolCategory: "FILE_FAST_PATH",
         mountLatencyMs: 0,
         mutations: [],
-        deletions: [params.filePath],
+        deletions: [safeFilePath],
       });
       return { commitId: nextCommit.commitId, committedNewSnapshot: true, containerSpawned: false };
     }
     const content = params.newContent ?? "";
-    const prevEntry = parentCommit.filesTree.get(params.filePath);
+    const prevEntry = parentCommit.filesTree.get(safeFilePath);
     if (prevEntry && prevEntry.content === content && (params.mode === undefined || prevEntry.mode === params.mode)) {
       return {
         commitId: headId,
@@ -156,7 +224,7 @@ export class LayerFsWorkspaceDriver {
       mountLatencyMs: 0,
       mutations: [
         {
-          filePath: params.filePath,
+          filePath: safeFilePath,
           content,
           mode: params.mode ?? prevEntry?.mode ?? 0o644,
         },
@@ -192,6 +260,11 @@ export class LayerFsWorkspaceDriver {
       throw new Error(`Branch '${params.branchName}' not found`);
     }
     const parentCommit = this.commits.get(headId)!;
+    const sanitizedOverlays = (params.overlayMutations ?? []).map((mut) => ({
+      filePath: LayerFsWorkspaceDriver.normalizeSafeWorkspacePath(mut.filePath),
+      content: mut.content,
+      mode: mut.mode,
+    }));
 
     const tMountStart = performance.now();
     const mountDir = fs.mkdtempSync(path.join(os.tmpdir(), `layerfs-ws-${params.branchName}-`));
@@ -199,7 +272,8 @@ export class LayerFsWorkspaceDriver {
     try {
       const baselineStats = new Map<string, { size: number; mode: number }>();
       for (const [relPath, fileEntry] of parentCommit.filesTree.entries()) {
-        const fullPath = path.join(mountDir, relPath);
+        const safeRel = LayerFsWorkspaceDriver.normalizeSafeWorkspacePath(relPath);
+        const fullPath = path.join(mountDir, safeRel);
         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
         fs.writeFileSync(fullPath, fileEntry.content, { encoding: "utf-8", mode: fileEntry.mode });
         try {
@@ -208,7 +282,7 @@ export class LayerFsWorkspaceDriver {
           // ignore if utimes unsupported
         }
         const st = fs.statSync(fullPath);
-        baselineStats.set(relPath, { size: st.size, mode: st.mode & 0o777 });
+        baselineStats.set(safeRel, { size: st.size, mode: st.mode & 0o777 });
       }
       const mountLatencyMs = Math.max(0.01, Number((performance.now() - tMountStart).toFixed(3)));
       const nodeModulesPreMounted = fs.existsSync(path.join(mountDir, "node_modules/react/index.js"));
@@ -219,7 +293,7 @@ export class LayerFsWorkspaceDriver {
           .toString("utf-8");
       }
 
-      for (const mut of params.overlayMutations ?? []) {
+      for (const mut of sanitizedOverlays) {
         const fullPath = path.join(mountDir, mut.filePath);
         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
         fs.writeFileSync(fullPath, mut.content, { encoding: "utf-8", mode: mut.mode ?? 0o644 });
@@ -239,7 +313,6 @@ export class LayerFsWorkspaceDriver {
             const mode = st.mode & 0o777;
             const baseSt = baselineStats.get(rel);
             const prev = parentCommit.filesTree.get(rel);
-            // Fast-path: skip reading file bytes if mtime (1700000000s), size, and mode are unchanged
             if (prev && baseSt && Math.floor(st.mtimeMs / 1000) === 1700000000 && st.size === baseSt.size && mode === baseSt.mode) {
               continue;
             }
@@ -373,6 +446,10 @@ export class LayerFsWorkspaceDriver {
 
   public getCommit(commitId: string): LayerFsCommitRecord | undefined {
     return this.commits.get(commitId);
+  }
+
+  public getCommitCount(): number {
+    return this.commits.size;
   }
 
   public getBranchHeadCommit(branchName: string): LayerFsCommitRecord {
@@ -526,6 +603,38 @@ export class LayerFsWorkspaceDriver {
     return this.branchHeads.delete(branchName);
   }
 
+  /**
+   * [M66-3] Reclaims unreachable `LayerFsCommitRecord` nodes and their corresponding B-Tree directory pages
+   * after branches are deleted or rolled back.
+   */
+  public gcUnreachableCommits(): {
+    prunedCommitIds: string[];
+    prunedBTreeCommitCount: number;
+    retainedCommitCount: number;
+  } {
+    const reachableCommitIds = new Set<string>(["C0"]);
+    for (const headCommitId of this.branchHeads.values()) {
+      let cur = this.commits.get(headCommitId);
+      while (cur && !reachableCommitIds.has(cur.commitId)) {
+        reachableCommitIds.add(cur.commitId);
+        cur = cur.parentCommitId ? this.commits.get(cur.parentCommitId) : undefined;
+      }
+    }
+    const prunedCommitIds: string[] = [];
+    for (const commitId of Array.from(this.commits.keys())) {
+      if (!reachableCommitIds.has(commitId)) {
+        this.commits.delete(commitId);
+        prunedCommitIds.push(commitId);
+      }
+    }
+    const prunedBTreeCommitCount = this.storeEngine.gcUnreachableCommitPages(reachableCommitIds);
+    return {
+      prunedCommitIds,
+      prunedBTreeCommitCount,
+      retainedCommitCount: this.commits.size,
+    };
+  }
+
   public listBranchesSummary(): Array<{
     branchName: string;
     headCommitId: string;
@@ -585,5 +694,85 @@ export class LayerFsWorkspaceDriver {
       result.set(branchName, Array.from(objIds));
     }
     return result;
+  }
+
+  /**
+   * [M72-1 / F4] Promotes a verified branch/commit into an immutable Golden Base Image (`golden/<episodeId>`),
+   * records its trajectory in `storeEngine.recordEpisodicTrajectory`, and enables 0ms CoW mounting for future tasks.
+   */
+  public hatchGoldenBaseBranch(params: {
+    episodeId: string;
+    taskId: string;
+    sourceBranchOrCommit: string;
+    repoSignature: string;
+    problemPattern: string;
+    resolutionSummary: string;
+    tags?: string[];
+    savedColdStartMs?: number;
+  }): {
+    episodeId: string;
+    goldenBaseBranch: string;
+    goldenCommitId: string;
+    pinnedFilesCount: number;
+    savedColdStartMs: number;
+  } {
+    const goldenBaseBranch = `golden/${params.episodeId}`;
+    const forked = this.forkBranch(params.sourceBranchOrCommit, goldenBaseBranch);
+    const commitRec = this.commits.get(forked.headCommitId)!;
+    const reusableFilePaths = Array.from(commitRec.filesTree.keys());
+    this.storeEngine.recordEpisodicTrajectory({
+      episodeId: params.episodeId,
+      taskId: params.taskId,
+      repoSignature: params.repoSignature,
+      problemPattern: params.problemPattern,
+      resolutionSummary: params.resolutionSummary,
+      verifiedCommitId: forked.headCommitId,
+      goldenBaseBranch,
+      reusableFilePaths,
+      tags: params.tags,
+      savedColdStartMs: params.savedColdStartMs ?? 4500,
+    });
+    return {
+      episodeId: params.episodeId,
+      goldenBaseBranch,
+      goldenCommitId: forked.headCommitId,
+      pinnedFilesCount: reusableFilePaths.length,
+      savedColdStartMs: params.savedColdStartMs ?? 4500,
+    };
+  }
+
+  /**
+   * [M72-1 / F4] Queries Episodic Memory for a matching Golden Base Image and forks `targetBranchName`
+   * in O(1) (0ms cold-start, 0 copied bytes) from the recommended golden commit.
+   */
+  public mountWorkspaceFromEpisodicMemory(params: {
+    queryText: string;
+    repoSignature: string;
+    targetBranchName: string;
+  }): {
+    mountedBranchName: string;
+    baseCommitId: string;
+    matchedEpisodeId: string | null;
+    similarityScore: number;
+    savedColdStartMs: number;
+    copiedFilesCount: 0;
+  } {
+    const retrieval = this.storeEngine.retrieveSimilarEpisodesAndGoldenBase({
+      queryText: params.queryText,
+      repoSignature: params.repoSignature,
+      topK: 3,
+      minSimilarity: 0.1,
+    });
+    const best = retrieval.matches[0];
+    const sourceRef = best ? best.goldenBaseBranch : "main";
+    const forked = this.forkBranch(sourceRef, params.targetBranchName);
+    return {
+      mountedBranchName: forked.branchName,
+      baseCommitId: forked.headCommitId,
+      matchedEpisodeId: best ? best.episodeId : null,
+      similarityScore: best ? best.similarityScore : 0,
+      savedColdStartMs: best ? best.savedColdStartMs : 0,
+      copiedFilesCount: 0,
+    };
   }
 }

@@ -1,10 +1,18 @@
 /**
- * @fileoverview M4 TASK-14 & M48-4: Linux PSI (Pressure Stall Information) Memory Guard,
- * Real `/proc/pressure/memory` + `/proc/meminfo` Kernel Probe & Graceful Evictor.
+ * @fileoverview M4 TASK-14, M48-4, M58-4 & M62-3: Linux PSI (Pressure Stall Information) Memory Guard,
+ * Real `/proc/pressure/memory` + `/proc/meminfo` Kernel Probe, Non-Terminal Victim Filtering,
+ * Non-Negative / Finite PSI Sanitization & High-Priority P0/P1 Eviction Immunity.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
-import { TaskPriority, TaskSpec } from "../models.js";
+import { TaskPriority, TaskSpec, TaskState } from "../models.js";
+
+const TERMINAL_STATES = new Set<TaskState>([
+  TaskState.SUCCEEDED,
+  TaskState.FAILED,
+  TaskState.DEAD_LETTER,
+  TaskState.CANCELLED,
+]);
 
 export interface PsiSample {
   someAvg10Pct: number;
@@ -37,16 +45,25 @@ export class LinuxPsiMemoryGuard {
         const content = fs.readFileSync("/proc/pressure/memory", "utf-8");
         for (const line of content.split("\n")) {
           const mSome = line.match(/^some\s+avg10=([0-9.]+)/);
-          if (mSome) someAvg10Pct = parseFloat(mSome[1]);
+          if (mSome) {
+            const parsed = parseFloat(mSome[1]);
+            if (Number.isFinite(parsed) && parsed >= 0) someAvg10Pct = parsed;
+          }
           const mFull = line.match(/^full\s+avg10=([0-9.]+)/);
-          if (mFull) fullAvg10Pct = parseFloat(mFull[1]);
+          if (mFull) {
+            const parsed = parseFloat(mFull[1]);
+            if (Number.isFinite(parsed) && parsed >= 0) fullAvg10Pct = parsed;
+          }
         }
       }
       if (fs.existsSync("/proc/meminfo")) {
         const meminfo = fs.readFileSync("/proc/meminfo", "utf-8");
         const mSwap = meminfo.match(/^SwapFree:\s+(\d+)\s+kB/m);
         if (mSwap) {
-          freeSwapMb = Math.max(256, Math.round(Number(mSwap[1]) / 1024));
+          const rawKb = Number(mSwap[1]);
+          if (Number.isFinite(rawKb) && rawKb >= 0) {
+            freeSwapMb = Math.max(256, Math.round(rawKb / 1024));
+          }
         }
       }
     } catch {
@@ -63,20 +80,39 @@ export class LinuxPsiMemoryGuard {
     };
   }
 
+  /**
+   * [M58-4 & M62-3] DFX-Safety: Evaluates PSI pressure and applies defensive actions:
+   * - Sanitizes negative or NaN metrics in incoming `sample` to prevent mis-triggered emergency freezes.
+   * - Restricts critical freeze-and-checkpoint eviction to `P2_STANDARD` and `P3_BATCH` tasks only,
+   *   providing immunity to `P0_EMERGENCY` and `P1_HIGH` tasks under memory pressure so control-plane
+   *   remediation and user-critical jobs are never abruptly sacrificed.
+   */
   public evaluateAndDefend(sample: PsiSample, runningTasks: TaskSpec[]): PsiDefenseAction {
-    if (sample.fullAvg10Pct >= this.criticalPsiThresholdPct || sample.freeSwapMb < 128) {
-      const candidates = [...runningTasks].sort((a, b) => {
-        if (b.priority !== a.priority) return b.priority - a.priority;
-        return b.resource_profile.act_memory_mb - a.resource_profile.act_memory_mb;
-      });
-      const victims = candidates
-        .filter((t) => t.priority >= TaskPriority.P1_HIGH)
-        .slice(0, Math.max(1, Math.ceil(candidates.length * 0.25)))
-        .map((t) => t.task_id);
+    const safeSome =
+      Number.isFinite(sample.someAvg10Pct) && sample.someAvg10Pct >= 0 ? sample.someAvg10Pct : 0;
+    const safeFull =
+      Number.isFinite(sample.fullAvg10Pct) && sample.fullAvg10Pct >= 0 ? sample.fullAvg10Pct : 0;
+    const safeSwap =
+      Number.isFinite(sample.freeSwapMb) && sample.freeSwapMb >= 0 ? sample.freeSwapMb : 1024;
+
+    const liveTasks = runningTasks.filter((t) => !TERMINAL_STATES.has(t.state));
+    if (safeFull >= this.criticalPsiThresholdPct || safeSwap < 128) {
+      const evictableCandidates = liveTasks
+        .filter((t) => t.priority >= TaskPriority.P2_STANDARD) // P0 & P1 have emergency immunity
+        .sort((a, b) => {
+          if (b.priority !== a.priority) return b.priority - a.priority;
+          return b.resource_profile.act_memory_mb - a.resource_profile.act_memory_mb;
+        });
+      const victims =
+        evictableCandidates.length > 0
+          ? evictableCandidates
+              .slice(0, Math.max(1, Math.ceil(evictableCandidates.length * 0.25)))
+              .map((t) => t.task_id)
+          : [];
       return { level: "FREEZE_AND_CHECKPOINT", evictedTaskIds: victims };
     }
-    if (sample.someAvg10Pct >= this.softPsiThresholdPct) {
-      const p3Victims = runningTasks
+    if (safeSome >= this.softPsiThresholdPct) {
+      const p3Victims = liveTasks
         .filter((t) => t.priority === TaskPriority.P3_BATCH)
         .map((t) => t.task_id);
       return { level: "THROTTLE_BATCH", evictedTaskIds: p3Victims };

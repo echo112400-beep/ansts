@@ -1,7 +1,7 @@
 /**
- * @fileoverview M16 TASK-77 & M54-4: denoland/celld Hot-Cell 64-Concurrent Fetch Admission Guard (`CELLD_MAX_CELL_REQUESTS=64`)
+ * @fileoverview M16 TASK-77, M54-4 & M67-2: denoland/celld Hot-Cell 64-Concurrent Fetch Admission Guard (`CELLD_MAX_CELL_REQUESTS=64`)
  * & Queue Broker 256-Producer Group-Commit Controller (`503 Retry-After: 1`, `X-Celld-Overload: cell`)
- * with RAII Exception-Safe Fetch Release & Stale In-Flight Slot Reclamation.
+ * with Idempotent Reclaimed/Double-Release Lease Protection & Finite Producer Validation.
  */
 export interface CellAdmissionDecision {
   admitted: boolean;
@@ -29,10 +29,14 @@ export class HotCellOverloadAndQueueGuard {
     maxQueueBatchCommitSize?: number;
     maxOverlappingTransactions?: number;
   }) {
-    this.maxCellConcurrentRequests = options?.maxCellConcurrentRequests ?? 64;
-    this.maxQueueConcurrentProducers = options?.maxQueueConcurrentProducers ?? 256;
-    this.maxQueueBatchCommitSize = options?.maxQueueBatchCommitSize ?? 64;
-    this.maxOverlappingTransactions = options?.maxOverlappingTransactions ?? 4;
+    const maxCell = Number(options?.maxCellConcurrentRequests ?? 64);
+    const maxProd = Number(options?.maxQueueConcurrentProducers ?? 256);
+    const maxBatch = Number(options?.maxQueueBatchCommitSize ?? 64);
+    const maxTx = Number(options?.maxOverlappingTransactions ?? 4);
+    this.maxCellConcurrentRequests = Number.isFinite(maxCell) && maxCell > 0 ? Math.floor(maxCell) : 64;
+    this.maxQueueConcurrentProducers = Number.isFinite(maxProd) && maxProd > 0 ? Math.floor(maxProd) : 256;
+    this.maxQueueBatchCommitSize = Number.isFinite(maxBatch) && maxBatch > 0 ? Math.floor(maxBatch) : 64;
+    this.maxOverlappingTransactions = Number.isFinite(maxTx) && maxTx > 0 ? Math.floor(maxTx) : 4;
   }
 
   public tryEnterCellFetch(cellScope: string, nowMs = Date.now()): CellAdmissionDecision {
@@ -69,16 +73,26 @@ export class HotCellOverloadAndQueueGuard {
     };
   }
 
+  /**
+   * [M67-2] Idempotent lease-aware release:
+   * When `leaseId` is provided, verifies that `leaseId` is still active in `cellLeases` before
+   * deleting it and decrementing `inFlightByCell`. If the lease was already released or reclaimed
+   * by `reclaimStaleInFlightFetches()`, this call is a safe no-op and never evicts another caller's slot.
+   */
   public leaveCellFetch(cellScope: string, leaseId?: string): void {
     const cellLeases = this.activeLeasesByCell.get(cellScope);
-    if (cellLeases) {
-      if (leaseId && cellLeases.has(leaseId)) {
-        cellLeases.delete(leaseId);
-      } else {
-        const firstKey = cellLeases.keys().next().value;
-        if (firstKey !== undefined) {
-          cellLeases.delete(firstKey);
-        }
+    if (leaseId !== undefined) {
+      if (!cellLeases || !cellLeases.has(leaseId)) {
+        return;
+      }
+      cellLeases.delete(leaseId);
+      if (cellLeases.size === 0) {
+        this.activeLeasesByCell.delete(cellScope);
+      }
+    } else if (cellLeases) {
+      const firstKey = cellLeases.keys().next().value;
+      if (firstKey !== undefined) {
+        cellLeases.delete(firstKey);
       }
       if (cellLeases.size === 0) {
         this.activeLeasesByCell.delete(cellScope);
@@ -141,7 +155,17 @@ export class HotCellOverloadAndQueueGuard {
     groupCommitTimerMs: number;
     errorBody?: { error: string };
   } {
-    if (this.activeQueueProducers + producerCount > this.maxQueueConcurrentProducers) {
+    if (!Number.isFinite(producerCount) || producerCount <= 0) {
+      return {
+        admitted: false,
+        statusCode: 503,
+        committedTransactions: 0,
+        groupCommitTimerMs: 4,
+        errorBody: { error: "invalid producerCount" },
+      };
+    }
+    const safeProducers = Math.floor(producerCount);
+    if (this.activeQueueProducers + safeProducers > this.maxQueueConcurrentProducers) {
       return {
         admitted: false,
         statusCode: 503,
@@ -150,9 +174,9 @@ export class HotCellOverloadAndQueueGuard {
         errorBody: { error: "cell admission refused" },
       };
     }
-    this.activeQueueProducers += producerCount;
+    this.activeQueueProducers += safeProducers;
     try {
-      const txNeeded = Math.ceil(producerCount / this.maxQueueBatchCommitSize);
+      const txNeeded = Math.ceil(safeProducers / this.maxQueueBatchCommitSize);
       const committedTransactions = Math.min(this.maxOverlappingTransactions, Math.max(1, txNeeded));
       return {
         admitted: true,
@@ -161,7 +185,7 @@ export class HotCellOverloadAndQueueGuard {
         groupCommitTimerMs: 4,
       };
     } finally {
-      this.activeQueueProducers = Math.max(0, this.activeQueueProducers - producerCount);
+      this.activeQueueProducers = Math.max(0, this.activeQueueProducers - safeProducers);
     }
   }
 }

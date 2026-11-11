@@ -1,5 +1,6 @@
 /**
- * @fileoverview Cross-Region Asynchronous LTX Snapshot Replicator with RPO Lag Tracking & S3 Sync.
+ * @fileoverview M11 & M62-5: Cross-Region Asynchronous LTX Snapshot Replicator
+ * with RPO Lag Tracking, S3 Sync, URL Sanitization, Safe HTTP Status Validation & Non-Blocking Error Isolation.
  */
 export class CrossRegionAsyncReplicator {
   private readonly replicatedByRegion: Map<string, Set<string>> = new Map();
@@ -19,6 +20,11 @@ export class CrossRegionAsyncReplicator {
     return { targetRegion, replicatedCount: set.size };
   }
 
+  /**
+   * [M62-5] DFX-Maintainability & Deployability: Sanitizes targetRegion/objectKey,
+   * isolates network and HTTP fetch rejections without crashing the caller, and returns
+   * safe structured RPO lag and storage telemetry.
+   */
   public async replicateToRemoteS3Region(params: {
     s3Endpoint: string;
     sourceRegion: string;
@@ -34,34 +40,44 @@ export class CrossRegionAsyncReplicator {
   }> {
     const t0 = performance.now();
     let s3Stored = false;
+    const safeRegion = params.targetRegion.trim();
+    const safeKey = params.objectKey.trim();
+
     try {
-      const resp = await fetch(
-        `${params.s3Endpoint.replace(/\/$/, "")}/ansts-fleet/regions/${encodeURIComponent(params.targetRegion)}/${encodeURIComponent(params.objectKey)}.json`,
-        {
-          method: "PUT",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            sourceRegion: params.sourceRegion,
-            targetRegion: params.targetRegion,
-            objectKey: params.objectKey,
-            replicatedAtMs: Date.now(),
-            payload: params.payload,
-          }),
-        }
-      );
-      s3Stored = resp.ok;
+      const endpoint = params.s3Endpoint.trim().replace(/\/$/, "");
+      if (endpoint.startsWith("http://") || endpoint.startsWith("https://")) {
+        const resp = await fetch(
+          `${endpoint}/ansts-fleet/regions/${encodeURIComponent(safeRegion)}/${encodeURIComponent(safeKey)}.json`,
+          {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              sourceRegion: params.sourceRegion,
+              targetRegion: safeRegion,
+              objectKey: safeKey,
+              replicatedAtMs: Date.now(),
+              payload: params.payload,
+            }),
+          }
+        );
+        s3Stored = resp.ok;
+      }
     } catch {
       s3Stored = false;
     }
-    const rpoLagMs = Number((performance.now() - t0).toFixed(3));
-    const local = this.replicateLtxObject(params.targetRegion, params.objectKey);
-    this.lastReplicationLagMs.set(params.targetRegion, rpoLagMs);
+    const rpoLagMs = Number(Math.max(0, performance.now() - t0).toFixed(3));
+    const local = this.replicateLtxObject(safeRegion, safeKey);
+    this.lastReplicationLagMs.set(safeRegion, rpoLagMs);
     return {
-      targetRegion: params.targetRegion,
-      objectKey: params.objectKey,
+      targetRegion: safeRegion,
+      objectKey: safeKey,
       replicatedCount: local.replicatedCount,
       rpoLagMs,
       s3Stored,
     };
+  }
+
+  public getRegionLagMs(region: string): number {
+    return this.lastReplicationLagMs.get(region) ?? 0;
   }
 }

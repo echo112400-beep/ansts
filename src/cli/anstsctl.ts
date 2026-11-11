@@ -368,6 +368,165 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-day2-ops") {
+    const subAction = rest[0] ?? "health-scorecard";
+    if (subAction === "health-scorecard") {
+      const resp = await fetch(`${baseUrl}/v1beta1/management/ops/health-scorecard`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+      });
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    if (subAction === "dlq-replay") {
+      const resp = await fetch(`${baseUrl}/v1beta1/management/ops/dlq-replay`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: rest[1] ?? "inspect_dlq", actor: "chen", role: "SRE_ADMIN" }),
+      });
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/day2-governance`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: subAction, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-final-closure-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/final-closure-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-deep-risk-phase3-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/deep-risk-phase3-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-deep-risk-phase2-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/deep-risk-phase2-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-potential-risks-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/potential-risks-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-consistency-phase2-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/deep-consistency-phase2-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-consistency-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/implementation-consistency-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-dfx-deep-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/dfx-deep-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-dfx-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/dfx-hardening-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-subsystem-idempotency-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/subsystem-persistence-idempotency-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-persistence-idempotency-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/persistence-idempotency-recovery-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-sql-kv-uffd-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/sql-kv-sse-uffd-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-container-security-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/container-security-telemetry-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-runtime-edge-audit") {
+    const resp = await fetch(`${baseUrl}/v1beta1/management/system/runtime-edge-audit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-kernel-storage-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/system/kernel-storage-audit`, {
       method: "POST",
@@ -530,6 +689,72 @@ export async function runAnstsCtlRemote(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ expectedProtocol, enqueueWebhookTest: true, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-phase3-market") {
+    const action = rest[0] ?? "run_all_phase3_suite";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/phase3-memory-spot-market`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-phase2-gov") {
+    const action = rest[0] ?? "run_all_phase2_suite";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/phase2-memory-guardrail-replay`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-phase1-accel") {
+    const action = rest[0] ?? "run_all_phase1_suite";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/phase1-cognitive-acceleration`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-phase3-market") {
+    const action = rest[0] ?? "run_all_phase3_suite";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/phase3-memory-spot-market`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-phase2-gov") {
+    const action = rest[0] ?? "run_all_phase2_suite";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/phase2-memory-guardrail-replay`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-phase1-accel") {
+    const action = rest[0] ?? "run_all_phase1_suite";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/phase1-cognitive-acceleration`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };

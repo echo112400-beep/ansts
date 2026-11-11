@@ -1,8 +1,10 @@
 /**
- * @fileoverview M6 TASK-23 & M54-4: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher
- * with Per-Message Exception Isolation, Replay-Window Signature Verification & Completed Message Compaction.
+ * @fileoverview M6 TASK-23, M54-4, M60-1, M66-1 & M70-1: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher
+ * with SQLite Durability, Per-Message Exception Isolation, Timing-Safe Replay-Window Signature Verification,
+ * Zero-Downtime Dual-Key Secret Rotation (Primary + Grace-Window Secondary), Constructor Overload Sanitization, Dead-Letter Requeue & Compaction.
  */
 import * as crypto from "node:crypto";
+import { SqlStorageLike } from "../cloudflare/env.js";
 
 export interface OutboxWebhookMessage {
   messageId: string;
@@ -18,22 +20,144 @@ export interface OutboxWebhookMessage {
 
 export class TransactionalOutboxDispatcher {
   private readonly outbox: Map<string, OutboxWebhookMessage> = new Map();
-  private readonly maxAttempts: number;
-  private readonly signingSecret: string;
+  public readonly maxAttempts: number;
+  private signingSecret: string;
+  private secondarySecret?: string;
+  private secondarySecretExpiresAtSec = 0;
+  private keyRotationGeneration = 1;
+  private sql?: SqlStorageLike;
 
-  constructor(signingSecret = "ansts-webhook-hmac-secret", maxAttempts = 4) {
-    this.signingSecret = signingSecret;
-    this.maxAttempts = maxAttempts;
+  constructor(
+    signingSecret = "ansts-webhook-hmac-secret",
+    maxAttemptsOrSql: number | SqlStorageLike = 4,
+    sql?: SqlStorageLike
+  ) {
+    this.signingSecret = signingSecret || "ansts-webhook-hmac-secret";
+    if (
+      typeof maxAttemptsOrSql === "object" &&
+      maxAttemptsOrSql !== null &&
+      "exec" in maxAttemptsOrSql
+    ) {
+      this.maxAttempts = 4;
+      this.bindSqlStorage(maxAttemptsOrSql);
+    } else {
+      const numericMax = Number(maxAttemptsOrSql);
+      this.maxAttempts =
+        Number.isFinite(numericMax) && numericMax > 0
+          ? Math.max(1, Math.floor(numericMax))
+          : 4;
+      if (sql) {
+        this.bindSqlStorage(sql);
+      }
+    }
+  }
+
+  /**
+   * [M70-1] Rotates the active HMAC signing secret without downtime by retaining the previous primary secret
+   * as `secondarySecret` for `graceWindowSec` seconds so in-flight webhook deliveries signed immediately prior
+   * to key rotation continue to pass `verifySignature`.
+   */
+  public rotateSigningSecret(
+    newPrimarySecret: string,
+    graceWindowSec = 3600,
+    nowSec = Math.floor(Date.now() / 1000)
+  ): {
+    keyRotationGeneration: number;
+    secondaryActive: boolean;
+    secondaryExpiresAtSec: number;
+  } {
+    if (!newPrimarySecret || typeof newPrimarySecret !== "string" || newPrimarySecret.trim().length < 4) {
+      throw new Error("New webhook signing secret must be at least 4 characters");
+    }
+    const safeGrace = Number.isFinite(graceWindowSec) && graceWindowSec >= 0 ? Math.floor(graceWindowSec) : 3600;
+    if (newPrimarySecret !== this.signingSecret) {
+      this.secondarySecret = this.signingSecret;
+      this.secondarySecretExpiresAtSec = nowSec + safeGrace;
+      this.signingSecret = newPrimarySecret;
+      this.keyRotationGeneration += 1;
+    }
+    return {
+      keyRotationGeneration: this.keyRotationGeneration,
+      secondaryActive: Boolean(this.secondarySecret && this.secondarySecretExpiresAtSec > nowSec),
+      secondaryExpiresAtSec: this.secondarySecretExpiresAtSec,
+    };
+  }
+
+  public getKeyRotationStatus(nowSec = Math.floor(Date.now() / 1000)): {
+    keyRotationGeneration: number;
+    secondaryActive: boolean;
+    secondaryExpiresAtSec: number;
+  } {
+    return {
+      keyRotationGeneration: this.keyRotationGeneration,
+      secondaryActive: Boolean(this.secondarySecret && nowSec <= this.secondarySecretExpiresAtSec),
+      secondaryExpiresAtSec: this.secondarySecretExpiresAtSec,
+    };
+  }
+
+  /**
+   * [M60-1] Binds SQLite storage so queued webhook messages survive process crashes before delivery.
+   */
+  public bindSqlStorage(sql: SqlStorageLike): number {
+    this.sql = sql;
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS transactional_outbox_messages (message_id TEXT PRIMARY KEY, task_id TEXT, target_url TEXT, payload_json TEXT, attempts INTEGER, delivered INTEGER, dead_lettered INTEGER, last_error TEXT, signature_header TEXT)"
+    );
+    const rows = this.sql
+      .exec<Record<string, unknown>>("SELECT * FROM transactional_outbox_messages")
+      .toArray();
+    let restored = 0;
+    for (const r of rows) {
+      const msg: OutboxWebhookMessage = {
+        messageId: String(r.message_id),
+        taskId: String(r.task_id),
+        targetUrl: String(r.target_url),
+        payload: JSON.parse(String(r.payload_json ?? "{}")) as Record<string, unknown>,
+        attempts: Number(r.attempts ?? 0),
+        delivered: Boolean(Number(r.delivered ?? 0)),
+        deadLettered: Boolean(Number(r.dead_lettered ?? 0)),
+        lastError: r.last_error ? String(r.last_error) : undefined,
+        signatureHeader: r.signature_header ? String(r.signature_header) : undefined,
+      };
+      this.outbox.set(msg.messageId, msg);
+      restored += 1;
+    }
+    return restored;
+  }
+
+  private persistOutboxMessage(msg: OutboxWebhookMessage): void {
+    if (!this.sql) return;
+    this.sql.exec(
+      "INSERT OR REPLACE INTO transactional_outbox_messages (message_id, task_id, target_url, payload_json, attempts, delivered, dead_lettered, last_error, signature_header) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      msg.messageId,
+      msg.taskId,
+      msg.targetUrl,
+      JSON.stringify(msg.payload),
+      msg.attempts,
+      msg.delivered ? 1 : 0,
+      msg.deadLettered ? 1 : 0,
+      msg.lastError ?? "",
+      msg.signatureHeader ?? ""
+    );
   }
 
   public enqueueOutbox(
     messageId: string,
     taskId: string,
     targetUrl: string,
-    payload: Record<string, unknown>
+    payload: Record<string, unknown>,
+    options?: { resetIfDeadLettered?: boolean }
   ): OutboxWebhookMessage {
     const existing = this.outbox.get(messageId);
     if (existing) {
+      if (existing.deadLettered && options?.resetIfDeadLettered) {
+        existing.deadLettered = false;
+        existing.attempts = 0;
+        existing.lastError = undefined;
+        existing.targetUrl = targetUrl;
+        existing.payload = payload;
+        this.persistOutboxMessage(existing);
+      }
       return existing;
     }
     const msg: OutboxWebhookMessage = {
@@ -46,7 +170,32 @@ export class TransactionalOutboxDispatcher {
       deadLettered: false,
     };
     this.outbox.set(messageId, msg);
+    this.persistOutboxMessage(msg);
     return msg;
+  }
+
+  /**
+   * [M66-1] Explicitly resets a dead-lettered webhook message so operators can re-drive failed deliveries
+   * after fixing downstream webhook endpoints.
+   */
+  public retryDeadLetteredMessage(
+    messageId: string,
+    newTargetUrl?: string
+  ): OutboxWebhookMessage | null {
+    const msg = this.outbox.get(messageId);
+    if (!msg || msg.delivered) return null;
+    msg.deadLettered = false;
+    msg.attempts = 0;
+    msg.lastError = undefined;
+    if (newTargetUrl) {
+      msg.targetUrl = newTargetUrl;
+    }
+    this.persistOutboxMessage(msg);
+    return msg;
+  }
+
+  public listMessages(): OutboxWebhookMessage[] {
+    return Array.from(this.outbox.values());
   }
 
   public signPayload(payloadJson: string, timestampSec = Math.floor(Date.now() / 1000)): string {
@@ -56,7 +205,8 @@ export class TransactionalOutboxDispatcher {
   }
 
   /**
-   * [M54-4] Verifies HMAC-SHA256 webhook signature and enforces replay timestamp tolerance (`maxSkewSec`).
+   * [M54-4, M66-1 & M70-1] Verifies HMAC-SHA256 webhook signature using constant-time `crypto.timingSafeEqual`,
+   * enforces replay timestamp tolerance (`maxSkewSec`), and supports dual-key verification during grace-window rotation.
    */
   public verifySignature(
     payloadJson: string,
@@ -64,21 +214,50 @@ export class TransactionalOutboxDispatcher {
     nowSec = Math.floor(Date.now() / 1000),
     maxSkewSec = 300
   ): boolean {
-    const parts = signatureHeader.split(",");
+    if (!signatureHeader || typeof signatureHeader !== "string") return false;
+    const parts = signatureHeader.split(",").map((p) => p.trim());
     const tPart = parts.find((p) => p.startsWith("t="));
     const v1Part = parts.find((p) => p.startsWith("v1="));
     if (!tPart || !v1Part) return false;
     const ts = Number(tPart.slice(2));
-    if (!Number.isFinite(ts) || Math.abs(nowSec - ts) > maxSkewSec) {
+    const tolerance = Number.isFinite(maxSkewSec) && maxSkewSec >= 0 ? maxSkewSec : 300;
+    if (!Number.isFinite(ts) || Math.abs(nowSec - ts) > tolerance) {
       return false;
     }
-    const expected = this.signPayload(payloadJson, ts);
-    return expected === signatureHeader;
+    const providedHex = v1Part.slice(3);
+    if (!/^[0-9a-fA-F]{64}$/.test(providedHex)) {
+      return false;
+    }
+    const providedBuf = Buffer.from(providedHex, "hex");
+    const body = `${ts}.${payloadJson}`;
+
+    const primaryHex = crypto
+      .createHmac("sha256", this.signingSecret)
+      .update(body, "utf-8")
+      .digest("hex");
+    const primaryBuf = Buffer.from(primaryHex, "hex");
+    if (primaryBuf.length === providedBuf.length && crypto.timingSafeEqual(primaryBuf, providedBuf)) {
+      return true;
+    }
+
+    if (this.secondarySecret && nowSec <= this.secondarySecretExpiresAtSec) {
+      const secondaryHex = crypto
+        .createHmac("sha256", this.secondarySecret)
+        .update(body, "utf-8")
+        .digest("hex");
+      const secondaryBuf = Buffer.from(secondaryHex, "hex");
+      if (
+        secondaryBuf.length === providedBuf.length &&
+        crypto.timingSafeEqual(secondaryBuf, providedBuf)
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
-   * [M54-4] Isolates exceptions thrown by `sender(msg)` per message so one poisoned/failing webhook endpoint
-   * never aborts the dispatch loop or starves subsequent messages in the outbox.
+   * [M54-4 & M60-1] Isolates exceptions thrown by `sender(msg)` per message and persists delivery state to SQLite.
    */
   public processPending(sender: (msg: OutboxWebhookMessage) => boolean): {
     deliveredCount: number;
@@ -110,6 +289,7 @@ export class TransactionalOutboxDispatcher {
           deadLetterCount += 1;
         }
       }
+      this.persistOutboxMessage(msg);
     }
     return { deliveredCount, deadLetterCount, failedAttemptCount };
   }
@@ -119,6 +299,9 @@ export class TransactionalOutboxDispatcher {
     for (const [id, msg] of Array.from(this.outbox.entries())) {
       if (msg.delivered || msg.deadLettered) {
         this.outbox.delete(id);
+        if (this.sql) {
+          this.sql.exec("DELETE FROM transactional_outbox_messages WHERE message_id = ?", id);
+        }
         purged += 1;
       }
     }

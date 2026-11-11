@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto";
-import { TurnWalFrame } from "../models";
+import { TurnWalFrame } from "../models.js";
 export interface VerifiableTurnProofStatement {
   proofId: string;
   taskId: string;

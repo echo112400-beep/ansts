@@ -1,6 +1,6 @@
 /**
- * @fileoverview M4 TASK-12 & M53-3: Pre-warmed Firecracker / Kata MicroVM Snapshot Pool Manager
- * with Idempotent Task Sandbox Re-Allocation & Orphan VM Reclamation.
+ * @fileoverview M4 TASK-12, M53-3 & M66-4: Pre-warmed Firecracker / Kata MicroVM Snapshot Pool Manager
+ * with Idempotent Task Sandbox Re-Allocation, Target Count Clamping & Closed-Sandbox Pruning in Multiplexer.
  */
 export interface MicroVmInstance {
   vmId: string;
@@ -13,14 +13,18 @@ export interface MicroVmInstance {
 
 export class WarmSandboxPoolManager {
   private readonly nodeId: string;
-  private readonly targetWarmCount: number;
+  public readonly targetWarmCount: number;
   private readonly warmPool: MicroVmInstance[] = [];
   private readonly activeVms: Map<string, MicroVmInstance> = new Map();
   private vmSeq = 0;
 
   constructor(nodeId: string, targetWarmCount = 8) {
     this.nodeId = nodeId;
-    this.targetWarmCount = targetWarmCount;
+    const rawTarget = Number(targetWarmCount);
+    this.targetWarmCount =
+      Number.isFinite(rawTarget) && rawTarget >= 0
+        ? Math.min(256, Math.floor(rawTarget))
+        : 8;
     this.replenishPool();
   }
 
@@ -112,9 +116,10 @@ export class WarmSandboxPoolManager {
 }
 
 /**
- * M17 TASK-87 & M53-3: LayerFS Numbered Self-Closing Sandbox Multiplexer
+ * M17 TASK-87, M53-3 & M66-4: LayerFS Numbered Self-Closing Sandbox Multiplexer
  * (Each Sandbox mounts up to 16 concurrent Workspaces, prevents duplicate multi-sandbox mounts for the same workspaceId,
- * starts a new Sandbox only when existing ones hold 16, and auto-closes after 120 seconds of inactivity).
+ * starts a new Sandbox only when existing ones hold 16, auto-closes after 120 seconds of inactivity,
+ * and prunes closed entries from `sandboxes` so linear lookup never degrades).
  */
 export interface NumberedLayerFsSandbox {
   sandboxNumber: number;
@@ -183,18 +188,30 @@ export class LayerFsNumberedSandboxMultiplexer {
     sb.lastActiveAtMs = nowMs;
   }
 
+  /**
+   * [M66-4] Closes idle sandboxes and physically deletes closed entries from `this.sandboxes`
+   * so long-running nodes do not accumulate dead sandbox descriptors.
+   */
   public sweepIdleSandboxes(nowMs = Date.now()): number[] {
     const closedNumbers: number[] = [];
-    for (const sb of this.sandboxes.values()) {
+    for (const [num, sb] of Array.from(this.sandboxes.entries())) {
+      if (sb.closed) {
+        this.sandboxes.delete(num);
+        continue;
+      }
       if (
-        !sb.closed &&
         sb.activeWorkspaceIds.size === 0 &&
         nowMs - sb.lastActiveAtMs >= LayerFsNumberedSandboxMultiplexer.IDLE_CLOSE_TIMEOUT_MS
       ) {
         sb.closed = true;
         closedNumbers.push(sb.sandboxNumber);
+        this.sandboxes.delete(num);
       }
     }
     return closedNumbers;
+  }
+
+  public getActiveSandboxCount(): number {
+    return this.sandboxes.size;
   }
 }

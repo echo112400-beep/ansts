@@ -1,20 +1,53 @@
 "use strict";
-
-
-var _nodeTest = require("node:test");
-var assert = _interopRequireWildcard(require("node:assert/strict"));
-var _index = require("../src/index.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+/**
  * @fileoverview feat/celld-v25 Scheduler Authority & 256-Slot HaSchedulerShardCoordinator Suite.
- */(0, _nodeTest.describe)("feat/celld-v25 Scheduler Shard Authority Suite", () => {
-  (0, _nodeTest.it)("Maps tasks across 256 virtual slots to registered celld-brain-01..03 nodes with monotonic epochs", () => {
-    const coord = new _index.HaSchedulerShardCoordinator(256, 8);
-    assert.equal(coord.registerBrainShardNode("brain-node-01"), 1);
-    assert.equal(coord.registerBrainShardNode("brain-node-02"), 1);
-    assert.equal(coord.registerBrainShardNode("brain-node-03"), 1);
-
-    const res = coord.resolveBrainForTask("tenant-alpha", "task-distributed-001");
-    assert.ok(res.slotIndex >= 0 && res.slotIndex < 256);
-    assert.ok(["brain-node-01", "brain-node-02", "brain-node-03"].includes(res.brainNodeId));
-    assert.equal(res.epoch, 1);
-  });
+ */
+const node_test_1 = require("node:test");
+const assert = __importStar(require("node:assert/strict"));
+const index_js_1 = require("../src/index.js");
+(0, node_test_1.describe)("feat/celld-v25 Scheduler Shard Authority Suite", () => {
+    (0, node_test_1.it)("Maps tasks across 256 virtual slots to registered celld-brain-01..03 nodes with monotonic epochs", () => {
+        const coord = new index_js_1.HaSchedulerShardCoordinator(256, 8);
+        assert.equal(coord.registerBrainShardNode("brain-node-01"), 1);
+        assert.equal(coord.registerBrainShardNode("brain-node-02"), 1);
+        assert.equal(coord.registerBrainShardNode("brain-node-03"), 1);
+        const res = coord.resolveBrainForTask("tenant-alpha", "task-distributed-001");
+        assert.ok(res.slotIndex >= 0 && res.slotIndex < 256);
+        assert.ok(["brain-node-01", "brain-node-02", "brain-node-03"].includes(res.brainNodeId));
+        assert.equal(res.epoch, 1);
+    });
 });

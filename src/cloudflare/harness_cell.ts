@@ -1,8 +1,10 @@
 /**
- * @fileoverview M7 TASK-27 & M54-1: AgentTaskHarnessCell (Per-Task Stateful Actor with R2/RustFS LTX Snapshot Sync
- * & Cold-Start SQLite Fencing Watermark Rehydration).
+ * @fileoverview M7 TASK-27, M54-1, M61-4, M64-1 & M69-5: AgentTaskHarnessCell (Per-Task Stateful Actor with R2/RustFS LTX Snapshot Sync,
+ * Cold-Start SQLite Fencing Watermark Rehydration, Idempotent Turn Checkpoint Retry, R2-to-SQLite Breakpoint Reconciliation
+ * with Foreign-TaskId Rejection, Positive Turn/Fence Validation, Turn Rollback Truncation & DO Fetch API).
  */
 import { DurableObjectStateLike, R2BucketLike } from "./env.js";
+import { SagaToolGateway } from "../saga_gateway.js";
 
 export interface HarnessTurnRecord {
   turnIndex: number;
@@ -10,6 +12,7 @@ export interface HarnessTurnRecord {
   toolName: string;
   toolOutput: Record<string, unknown>;
   r2SnapshotKey: string;
+  deduplicated?: boolean;
 }
 
 export class AgentTaskHarnessCell {
@@ -34,6 +37,7 @@ export class AgentTaskHarnessCell {
    * on Cell cold-start or live migration so zombie workers holding stale fencing tokens cannot overwrite turns.
    */
   public rehydrateWatermarksFromSql(): { highestFencingToken: number; highestTurnIndex: number } {
+    this.highestTurnIndex = 0;
     const rows = this.ctx.storage.sql
       .exec<Record<string, unknown>>("SELECT * FROM harness_turns")
       .toArray();
@@ -53,6 +57,92 @@ export class AgentTaskHarnessCell {
     };
   }
 
+  /**
+   * [M61-4 & M69-5] Reconciles any committed R2 LTX turn snapshots (`cells/${taskId}/turn-*.ltx`) that were written
+   * before an abrupt crash interrupted the subsequent SQLite `INSERT INTO harness_turns`, while rejecting any
+   * foreign `taskId` payloads or non-positive turn/fencing metadata.
+   */
+  public async reconcileBreakpointFromR2AndSql(): Promise<{
+    reconciledTurnsCount: number;
+    highestTurnIndex: number;
+    highestFencingToken: number;
+  }> {
+    const prefix = `cells/${this.taskId}/`;
+    const listed = await this.r2Bucket.list({ prefix });
+    let reconciledTurnsCount = 0;
+    for (const objInfo of listed.objects) {
+      const body = await this.r2Bucket.get(objInfo.key);
+      if (!body) continue;
+      try {
+        const parsed = JSON.parse(await body.text()) as {
+          taskId?: string;
+          turnIndex?: number;
+          fencingToken?: number;
+          toolName?: string;
+          toolOutput?: Record<string, unknown>;
+        };
+        if (parsed.taskId && parsed.taskId !== this.taskId) {
+          continue;
+        }
+        if (body.customMetadata?.taskId && body.customMetadata.taskId !== this.taskId) {
+          continue;
+        }
+        const tIdx = Number(parsed.turnIndex ?? body.customMetadata?.turnIndex ?? 0);
+        const fTok = Number(parsed.fencingToken ?? body.customMetadata?.fencingToken ?? 0);
+        if (!Number.isFinite(tIdx) || tIdx <= 0 || !Number.isFinite(fTok) || fTok <= 0) continue;
+
+        const existingSql = this.ctx.storage.sql
+          .exec<Record<string, unknown>>("SELECT * FROM harness_turns WHERE turn_index = ?", tIdx)
+          .one();
+        if (!existingSql || Number(existingSql.fencing_token ?? 0) < fTok) {
+          this.ctx.storage.sql.exec(
+            "INSERT OR REPLACE INTO harness_turns (turn_index, fencing_token, tool_name, output_json, r2_key) VALUES (?, ?, ?, ?, ?)",
+            Math.floor(tIdx),
+            Math.floor(fTok),
+            String(parsed.toolName ?? "reconciled_r2_turn"),
+            JSON.stringify(parsed.toolOutput ?? {}),
+            objInfo.key
+          );
+          reconciledTurnsCount += 1;
+        }
+      } catch {
+        // ignore malformed object
+      }
+    }
+    const watermarks = this.rehydrateWatermarksFromSql();
+    return {
+      reconciledTurnsCount,
+      highestTurnIndex: watermarks.highestTurnIndex,
+      highestFencingToken: watermarks.highestFencingToken,
+    };
+  }
+
+  /**
+   * [M69-5] Truncates and rolls back persisted turns at or after `fromTurnInclusive` (under a valid `fencingToken`)
+   * so breakpoint rollbacks reset `highestTurnIndex` cleanly while advancing `highestFencingToken`.
+   */
+  public truncateTurnsFrom(fromTurnInclusive: number, fencingToken: number): number {
+    if (!Number.isFinite(fencingToken) || fencingToken < this.highestFencingToken) {
+      throw new Error(
+        `Stale fencing token ${fencingToken} < highest ${this.highestFencingToken} in AgentTaskHarnessCell.truncateTurnsFrom`
+      );
+    }
+    this.highestFencingToken = Math.floor(fencingToken);
+    const rows = this.ctx.storage.sql
+      .exec<Record<string, unknown>>("SELECT * FROM harness_turns")
+      .toArray();
+    let deleted = 0;
+    for (const r of rows) {
+      const tIdx = Number(r.turn_index ?? 0);
+      if (tIdx >= fromTurnInclusive) {
+        this.ctx.storage.sql.exec("DELETE FROM harness_turns WHERE turn_index = ?", tIdx);
+        deleted += 1;
+      }
+    }
+    this.rehydrateWatermarksFromSql();
+    return deleted;
+  }
+
   public getHighestFencingToken(): number {
     return this.highestFencingToken;
   }
@@ -64,11 +154,43 @@ export class AgentTaskHarnessCell {
     toolOutput: Record<string, unknown>;
     enforceTurnMonotonicity?: boolean;
   }): Promise<HarnessTurnRecord> {
+    if (!Number.isFinite(params.turnIndex) || params.turnIndex <= 0) {
+      throw new Error(`Invalid turnIndex '${params.turnIndex}' in AgentTaskHarnessCell`);
+    }
+    if (!Number.isFinite(params.fencingToken) || params.fencingToken <= 0) {
+      throw new Error(`Invalid fencingToken '${params.fencingToken}' in AgentTaskHarnessCell`);
+    }
     if (params.fencingToken < this.highestFencingToken) {
       throw new Error(
         `Stale fencing token ${params.fencingToken} < highest ${this.highestFencingToken} in AgentTaskHarnessCell`
       );
     }
+
+    // [M61-4] Check if this exact (turnIndex, fencingToken, toolName, canonical toolOutput) was already committed
+    const existingRow = this.ctx.storage.sql
+      .exec<Record<string, unknown>>("SELECT * FROM harness_turns WHERE turn_index = ?", params.turnIndex)
+      .one();
+    if (
+      existingRow &&
+      Number(existingRow.fencing_token) === params.fencingToken &&
+      String(existingRow.tool_name) === params.toolName
+    ) {
+      const existingOut = JSON.parse(String(existingRow.output_json ?? "{}")) as Record<string, unknown>;
+      if (
+        JSON.stringify(SagaToolGateway.canonicalizeValue(existingOut)) ===
+        JSON.stringify(SagaToolGateway.canonicalizeValue(params.toolOutput))
+      ) {
+        return {
+          turnIndex: params.turnIndex,
+          fencingToken: params.fencingToken,
+          toolName: params.toolName,
+          toolOutput: existingOut,
+          r2SnapshotKey: String(existingRow.r2_key),
+          deduplicated: true,
+        };
+      }
+    }
+
     if (
       (params.enforceTurnMonotonicity ?? false) &&
       params.fencingToken === this.highestFencingToken &&
@@ -88,6 +210,7 @@ export class AgentTaskHarnessCell {
       taskId: this.taskId,
       turnIndex: params.turnIndex,
       fencingToken: params.fencingToken,
+      toolName: params.toolName,
       toolOutput: params.toolOutput,
     });
 
@@ -114,6 +237,7 @@ export class AgentTaskHarnessCell {
       toolName: params.toolName,
       toolOutput: params.toolOutput,
       r2SnapshotKey: r2Key,
+      deduplicated: false,
     };
   }
 
@@ -152,5 +276,61 @@ export class AgentTaskHarnessCell {
         r2SnapshotKey: String(r.r2_key),
       }))
       .sort((a, b) => a.turnIndex - b.turnIndex);
+  }
+
+  /**
+   * [M64-1] Durable Object HTTP `fetch` entrypoint supporting `/execute-turn`, `/reconcile`, and `/history`
+   * (with or without `/v1/harness` prefix).
+   */
+  public async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const normalizedPath = url.pathname.replace(/^\/v1\/harness(?=\/|$)/, "") || "/";
+
+    if (request.method === "POST" && normalizedPath === "/execute-turn") {
+      try {
+        const body = (await request.json()) as Record<string, unknown>;
+        const record = await this.executeAndCheckpointTurn({
+          turnIndex: Number(body.turnIndex ?? 1),
+          fencingToken: Number(body.fencingToken ?? 1),
+          toolName: String(body.toolName ?? "shell_exec"),
+          toolOutput: (body.toolOutput as Record<string, unknown>) ?? {},
+          enforceTurnMonotonicity: Boolean(body.enforceTurnMonotonicity ?? false),
+        });
+        return new Response(JSON.stringify(record), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: (err as Error).message }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      }
+    }
+
+    if (request.method === "POST" && normalizedPath === "/reconcile") {
+      const reconciled = await this.reconcileBreakpointFromR2AndSql();
+      return new Response(JSON.stringify(reconciled), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (request.method === "GET" && (normalizedPath === "/history" || normalizedPath === "/")) {
+      return new Response(
+        JSON.stringify({
+          taskId: this.taskId,
+          highestTurnIndex: this.highestTurnIndex,
+          highestFencingToken: this.highestFencingToken,
+          turns: this.getTurnHistory(),
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      );
+    }
+
+    return new Response(JSON.stringify({ error: "NOT_FOUND" }), { status: 404 });
   }
 }

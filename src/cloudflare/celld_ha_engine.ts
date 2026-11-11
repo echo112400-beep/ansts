@@ -1,6 +1,7 @@
 /**
- * @fileoverview M8 TASK-28 ~ TASK-31 & M55-4: RPO=0 LTX Durability Engine (with Atomic SQL Rollback on CAS Conflict),
- * DurableWorkflowContext (with Single-Flight Concurrent Deduplication & Step Invalidation), Sharded Queue Broker & Safe Epoch GC.
+ * @fileoverview M8 TASK-28 ~ TASK-31, M55-4 & M67-2: RPO=0 LTX Durability Engine (with Atomic SQL Rollback on CAS Conflict),
+ * DurableWorkflowContext (with Single-Flight Concurrent Deduplication & Step Invalidation),
+ * Bounded Idempotent Sharded Queue Broker & Safe Epoch GC.
  */
 import * as crypto from "node:crypto";
 import { R2BucketLike, SqlStorageLike } from "./env.js";
@@ -147,12 +148,16 @@ export class DurableWorkflowContext {
 }
 
 export class ShardedQueueBrokerPool {
-  private readonly shardCount: number;
+  public readonly shardCount: number;
+  public readonly maxDepthPerShard: number;
   private readonly queuesByShard: Map<number, Array<{ id: string; payload: Record<string, unknown> }>> = new Map();
 
-  constructor(shardCount = 16) {
-    this.shardCount = shardCount;
-    for (let i = 0; i < shardCount; i++) {
+  constructor(shardCount = 16, maxDepthPerShard = 4096) {
+    const rawShards = Number(shardCount);
+    const rawDepth = Number(maxDepthPerShard);
+    this.shardCount = Number.isFinite(rawShards) && rawShards > 0 ? Math.max(1, Math.floor(rawShards)) : 16;
+    this.maxDepthPerShard = Number.isFinite(rawDepth) && rawDepth > 0 ? Math.max(1, Math.floor(rawDepth)) : 4096;
+    for (let i = 0; i < this.shardCount; i++) {
       this.queuesByShard.set(i, []);
     }
   }
@@ -162,15 +167,27 @@ export class ShardedQueueBrokerPool {
     return hash.readUInt32BE(0) % this.shardCount;
   }
 
+  /**
+   * [M67-2] Idempotent bounded shard publish: deduplicates in-queue messages with the same `id`
+   * and enforces `maxDepthPerShard` to prevent unbounded shard queue growth.
+   */
   public publish(partitionKey: string, id: string, payload: Record<string, unknown>): number {
     const shard = this.computeShard(partitionKey);
-    this.queuesByShard.get(shard)!.push({ id, payload });
+    const queue = this.queuesByShard.get(shard)!;
+    if (id && queue.some((item) => item.id === id)) {
+      return shard;
+    }
+    if (queue.length >= this.maxDepthPerShard) {
+      throw new Error(`Shard ${shard} queue capacity (${this.maxDepthPerShard}) exceeded`);
+    }
+    queue.push({ id, payload });
     return shard;
   }
 
   public consumeBatch(shard: number, maxBatch = 32): Array<{ id: string; payload: Record<string, unknown> }> {
+    const safeBatch = Number.isFinite(maxBatch) && maxBatch > 0 ? Math.floor(maxBatch) : 32;
     const q = this.queuesByShard.get(shard) ?? [];
-    return q.splice(0, maxBatch);
+    return q.splice(0, safeBatch);
   }
 }
 

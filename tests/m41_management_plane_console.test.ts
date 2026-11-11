@@ -8,6 +8,8 @@
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as http from "node:http";
+import { AddressInfo } from "node:net";
 import { AnstsLocalAndComposeServer } from "../src/server_main.js";
 
 describe("M41 Platform Management Console Prototype & Real Backend BFF Suite", () => {
@@ -224,6 +226,106 @@ describe("M41 Platform Management Console Prototype & Real Backend BFF Suite", (
     } finally {
       await server.stop();
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates the management scenario across gateways through SigV4-signed S3 requests", async () => {
+    const objects = new Map<string, string>();
+    const signedRequests: string[] = [];
+    const fakeS3 = http.createServer((req, res) => {
+      const authorization = req.headers.authorization;
+      if (typeof authorization !== "string" || !authorization.startsWith("AWS4-HMAC-SHA256")) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+      signedRequests.push(`${req.method} ${req.url ?? ""}`);
+      if (req.method === "HEAD") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+      if (req.method === "GET") {
+        const body = objects.get(req.url ?? "");
+        if (body === undefined) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(body);
+        return;
+      }
+      if (req.method === "PUT") {
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => chunks.push(chunk));
+        req.on("end", () => {
+          objects.set(req.url ?? "", Buffer.concat(chunks).toString("utf-8"));
+          res.writeHead(200);
+          res.end();
+        });
+        return;
+      }
+      res.writeHead(405);
+      res.end();
+    });
+    const listening = Promise.withResolvers<void>();
+    fakeS3.listen(0, "127.0.0.1", listening.resolve);
+    await listening.promise;
+    const s3Endpoint = `http://127.0.0.1:${(fakeS3.address() as AddressInfo).port}`;
+    const tmpA = `/tmp/ansts-m41a-${process.pid}-${Date.now()}`;
+    const tmpB = `/tmp/ansts-m41b-${process.pid}-${Date.now()}`;
+    fs.mkdirSync(tmpA, { recursive: true });
+    fs.mkdirSync(tmpB, { recursive: true });
+
+    const s3Options = {
+      host: "127.0.0.1",
+      nodeRole: "gateway" as const,
+      s3Endpoint,
+      s3AccessKeyId: "test-access-key",
+      s3SecretAccessKey: "test-secret-key",
+      s3Region: "us-east-1",
+    };
+    const gatewayA = new AnstsLocalAndComposeServer({ ...s3Options, nodeId: "celld-gw-01", storageDir: tmpA });
+    const gatewayB = new AnstsLocalAndComposeServer({ ...s3Options, nodeId: "celld-gw-02", storageDir: tmpB });
+
+    try {
+      const { apiPort: portA } = await gatewayA.start(0, 0);
+      const { apiPort: portB } = await gatewayB.start(0, 0);
+      const urlA = `http://127.0.0.1:${portA}/v1beta1/management/state`;
+      const urlB = `http://127.0.0.1:${portB}/v1beta1/management/state`;
+
+      assert.equal((await fetch(urlA)).status, 200);
+      assert.equal((await fetch(urlB)).status, 200);
+
+      // A write accepted by gateway B must become visible on gateway A (shared S3 snapshot).
+      const switchResp = await fetch(`http://127.0.0.1:${portB}/v1beta1/management/scenario`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scenario: "offline", actor: "chen" }),
+      });
+      assert.equal(switchResp.status, 200);
+      assert.equal((await fetch(urlB)).status, 503);
+      assert.equal((await fetch(urlA)).status, 503);
+
+      // A recovery performed on gateway A must restore gateway B as well.
+      assert.equal((await fetch(`${urlA}?recover=1`)).status, 200);
+      assert.equal((await fetch(urlB)).status, 200);
+      assert.equal((await fetch(urlA)).status, 200);
+
+      const persisted = JSON.parse(objects.get("/ansts-fleet/management/cluster_state.json") ?? "{}") as {
+        scenario?: string;
+      };
+      assert.equal(persisted.scenario, "normal");
+      assert.ok(signedRequests.some((r) => r.startsWith("PUT ")));
+    } finally {
+      await gatewayA.stop();
+      await gatewayB.stop();
+      const closed = Promise.withResolvers<void>();
+      fakeS3.close(closed.resolve);
+      await closed.promise;
+      fs.rmSync(tmpA, { recursive: true, force: true });
+      fs.rmSync(tmpB, { recursive: true, force: true });
     }
   });
 });

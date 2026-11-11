@@ -1,6 +1,6 @@
 /**
- * @fileoverview M13 TASK-62 & M53-4: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller
- * with Drain-Token Lease TTL Auto-Expiration to prevent rolling-shutdown deadlocks.
+ * @fileoverview M13 TASK-62, M53-4 & M57-3: Non-K8s Bare-Metal/VM Systemd & Docker Compose Manual Fleet Scale-Out/Scale-In Controller
+ * with Role-Isolated Cell Rebalancing, Atomic Cordon/Drain Pre-Check, and Drain-Token Lease TTL Auto-Expiration.
  */
 import * as crypto from "node:crypto";
 
@@ -95,18 +95,30 @@ export class ManualFleetScaleController {
   private readonly nodes: Map<string, BareMetalFleetNode> = new Map();
   public readonly slotRing: VirtualHashSlotRingManager = new VirtualHashSlotRingManager(1024, 16);
 
-  public registerBareMetalNode(node: Omit<BareMetalFleetNode, "state" | "runningCells"> & { runningCells?: string[] }): BareMetalFleetNode {
+  public registerBareMetalNode(
+    node: Omit<BareMetalFleetNode, "state" | "runningCells"> & { runningCells?: string[] }
+  ): BareMetalFleetNode {
+    const existing = this.nodes.get(node.nodeId);
+    const mergedCells = node.runningCells
+      ? [...node.runningCells]
+      : existing
+        ? [...existing.runningCells]
+        : [];
     const full: BareMetalFleetNode = {
       ...node,
       state: "ACTIVE",
-      runningCells: node.runningCells ? [...node.runningCells] : [],
+      runningCells: Array.from(new Set(mergedCells)),
     };
     this.nodes.set(node.nodeId, full);
     this.slotRing.addNode(node.nodeId);
     return full;
   }
 
-  public scaleOutNode(nodeId: string, ipAddress: string, role: "control-plane" | "worker" | "storage" = "worker"): {
+  public scaleOutNode(
+    nodeId: string,
+    ipAddress: string,
+    role: "control-plane" | "worker" | "storage" = "worker"
+  ): {
     node: BareMetalFleetNode;
     rebalancedCells: string[];
   } {
@@ -117,8 +129,14 @@ export class ManualFleetScaleController {
       systemdUnit: role === "control-plane" ? "celld.service" : "ansts-node-daemon.service",
     });
     const rebalancedCells: string[] = [];
+    // [M57-3] Role-isolated rebalancing: only steal cells from ACTIVE nodes of the exact same role
     for (const existing of this.nodes.values()) {
-      if (existing.nodeId !== nodeId && existing.state === "ACTIVE" && existing.runningCells.length > 2) {
+      if (
+        existing.nodeId !== nodeId &&
+        existing.state === "ACTIVE" &&
+        existing.role === role &&
+        existing.runningCells.length > 2
+      ) {
         const moved = existing.runningCells.pop()!;
         newNode.runningCells.push(moved);
         rebalancedCells.push(moved);
@@ -135,14 +153,16 @@ export class ManualFleetScaleController {
     if (!source) {
       throw new Error(`Node '${nodeId}' not found in ManualFleetScaleController`);
     }
-    source.state = "CORDONED";
     const activeTargets = Array.from(this.nodes.values()).filter(
       (n) => n.nodeId !== nodeId && n.state === "ACTIVE" && n.role === source.role
     );
+    // [M57-3] Atomic pre-check BEFORE mutating source.state to CORDONED so a rejected drain on the last active node
+    // of a role never leaves that node stranded in CORDONED state.
     if (activeTargets.length === 0 && source.runningCells.length > 0) {
       throw new Error(`Cannot drain node '${nodeId}': no other ACTIVE nodes with role '${source.role}'`);
     }
 
+    source.state = "CORDONED";
     source.state = "DRAINING";
     const drainedCells: Array<{ cellId: string; targetNodeId: string }> = [];
     let idx = 0;

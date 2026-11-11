@@ -1,10 +1,19 @@
 /**
- * @fileoverview M14 TASK-63 ~ TASK-66, M48-1 & M56-1: Unified 8-Table Component Persistence Store & Cold-Start Rehydration Engine
- * with Monotonic Fencing Watermark Rehydration & Interrupted In-Flight Task Recovery.
+ * @fileoverview M14 TASK-63 ~ TASK-66, M48-1, M56-1, M60-1 & M64-2/M64-3: Unified Component & Full-Link Persistence Store & Cold-Start Rehydration Engine
+ * with Monotonic Fencing Watermark Rehydration, 100% TaskSpec Field Fidelity, Tenant-Scoped Idempotency Index Restoration, Interrupted In-Flight Task Recovery,
+ * and End-to-End Snapshot/Rehydration across Scheduler, TurnWalEngine, SagaToolGateway (Journal + Compensator + StagingGate),
+ * TransactionalOutboxDispatcher, DagEscrowCoordinator, FinOpsBudgetController, CognitiveRouter & McpDynamicToolRegistry.
  */
 import { SqlStorageLike } from "../cloudflare/env.js";
 import { CoreScheduler5D } from "../scheduler.js";
-import { TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { TurnWalEngine } from "./wal_engine.js";
+import { SagaToolGateway } from "../saga_gateway.js";
+import { TransactionalOutboxDispatcher } from "../telemetry/outbox_webhook.js";
+import { DagEscrowCoordinator } from "../dag/escrow.js";
+import { FinOpsBudgetController } from "../finops/budget_controller.js";
+import { CognitiveRouter } from "../cognitive_router.js";
+import { McpDynamicToolRegistry } from "../saga/mcp_registry.js";
 
 export class UnifiedComponentPersistenceStore {
   private readonly sql: SqlStorageLike;
@@ -55,9 +64,10 @@ export class UnifiedComponentPersistenceStore {
   }
 
   /**
-   * [M56-1] Rehydrates tasks and fencing watermarks from `persisted_tasks` and `persisted_leases`.
-   * Any task that was interrupted mid-flight (`LEASED`, `RUNNING_THINK`, `RUNNING_ACT`) is safely
-   * transitioned back to `QUEUED` and enqueued so it is re-dispatched with a higher monotonic fencing token.
+   * [M56-1, M60-1 & M64-2] Rehydrates tasks with 100% `TaskSpec` field fidelity (`resource_profile`,
+   * `parent_task_id`, `expected_SubAgent_count`, `prefix_Cache_hash`, `last_preempted_at`, `created_at`),
+   * fencing watermarks, tenant-scoped `idempotencyIndex`, `contentFingerprintIndex`, `deadLetterIds`,
+   * and merged duplicate metadata from `persisted_tasks` and `persisted_leases`.
    */
   public rehydrateSchedulerFromSql(
     targetScheduler: CoreScheduler5D,
@@ -77,6 +87,10 @@ export class UnifiedComponentPersistenceStore {
     let restored = 0;
     for (const r of rows) {
       const raw = JSON.parse(String(r.payload_json)) as Record<string, unknown>;
+      const rawProfile =
+        raw.resource_profile && typeof raw.resource_profile === "object"
+          ? (raw.resource_profile as Partial<ResourceProfile>)
+          : undefined;
       const spec = new TaskSpec({
         task_id: String(raw.task_id),
         tenant_id: String(raw.tenant_id),
@@ -84,18 +98,47 @@ export class UnifiedComponentPersistenceStore {
         prompt: String(raw.prompt ?? ""),
         max_turns: Number(raw.max_turns ?? 30),
         timeout_seconds: Number(raw.timeout_seconds ?? 1800),
+        resource_profile: rawProfile,
         dependencies: Array.isArray(raw.dependencies) ? raw.dependencies.map(String) : [],
         idempotency_key: raw.idempotency_key ? String(raw.idempotency_key) : undefined,
         parent_task_id: raw.parent_task_id ? String(raw.parent_task_id) : undefined,
         expected_SubAgent_count:
           raw.expected_SubAgent_count !== undefined ? Number(raw.expected_SubAgent_count) : undefined,
+        prefix_Cache_hash: raw.prefix_Cache_hash ? String(raw.prefix_Cache_hash) : "",
+        content_fingerprint: raw.content_fingerprint ? String(raw.content_fingerprint) : undefined,
+        merged_duplicate_count:
+          raw.merged_duplicate_count !== undefined ? Number(raw.merged_duplicate_count) : 0,
+        merged_request_ids: Array.isArray(raw.merged_request_ids)
+          ? raw.merged_request_ids.map(String)
+          : [],
+        merged_idempotency_keys: Array.isArray(raw.merged_idempotency_keys)
+          ? raw.merged_idempotency_keys.map(String)
+          : undefined,
       });
       if (raw.current_turn !== undefined) {
         spec.current_turn = Number(raw.current_turn);
       }
+      if (raw.retry_count !== undefined) {
+        spec.retry_count = Number(raw.retry_count);
+      }
+      if (raw.preempted_count !== undefined) {
+        spec.preempted_count = Number(raw.preempted_count);
+      }
+      if (raw.last_preempted_at !== undefined) {
+        spec.last_preempted_at = Number(raw.last_preempted_at);
+      }
+      if (raw.dead_letter_reason) {
+        spec.dead_letter_reason = String(raw.dead_letter_reason);
+      }
+      if (raw.created_at !== undefined) {
+        spec.created_at = Number(raw.created_at);
+      }
       spec.state = (raw.state as TaskState) ?? TaskState.QUEUED;
       spec.lease_fencing_token = Number(raw.lease_fencing_token ?? 0);
       spec.assigned_node_id = raw.assigned_node_id ? String(raw.assigned_node_id) : undefined;
+      if (!spec.content_fingerprint) {
+        spec.content_fingerprint = CoreScheduler5D.computeTaskContentFingerprint(spec);
+      }
 
       if (spec.lease_fencing_token > 0) {
         targetScheduler.leaseCoordinator.rehydrateFencingWatermark(spec.task_id, spec.lease_fencing_token);
@@ -107,19 +150,192 @@ export class UnifiedComponentPersistenceStore {
           spec.state === TaskState.RUNNING_THINK ||
           spec.state === TaskState.RUNNING_ACT)
       ) {
+        if (spec.assigned_node_id) {
+          const oldNode = targetScheduler.nodes.get(spec.assigned_node_id);
+          if (oldNode) {
+            oldNode.free_cpu_cores = Math.min(
+              oldNode.total_cpu_cores,
+              oldNode.free_cpu_cores + spec.resource_profile.think_cpu_cores
+            );
+            oldNode.free_memory_mb = Math.min(
+              oldNode.total_memory_mb,
+              oldNode.free_memory_mb + Math.floor(spec.resource_profile.act_memory_mb * 0.25)
+            );
+            oldNode.running_tasks = Math.max(0, oldNode.running_tasks - 1);
+          }
+        }
         spec.state = TaskState.QUEUED;
         spec.assigned_node_id = undefined;
       }
 
       targetScheduler.allTasks.set(spec.task_id, spec);
+      if (spec.idempotency_key) {
+        targetScheduler.idempotencyIndex.set(
+          CoreScheduler5D.scopeIdempotencyKey(spec.tenant_id, spec.idempotency_key),
+          spec.task_id
+        );
+      }
+      for (const mKey of spec.merged_idempotency_keys) {
+        targetScheduler.idempotencyIndex.set(
+          CoreScheduler5D.scopeIdempotencyKey(spec.tenant_id, mKey),
+          spec.task_id
+        );
+      }
+      if (
+        spec.state !== TaskState.COMPLETED &&
+        spec.state !== TaskState.SUCCEEDED &&
+        spec.state !== TaskState.FAILED &&
+        spec.state !== TaskState.DEAD_LETTER &&
+        spec.state !== TaskState.CANCELLED
+      ) {
+        targetScheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+      }
+
       if (spec.state === TaskState.QUEUED) {
         targetScheduler.queueManager.enqueue(spec);
       } else if (spec.state === TaskState.COMPLETED) {
         targetScheduler.completedIds.add(spec.task_id);
+      } else if (spec.state === TaskState.DEAD_LETTER) {
+        targetScheduler.deadLetterIds.add(spec.task_id);
       }
       restored += 1;
     }
     return restored;
+  }
+
+  /**
+   * [M60-1 & M64-3] Atomically snapshots the full end-to-end execution chain across all 8 unified tables
+   * plus `turn_wal_entries`, `saga_execution_journal`, and `transactional_outbox_messages`.
+   */
+  public snapshotFullLinkState(params: {
+    scheduler: CoreScheduler5D;
+    walEngine?: TurnWalEngine;
+    sagaGateway?: SagaToolGateway;
+    outboxDispatcher?: TransactionalOutboxDispatcher;
+    dagEscrow?: DagEscrowCoordinator;
+    finopsController?: FinOpsBudgetController;
+    router?: CognitiveRouter;
+    mcpRegistry?: McpDynamicToolRegistry;
+  }): {
+    tasksSaved: number;
+    leasesSaved: number;
+    walEntriesSaved: number;
+    sagaJournalSaved: number;
+    outboxMessagesSaved: number;
+  } {
+    const schedSnap = this.snapshotSchedulerState(params.scheduler);
+    let walEntriesSaved = 0;
+    if (params.walEngine) {
+      params.walEngine.bindSqlStorage(this.sql);
+      for (const task of params.scheduler.allTasks.values()) {
+        const entries = params.walEngine.getTaskWalEntries(task.task_id);
+        for (const e of entries) {
+          this.sql.exec(
+            "INSERT OR REPLACE INTO turn_wal_entries (task_id, wal_seq, turn_index, fencing_token, changed_files_json, sqlite_wal_pages, checksum_sha256, frame_crc32, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            e.taskId,
+            e.walSeq,
+            e.turnIndex,
+            e.fencingToken,
+            JSON.stringify(e.changedFiles),
+            e.sqliteWalPages,
+            e.checksumSha256,
+            e.frame.crc32Hex,
+            e.checkpoint.created_at
+          );
+          walEntriesSaved += 1;
+        }
+      }
+    }
+
+    let sagaJournalSaved = 0;
+    if (params.sagaGateway) {
+      params.sagaGateway.bindSqlStorage(this.sql);
+      const records = params.sagaGateway.exportJournalRecords();
+      sagaJournalSaved = params.sagaGateway.importJournalRecords(records);
+    }
+
+    let outboxMessagesSaved = 0;
+    if (params.outboxDispatcher) {
+      params.outboxDispatcher.bindSqlStorage(this.sql);
+      for (const msg of params.outboxDispatcher.listMessages()) {
+        params.outboxDispatcher.enqueueOutbox(msg.messageId, msg.taskId, msg.targetUrl, msg.payload);
+        outboxMessagesSaved += 1;
+      }
+    }
+
+    if (params.dagEscrow) {
+      params.dagEscrow.bindSqlStorage(this.sql);
+    }
+    if (params.finopsController) {
+      params.finopsController.bindSqlStorage(this.sql);
+    }
+    if (params.router) {
+      params.router.bindSqlStorage(this.sql);
+    }
+    if (params.mcpRegistry) {
+      params.mcpRegistry.bindSqlStorage(this.sql, params.sagaGateway);
+    }
+
+    return {
+      tasksSaved: schedSnap.tasksSaved,
+      leasesSaved: schedSnap.leasesSaved,
+      walEntriesSaved,
+      sagaJournalSaved,
+      outboxMessagesSaved,
+    };
+  }
+
+  /**
+   * [M60-1 & M64-3] Rehydrates the full end-to-end execution chain (Scheduler, TurnWalEngine, SagaToolGateway +
+   * Compensator + StagingGate, TransactionalOutboxDispatcher, DagEscrowCoordinator, FinOpsBudgetController,
+   * CognitiveRouter, and McpDynamicToolRegistry) from SQLite on process/cell cold-start.
+   */
+  public rehydrateFullLinkState(params: {
+    scheduler: CoreScheduler5D;
+    walEngine?: TurnWalEngine;
+    sagaGateway?: SagaToolGateway;
+    outboxDispatcher?: TransactionalOutboxDispatcher;
+    dagEscrow?: DagEscrowCoordinator;
+    finopsController?: FinOpsBudgetController;
+    router?: CognitiveRouter;
+    mcpRegistry?: McpDynamicToolRegistry;
+    requeueInterruptedLeases?: boolean;
+  }): {
+    tasksRestored: number;
+    walEntriesRestored: number;
+    sagaJournalRestored: number;
+    outboxMessagesRestored: number;
+    escrowsRestored?: number;
+    finopsLedgersRestored?: number;
+    routerEndpointsRestored?: number;
+    mcpToolsRestored?: number;
+  } {
+    const tasksRestored = this.rehydrateSchedulerFromSql(params.scheduler, {
+      requeueInterruptedLeases: params.requeueInterruptedLeases ?? true,
+    });
+    const walEntriesRestored = params.walEngine ? params.walEngine.bindSqlStorage(this.sql) : 0;
+    const sagaJournalRestored = params.sagaGateway ? params.sagaGateway.bindSqlStorage(this.sql) : 0;
+    const outboxMessagesRestored = params.outboxDispatcher
+      ? params.outboxDispatcher.bindSqlStorage(this.sql)
+      : 0;
+    const escrowsRestored = params.dagEscrow ? params.dagEscrow.bindSqlStorage(this.sql) : undefined;
+    const finopsLedgersRestored = params.finopsController
+      ? params.finopsController.bindSqlStorage(this.sql)
+      : undefined;
+    const routerEndpointsRestored = params.router ? params.router.bindSqlStorage(this.sql) : undefined;
+    const mcpToolsRestored = params.mcpRegistry
+      ? params.mcpRegistry.bindSqlStorage(this.sql, params.sagaGateway)
+      : undefined;
+    return {
+      tasksRestored,
+      walEntriesRestored,
+      sagaJournalRestored,
+      outboxMessagesRestored,
+      escrowsRestored,
+      finopsLedgersRestored,
+      routerEndpointsRestored,
+      mcpToolsRestored,
+    };
   }
 
   public saveComponentRecord(

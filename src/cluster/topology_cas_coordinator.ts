@@ -1,6 +1,6 @@
 /**
- * @fileoverview M25 & M55-2: Cluster Topology Compare-And-Swap (CAS) Membership Coordinator
- * with Member Deduplication, SHA-256 Ring Digest & SQLite Persistence.
+ * @fileoverview M25, M55-2 & M61-1: Cluster Topology Compare-And-Swap (CAS) Membership Coordinator
+ * with Member Deduplication, Idempotent CAS Retry, SHA-256 Ring Digest & SQLite Persistence.
  */
 import * as crypto from "node:crypto";
 import { SqlStorageLike } from "../cloudflare/env.js";
@@ -55,18 +55,34 @@ export class TopologyCasCoordinator {
     return ringDigest;
   }
 
+  /**
+   * [M61-1] Supports idempotent CAS retry when `expectedGeneration === this.generation - 1`
+   * and the normalized sorted member set matches `this.members`.
+   */
   public updateTopologyCas(expectedGeneration: number, nextMembers: string[]): {
     generation: number;
     members: string[];
     ringDigest: string;
+    deduplicated?: boolean;
   } {
+    const dedupedNext = Array.from(new Set(nextMembers));
     if (expectedGeneration !== this.generation) {
+      const currentSorted = this.members.slice().sort().join(",");
+      const nextSorted = dedupedNext.slice().sort().join(",");
+      if (expectedGeneration === this.generation - 1 && currentSorted === nextSorted) {
+        return {
+          generation: this.generation,
+          members: [...this.members],
+          ringDigest: this.computeRingDigest(),
+          deduplicated: true,
+        };
+      }
       throw new Error(`Topology CAS conflict: expected gen=${expectedGeneration}, actual=${this.generation}`);
     }
     this.generation += 1;
-    this.members = Array.from(new Set(nextMembers));
+    this.members = dedupedNext;
     const ringDigest = this.persist();
-    return { generation: this.generation, members: [...this.members], ringDigest };
+    return { generation: this.generation, members: [...this.members], ringDigest, deduplicated: false };
   }
 
   public forceSyncMembers(nextMembers: string[]): {
@@ -74,8 +90,18 @@ export class TopologyCasCoordinator {
     members: string[];
     ringDigest: string;
   } {
+    const dedupedNext = Array.from(new Set(nextMembers));
+    const currentSorted = this.members.slice().sort().join(",");
+    const nextSorted = dedupedNext.slice().sort().join(",");
+    if (this.generation > 0 && currentSorted === nextSorted) {
+      return {
+        generation: this.generation,
+        members: [...this.members],
+        ringDigest: this.computeRingDigest(),
+      };
+    }
     this.generation += 1;
-    this.members = Array.from(new Set(nextMembers));
+    this.members = dedupedNext;
     const ringDigest = this.persist();
     return { generation: this.generation, members: [...this.members], ringDigest };
   }

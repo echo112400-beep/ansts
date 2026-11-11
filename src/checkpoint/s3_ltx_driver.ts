@@ -1,5 +1,6 @@
 /**
- * @fileoverview M10 TASK-35: RustFS / AWS S3 SigV4 CAS (`If-None-Match: *`) LTX Snapshot Driver.
+ * @fileoverview M10 TASK-35 & M59-6: RustFS / AWS S3 SigV4 CAS (`If-None-Match: *`) LTX Snapshot Driver
+ * with Strict Integer `txId`/`fencingToken` & Path-Safe `cellId` Validation.
  */
 import * as crypto from "node:crypto";
 import { R2BucketLike } from "../cloudflare/env.js";
@@ -53,7 +54,17 @@ export class RustFsS3LtxDriver {
     fencingToken: number;
     ltxBytes: Uint8Array;
   }): Promise<{ key: string; etag: string; sha256: string; authHeader: string }> {
-    const key = `cells/${params.cellId}/ltx/${String(params.txId).padStart(10, "0")}-f${params.fencingToken}.ltx`;
+    const safeCellId = params.cellId.trim();
+    if (!safeCellId || !/^[a-zA-Z0-9._:-]+$/.test(safeCellId) || safeCellId.includes("..")) {
+      throw new Error(`Invalid LTX cellId '${params.cellId}'`);
+    }
+    if (!Number.isInteger(params.txId) || params.txId < 0) {
+      throw new Error(`Invalid LTX txId '${params.txId}': must be a non-negative integer`);
+    }
+    if (!Number.isInteger(params.fencingToken) || params.fencingToken < 1) {
+      throw new Error(`Invalid LTX fencingToken '${params.fencingToken}': must be a positive integer`);
+    }
+    const key = `cells/${safeCellId}/ltx/${String(params.txId).padStart(10, "0")}-f${params.fencingToken}.ltx`;
     const sha256 = crypto.createHash("sha256").update(params.ltxBytes).digest("hex");
     const authHeader = this.buildSigV4AuthorizationHeader({
       method: "PUT",
@@ -65,7 +76,7 @@ export class RustFsS3LtxDriver {
     const res = await this.bucket.put(key, params.ltxBytes, {
       onlyIf: { etagDoesNotMatch: "*" },
       customMetadata: {
-        cellId: params.cellId,
+        cellId: safeCellId,
         txId: String(params.txId),
         fencingToken: String(params.fencingToken),
         sha256,

@@ -1,5 +1,6 @@
 /**
- * @fileoverview M6 TASK-24: End-to-End Bidirectional Backpressure Closed-Loop Coordinator.
+ * @fileoverview M6 TASK-24 & M63-2: End-to-End Bidirectional Backpressure Closed-Loop Coordinator
+ * with Zero-Endpoint Outage Protection & NaN/Out-of-Range Snapshot Sanitization.
  */
 import { IngressBackpressureController } from "../gateway/backpressure.js";
 import { TaskPriority } from "../models.js";
@@ -18,22 +19,43 @@ export class BidirectionalBackpressureController {
     this.ingressController = ingressController;
   }
 
+  /**
+   * [M63-2] DFX-Availability:
+   * - Treats `totalEndpoints <= 0` with `globalRateLimitedEndpoints > 0` (or negative/NaN PSI) safely:
+   *   if `maxNodePsiSomePct` is NaN, defaults to conservative degraded evaluation;
+   *   clamps `llmUnhealthyRatio` to `[0, 1]`.
+   */
   public computeClusterHealthState(snapshot: ClusterCongestionSnapshot): {
     mode: "GREEN" | "YELLOW_DEGRADED" | "RED_SHEDDING";
     recommendedDispatchRateScale: number;
     allowBatchAdmission: boolean;
   } {
-    const llmUnhealthyRatio =
-      snapshot.totalEndpoints > 0
-        ? snapshot.globalRateLimitedEndpoints / snapshot.totalEndpoints
-        : 0;
+    const safePsi = Number.isFinite(snapshot.maxNodePsiSomePct)
+      ? Math.max(0, snapshot.maxNodePsiSomePct)
+      : 80.0;
+    const safeTotalEp = Number.isFinite(snapshot.totalEndpoints)
+      ? Math.max(0, Math.floor(snapshot.totalEndpoints))
+      : 0;
+    const safeLimitedEp = Number.isFinite(snapshot.globalRateLimitedEndpoints)
+      ? Math.max(0, Math.floor(snapshot.globalRateLimitedEndpoints))
+      : 0;
+    const safeQueueDepth = Number.isFinite(snapshot.globalQueueDepth)
+      ? Math.max(0, Math.floor(snapshot.globalQueueDepth))
+      : 0;
 
-    if (snapshot.maxNodePsiSomePct >= 75.0 || llmUnhealthyRatio >= 0.75) {
+    const llmUnhealthyRatio =
+      safeTotalEp > 0
+        ? Math.min(1.0, safeLimitedEp / safeTotalEp)
+        : safeLimitedEp > 0
+          ? 1.0
+          : 0;
+
+    if (safePsi >= 75.0 || llmUnhealthyRatio >= 0.75) {
       const p3Check = this.ingressController.evaluateAdmission({
         priority: TaskPriority.P3_BATCH,
-        globalQueueDepth: snapshot.globalQueueDepth,
+        globalQueueDepth: safeQueueDepth,
         tenantActiveTasks: 0,
-        clusterPsiPressurePct: 90.0,
+        clusterPsiPressurePct: Math.max(90.0, safePsi),
       });
       return {
         mode: "RED_SHEDDING",
@@ -42,7 +64,7 @@ export class BidirectionalBackpressureController {
       };
     }
 
-    if (snapshot.maxNodePsiSomePct >= 45.0 || llmUnhealthyRatio >= 0.35) {
+    if (safePsi >= 45.0 || llmUnhealthyRatio >= 0.35) {
       return {
         mode: "YELLOW_DEGRADED",
         recommendedDispatchRateScale: 0.55,

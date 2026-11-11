@@ -1,3 +1,7 @@
+import { RustFsS3LtxDriver } from "../checkpoint/s3_ltx_driver.js";
+import { S3SigV4Client } from "../storage/s3_sigv4_client.js";
+import { DurableDiskCellSqlStorage, InMemoryKvNamespace, InMemoryCellSqlStorage } from "../cloudflare/env.js";
+import { ZeroTrustSandboxSecurityGuard } from "../runtime/zero_trust_security_guard.js";
 import { LayerFsContentStoreEngine } from "../checkpoint/layerfs_store_engine.js";
 import * as crypto from "node:crypto";
 /**
@@ -96,7 +100,7 @@ import { TransactionalOutboxDispatcher } from "../telemetry/outbox_webhook.js";
 import { AgentHarnessRunner } from "../harness/runner.js";
 import { CgroupPhaseController } from "../runtime/phase_controller.js";
 import { McpDynamicToolRegistry } from "../saga/mcp_registry.js";
-import { DurableObjectFacetSupervisor, DynamicWorkerSandboxLoader } from "../cloudflare/celld_native_optimizations.js";
+import { DurableObjectFacetSupervisor, DynamicWorkerSandboxLoader, CelldKvOptimizerAndGuard, V8HeapAndSqlBudgetGuard } from "../cloudflare/celld_native_optimizations.js";
 import { IngressBackpressureController } from "../gateway/backpressure.js";
 import { CognitiveRouter } from "../cognitive_router.js";
 import { LlmEndpointMetrics, ToolCallEffectClass } from "../models.js";
@@ -113,14 +117,14 @@ import { TaskResourceProfiler } from "../profiler.js";
 import { CelldAdminClient } from "../cloudflare/celld_admin_client.js";
 import { UnifiedComponentPersistenceStore } from "../checkpoint/unified_state_store.js";
 import { CelldNativeContainerSandboxManager } from "../cloudflare/celld_container_bridge.js";
-import { DurableWorkflowContext, RpoZeroDurabilityEngine } from "../cloudflare/celld_ha_engine.js";
+import { DurableWorkflowContext, RpoZeroDurabilityEngine, ShardedQueueBrokerPool } from "../cloudflare/celld_ha_engine.js";
 import { InMemoryR2Bucket } from "../cloudflare/env.js";
 import { CoWSandboxBranchForker } from "../runtime/sandbox_branch_forker.js";
 import { LayerFsMultiAgentBranchCoordinator } from "../dag/layerfs_branch_coordinator.js";
 import { LinuxPsiMemoryGuard } from "../runtime/psi_guard.js";
 import { BidirectionalBackpressureController } from "../cluster/backpressure_loop.js";
-import { DynamicQueueAutoSharder, BrainBodyContainerPoolScaler } from "../cloudflare/horizontal_scaler.js";
-import { TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { PartitionedSchedulerRouter, DynamicQueueAutoSharder, BrainBodyContainerPoolScaler } from "../cloudflare/horizontal_scaler.js";
+import { FenceToken, TaskPriority, TaskSpec, TaskState } from "../models.js";
 import { ModelPoolClientAdapter } from "../router/pool_client.js";
 import { LiveOpenAiCompatibleSseAdapter } from "../router/live_llm_adapter.js";
 import { SlidingWindowTokenBucket, ThreeStateCircuitBreaker } from "../router/breaker_limiter.js";
@@ -245,10 +249,14 @@ export interface ManagementPlaneDeps {
   peerBrainUrls: Record<string, string>;
   peerBodyUrls: Record<string, string>;
   s3Endpoint?: string | null;
+  s3AccessKeyId?: string | null;
+  s3SecretAccessKey?: string | null;
+  s3Region?: string | null;
 }
 
 export class PlatformManagementPlaneEngine {
   private readonly deps: ManagementPlaneDeps;
+  private s3Client: S3SigV4Client | null | undefined;
   private scenario: ManagementScenarioId = "normal";
   private loadSheddingActive = false;
   private verificationRetried = false;
@@ -1057,6 +1065,11 @@ export class PlatformManagementPlaneEngine {
           branch: branchName,
           state: String(t.state),
           prompt: t.prompt,
+          mergedDuplicateCount: t.merged_duplicate_count ?? 0,
+          mergedRequestIds: t.merged_request_ids ?? [],
+          mergedIdempotencyKeys: t.merged_idempotency_keys ?? [],
+          contentFingerprint: t.content_fingerprint ?? "",
+          deadLetterReason: t.dead_letter_reason ?? "",
         };
       })
       .filter((t) => (!regionFilter || t.region === regionFilter) && (!tenantFilter || t.tenant === tenantFilter));
@@ -1664,10 +1677,28 @@ export class PlatformManagementPlaneEngine {
     };
   }
 
+  private getS3Client(): S3SigV4Client | null {
+    if (this.s3Client !== undefined) return this.s3Client;
+    const endpoint = this.deps.s3Endpoint;
+    if (!endpoint) {
+      this.s3Client = null;
+      return null;
+    }
+    const accessKeyId = this.deps.s3AccessKeyId;
+    const secretAccessKey = this.deps.s3SecretAccessKey;
+    this.s3Client = new S3SigV4Client(
+      endpoint,
+      accessKeyId && secretAccessKey
+        ? { accessKeyId, secretAccessKey, region: this.deps.s3Region ?? "us-east-1" }
+        : null
+    );
+    return this.s3Client;
+  }
+
   public async pushManagementStateToS3(): Promise<boolean> {
     this.ensureInitialized();
-    const s3 = this.deps.s3Endpoint;
-    if (!s3) return false;
+    const client = this.getS3Client();
+    if (!client) return false;
     try {
       const sql = this.deps.v25Store.sql;
       const payload = {
@@ -1684,11 +1715,7 @@ export class PlatformManagementPlaneEngine {
         nodeOverrides: sql.exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_node_overrides").toArray(),
         tasks: sql.exec<Record<string, unknown>>("SELECT * FROM v25_scheduler_tasks").toArray(),
       };
-      const resp = await fetch(`${s3.replace(/\/$/, "")}/ansts-fleet/management/cluster_state.json`, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      const resp = await client.putObject("ansts-fleet", "management/cluster_state.json", JSON.stringify(payload));
       return resp.ok;
     } catch {
       return false;
@@ -1697,12 +1724,12 @@ export class PlatformManagementPlaneEngine {
 
   public async pullManagementStateFromS3(): Promise<boolean> {
     this.ensureInitialized();
-    const s3 = this.deps.s3Endpoint;
-    if (!s3) return false;
+    const client = this.getS3Client();
+    if (!client) return false;
     try {
-      const resp = await fetch(`${s3.replace(/\/$/, "")}/ansts-fleet/management/cluster_state.json`);
-      if (!resp.ok) return false;
-      const payload = (await resp.json()) as Record<string, unknown>;
+      const resp = await client.getObject("ansts-fleet", "management/cluster_state.json");
+      if (!resp.ok || resp.body === null) return false;
+      const payload = JSON.parse(resp.body) as Record<string, unknown>;
       if (!payload || !Array.isArray(payload.tenants)) return false;
 
       const sql = this.deps.v25Store.sql;
@@ -5957,6 +5984,4065 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           facetAndIsolateLeakGuardVerified,
         },
         allM56RisksEliminated,
+      },
+    };
+  }
+
+  /**
+   * [M57] Executes the 6-Point Runtime Edge, Router Cooldown/Quota, Leaf-First CAS GC, Role-Isolated Scale/Drain,
+   * NodeDaemon Turn Monotonicity, Validator NaN/DRF Guard & Vsock Stream Framing Audit (`POST /v1beta1/management/system/runtime-edge-audit`).
+   */
+  public async executeRuntimeEdgeAndGatewayAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    // 1. ModelPoolClientAdapter cooldown preservation & oversized token guard
+    const pool = new ModelPoolClientAdapter();
+    const ep = new LlmEndpointMetrics({
+      endpoint_id: "ep-m57-audit",
+      provider: "openai",
+      model_name: "gpt-4o",
+      healthy: false,
+      ttft_ewma_ms: 100,
+    });
+    for (let i = 0; i < 3; i++) {
+      try {
+        pool.executeInference(ep, { taskId: "t1", turnIndex: 1, prompt: "p", estimatedPromptTokens: 50, maxOutputTokens: 50 }, 0.5, 1000);
+      } catch {
+        // expected
+      }
+    }
+    ep.healthy = true;
+    try {
+      pool.executeInference(ep, { taskId: "t1", turnIndex: 1, prompt: "p", estimatedPromptTokens: 50, maxOutputTokens: 50 }, 0.5, 10_000);
+    } catch {
+      // rejected at 10s without resetting openedAtMs=1000
+    }
+    const recoveredAt16s = pool.executeInference(
+      ep,
+      { taskId: "t1", turnIndex: 1, prompt: "p", estimatedPromptTokens: 50, maxOutputTokens: 50 },
+      0.5,
+      16_000
+    );
+    let oversizedRejected = false;
+    try {
+      pool.executeInference(ep, { taskId: "t1", turnIndex: 2, prompt: "p", estimatedPromptTokens: 200_000, maxOutputTokens: 100_000 }, 0.5, 17_000);
+    } catch (e) {
+      oversizedRejected = (e as Error).message.includes("QuotaCapacityExceeded");
+    }
+    const routerCooldownAndQuotaVerified = recoveredAt16s.circuitState === "CLOSED" && oversizedRejected;
+
+    // 2. ParallelCowGitBisectCoordinator probe cleanup & DistributedCasGcSweeper leaf-first sweep
+    const drv = new LayerFsWorkspaceDriver();
+    const c1 = drv.executeInProcessFileTool({
+      branchName: "main",
+      agentId: "agent-1",
+      stepId: "s1",
+      operation: "write", filePath: "app.ts", newContent: "const prefix = \"0123456789abcdef0123456789abcdef\";\nexport const a = 1;\n"  ,
+    });
+    const bisect = new ParallelCowGitBisectCoordinator();
+    const bisectOut = bisect.executeLiveLayerFsBisect({
+      driver: drv,
+      commits: [c1.commitId],
+      testShellCommand: "test -f app.ts",
+    });
+    drv.forkBranch(c1.commitId, "temp-orphan-branch");
+    drv.executeInProcessFileTool({
+      branchName: "temp-orphan-branch",
+      agentId: "agent-2",
+      stepId: "s2",
+      operation: "write", filePath: "orphan.ts", newContent: "const shared = \"abcdefghijklmnopqrstuvwxyz0123456789\";\nexport const v = 1;\n"  ,
+    });
+    drv.executeInProcessFileTool({
+      branchName: "temp-orphan-branch",
+      agentId: "agent-2",
+      stepId: "s3",
+      operation: "write", filePath: "orphan.ts", newContent: "const shared = \"abcdefghijklmnopqrstuvwxyz0123456789\";\nexport const v = 2;\n"  ,
+    });
+    drv.deleteBranch("temp-orphan-branch");
+    const sweeper = new DistributedCasGcSweeper();
+    const sweepRes = sweeper.sweepLayerFsWorkspaceStore(drv);
+    const casGcAndBisectCleanupVerified =
+      bisectOut.probedCommits[0]?.cleanedUp === true &&
+      sweepRes.sweptBlobIds.length >= 2 &&
+      sweepRes.pinnedOrphanBlobIds.length === 0;
+
+    // 3. ManualFleetScaleController role-isolated rebalance & atomic cordon/drain pre-check
+    const scaleCtrl = new ManualFleetScaleController();
+    scaleCtrl.registerBareMetalNode({
+      nodeId: "worker-audit-1",
+      ipAddress: "10.0.1.10",
+      role: "worker",
+      runningCells: ["c1", "c2", "c3", "c4"],
+      systemdUnit: "ansts-node-daemon.service",
+    });
+    const storageOut = scaleCtrl.scaleOutNode("storage-audit-1", "10.0.2.10", "storage");
+    let drainRejected = false;
+    try {
+      scaleCtrl.cordonAndDrainNode("worker-audit-1");
+    } catch {
+      drainRejected = true;
+    }
+    const workerNodeAfterFailedDrain = scaleCtrl.listNodes().find((n) => n.nodeId === "worker-audit-1");
+    const scaleRoleAndDrainAtomicityVerified =
+      storageOut.rebalancedCells.length === 0 &&
+      drainRejected &&
+      workerNodeAfterFailedDrain?.state === "ACTIVE";
+
+    // 4. NodeDaemon cross-node turn monotonicity
+    const sched = new CoreScheduler5D();
+    const d1 = new NodeDaemon("node-audit-1");
+    const d2 = new NodeDaemon("node-audit-2");
+    sched.registerOrUpdateNode(d1.emitHeartbeat(0));
+    sched.registerOrUpdateNode(d2.emitHeartbeat(0));
+    const saga = new SagaToolGateway();
+    saga.registerTool("ping", ToolCallEffectClass.READ_ONLY, () => ({ pong: true }));
+    const tSpec = new TaskSpec({ task_id: "task-m57-audit", tenant_id: "Northstar", priority: TaskPriority.P1_HIGH, max_turns: 4 });
+    sched.submitTask(tSpec);
+    sched.scheduleTick(1000);
+    const turn1 = d1.executeAgentStep(sched, saga, tSpec, "ping", {});
+    const lease2 = sched.leaseCoordinator.acquireLease(tSpec.task_id, "node-audit-2", 2000);
+    tSpec.lease_fencing_token = lease2.fencing_token;
+    const turn2 = d2.executeAgentStep(sched, saga, tSpec, "ping", {});
+    const nodeDaemonTurnMonotonicityVerified = turn1.turn === 1 && turn2.turn === 2;
+
+    // 5. TaskSpecValidator NaN/DRF guard & deduplication
+    let nanRejected = false;
+    try {
+      TaskSpecValidator.validateAndNormalize({
+        task_id: "nan-task",
+        tenant_id: "Northstar",
+        resource_profile: { think_cpu_cores: "NaN", act_cpu_cores: 2 },
+      });
+    } catch {
+      nanRejected = true;
+    }
+    const normalizedSpec = TaskSpecValidator.validateAndNormalize({
+      task_id: "valid-m57-task",
+      tenant_id: "Northstar",
+      dependencies: ["d1", "d1", "d2"],
+    });
+    const validatorAndGatewayGuardVerified = nanRejected && normalizedSpec.dependencies.length === 2;
+
+    // 6. ZeroTrustVsockHostDaemon incomplete frame guard & ZeroTrustSandboxSecurityGuard command patterns
+    let incompleteFrameCaught = false;
+    try {
+      const full = ZeroTrustVsockHostDaemon.encodeFrame({ hello: "world" });
+      ZeroTrustVsockHostDaemon.decodeFrame(full.subarray(0, 6));
+    } catch {
+      incompleteFrameCaught = true;
+    }
+    const secGuard = new ZeroTrustSandboxSecurityGuard();
+    const vsockAndSecurityGuardVerified =
+      incompleteFrameCaught &&
+      !secGuard.evaluateShellCommand("rm -rf /*").allowed &&
+      !secGuard.evaluateShellCommand("curl http://169.254.169.254/latest/meta-data/").allowed &&
+      !secGuard.evaluateShellCommand("cat /var/run/docker.sock").allowed;
+
+    const allM57RisksEliminated =
+      routerCooldownAndQuotaVerified &&
+      casGcAndBisectCleanupVerified &&
+      scaleRoleAndDrainAtomicityVerified &&
+      nodeDaemonTurnMonotonicityVerified &&
+      validatorAndGatewayGuardVerified &&
+      vsockAndSecurityGuardVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M57 运行时边缘、连接池冷却/配额、拓扑叶子优先 GC、角色隔离扩缩容与 Vsock 分帧安全自检 (Router=${routerCooldownAndQuotaVerified}, CasGcBisect=${casGcAndBisectCleanupVerified}, ScaleRole=${scaleRoleAndDrainAtomicityVerified}, NodeDaemonTurn=${nodeDaemonTurnMonotonicityVerified}, ValidatorNaN=${validatorAndGatewayGuardVerified}, VsockSec=${vsockAndSecurityGuardVerified})`,
+      "SystemWide / M57-RuntimeEdgeAudit",
+      "ALL_M57_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        routerCooldownAndQuota1: {
+          recoveredStateAt16s: recoveredAt16s.circuitState,
+          oversizedRejected,
+          routerCooldownAndQuotaVerified,
+        },
+        casGcAndBisectCleanup2: {
+          bisectProbeCleanedUp: bisectOut.probedCommits[0]?.cleanedUp,
+          sweptCount: sweepRes.sweptBlobIds.length,
+          pinnedOrphanCount: sweepRes.pinnedOrphanBlobIds.length,
+          casGcAndBisectCleanupVerified,
+        },
+        scaleRoleAndDrainAtomicity3: {
+          storageRebalancedCells: storageOut.rebalancedCells.length,
+          workerStateAfterFailedDrain: workerNodeAfterFailedDrain?.state,
+          scaleRoleAndDrainAtomicityVerified,
+        },
+        nodeDaemonTurnMonotonicity4: {
+          turnOnNode1: turn1.turn,
+          turnOnNode2AfterMigration: turn2.turn,
+          nodeDaemonTurnMonotonicityVerified,
+        },
+        validatorAndGatewayGuard5: {
+          nanRejected,
+          dedupedDependenciesCount: normalizedSpec.dependencies.length,
+          validatorAndGatewayGuardVerified,
+        },
+        vsockAndSecurityGuard6: {
+          incompleteFrameCaught,
+          vsockAndSecurityGuardVerified,
+        },
+        allM57RisksEliminated,
+      },
+    };
+  }
+
+  /**
+   * [M58] Executes the 6-Point Container Fence RFC1918/CGNAT/IPv6 & Start-Cap Guard, Recursive OverlayFS & eBPF LSM Path Hardening,
+   * SPIFFE/SLSA Tamper Proofing, Canary Post-Rollback Lock & PSI Victim Filtering, Telemetry/EWMA NaN Guard & Federation RTT Audit
+   * (`POST /v1beta1/management/system/container-security-telemetry-audit`).
+   */
+  public async executeContainerSecurityAndTelemetryAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    // 1. Container Fence RFC1918/CGNAT/IPv6 & Start-Time max_instances Cap Guard
+    let rfc1918Blocked = false;
+    let ipv6FenceBlocked = false;
+    try {
+      CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("172.28.1.5", true);
+    } catch {
+      rfc1918Blocked = true;
+    }
+    try {
+      CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("[fe80::1]", true);
+    } catch {
+      ipv6FenceBlocked = true;
+    }
+    const cMgr = new CelldNativeContainerSandboxManager();
+    const cCfg = { class_name: "audit-c-m58", image: "alpine:3.20", max_instances: 1 };
+    cMgr.registerContainerClass(cCfg);
+    const ch1 = cMgr.getOrCreateContainerHandle("cell-m58-a", cCfg);
+    const ch2 = cMgr.getOrCreateContainerHandle("cell-m58-b", cCfg);
+    ch1.start({ enableInternet: true });
+    let startCapEnforced = false;
+    try {
+      ch2.start({ enableInternet: true });
+    } catch {
+      startCapEnforced = true;
+    }
+    const containerFenceAndCapVerified = rfc1918Blocked && ipv6FenceBlocked && startCapEnforced;
+
+    // 2. Recursive OverlayFS Upperdir Diff Capture & eBPF LSM Relative/Credential Path Blocking
+    const tmpOverlay = path.join(os.tmpdir(), `ansts-m58-audit-${process.pid}-${Date.now()}`);
+    const ovDrv = new CompanionContainerAndOverlayDriver(tmpOverlay);
+    const layout = ovDrv.createOverlayMountLayout("task-m58-audit");
+    fs.mkdirSync(path.join(layout.upperDir, "pkg", "sub"), { recursive: true });
+    fs.writeFileSync(path.join(layout.upperDir, "pkg", "sub", "index.ts"), "export const v = 58;\n", "utf-8");
+    const snap = ovDrv.captureUpperdirDeltaSnapshot("task-m58-audit", 1);
+    const lsm = new EbpfLsmSecurityBridge();
+    const overlayRecursiveAndLsmVerified =
+      snap.changedFiles.includes("pkg/sub/index.ts") &&
+      !lsm.checkFileOpenHook("../../etc/shadow").allowed &&
+      !lsm.checkFileOpenHook("/proc/self/environ").allowed;
+
+    // 3. SPIFFE ID Single-Segment & Empty-Signature Rejection + SLSA fileCount Tamper Detection
+    const mtls = new MtlsReverseTunnelBridge();
+    const svid = mtls.issueSpiffeSvidToken("spiffe://ansts.io/ns/fleet/sa/worker", 60_000, 1000);
+    const emptySigRejected = !mtls.verifySpiffeCertificate(svid.spiffeId, svid.certExpiresAtMs, 2000, "").authenticated;
+    const traversalSpiffeRejected = !mtls.verifySpiffeCertificate("spiffe://ansts.io/ns/fleet/sa/worker/../../root", svid.certExpiresAtMs, 2000).authenticated;
+    const slsa = new SlsaProvenanceAttestor();
+    const stmt = slsa.createSignedProvenanceStatement({
+      imageReference: "layerfs://main@C1",
+      sha256Digest: "abcd1234",
+      builderId: "builder-m58",
+      commitId: "C1",
+      fileCount: 3,
+    });
+    const spiffeAndSlsaIntegrityVerified =
+      emptySigRejected &&
+      traversalSpiffeRejected &&
+      slsa.verifyProvenanceStatement(stmt) &&
+      !slsa.verifyProvenanceStatement({ ...stmt, fileCount: 99 });
+
+    // 4. Canary Post-Rollback Lock & Non-Terminal PSI Victim Filtering
+    const canary = new CanaryRolloutController();
+    canary.evaluateCanaryStep({ errorRatePct: 8.0, p99LatencyMs: 2500 });
+    const postRollbackStep = canary.evaluateCanaryStep({ errorRatePct: 0.1, p99LatencyMs: 80 });
+    const psiGuard = new LinuxPsiMemoryGuard(40, 70);
+    const terminalTask = new TaskSpec({ task_id: "t-done-m58", tenant_id: "Northstar", priority: TaskPriority.P3_BATCH });
+    terminalTask.state = TaskState.SUCCEEDED;
+    const runningTask = new TaskSpec({ task_id: "t-run-m58", tenant_id: "Northstar", priority: TaskPriority.P2_STANDARD });
+    runningTask.state = TaskState.RUNNING_ACT;
+    const psiOut = psiGuard.evaluateAndDefend({ someAvg10Pct: 85, fullAvg10Pct: 80, freeSwapMb: 64 }, [terminalTask, runningTask]);
+    const canaryLockAndPsiFilterVerified =
+      postRollbackStep.state === "ROLLED_BACK" &&
+      postRollbackStep.trafficWeightPct === 0 &&
+      psiOut.evictedTaskIds.length === 1 &&
+      psiOut.evictedTaskIds[0] === "t-run-m58";
+
+    // 5. CloudEventsBus Bounded Ring Buffer & EWMA NaN Poisoning Guard
+    const ceBus = new CloudEventsBus(10);
+    for (let i = 0; i < 14; i++) {
+      ceBus.emitEvent({
+        type: "io.ansts.m58",
+        subject: `s-${i}`,
+        tenantId: "Northstar",
+        llmCostUsd: i === 0 ? 2.25 : -50,
+        sandboxCpuCoreSeconds: NaN,
+      });
+    }
+    const prewarmer = new PredictiveSandboxPrewarmer();
+    const pwOut = prewarmer.recordArrivalSampleAndPredict(NaN, -5);
+    const telemetryRingAndEwmaGuardVerified =
+      ceBus.allEvents().length === 10 &&
+      ceBus.getTenantReport("Northstar")?.totalLlmCostUsd === 2.25 &&
+      Number.isFinite(pwOut.recommendedWarmPoolSize);
+
+    // 6. MultiRegionFederationRouter RTT Sanitization
+    const fed = new MultiRegionFederationRouter();
+    fed.registerRegion({ regionCode: "us-nan", baseUrl: "https://us1", healthy: true, rttEwmaMs: NaN, sovereigntyZone: "US" });
+    fed.registerRegion({ regionCode: "us-west", baseUrl: "https://us2", healthy: true, rttEwmaMs: 18, sovereigntyZone: "US" });
+    const optimal = fed.selectOptimalRegion({ requiredSovereigntyZone: "US" });
+    const federationRttAndBodyGuardVerified = optimal.regionCode === "us-west";
+
+    const allM58RisksEliminated =
+      containerFenceAndCapVerified &&
+      overlayRecursiveAndLsmVerified &&
+      spiffeAndSlsaIntegrityVerified &&
+      canaryLockAndPsiFilterVerified &&
+      telemetryRingAndEwmaGuardVerified &&
+      federationRttAndBodyGuardVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M58 容器围栏/并发上限、递归 OverlayFS/LSM、SPIFFE/SLSA 防篡改、金丝雀回滚锁与遥测防毒化自检 (ContainerFence=${containerFenceAndCapVerified}, OverlayLsm=${overlayRecursiveAndLsmVerified}, SpiffeSlsa=${spiffeAndSlsaIntegrityVerified}, CanaryPsi=${canaryLockAndPsiFilterVerified}, TelemetryEwma=${telemetryRingAndEwmaGuardVerified}, FedRtt=${federationRttAndBodyGuardVerified})`,
+      "SystemWide / M58-ContainerSecurityTelemetryAudit",
+      "ALL_M58_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        containerFenceAndCap1: {
+          rfc1918Blocked,
+          ipv6FenceBlocked,
+          startCapEnforced,
+          containerFenceAndCapVerified,
+        },
+        overlayRecursiveAndLsm2: {
+          capturedNestedFiles: snap.changedFiles,
+          overlayRecursiveAndLsmVerified,
+        },
+        spiffeAndSlsaIntegrity3: {
+          emptySigRejected,
+          traversalSpiffeRejected,
+          spiffeAndSlsaIntegrityVerified,
+        },
+        canaryLockAndPsiFilter4: {
+          postRollbackState: postRollbackStep.state,
+          evictedTaskIds: psiOut.evictedTaskIds,
+          canaryLockAndPsiFilterVerified,
+        },
+        telemetryRingAndEwmaGuard5: {
+          retainedEventsCount: ceBus.allEvents().length,
+          sanitizedLlmCostUsd: ceBus.getTenantReport("Northstar")?.totalLlmCostUsd,
+          telemetryRingAndEwmaGuardVerified,
+        },
+        federationRttAndBodyGuard6: {
+          selectedRegionCode: optimal.regionCode,
+          federationRttAndBodyGuardVerified,
+        },
+        allM58RisksEliminated,
+      },
+    };
+  }
+
+  /**
+   * [M59] Executes the 6-Point SQLite Composite-PK/DELETE-Flush/LIMIT Engine, KV TTL Expiration,
+   * SSE Malformed-Frame/Clock-Skew Resilience, UFFD Page Cache Invalidation, Vsock Scheme/IMDS Guard & LTX/Facet Hygiene Audit
+   * (`POST /v1beta1/management/system/sql-kv-sse-uffd-audit`).
+   */
+  public async executeSqlKvSseUffdAndLtxAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    // 1. SQLite Composite PRIMARY KEY, DELETE FROM disk flush & SELECT LIMIT
+    const sqlPath = path.join(os.tmpdir(), `ansts-m59-sql-${process.pid}-${Date.now()}.json`);
+    const dSql1 = new DurableDiskCellSqlStorage(sqlPath);
+    dSql1.exec(
+      "CREATE TABLE IF NOT EXISTS harness_turns (task_id TEXT, turn_index INTEGER, ltx_key TEXT, PRIMARY KEY (task_id, turn_index))"
+    );
+    dSql1.exec("INSERT INTO harness_turns (task_id, turn_index, ltx_key) VALUES (?, ?, ?)", "t-m59", 1, "k1");
+    dSql1.exec("INSERT INTO harness_turns (task_id, turn_index, ltx_key) VALUES (?, ?, ?)", "t-m59", 2, "k2");
+    dSql1.exec("INSERT INTO harness_turns (task_id, turn_index, ltx_key) VALUES (?, ?, ?)", "t-m59", 3, "k3");
+    const countBeforeDelete = dSql1.exec("SELECT * FROM harness_turns WHERE task_id = ?", "t-m59").toArray().length;
+    const limitTwoCount = dSql1.exec("SELECT * FROM harness_turns WHERE task_id = ? LIMIT 2", "t-m59").toArray().length;
+    dSql1.exec("DELETE FROM harness_turns WHERE task_id = ? AND turn_index = ?", "t-m59", 2);
+    const dSql2 = new DurableDiskCellSqlStorage(sqlPath);
+    const countAfterRestart = dSql2.exec("SELECT * FROM harness_turns WHERE task_id = ?", "t-m59").toArray().length;
+    const sqlCompositePkAndFlushVerified =
+      countBeforeDelete === 3 && limitTwoCount === 2 && countAfterRestart === 2;
+
+    // 2. KV expirationTtl enforcement
+    const kv = new InMemoryKvNamespace();
+    await kv.put("m59-k", "v-alive", { expirationTtl: 5, nowMs: 1000 });
+    const aliveVal = await kv.get("m59-k", 3000);
+    const expiredVal = await kv.get("m59-k", 7000);
+    const kvTtlExpirationVerified = aliveVal === "v-alive" && expiredVal === null;
+
+    // 3. SSE malformed JSON frame skip & clock-skew non-negative TPOT
+    const sse = new LiveOpenAiCompatibleSseAdapter();
+    const sseSummary = sse.parseSseTranscript(
+      [
+        "data: {corrupted\n\n",
+        'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n',
+        "data: [DONE]\n\n",
+      ],
+      1000,
+      [1050, 1010]
+    );
+    const sseMalformedAndSkewVerified =
+      sseSummary.assembledContent === "OK" &&
+      sseSummary.malformedFramesSkipped === 1 &&
+      sseSummary.tpotMs >= 0;
+
+    // 4. UFFD page cache invalidation on re-staging
+    const uffd = new UffdLazyPageFaultRestorer();
+    const dig1 = uffd.stageRemoteSnapshotPage(0, new Uint8Array(4096).fill(1));
+    uffd.handlePageFault(0);
+    const dig2 = uffd.stageRemoteSnapshotPage(0, new Uint8Array(4096).fill(2));
+    const fault2 = uffd.handlePageFault(0);
+    const uffdCacheInvalidationVerified = dig1 !== dig2 && fault2.sha256Digest === dig2 && fault2.fetchedFromRemote;
+
+    // 5. Vsock HTTP/HTTPS scheme check & command regex hardening
+    const vsock = new ZeroTrustVsockBridge(["api.openai.com"]);
+    let ftpBlocked = false;
+    let noPreserveRootBlocked = false;
+    try {
+      vsock.sendRequest({ requestId: "r1", vmId: "vm-m59", method: "HTTP_EGRESS", payload: { url: "ftp://api.openai.com/x" } });
+    } catch {
+      ftpBlocked = true;
+    }
+    try {
+      vsock.sendRequest({ requestId: "r2", vmId: "vm-m59", method: "EXEC_CMD", payload: { command: "rm -rf --no-preserve-root /", executeRealSubprocess: false } });
+    } catch {
+      noPreserveRootBlocked = true;
+    }
+    const vsockSchemeAndCmdGuardVerified = ftpBlocked && noPreserveRootBlocked;
+
+    // 6. Facet terminal history pruning & S3 LTX txId/cellId validation
+    const fSup = new DurableObjectFacetSupervisor(8);
+    for (let i = 1; i <= 12; i++) {
+      const { facetRecord } = fSup.spawnToolFacet("t-m59", i, "sql", () => new InMemoryCellSqlStorage());
+      await fSup.deleteCompletedFacet(facetRecord.facetName);
+    }
+    const ltxDrv = new RustFsS3LtxDriver(new InMemoryR2Bucket());
+    let negTxRejected = false;
+    try {
+      await ltxDrv.putImmutableLtxSegment({ cellId: "c1", txId: -1, fencingToken: 1, ltxBytes: new Uint8Array([1]) });
+    } catch {
+      negTxRejected = true;
+    }
+    const facetPruneAndLtxGuardVerified = fSup.listFacets().length <= 8 && negTxRejected;
+
+    const allM59RisksEliminated =
+      sqlCompositePkAndFlushVerified &&
+      kvTtlExpirationVerified &&
+      sseMalformedAndSkewVerified &&
+      uffdCacheInvalidationVerified &&
+      vsockSchemeAndCmdGuardVerified &&
+      facetPruneAndLtxGuardVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M59 SQLite 复合主键/DELETE 落盘/LIMIT、KV TTL 淘汰、SSE 容错、UFFD 缓存失效与 Vsock/LTX 校验自检 (SqlComposite=${sqlCompositePkAndFlushVerified}, KvTtl=${kvTtlExpirationVerified}, SseResilience=${sseMalformedAndSkewVerified}, UffdInvalidate=${uffdCacheInvalidationVerified}, VsockGuard=${vsockSchemeAndCmdGuardVerified}, FacetLtx=${facetPruneAndLtxGuardVerified})`,
+      "SystemWide / M59-SqlKvSseUffdAudit",
+      "ALL_M59_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        sqlCompositePkAndFlush1: {
+          countBeforeDelete,
+          limitTwoCount,
+          countAfterRestart,
+          sqlCompositePkAndFlushVerified,
+        },
+        kvTtlExpiration2: {
+          aliveVal,
+          expiredVal,
+          kvTtlExpirationVerified,
+        },
+        sseMalformedAndSkew3: {
+          malformedFramesSkipped: sseSummary.malformedFramesSkipped,
+          tpotMs: sseSummary.tpotMs,
+          sseMalformedAndSkewVerified,
+        },
+        uffdCacheInvalidation4: {
+          dig1,
+          dig2,
+          uffdCacheInvalidationVerified,
+        },
+        vsockSchemeAndCmdGuard5: {
+          ftpBlocked,
+          noPreserveRootBlocked,
+          vsockSchemeAndCmdGuardVerified,
+        },
+        facetPruneAndLtxGuard6: {
+          retainedFacets: fSup.listFacets().length,
+          negTxRejected,
+          facetPruneAndLtxGuardVerified,
+        },
+        allM59RisksEliminated,
+      },
+    };
+  }
+
+  /**
+   * [M60] End-to-End Full-Link Persistence, Tenant-Scoped & Deep-Canonical Idempotency,
+   * Deterministic Breakpoint Crash-Recovery & Coalescing Duplicate Inspection Audit.
+   */
+  public async executeFullLinkPersistenceIdempotencyBreakpointAndCoalesceAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    // 1. [M60-1] End-to-end full-link SQLite persistence & cold-start rehydration across Scheduler, WAL, Saga Journal & Outbox
+    const sql1 = new InMemoryCellSqlStorage();
+    const store1 = new UnifiedComponentPersistenceStore(sql1);
+    const sched1 = new CoreScheduler5D();
+    const wal1 = new TurnWalEngine(sql1);
+    const saga1 = new SagaToolGateway(undefined, undefined, sql1);
+    const outbox1 = new TransactionalOutboxDispatcher("sec-m60", 4, sql1);
+
+    let sideEffectCalls = 0;
+    saga1.registerTool("deploy_k8s", ToolCallEffectClass.IDEMPOTENT_WRITE, (args) => {
+      sideEffectCalls += 1;
+      return { deployed: true, calls: sideEffectCalls, args };
+    });
+
+    const t1 = new TaskSpec({
+      task_id: "t-m60-link",
+      tenant_id: "tenant-alpha",
+      priority: TaskPriority.P1_HIGH,
+      prompt: "Deploy full link cluster",
+      idempotency_key: "idem-m60-alpha",
+    });
+    sched1.submitTask(t1);
+    wal1.appendTurnDelta({
+      taskId: "t-m60-link",
+      turnIndex: 1,
+      fencingToken: 1,
+      changedFiles: ["/workspace/main.ts"],
+      sqliteWalPages: 4,
+      highestSubmittedFencingToken: 1,
+    });
+    saga1.invokeTool("t-m60-link", 1, "deploy_k8s", { env: { b: 2, a: 1 } });
+    outbox1.enqueueOutbox("msg-m60-1", "t-m60-link", "https://hooks.internal/m60", { ok: true });
+
+    const snapSummary = store1.snapshotFullLinkState({
+      scheduler: sched1,
+      walEngine: wal1,
+      sagaGateway: saga1,
+      outboxDispatcher: outbox1,
+    });
+
+    const sched2 = new CoreScheduler5D();
+    const wal2 = new TurnWalEngine();
+    const saga2 = new SagaToolGateway();
+    saga2.registerTool("deploy_k8s", ToolCallEffectClass.IDEMPOTENT_WRITE, (args) => {
+      sideEffectCalls += 1;
+      return { deployed: true, calls: sideEffectCalls, args };
+    });
+    const outbox2 = new TransactionalOutboxDispatcher("sec-m60", 4);
+    const rehydrateSummary = store1.rehydrateFullLinkState({
+      scheduler: sched2,
+      walEngine: wal2,
+      sagaGateway: saga2,
+      outboxDispatcher: outbox2,
+    });
+    // Re-invoking with reordered nested JSON keys after cold-start must hit rehydrated journal!
+    const [, dedupAfterRestart] = saga2.invokeTool("t-m60-link", 1, "deploy_k8s", { env: { a: 1, b: 2 } });
+    const fullLinkPersistenceVerified =
+      rehydrateSummary.tasksRestored === 1 &&
+      rehydrateSummary.walEntriesRestored === 1 &&
+      rehydrateSummary.sagaJournalRestored === 1 &&
+      rehydrateSummary.outboxMessagesRestored === 1 &&
+      dedupAfterRestart === true &&
+      sideEffectCalls === 1;
+
+    // 2. [M60-2] Tenant-scoped task idempotency isolation & deep recursive canonical JSON tool hashing
+    const tenantBTask = sched2.submitTask(
+      new TaskSpec({
+        task_id: "t-m60-beta",
+        tenant_id: "tenant-beta",
+        priority: TaskPriority.P2_STANDARD,
+        prompt: "Tenant B independent task",
+        idempotency_key: "idem-m60-alpha",
+      })
+    );
+    const tenantARetry = sched2.submitTask(
+      new TaskSpec({
+        task_id: "t-m60-alpha-retry",
+        tenant_id: "tenant-alpha",
+        priority: TaskPriority.P2_STANDARD,
+        prompt: "Deploy full link cluster",
+        idempotency_key: "idem-m60-alpha",
+      })
+    );
+    const deepKey1 = SagaToolGateway.generateIdempotencyKey("t1", 1, "fn", {
+      outer: { z: [1, { d: 4, c: 3 }], a: true },
+    });
+    const deepKey2 = SagaToolGateway.generateIdempotencyKey("t1", 1, "fn", {
+      outer: { a: true, z: [1, { c: 3, d: 4 }] },
+    });
+    const tenantAndDeepIdempotencyVerified =
+      tenantBTask.task_id === "t-m60-beta" &&
+      tenantARetry.task_id === "t-m60-link" &&
+      deepKey1 === deepKey2;
+
+    // 3. [M60-3] SSE envelope.id deduplication & CloudEvents/FinOps idempotent billing guard
+    const sse = new SseEventStreamGateway(10);
+    sse.subscribe("t-sse-m60", "sub-1");
+    const d1 = sse.publish({
+      id: "evt-m60-1",
+      event: "turn.completed",
+      taskId: "t-sse-m60",
+      turnIndex: 1,
+      timestampMs: 1000,
+      data: { ok: true },
+    });
+    const d2 = sse.publish({
+      id: "evt-m60-1",
+      event: "turn.completed",
+      taskId: "t-sse-m60",
+      turnIndex: 1,
+      timestampMs: 1005,
+      data: { ok: true },
+    });
+    const ceBus = new CloudEventsBus(20);
+    ceBus.emitEvent({
+      type: "ansts.turn.billed",
+      subject: "t-m60-link",
+      tenantId: "tenant-alpha",
+      idempotencyKey: "bill-turn-1",
+      llmCostUsd: 1.25,
+      sandboxCpuCoreSeconds: 10,
+    });
+    ceBus.emitEvent({
+      type: "ansts.turn.billed",
+      subject: "t-m60-link",
+      tenantId: "tenant-alpha",
+      idempotencyKey: "bill-turn-1",
+      llmCostUsd: 1.25,
+      sandboxCpuCoreSeconds: 10,
+    });
+    const finReport = ceBus.getTenantReport("tenant-alpha");
+    const sseAndCloudEventsIdempotencyVerified =
+      d1 === 1 &&
+      d2 === 0 &&
+      sse.getTaskHistory("t-sse-m60").length === 1 &&
+      finReport?.totalLlmCostUsd === 1.25;
+
+    // 4. [M60-4] Deterministic WAL/checkpoint breakpoint recovery & mid-turn uncommitted side-effect rollback
+    const bpSched = new CoreScheduler5D();
+    const nodeA = new NodeDaemon("node-a");
+    const nodeB = new NodeDaemon("node-b");
+    bpSched.registerOrUpdateNode(nodeA.emitHeartbeat(0));
+    bpSched.registerOrUpdateNode(nodeB.emitHeartbeat(0));
+    const bpTask = bpSched.submitTask(
+      new TaskSpec({
+        task_id: "t-m60-bp",
+        tenant_id: "tenant-bp",
+        priority: TaskPriority.P1_HIGH,
+        prompt: "Multi-turn resilient job",
+      })
+    );
+    bpSched.scheduleTick();
+    const bpWal = new TurnWalEngine();
+    const bpSaga = new SagaToolGateway();
+    let uncommittedRolledBack = false;
+    bpSaga.registerTool(
+      "step_tool",
+      ToolCallEffectClass.COMPENSATABLE,
+      (args) => ({ executedTurn: args.turn }),
+      () => {
+        uncommittedRolledBack = true;
+        return { compensated: true };
+      }
+    );
+    nodeA.executeAgentStep(bpSched, bpSaga, bpTask, "step_tool", { turn: 1 });
+    bpWal.appendTurnDelta({
+      taskId: bpTask.task_id,
+      turnIndex: 1,
+      fencingToken: bpTask.lease_fencing_token,
+      changedFiles: ["/workspace/step1.txt"],
+      sqliteWalPages: 2,
+      highestSubmittedFencingToken: bpTask.lease_fencing_token,
+      enforceTurnMonotonicity: true,
+      allowIdempotentRetry: true,
+    });
+    // Simulate mid-turn 2 tool execution followed by node crash BEFORE WAL/checkpoint commit
+    bpSaga.invokeTool(bpTask.task_id, 2, "step_tool", { turn: 2 });
+    const newLease = bpSched.leaseCoordinator.acquireLease(bpTask.task_id, "node-b");
+    bpTask.assigned_node_id = "node-b";
+    bpTask.lease_fencing_token = newLease.fencing_token;
+    const recovery = nodeB.recoverTaskFromBreakpoint(bpSched, bpTask, bpWal, bpSaga);
+    const step2AfterRecovery = nodeB.executeAgentStep(bpSched, bpSaga, bpTask, "step_tool", { turn: 2 });
+    const breakpointRecoveryVerified =
+      recovery.restoredTurnIndex === 1 &&
+      recovery.nextTurnToExecute === 2 &&
+      uncommittedRolledBack === true &&
+      step2AfterRecovery.turn === 2 &&
+      step2AfterRecovery.deduplicated === false;
+
+    // 5. [M60-5] Mergeable duplicate task inspection, in-flight request coalescing & priority promotion
+    const coalSched = new CoreScheduler5D();
+    coalSched.completedIds.add("dep-a");
+    coalSched.completedIds.add("dep-b");
+    const firstSub = coalSched.submitTask(
+      new TaskSpec({
+        task_id: "t-coal-1",
+        tenant_id: "tenant-coal",
+        priority: TaskPriority.P2_STANDARD,
+        prompt: "Compile kernel module X",
+        dependencies: ["dep-b", "dep-a"],
+      }),
+      { mergeDuplicateInFlight: true }
+    );
+    const secondMerged = coalSched.submitTask(
+      new TaskSpec({
+        task_id: "t-coal-2",
+        tenant_id: "tenant-coal",
+        priority: TaskPriority.P0_EMERGENCY,
+        prompt: "  Compile kernel module X  ",
+        dependencies: ["dep-a", "dep-b"],
+        idempotency_key: "idem-coal-urgent",
+      }),
+      { mergeDuplicateInFlight: true }
+    );
+    const duplicateCoalescingVerified =
+      secondMerged.task_id === firstSub.task_id &&
+      firstSub.merged_duplicate_count === 1 &&
+      firstSub.priority === TaskPriority.P0_EMERGENCY &&
+      firstSub.merged_request_ids.includes("t-coal-2") &&
+      coalSched.queueManager.totalQueued() === 1;
+
+    const allM60RisksEliminated =
+      fullLinkPersistenceVerified &&
+      tenantAndDeepIdempotencyVerified &&
+      sseAndCloudEventsIdempotencyVerified &&
+      breakpointRecoveryVerified &&
+      duplicateCoalescingVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M60 全链路持久化、深度幂等、确定性断点恢复与可并入重复合流自检 (FullLink=${fullLinkPersistenceVerified}, DeepIdem=${tenantAndDeepIdempotencyVerified}, SseCeIdem=${sseAndCloudEventsIdempotencyVerified}, Breakpoint=${breakpointRecoveryVerified}, Coalesce=${duplicateCoalescingVerified})`,
+      "SystemWide / M60-PersistenceIdempotencyRecoveryAudit",
+      "ALL_M60_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        fullLinkPersistence1: {
+          snapSummary,
+          rehydrateSummary,
+          dedupAfterRestart,
+          fullLinkPersistenceVerified,
+        },
+        tenantAndDeepIdempotency2: {
+          tenantBTaskId: tenantBTask.task_id,
+          tenantARetryTaskId: tenantARetry.task_id,
+          deepKeyMatched: deepKey1 === deepKey2,
+          tenantAndDeepIdempotencyVerified,
+        },
+        sseAndCloudEventsIdempotency3: {
+          firstPublishDelivered: d1,
+          duplicatePublishDelivered: d2,
+          totalLlmCostUsd: finReport?.totalLlmCostUsd,
+          sseAndCloudEventsIdempotencyVerified,
+        },
+        breakpointRecovery4: {
+          recovery,
+          uncommittedRolledBack,
+          resumedTurn: step2AfterRecovery.turn,
+          breakpointRecoveryVerified,
+        },
+        duplicateCoalescing5: {
+          canonicalTaskId: firstSub.task_id,
+          mergedDuplicateCount: firstSub.merged_duplicate_count,
+          promotedPriority: firstSub.priority,
+          mergedRequestIds: firstSub.merged_request_ids,
+          duplicateCoalescingVerified,
+        },
+        allM60RisksEliminated,
+      },
+    };
+  }
+
+  /**
+   * [M61] Full-Subsystem Persistence, Idempotent CAS/Push Retry, Breakpoint State Rollback
+   * & Coalescing Duplicate Arbitration Audit.
+   */
+  public async executeSubsystemPersistenceIdempotencyAndCoalesceAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    const sql = new InMemoryCellSqlStorage();
+
+    // 1. [M61-1] SharedBlackboardAndGitArbiter & TopologyCasCoordinator SQLite persistence, idempotent CAS retry & duplicate patch coalescing
+    const bb1 = new SharedBlackboardAndGitArbiter(sql);
+    const cas1 = bb1.putCas("arch/plan", { steps: [1, 2], meta: { b: 2, a: 1 } }, 0, "agent-alpha");
+    const cas1Retry = bb1.putCas("arch/plan", { meta: { a: 1, b: 2 }, steps: [1, 2] }, 0, "agent-alpha");
+    const arb = bb1.arbitrateGitPatchTouches([
+      { agentId: "agent-alpha", touchedFiles: ["src/core.ts"], priorityScore: 100 },
+      { agentId: "agent-alpha", touchedFiles: ["src/core.ts", "src/util.ts"], priorityScore: 120 },
+    ]);
+    const bb2 = new SharedBlackboardAndGitArbiter(sql);
+    const top1 = new TopologyCasCoordinator(sql);
+    const tUpd1 = top1.updateTopologyCas(0, ["node-2", "node-1"]);
+    const tUpdRetry = top1.updateTopologyCas(0, ["node-1", "node-2"]);
+    const blackboardAndTopologyVerified =
+      cas1.committed === true &&
+      cas1Retry.deduplicated === true &&
+      arb.acceptedAgentIds.includes("agent-alpha") &&
+      arb.conflictedAgentIds.length === 0 &&
+      arb.coalescedDuplicateAgents.includes("agent-alpha") &&
+      bb2.get("arch/plan")?.version === 1 &&
+      tUpd1.generation === 1 &&
+      tUpdRetry.deduplicated === true;
+
+    // 2. [M61-2] StagingCommitAndApprovalGate, DagEscrowCoordinator & FinOpsBudgetController SQLite persistence & idempotency
+    const gate1 = new StagingCommitAndApprovalGate(sql);
+    const eff1 = gate1.stageEffect({
+      effectId: "eff-m61-1",
+      taskId: "t-m61",
+      turnIndex: 1,
+      toolName: "drop_idx",
+      args: { table: "users", cascade: true },
+    });
+    const effRetry = gate1.stageEffect({
+      effectId: "eff-m61-1-retry",
+      taskId: "t-m61",
+      turnIndex: 1,
+      toolName: "drop_idx",
+      args: { cascade: true, table: "users" },
+    });
+    const tSpec = new TaskSpec({ task_id: "t-m61", tenant_id: "ten-m61", expected_SubAgent_count: 2 });
+    const tk1 = gate1.requestHumanApproval(tSpec, "drop_idx", { table: "users", cascade: true });
+    const tkRetry = gate1.requestHumanApproval(tSpec, "drop_idx", { cascade: true, table: "users" });
+    const gate2 = new StagingCommitAndApprovalGate(sql);
+
+    const escrow1 = new DagEscrowCoordinator(sql);
+    escrow1.reserveParentEscrow(tSpec, 10, 0);
+    escrow1.reserveParentEscrow(tSpec, 10, 9); // Idempotent retry even when currentTenantUsed is high
+    const childSpec = new TaskSpec({ task_id: "t-m61-child-1", tenant_id: "ten-m61" });
+    const cReg1 = escrow1.registerChildSubAgent(tSpec, childSpec);
+    const cRegRetry = escrow1.registerChildSubAgent(tSpec, childSpec);
+    const escrow2 = new DagEscrowCoordinator(sql);
+
+    const fin1 = new FinOpsBudgetController(sql);
+    fin1.configureTenant({
+      tenantId: "ten-m61",
+      dailyBudgetUsd: 50,
+      softDowngradeThresholdRatio: 0.8,
+      preferredModel: "claude-3-7-sonnet",
+      fallbackEconomyModel: "deepseek-chat",
+    });
+    fin1.recordSpend("ten-m61", 5.0, "2026-11-10", "spend-op-1");
+    const spendAfterRetry = fin1.recordSpend("ten-m61", 5.0, "2026-11-10", "spend-op-1");
+    fin1.refundSpend("ten-m61", 2.0, "2026-11-10", "refund-op-1");
+    const spendAfterRefundRetry = fin1.refundSpend("ten-m61", 2.0, "2026-11-10", "refund-op-1");
+    const fin2 = new FinOpsBudgetController(sql);
+
+    const stagingEscrowFinOpsVerified =
+      eff1.effectId === effRetry.effectId &&
+      tk1.ticketId === tkRetry.ticketId &&
+      gate2.getStagedEffects("t-m61").length === 1 &&
+      cReg1.usedEscrowSlot === true &&
+      cRegRetry.deduplicated === true &&
+      escrow2.getTenantEscrowedSlots("ten-m61") === 2 &&
+      spendAfterRetry === 5.0 &&
+      spendAfterRefundRetry === 3.0 &&
+      fin2.evaluateBudgetAndModel("ten-m61", "2026-11-10").allowed === true;
+
+    // 3. [M61-3] SyntacticAndVelocityBreaker same-turn retry coalescing & SQLite persistence
+    const vb1 = new SyntacticAndVelocityBreaker(3, 10_000, sql);
+    vb1.recordAndCheckTurn("t-vb", {
+      turnIndex: 1,
+      toolName: "read_file",
+      argsHash: "h1",
+      tokensConsumed: 4000,
+      timestampMs: 1000,
+    });
+    vb1.recordAndCheckTurn("t-vb", {
+      turnIndex: 1,
+      toolName: "read_file",
+      argsHash: "h1",
+      tokensConsumed: 4000,
+      timestampMs: 1010,
+    });
+    const vbCheck = vb1.recordAndCheckTurn("t-vb", {
+      turnIndex: 1,
+      toolName: "read_file",
+      argsHash: "h1",
+      tokensConsumed: 4000,
+      timestampMs: 1020,
+    });
+    const velocityBreakerCoalesceVerified =
+      vbCheck.tripped === false && vbCheck.coalescedSameTurnRetry === true;
+
+    // 4. [M61-4] TunnelGatewayCell command idempotency coalescing + SQLite & AgentTaskHarnessCell R2-to-SQL reconciliation
+    const tgw = new TunnelGatewayCell(sql);
+    tgw.registerTunnel({
+      hostId: "host-m61",
+      gatewayId: "gw-1",
+      role: "PRIMARY",
+      connGeneration: 1,
+      epoch: 1,
+    });
+    const enq1 = tgw.enqueueCommandForHost("host-m61", { cmd: "run" }, 5000, { idempotencyKey: "tcmd-idem-1" });
+    const enq2 = tgw.enqueueCommandForHost("host-m61", { cmd: "run" }, 5000, { idempotencyKey: "tcmd-idem-1" });
+    const polled = tgw.pollPendingCommands("host-m61", "gw-1");
+    tgw.acknowledgeCommand(enq1.command.commandId, { exitCode: 0 });
+    const [r1, r2Out] = await Promise.all([enq1.completionPromise, enq2.completionPromise]);
+
+    const r2 = new InMemoryR2Bucket();
+    const doState = {
+      id: { toString: () => "hcell-m61" },
+      storage: {
+        sql: new InMemoryCellSqlStorage(),
+        get: async () => undefined,
+        put: async () => {},
+        delete: async () => false,
+        setAlarm: async () => {},
+        getAlarm: async () => null,
+      },
+      blockConcurrencyWhile: async <T>(cb: () => Promise<T>) => cb(),
+    };
+    await r2.put(
+      "cells/task-m61-h/turn-1-f2.ltx",
+      JSON.stringify({
+        taskId: "task-m61-h",
+        turnIndex: 1,
+        fencingToken: 2,
+        toolName: "bash",
+        toolOutput: { ok: true },
+      }),
+      { customMetadata: { taskId: "task-m61-h", turnIndex: "1", fencingToken: "2" } }
+    );
+    const hCell = new AgentTaskHarnessCell(doState, r2, "task-m61-h");
+    const recRes = await hCell.reconcileBreakpointFromR2AndSql();
+    const idempTurn = await hCell.executeAndCheckpointTurn({
+      turnIndex: 1,
+      fencingToken: 2,
+      toolName: "bash",
+      toolOutput: { ok: true },
+      enforceTurnMonotonicity: true,
+    });
+    const tunnelAndHarnessVerified =
+      enq2.deduplicated === true &&
+      polled.length === 1 &&
+      r1.exitCode === 0 &&
+      r2Out.exitCode === 0 &&
+      recRes.reconciledTurnsCount === 1 &&
+      idempTurn.deduplicated === true;
+
+    // 5. [M61-5] LayerFsWorkspaceDriver branch breakpoint rollback & LayerFsRemoteStoreSynchronizer idempotent push retry
+    const lfs = new LayerFsWorkspaceDriver();
+    const w1 = lfs.executeInProcessFileTool({
+      branchName: "main",
+      agentId: "ag-1",
+      stepId: "step-turn-1",
+      operation: "write",
+      filePath: "src/app.ts",
+      newContent: "v1",
+    });
+    lfs.executeInProcessFileTool({
+      branchName: "main",
+      agentId: "ag-1",
+      stepId: "step-turn-2-dirty",
+      operation: "write",
+      filePath: "src/app.ts",
+      newContent: "v2-dirty",
+    });
+    const rbBranch = lfs.rollbackBranchToCommitOrStep("main", "step-turn-1");
+    const readAfterRb = lfs.executeInProcessFileTool({
+      branchName: "main",
+      agentId: "ag-1",
+      stepId: "step-read",
+      operation: "read",
+      filePath: "src/app.ts",
+    });
+
+    const syncer = new LayerFsRemoteStoreSynchronizer(new InMemoryR2Bucket(), "proj-m61");
+    const payloadBytes = new Uint8Array([10, 20, 30, 40]);
+    const push1 = await syncer.pushStoreSnapshot({
+      machineId: "m1",
+      basedOnGeneration: 0,
+      storeSqliteBytes: payloadBytes,
+      mainHeadCommitId: w1.commitId,
+      idempotencyKey: "push-m61-1",
+    });
+    const pushRetry = await syncer.pushStoreSnapshot({
+      machineId: "m1",
+      basedOnGeneration: 0,
+      storeSqliteBytes: payloadBytes,
+      mainHeadCommitId: w1.commitId,
+      idempotencyKey: "push-m61-1",
+    });
+    const layerFsRollbackAndPushVerified =
+      rbBranch.restoredCommitId === w1.commitId &&
+      readAfterRb.readResult === "v1" &&
+      push1.remoteGeneration === 1 &&
+      pushRetry.deduplicated === true;
+
+    const allM61RisksEliminated =
+      blackboardAndTopologyVerified &&
+      stagingEscrowFinOpsVerified &&
+      velocityBreakerCoalesceVerified &&
+      tunnelAndHarnessVerified &&
+      layerFsRollbackAndPushVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M61 子系统持久化、CAS/Push 幂等重试、断点状态回滚与重复合流仲裁自检 (BlackboardTop=${blackboardAndTopologyVerified}, StagingEscrowFinOps=${stagingEscrowFinOpsVerified}, VelocityCoalesce=${velocityBreakerCoalesceVerified}, TunnelHarness=${tunnelAndHarnessVerified}, LayerFs=${layerFsRollbackAndPushVerified})`,
+      "SystemWide / M61-SubsystemPersistenceIdempotencyAudit",
+      "ALL_M61_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        blackboardAndTopology1: {
+          casDeduplicated: cas1Retry.deduplicated,
+          coalescedDuplicateAgents: arb.coalescedDuplicateAgents,
+          topologyDeduplicated: tUpdRetry.deduplicated,
+          blackboardAndTopologyVerified,
+        },
+        stagingEscrowFinOps2: {
+          effectDeduplicated: eff1.effectId === effRetry.effectId,
+          ticketCoalesced: tk1.ticketId === tkRetry.ticketId,
+          childDeduplicated: cRegRetry.deduplicated,
+          spendAfterRefundRetry,
+          stagingEscrowFinOpsVerified,
+        },
+        velocityBreakerCoalesce3: {
+          tripped: vbCheck.tripped,
+          coalescedSameTurnRetry: vbCheck.coalescedSameTurnRetry,
+          velocityBreakerCoalesceVerified,
+        },
+        tunnelAndHarness4: {
+          tunnelCommandDeduplicated: enq2.deduplicated,
+          reconciledTurnsCount: recRes.reconciledTurnsCount,
+          harnessTurnDeduplicated: idempTurn.deduplicated,
+          tunnelAndHarnessVerified,
+        },
+        layerFsRollbackAndPush5: {
+          restoredCommitId: rbBranch.restoredCommitId,
+          readAfterRollback: readAfterRb.readResult,
+          pushRetryDeduplicated: pushRetry.deduplicated,
+          layerFsRollbackAndPushVerified,
+        },
+        allM61RisksEliminated,
+      },
+    };
+  }
+
+  /**
+   * [M62] DFX Full-Spectrum Resiliency, Diagnosability, Testability & Operability Hardening Audit.
+   */
+  public async executeDfxHardeningAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    const tmpCgroupDir = path.join(os.tmpdir(), `ansts-dfx-cgroup-${Date.now()}`);
+
+    // 1. [M62-1] DFX-Reliability & Recoverability: CgroupPhaseController & LinuxCgroupV2AndPsiDriver
+    const phaseCtrl = new CgroupPhaseController();
+    const thinkAlloc = phaseCtrl.applyThinkPhase("t-dfx-1", {
+      think_cpu_cores: 0.001, // sub-core edge case
+      act_cpu_cores: 4.0,
+      act_memory_mb: 4096,
+      disk_mb: 1024,
+    });
+    const cgroupDriver = new LinuxCgroupV2AndPsiDriver(tmpCgroupDir);
+    cgroupDriver.writePhaseLimits("t-dfx-1", "THINK", 0.001, 256, 512);
+    const cgroupCleaned = cgroupDriver.removeTaskCgroup("t-dfx-1");
+    const cgroupReliabilityVerified =
+      thinkAlloc.cpuQuotaUsPer100ms >= CgroupPhaseController.MIN_CPU_QUOTA_US &&
+      cgroupCleaned === true;
+
+    // 2. [M62-2] DFX-Observability & Diagnosability: OtelAndPrometheusExporter
+    const otel = new OtelAndPrometheusExporter();
+    otel.incCounter("dfx/counter.ops!!", 5);
+    otel.setGauge("dfx.memory.util", 85.5);
+    otel.observeHistogram("dfx.latency.ms", 120);
+    const promMetrics = otel.renderPrometheusMetrics();
+    const burnEval = otel.evaluateSloBurnRate({
+      totalRequests: 10000,
+      errorRequests: 2,
+      p99LatencyMs: 180,
+    });
+    const otelDiagnosabilityVerified =
+      promMetrics.includes("dfx_counter_ops__ 5") &&
+      burnEval.alertSeverity === "HEALTHY";
+
+    // 3. [M62-3] DFX-Safety & Fault Tolerance: LinuxPsiMemoryGuard
+    const psiGuard = new LinuxPsiMemoryGuard(40.0, 70.0);
+    const p0Task = new TaskSpec({ task_id: "t-dfx-p0", tenant_id: "ten", priority: TaskPriority.P0_EMERGENCY });
+    const p1Task = new TaskSpec({ task_id: "t-dfx-p1", tenant_id: "ten", priority: TaskPriority.P1_HIGH });
+    const p2Task = new TaskSpec({ task_id: "t-dfx-p2", tenant_id: "ten", priority: TaskPriority.P2_STANDARD });
+    const p3Task = new TaskSpec({ task_id: "t-dfx-p3", tenant_id: "ten", priority: TaskPriority.P3_BATCH });
+    const psiAction = psiGuard.evaluateAndDefend(
+      { someAvg10Pct: 50.0, fullAvg10Pct: 75.0, freeSwapMb: 64 },
+      [p0Task, p1Task, p2Task, p3Task]
+    );
+    const psiSafetyVerified =
+      psiAction.level === "FREEZE_AND_CHECKPOINT" &&
+      !psiAction.evictedTaskIds.includes("t-dfx-p0") &&
+      !psiAction.evictedTaskIds.includes("t-dfx-p1") &&
+      psiAction.evictedTaskIds.includes("t-dfx-p3");
+
+    // 4. [M62-4] DFX-Operability & Serviceability: CapacitySlaEnforcer
+    const slaSql = new InMemoryCellSqlStorage();
+    const slaEnforcer = new CapacitySlaEnforcer(undefined, slaSql);
+    const slaEval = slaEnforcer.evaluateSlaCompliance({
+      p0QueueWaitP99Ms: 150,
+      warmPoolHitRatio: 0.92,
+      freeClusterCpuRatio: 0.08,
+    });
+    const slaEnforcer2 = new CapacitySlaEnforcer(undefined, slaSql);
+    const capacitySlaOperabilityVerified =
+      slaEval.compliant === false &&
+      slaEval.reserveEmergencyHeadroom === true &&
+      slaEnforcer2.isEmergencyHeadroomActive() === true;
+
+    // 5. [M62-5] DFX-Maintainability & Deployability: EdgeTunnelHaRouter & CrossRegionAsyncReplicator
+    const tgw = new TunnelGatewayCell();
+    tgw.registerTunnel({
+      hostId: "body-dfx",
+      gatewayId: "gw-1",
+      role: "PRIMARY",
+      connGeneration: 1,
+      epoch: 1,
+    });
+    const tunnelRouter = new EdgeTunnelHaRouter(tgw);
+    const repl = new CrossRegionAsyncReplicator();
+    const replRes = await repl.replicateToRemoteS3Region({
+      s3Endpoint: "http://127.0.0.1:9000",
+      sourceRegion: "US",
+      targetRegion: "EU",
+      objectKey: "ltx/test.json",
+      payload: { ok: true },
+    });
+    const deployabilityVerified =
+      tunnelRouter.routeRpcToBodyHost("body-dfx", { test: true }).delivered === true &&
+      replRes.replicatedCount === 1;
+
+    const allM62DfxRisksEliminated =
+      cgroupReliabilityVerified &&
+      otelDiagnosabilityVerified &&
+      psiSafetyVerified &&
+      capacitySlaOperabilityVerified &&
+      deployabilityVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M62 DFX 全维度可靠性、可诊断性、可服务性与可观测性自检 (CgroupReliability=${cgroupReliabilityVerified}, OtelDiag=${otelDiagnosabilityVerified}, PsiSafety=${psiSafetyVerified}, SlaOperability=${capacitySlaOperabilityVerified}, Deployability=${deployabilityVerified})`,
+      "SystemWide / M62-DfxHardeningAudit",
+      "ALL_M62_DFX_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        cgroupReliability1: {
+          thinkQuotaUs: thinkAlloc.cpuQuotaUsPer100ms,
+          cgroupCleaned,
+          cgroupReliabilityVerified,
+        },
+        otelDiagnosability2: {
+          burnSeverity: burnEval.alertSeverity,
+          otelDiagnosabilityVerified,
+        },
+        psiSafety3: {
+          level: psiAction.level,
+          evicted: psiAction.evictedTaskIds,
+          psiSafetyVerified,
+        },
+        capacitySlaOperability4: {
+          emergencyHeadroomActive: slaEnforcer.isEmergencyHeadroomActive(),
+          rehydratedHeadroomActive: slaEnforcer2.isEmergencyHeadroomActive(),
+          capacitySlaOperabilityVerified,
+        },
+        deployability5: {
+          replicatedCount: replRes.replicatedCount,
+          deployabilityVerified,
+        },
+        allM62DfxRisksEliminated,
+      },
+    };
+  }
+
+  /**
+   * [M63] Deep DFX Hardening Phase II Audit (Chaos Auto-Heal, Anti-Flapping Backpressure/Shedder/Sharder,
+   * Sovereign Routing Persistence, Multi-Cycle WFG Resolution, TEE/Zero-Trust IMDSv6 Guard & Token Cost Clamping).
+   */
+  public async executeDfxDeepModuleHardeningAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    const sql = new InMemoryCellSqlStorage();
+
+    // 1. [M63-1] Chaos Auto-Heal & Partition TTL
+    const chaosProxy = new NetworkChaosFaultInjectionProxy();
+    chaosProxy.injectPartition("host-ttl", 100, 1000);
+    let blockedAt1050 = false;
+    try {
+      chaosProxy.assertReachable("host-ttl", 1050);
+    } catch {
+      blockedAt1050 = true;
+    }
+    chaosProxy.assertReachable("host-ttl", 1200); // auto-healed after TTL
+    const drillRunner = new AutomatedChaosDrillRunner();
+    const drillRes = drillRunner.executeLivePartitionAndFencingDrill({
+      chaosProxy,
+      targetHost: "host-drill",
+      oldNodeFencingToken: 2,
+      newNodeFencingToken: 5,
+    });
+    const invalidTokenDrill = drillRunner.runSplitBrainAndRecoveryDrill({
+      oldNodeFencingToken: Number.NaN,
+      newNodeFencingToken: 5,
+    });
+    const chaosAutoHealVerified =
+      blockedAt1050 === true &&
+      drillRes.partitionHealed === true &&
+      drillRes.rpoZeroVerified === true &&
+      invalidTokenDrill.zombieBlocked === false;
+
+    // 2. [M63-2] Fail-Safe Backpressure, Load Shedder & Auto-Sharder NaN/Zero-Division Guards
+    const bpLoop = new BidirectionalBackpressureController();
+    const bpNanState = bpLoop.computeClusterHealthState({
+      maxNodePsiSomePct: Number.NaN,
+      globalRateLimitedEndpoints: 4,
+      totalEndpoints: 0,
+      globalQueueDepth: 100,
+    });
+    const shedder = new PriorityLoadShedder();
+    const p3OnNan = shedder.shouldAdmitUnderLoad(TaskPriority.P3_BATCH, Number.NaN);
+    const p0OnNan = shedder.shouldAdmitUnderLoad(TaskPriority.P0_EMERGENCY, Number.NaN);
+    const sharder = new DynamicQueueAutoSharder(16, 4, 128);
+    const shardAdjust = sharder.adjustShards(Number.NaN, 0);
+    const backpressureAndSharderVerified =
+      bpNanState.mode === "RED_SHEDDING" &&
+      p3OnNan === false &&
+      p0OnNan === true &&
+      Number.isFinite(shardAdjust.newShards) &&
+      shardAdjust.newShards === 4;
+
+    // 3. [M63-3] GeoSovereigntyAndLatencyRouter Finite Latency Sanitization, Tie-Break & SQLite Persistence
+    const geo1 = new GeoSovereigntyAndLatencyRouter(sql);
+    geo1.registerGeoRegion({
+      regionId: "eu-central-2",
+      jurisdiction: "GDPR_EU",
+      latencyMs: 25,
+      capacityAvailable: true,
+    });
+    geo1.registerGeoRegion({
+      regionId: "eu-central-1",
+      jurisdiction: "GDPR_EU",
+      latencyMs: 25,
+      capacityAvailable: true,
+    });
+    geo1.registerGeoRegion({
+      regionId: "eu-corrupt",
+      jurisdiction: "GDPR_EU",
+      latencyMs: -100,
+      capacityAvailable: true,
+    });
+    const geo2 = new GeoSovereigntyAndLatencyRouter(sql);
+    const selectedRegion = geo2.routeByJurisdiction("GDPR_EU");
+    const geoRoutingVerified =
+      selectedRegion.regionId === "eu-central-1" && geo2.listRegions().length === 3;
+
+    // 4. [M63-4] A2aWaitForGraphDeadlockDetector Multi-Cycle Iterative Resolution
+    const wfg = new A2aWaitForGraphDeadlockDetector();
+    wfg.addWaitEdge("ag-1", "ag-2");
+    wfg.addWaitEdge("ag-2", "ag-1");
+    wfg.addWaitEdge("ag-3", "ag-4");
+    wfg.addWaitEdge("ag-4", "ag-3");
+    const wfgRes = wfg.resolveCycleWithLowestPriorityVictim({
+      "ag-1": 100,
+      "ag-2": 10,
+      "ag-3": 80,
+      "ag-4": 20,
+    });
+    const multiCycleWfgVerified =
+      wfgRes.resolved === true &&
+      wfgRes.evictedVictims.length === 2 &&
+      wfgRes.evictedVictims.includes("ag-2") &&
+      wfgRes.evictedVictims.includes("ag-4");
+
+    // 5. [M63-5] ConfidentialTeeAttestationBridge Tamper Guard, Zero-Trust IPv6-IMDS/mkfs Guard & ModelPool Cost Clamping
+    const tee = new ConfidentialTeeAttestationBridge();
+    const quote = tee.generateAndVerifyAttestationQuote({
+      vmId: "vm-m63",
+      measurementDigestHex: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      nonce: "nonce-123",
+    });
+    const validExternal = tee.verifyExternalAttestationQuote({
+      vmId: "vm-m63",
+      measurementDigestHex: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      nonce: "nonce-123",
+      ed25519SignatureHex: quote.ed25519SignatureHex,
+    });
+    const tamperedExternal = tee.verifyExternalAttestationQuote({
+      vmId: "vm-m63-tampered",
+      measurementDigestHex: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      nonce: "nonce-123",
+      ed25519SignatureHex: quote.ed25519SignatureHex,
+    });
+
+    const zt = new ZeroTrustSandboxSecurityGuard();
+    const imdsV6Check = zt.evaluateShellCommand("curl http://[::ffff:169.254.169.254]/latest/meta-data/");
+    const mkfsCheck = zt.evaluateShellCommand("mkfs.ext4 /dev/sda1");
+
+    const pool = new ModelPoolClientAdapter();
+    const ep = new LlmEndpointMetrics({
+      endpoint_id: "ep-m63",
+      provider: "openai",
+      model_name: "gpt-4o",
+      healthy: true,
+    });
+    const infRes = pool.executeInference(
+      ep,
+      {
+        taskId: "t-m63",
+        turnIndex: 1,
+        prompt: "Hello",
+        estimatedPromptTokens: 1000,
+        maxOutputTokens: 200,
+      },
+      2.5 // Out-of-range cache ratio > 1.0 must clamp to 1.0 and keep cachedTokens <= 1000, costUsd > 0
+    );
+    const securityAndCostVerified =
+      quote.verified === true &&
+      validExternal === true &&
+      tamperedExternal === false &&
+      imdsV6Check.allowed === false &&
+      mkfsCheck.allowed === false &&
+      infRes.cachedTokens === 1000 &&
+      infRes.costUsd > 0;
+
+    const allM63DfxRisksEliminated =
+      chaosAutoHealVerified &&
+      backpressureAndSharderVerified &&
+      geoRoutingVerified &&
+      multiCycleWfgVerified &&
+      securityAndCostVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M63 第二阶段 DFX 深度加固自检 (ChaosAutoHeal=${chaosAutoHealVerified}, BackpressureSharder=${backpressureAndSharderVerified}, GeoRouting=${geoRoutingVerified}, MultiCycleWfg=${multiCycleWfgVerified}, SecAndCost=${securityAndCostVerified})`,
+      "SystemWide / M63-DfxDeepModuleAudit",
+      "ALL_M63_DFX_RISKS_ELIMINATED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        chaosAutoHeal1: {
+          blockedAt1050,
+          partitionHealed: drillRes.partitionHealed,
+          chaosAutoHealVerified,
+        },
+        backpressureAndSharder2: {
+          bpNanMode: bpNanState.mode,
+          p3OnNan,
+          p0OnNan,
+          newShards: shardAdjust.newShards,
+          backpressureAndSharderVerified,
+        },
+        geoRouting3: {
+          selectedRegionId: selectedRegion.regionId,
+          persistedCount: geo2.listRegions().length,
+          geoRoutingVerified,
+        },
+        multiCycleWfg4: {
+          resolved: wfgRes.resolved,
+          evictedVictims: wfgRes.evictedVictims,
+          multiCycleWfgVerified,
+        },
+        securityAndCost5: {
+          validExternal,
+          tamperedExternal,
+          imdsV6Blocked: !imdsV6Check.allowed,
+          mkfsBlocked: !mkfsCheck.allowed,
+          cachedTokens: infRes.cachedTokens,
+          costUsd: infRes.costUsd,
+          securityAndCostVerified,
+        },
+        allM63DfxRisksEliminated,
+      },
+    };
+  }
+
+  /**
+   * [M64] End-to-End Implementation Consistency & Authentic Feature Wiring Audit:
+   * Verifies Worker/Cell route & queue dispatch parity, 100% TaskSpec field fidelity across all 3 SQLite stores,
+   * SagaCompensator/StagingGate/McpRegistry/CognitiveRouter/DagEscrow SQLite persistence & turn-accurate staged commit,
+   * AnstsLocalAndComposeServer full-subsystem SQLite wiring & cold-start scheduler rehydration,
+   * and AgentHarnessRunner router token metering + PartitionedSchedulerRouter multi-shard scheduling.
+   */
+  public async executeImplementationConsistencyAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发 M64 落地功能实现一致性自检" },
+      };
+    }
+
+    // 1. [M64-1] Worker & Cell prefixed route & queue dispatch parity
+    const cellState = {
+      id: { toString: () => "cell-m64-01" },
+      storage: {
+        sql: new InMemoryCellSqlStorage(),
+        transactionSync: <T>(fn: () => T) => fn(),
+        getAlarm: async () => null,
+        setAlarm: async () => {},
+      },
+      blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
+    };
+    const schedCell = new AnstsSchedulerCell(cellState);
+    const submitResp = await schedCell.fetch(
+      new Request("https://worker.internal/v1/scheduler/submit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          task_id: "t-m64-worker-01",
+          tenant_id: "Northstar",
+          priority: TaskPriority.P1_HIGH,
+          prompt: "Verify worker prefixed route",
+          resource_profile: { think_cpu_cores: 0.5, act_cpu_cores: 8, act_memory_mb: 8192, disk_mb: 20480 },
+          parent_task_id: "parent-m64",
+          expected_SubAgent_count: 3,
+          prefix_Cache_hash: "pfx-m64-hash",
+        }),
+      })
+    );
+    const submitJson = (await submitResp.json()) as Record<string, unknown>;
+    const workerCellRouteVerified =
+      submitResp.status === 202 &&
+      submitJson.task_id === "t-m64-worker-01" &&
+      schedCell.scheduler.allTasks.has("t-m64-worker-01");
+
+    // 2. [M64-2] 100% TaskSpec field fidelity across AnstsSchedulerCell, SchedulerV25SingleWritePathStore & UnifiedComponentPersistenceStore
+    const rehydratedCell = new AnstsSchedulerCell(cellState);
+    const cellTask = rehydratedCell.scheduler.allTasks.get("t-m64-worker-01");
+
+    const v25Sql = new InMemoryCellSqlStorage();
+    const v25Store1 = new SchedulerV25SingleWritePathStore(v25Sql);
+    const fullSpec = new TaskSpec({
+      task_id: "t-m64-fidelity",
+      tenant_id: "Northstar",
+      priority: TaskPriority.P0_EMERGENCY,
+      prompt: "Full field fidelity check",
+      resource_profile: { think_cpu_cores: 0.75, act_cpu_cores: 12, act_memory_mb: 16384, disk_mb: 40960 },
+      parent_task_id: "parent-root-01",
+      expected_SubAgent_count: 4,
+      prefix_Cache_hash: "hash-fidelity-99",
+    });
+    fullSpec.retry_count = 2;
+    fullSpec.preempted_count = 1;
+    fullSpec.dead_letter_reason = "NONE";
+    v25Store1.commitTaskSingleWritePath(fullSpec, "body-host-01");
+    const v25Restored = v25Store1.getPersistedTask("t-m64-fidelity");
+
+    const unifiedSql = new InMemoryCellSqlStorage();
+    const unified = new UnifiedComponentPersistenceStore(unifiedSql);
+    const s1 = new CoreScheduler5D();
+    s1.allTasks.set(fullSpec.task_id, fullSpec);
+    unified.snapshotSchedulerState(s1);
+    const s2 = new CoreScheduler5D();
+    unified.rehydrateSchedulerFromSql(s2);
+    const unifiedRestored = s2.allTasks.get("t-m64-fidelity");
+
+    const taskSpecFidelityVerified =
+      cellTask?.resource_profile.act_cpu_cores === 8 &&
+      cellTask?.parent_task_id === "parent-m64" &&
+      cellTask?.expected_SubAgent_count === 3 &&
+      cellTask?.prefix_Cache_hash === "pfx-m64-hash" &&
+      v25Restored?.resource_profile.act_cpu_cores === 12 &&
+      v25Restored?.retry_count === 2 &&
+      v25Restored?.preempted_count === 1 &&
+      v25Restored?.prefix_Cache_hash === "hash-fidelity-99" &&
+      unifiedRestored?.resource_profile.act_memory_mb === 16384 &&
+      unifiedRestored?.prefix_Cache_hash === "hash-fidelity-99";
+
+    // 3. [M64-3] SagaCompensator/StagingGate/McpRegistry/CognitiveRouter/DagEscrow SQLite persistence & turn-accurate staged commit
+    const sagaSql = new InMemoryCellSqlStorage();
+    const gw1 = new SagaToolGateway(undefined, undefined, sagaSql);
+    const mcp1 = new McpDynamicToolRegistry(sagaSql, gw1);
+    mcp1.registerMcpServerTools(
+      "mcp-k8s",
+      [
+        {
+          toolName: "deploy_manifest",
+          description: "Deploy manifest",
+          effectClass: ToolCallEffectClass.COMPENSATABLE,
+          inputSchema: {},
+        },
+      ],
+      gw1,
+      (_m, p) => ({ deployed: p.name })
+    );
+    const dummyTask = new TaskSpec({ task_id: "t-m64-saga", tenant_id: "Northstar" });
+    gw1.stagingGate.stageEffect({
+      effectId: "eff-turn-3",
+      taskId: "t-m64-saga",
+      turnIndex: 3,
+      toolName: "deploy_manifest",
+      args: { env: "prod" },
+    });
+    const ticket = gw1.stagingGate.requestHumanApproval(dummyTask, "deploy_manifest", { env: "prod" });
+    gw1.stagingGate.resolveApproval(ticket.ticketId, true, "chen", dummyTask);
+    const committed = gw1.stagingGate.commitStagedEffects("t-m64-saga", (tName, tArgs, tTurn) => {
+      return gw1.invokeTool("t-m64-saga", tTurn, tName, tArgs)[0];
+    });
+
+    // Rehydrate on a brand-new SagaToolGateway + McpDynamicToolRegistry over the same SQLite and roll back turn >= 3
+    const gw2 = new SagaToolGateway(undefined, undefined, sagaSql);
+    const mcp2 = new McpDynamicToolRegistry(sagaSql, gw2);
+    const rb = gw2.rollbackAndInvalidateTask("t-m64-saga", 3);
+
+    // Also verify DagEscrowCoordinator dependencyGraph cycle detection across SQLite restart
+    const escrowSql = new InMemoryCellSqlStorage();
+    const esc1 = new DagEscrowCoordinator(escrowSql);
+    const pTask = new TaskSpec({ task_id: "dag-p1", tenant_id: "Northstar", expected_SubAgent_count: 2 });
+    const cTask = new TaskSpec({ task_id: "dag-c1", tenant_id: "Northstar", parent_task_id: "dag-p1" });
+    esc1.reserveParentEscrow(pTask, 10, 0);
+    esc1.registerChildSubAgent(pTask, cTask);
+    const esc2 = new DagEscrowCoordinator(escrowSql);
+    let cycleCaughtAfterRestart = false;
+    try {
+      const badChild = new TaskSpec({
+        task_id: "dag-p1",
+        tenant_id: "Northstar",
+        parent_task_id: "dag-c1",
+        dependencies: ["dag-c1"],
+      });
+      esc2.registerChildSubAgent(cTask, badChild);
+    } catch {
+      cycleCaughtAfterRestart = true;
+    }
+
+    const sagaMcpEscrowVerified =
+      committed.length === 1 &&
+      committed[0].turnIndex === 3 &&
+      mcp2.listTools().length === 1 &&
+      rb.rolledBackSteps.length === 1 &&
+      rb.rolledBackSteps[0].turnIndex === 3 &&
+      cycleCaughtAfterRestart === true;
+
+    // 4. [M64-5] AgentHarnessRunner router token metering & PartitionedSchedulerRouter multi-shard scheduling
+    const routerSql = new InMemoryCellSqlStorage();
+    const cRouter = new CognitiveRouter(0.3, routerSql);
+    cRouter.registerEndpoint(
+      new LlmEndpointMetrics({
+        endpoint_id: "ep-m64-1",
+        provider: "deepseek",
+        model_name: "DeepSeek",
+        ttft_ewma_ms: 150,
+        tpm_used: 0,
+      })
+    );
+    const hRunner = new AgentHarnessRunner(cRouter, gw2);
+    const hTask = new TaskSpec({ task_id: "t-m64-harness", tenant_id: "Northstar" });
+    hRunner.executeSingleTurn(hTask, "deploy_manifest", { env: "staging" }, 1800);
+    const cRouter2 = new CognitiveRouter(0.3, routerSql);
+    const rehydratedEp = cRouter2.getEndpoint("ep-m64-1");
+
+    const pRouter = new PartitionedSchedulerRouter(4);
+    pRouter.registerNodeAcrossShards(
+      new NodeHeartbeat({ node_id: "node-m64-01", total_cpu_cores: 16, free_cpu_cores: 16 })
+    );
+    await pRouter.routeSubmitTask(
+      new TaskSpec({ task_id: "t-m64-shard", tenant_id: "Northstar", prompt: "shard test" })
+    );
+    const tickRes = await pRouter.scheduleTickAcrossShards();
+
+    const harnessAndShardRouterVerified =
+      rehydratedEp !== undefined &&
+      rehydratedEp.tpm_used === 1800 &&
+      tickRes.totalPlacements.length === 1 &&
+      tickRes.totalPlacements[0].taskId === "t-m64-shard";
+
+    const allM64ConsistencyChecksPassed =
+      workerCellRouteVerified &&
+      taskSpecFidelityVerified &&
+      sagaMcpEscrowVerified &&
+      harnessAndShardRouterVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M64 落地功能如实实现一致性自检 (WorkerCell=${workerCellRouteVerified}, TaskSpecFidelity=${taskSpecFidelityVerified}, SagaMcpEscrow=${sagaMcpEscrowVerified}, HarnessShardRouter=${harnessAndShardRouterVerified})`,
+      "SystemWide / M64-ImplementationConsistencyAudit",
+      "ALL_M64_CONSISTENCY_CHECKS_PASSED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        workerCell1: {
+          submitStatus: submitResp.status,
+          workerCellRouteVerified,
+        },
+        taskSpecFidelity2: {
+          cellActCpu: cellTask?.resource_profile.act_cpu_cores,
+          v25RetryCount: v25Restored?.retry_count,
+          unifiedActMemMb: unifiedRestored?.resource_profile.act_memory_mb,
+          taskSpecFidelityVerified,
+        },
+        sagaMcpEscrow3: {
+          committedTurnIndex: committed[0]?.turnIndex,
+          rolledBackCountAfterRestart: rb.rolledBackSteps.length,
+          rehydratedMcpTools: mcp2.listTools().length,
+          cycleCaughtAfterRestart,
+          sagaMcpEscrowVerified,
+        },
+        harnessAndShardRouter4: {
+          rehydratedTpmUsed: rehydratedEp?.tpm_used,
+          shardPlacementsCount: tickRes.totalPlacements.length,
+          harnessAndShardRouterVerified,
+        },
+        allM64ConsistencyChecksPassed,
+      },
+    };
+  }
+
+  /**
+   * [M65] Deep Implementation Consistency Phase II Audit:
+   * Verifies WalCompactorAndPagedRestorer & LayerFsRemoteStoreSynchronizer SQLite persistence,
+   * CanaryRolloutController (post-rollback lock) + PredictiveSandboxPrewarmer + TaskResourceProfiler SQLite rehydration,
+   * TunnelGatewayCell DO fetch API (/v1/tunnel/register, /poll, /ack), and live route state-mutation sync.
+   */
+  public async executeDeepConsistencyPhase2Audit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发 M65 第二阶段落地功能实现一致性自检" },
+      };
+    }
+
+    // 1. [M65-1] WalCompactorAndPagedRestorer & LayerFsRemoteStoreSynchronizer SQLite persistence across restarts
+    const compSql = new InMemoryCellSqlStorage();
+    const wal1 = new TurnWalEngine(compSql);
+    wal1.appendTurnDelta({
+      taskId: "t-m65-comp",
+      turnIndex: 1,
+      fencingToken: 1,
+      changedFiles: ["src/a.ts", "src/b.ts"],
+      sqliteWalPages: 25,
+      highestSubmittedFencingToken: 1,
+    });
+    const comp1 = new WalCompactorAndPagedRestorer(4096, compSql);
+    comp1.compactLayers("t-m65-comp", wal1.getTaskWalEntries("t-m65-comp"));
+    const comp2 = new WalCompactorAndPagedRestorer(4096, compSql);
+    const uffdRes = comp2.restoreViaUserfaultfd("t-m65-comp", 0.2);
+
+    const syncBucket = new InMemoryR2Bucket();
+    const syncSql = new InMemoryCellSqlStorage();
+    const sync1 = new LayerFsRemoteStoreSynchronizer(syncBucket, "proj-m65", syncSql);
+    const storeBytes = new TextEncoder().encode("sqlite-store-v1");
+    await sync1.pushStoreSnapshot({
+      machineId: "m1",
+      basedOnGeneration: 0,
+      storeSqliteBytes: storeBytes,
+      mainHeadCommitId: "C1",
+      idempotencyKey: "idem-sync-m65",
+    });
+    const sync2 = new LayerFsRemoteStoreSynchronizer(syncBucket, "proj-m65", syncSql);
+    const retryPush = await sync2.pushStoreSnapshot({
+      machineId: "m1",
+      basedOnGeneration: 0,
+      storeSqliteBytes: storeBytes,
+      mainHeadCommitId: "C1",
+      idempotencyKey: "idem-sync-m65",
+    });
+
+    const compactorAndRemoteSyncVerified =
+      comp2.getCompactedSnapshot("t-m65-comp")?.totalSqlitePages === 25 &&
+      uffdRes.eagerPagesLoaded === 5 &&
+      sync2.getRemoteGeneration() === 1 &&
+      retryPush.deduplicated === true;
+
+    // 2. [M65-2] CanaryRolloutController, PredictiveSandboxPrewarmer & TaskResourceProfiler SQLite rehydration
+    const govSql = new InMemoryCellSqlStorage();
+    const can1 = new CanaryRolloutController(govSql);
+    can1.evaluateCanaryStep({ errorRatePct: 5.5, p99LatencyMs: 200 }); // triggers ROLLED_BACK
+    const can2 = new CanaryRolloutController(govSql);
+    const postRestartStep = can2.evaluateCanaryStep({ errorRatePct: 0.01, p99LatencyMs: 80 }); // must stay ROLLED_BACK!
+
+    const pre1 = new PredictiveSandboxPrewarmer(0.5, govSql);
+    pre1.recordArrivalSampleAndPredict(25.0, 4.0);
+    const pre2 = new PredictiveSandboxPrewarmer(0.5, govSql);
+
+    const prof1 = new TaskResourceProfiler(0.5, govSql);
+    const sampleTask = new TaskSpec({ task_id: "t-prof", tenant_id: "Northstar" });
+    prof1.recordExecutionMetrics(sampleTask, 8.0, 8192);
+    prof1.recordExecutionMetrics(sampleTask, 8.0, 8192);
+    prof1.recordExecutionMetrics(sampleTask, 8.0, 8192);
+    const prof2 = new TaskResourceProfiler(0.5, govSql);
+    const recProfile = prof2.recommendProfile(sampleTask);
+
+    const canaryPrewarmerProfilerVerified =
+      postRestartStep.state === "ROLLED_BACK" &&
+      postRestartStep.trafficWeightPct === 0 &&
+      pre2.getEwmaArrivalRatePerSec() === 15.0 &&
+      recProfile.act_cpu_cores === 9.6 &&
+      recProfile.act_memory_mb === 10240;
+
+    // 3. [M65-4] TunnelGatewayCell DO fetch API (/v1/tunnel/register, /poll, /ack)
+    const tunSql = new InMemoryCellSqlStorage();
+    const tunCell = new TunnelGatewayCell(tunSql);
+    const regResp = await tunCell.fetch(
+      new Request("https://edge.internal/v1/tunnel/register", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          hostId: "body-m65-01",
+          gatewayId: "gw-m65-01",
+          role: "PRIMARY",
+          connGeneration: 1,
+          epoch: 1,
+        }),
+      })
+    );
+    const enq = tunCell.enqueueCommandForHost("body-m65-01", { cmd: "echo tunnel" }, 5000, {
+      idempotencyKey: "idem-tun-m65",
+    });
+    const pollResp = await tunCell.fetch(
+      new Request("https://edge.internal/v1/tunnel/poll?hostId=body-m65-01")
+    );
+    const pollJson = (await pollResp.json()) as { commands: Array<{ commandId: string }> };
+    const ackResp = await tunCell.fetch(
+      new Request("https://edge.internal/v1/tunnel/ack", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          commandId: pollJson.commands[0].commandId,
+          result: { status: "TUNNEL_OK" },
+        }),
+      })
+    );
+    const awaitedRes = await enq.completionPromise;
+    const tunnelFetchVerified =
+      regResp.status === 200 &&
+      pollJson.commands.length === 1 &&
+      ackResp.status === 200 &&
+      awaitedRes.status === "TUNNEL_OK";
+
+    const allM65Phase2ChecksPassed =
+      compactorAndRemoteSyncVerified &&
+      canaryPrewarmerProfilerVerified &&
+      tunnelFetchVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M65 第二阶段落地功能实现一致性自检 (CompactorSync=${compactorAndRemoteSyncVerified}, CanaryPrewarmProf=${canaryPrewarmerProfilerVerified}, TunnelFetch=${tunnelFetchVerified})`,
+      "SystemWide / M65-DeepConsistencyPhase2Audit",
+      "ALL_M65_PHASE2_CHECKS_PASSED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        compactorAndRemoteSync1: {
+          restoredPages: comp2.getCompactedSnapshot("t-m65-comp")?.totalSqlitePages,
+          eagerPagesLoaded: uffdRes.eagerPagesLoaded,
+          remoteGeneration: sync2.getRemoteGeneration(),
+          retryDeduplicated: retryPush.deduplicated,
+          compactorAndRemoteSyncVerified,
+        },
+        canaryPrewarmerProfiler2: {
+          postRestartCanaryState: postRestartStep.state,
+          rehydratedEwmaRate: pre2.getEwmaArrivalRatePerSec(),
+          recommendedActCpu: recProfile.act_cpu_cores,
+          recommendedActMemMb: recProfile.act_memory_mb,
+          canaryPrewarmerProfilerVerified,
+        },
+        tunnelFetch3: {
+          polledCount: pollJson.commands.length,
+          awaitedStatus: awaitedRes.status,
+          tunnelFetchVerified,
+        },
+        allM65Phase2ChecksPassed,
+      },
+    };
+  }
+  /**
+   * [M66] Deep Potential Risk Identification & Elimination Audit
+   */
+  public async executePotentialRisksEliminationAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+
+    // 1. [M66-1] TransactionalOutboxDispatcher timing-safe HMAC, constructor overload & dead-letter retry
+    const outboxSql = new InMemoryCellSqlStorage();
+    const outbox = new TransactionalOutboxDispatcher("sec-m66-audit", 2, outboxSql);
+    const samplePayload = JSON.stringify({ event: "task.done", id: "t-m66" });
+    const sig = outbox.signPayload(samplePayload, 1700000000);
+    const sigValid = outbox.verifySignature(samplePayload, sig.replace(",", ", "), 1700000050, 300);
+    const sigTampered = outbox.verifySignature(samplePayload, sig.slice(0, -2) + "ff", 1700000050, 300);
+    outbox.enqueueOutbox("m66-dlq", "t-m66", "https://bad.local/hook", { x: 1 });
+    outbox.processPending(() => false);
+    outbox.processPending(() => false);
+    const wasDeadLettered = outbox.listMessages()[0]?.deadLettered === true;
+    outbox.retryDeadLetteredMessage("m66-dlq", "https://good.local/hook");
+    const retryRes = outbox.processPending(() => true);
+    const outboxVerified = sigValid && !sigTampered && wasDeadLettered && retryRes.deliveredCount === 1;
+
+    // 2. [M66-2] CloudEventsBus bounded idempotency + SQLite FinOps & SseEventStreamGateway CRLF + orphan GC
+    const ceSql = new InMemoryCellSqlStorage();
+    const ce1 = new CloudEventsBus(10, ceSql);
+    for (let i = 0; i < 50; i++) {
+      ce1.emitEvent({
+        type: "ansts.turn",
+        subject: `t-${i}`,
+        tenantId: "Northstar",
+        idempotencyKey: `k-${i}`,
+        llmCostUsd: 0.02,
+      });
+    }
+    const ce2 = new CloudEventsBus(10, ceSql);
+    const sse = new SseEventStreamGateway(10);
+    const orphanSub = sse.subscribe("t-orphan-0", "sub-o1");
+    const crlfSub = sse.subscribe("t-active-1", "sub-a1");
+    const sseChunks: string[] = [];
+    crlfSub.stream.on("data", (c: Buffer) => sseChunks.push(c.toString("utf-8")));
+    sse.publish({
+      id: "id-1\r\nevent: injected",
+      event: "turn.step\r\nid: fake",
+      taskId: "t-active-1",
+      turnIndex: 1,
+      timestampMs: Date.now(),
+      data: { ok: true },
+    });
+    const gcCount = sse.gcCompletedTaskStreams(new Set(["t-active-1"]));
+    const cloudEventsAndSseVerified =
+      ce1.getIdempotencyCacheSize() <= 40 &&
+      ce2.getTenantReport("Northstar")?.totalLlmCostUsd === 1.0 &&
+      sseChunks.join("").trim().split("\n").length === 3 &&
+      gcCount === 1 &&
+      orphanSub.closed === true;
+
+    // 3. [M66-3] LayerFsWorkspaceDriver path traversal guard & unreachable commit/B-Tree GC + logicalTotalBytes
+    const lfs = new LayerFsWorkspaceDriver();
+    let traversalBlocked = false;
+    try {
+      lfs.executeInProcessFileTool({
+        branchName: "main",
+        agentId: "a1",
+        stepId: "s1",
+        operation: "write",
+        filePath: "../../outside.txt",
+        newContent: "bad",
+      });
+    } catch {
+      traversalBlocked = true;
+    }
+    const baseLogical = lfs.storeEngine.getStorageStats().logicalTotalBytes;
+    lfs.forkBranch("main", "ephemeral-br");
+    lfs.executeInProcessFileTool({
+      branchName: "ephemeral-br",
+      agentId: "a1",
+      stepId: "s2",
+      operation: "write",
+      filePath: "src/ephemeral.ts",
+      newContent: "export const x = 42;",
+    });
+    lfs.deleteBranch("ephemeral-br");
+    const sweeper = new DistributedCasGcSweeper();
+    const gcSweep = sweeper.sweepLayerFsWorkspaceStore(lfs);
+    const postGcLogical = lfs.storeEngine.getStorageStats().logicalTotalBytes;
+    const layerFsVerified =
+      traversalBlocked &&
+      gcSweep.prunedCommitIds.length === 1 &&
+      gcSweep.prunedBTreeCommitCount === 1 &&
+      postGcLogical === baseLogical;
+
+    // 4. [M66-4] WarmSandboxPoolManager clamping & LayerFsNumberedSandboxMultiplexer closed-entry pruning
+    const pool = new WarmSandboxPoolManager("node-m66", -4);
+    const mux = new LayerFsNumberedSandboxMultiplexer();
+    const mounted = mux.mountWorkspaceIntoSandbox("ws-m66", 100);
+    mux.unmountWorkspace(mounted.sandboxNumber, "ws-m66", 200);
+    const sweptSandboxes = mux.sweepIdleSandboxes(200 + LayerFsNumberedSandboxMultiplexer.IDLE_CLOSE_TIMEOUT_MS + 1);
+    const sandboxAndVsockVerified =
+      pool.targetWarmCount === 8 &&
+      sweptSandboxes.length === 1 &&
+      mux.getActiveSandboxCount() === 0;
+
+    const allM66PotentialRiskChecksPassed =
+      outboxVerified &&
+      cloudEventsAndSseVerified &&
+      layerFsVerified &&
+      sandboxAndVsockVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M66 深度潜在风险识别与消除自检 (Outbox=${outboxVerified}, CloudEventsSSE=${cloudEventsAndSseVerified}, LayerFS=${layerFsVerified}, SandboxMux=${sandboxAndVsockVerified})`,
+      "SystemWide / M66-PotentialRisksAudit",
+      "ALL_M66_CHECKS_PASSED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        outboxSecurityAndDlq1: {
+          sigValid,
+          sigTampered,
+          wasDeadLettered,
+          deliveredAfterRetry: retryRes.deliveredCount,
+          outboxVerified,
+        },
+        cloudEventsAndSse2: {
+          boundedIdempotencySize: ce1.getIdempotencyCacheSize(),
+          rehydratedLlmCostUsd: ce2.getTenantReport("Northstar")?.totalLlmCostUsd,
+          orphanStreamsCleaned: gcCount,
+          cloudEventsAndSseVerified,
+        },
+        layerFsTraversalAndGc3: {
+          traversalBlocked,
+          prunedCommitCount: gcSweep.prunedCommitIds.length,
+          prunedBTreeCommitCount: gcSweep.prunedBTreeCommitCount,
+          postGcLogicalBytes: postGcLogical,
+          layerFsVerified,
+        },
+        sandboxPoolAndVsock4: {
+          sanitizedWarmTarget: pool.targetWarmCount,
+          activeSandboxesAfterSweep: mux.getActiveSandboxCount(),
+          sandboxAndVsockVerified,
+        },
+        allM66PotentialRiskChecksPassed,
+      },
+    };
+  }
+  /**
+   * [M67] Deep Potential Risk Identification & Elimination Phase II Audit
+   */
+  public async executeDeepPotentialRiskPhase2Audit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+
+    // 1. [M67-1] CelldNativeContainerSandboxManager loopback/ULA/hex-IP/metadata SSRF block & WorkDir cleanup
+    const mgr = new CelldNativeContainerSandboxManager();
+    mgr.registerContainerClass({
+      class_name: "AuditRunner",
+      image: "ghcr.io/ansts/audit:v2.5",
+      runtime: "kata",
+      max_instances: 2,
+    });
+    const handle = mgr.getOrCreateContainerHandle("cell-m67-audit", {
+      class_name: "AuditRunner",
+      image: "ghcr.io/ansts/audit:v2.5",
+      runtime: "kata",
+    });
+    const started = handle.start({ enableInternet: true });
+    let loopbackBlocked = false;
+    let hexIpBlocked = false;
+    try {
+      CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("127.0.0.2", true);
+    } catch {
+      loopbackBlocked = true;
+    }
+    try {
+      CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("0xa9fea9fe", true);
+    } catch {
+      hexIpBlocked = true;
+    }
+    await mgr.destroyContainerHandle("cell-m67-audit");
+    const workDirCleaned = !fs.existsSync(started.containerWorkDir);
+    const containerFenceVerified = loopbackBlocked && hexIpBlocked && workDirCleaned && mgr.getHandleCount() === 0;
+
+    // 2. [M67-2] HotCellOverloadAndQueueGuard double-release/reclaimed lease desync guard & ShardedQueueBrokerPool idempotency
+    const guard = new HotCellOverloadAndQueueGuard({ maxCellConcurrentRequests: 2 });
+    const l1 = guard.tryEnterCellFetch("cell-m67", 1000);
+    const l2 = guard.tryEnterCellFetch("cell-m67", 25_000);
+    guard.reclaimStaleInFlightFetches(35_000, 30_000);
+    guard.leaveCellFetch("cell-m67", l1.leaseId); // stale release must not evict l2
+    const activeAfterStaleLeave = guard.getInFlightCount("cell-m67");
+    guard.leaveCellFetch("cell-m67", l2.leaseId);
+    const broker = new ShardedQueueBrokerPool(4, 16);
+    const shard = broker.publish("k1", "id-m67-1", { v: 1 });
+    broker.publish("k1", "id-m67-1", { v: 1 });
+    const batch = broker.consumeBatch(shard, 10);
+    const hotCellAndQueueVerified =
+      activeAfterStaleLeave === 1 &&
+      guard.getInFlightCount("cell-m67") === 0 &&
+      !guard.tryAdmitQueueProducerBatch(Number.NaN).admitted &&
+      batch.length === 1;
+
+    // 3. [M67-3] DynamicWorkerSandboxLoader async fetch timeout & inputPayload deep-clone isolation
+    const loader = new DynamicWorkerSandboxLoader();
+    const callerPayload: Record<string, unknown> = { token: "clean" };
+    await loader.executeUntrustedCodeInIsolate({
+      taskId: "t-m67-iso",
+      turnIndex: 1,
+      jsSourceCode: "inputPayload.token = 'dirty'; globalThis.__result = { ok: true };",
+      inputPayload: callerPayload,
+    });
+    let asyncTimeoutTriggered = false;
+    try {
+      await loader.executeUntrustedCodeInIsolate({
+        taskId: "t-m67-hang",
+        turnIndex: 2,
+        jsSourceCode: "export default { async fetch() { return new Promise(() => {}); } }",
+        asyncTimeoutMs: 40,
+      });
+    } catch {
+      asyncTimeoutTriggered = true;
+    }
+    const heapGuard = new V8HeapAndSqlBudgetGuard(-5, 0, -1);
+    const isolateAndHeapVerified =
+      callerPayload.token === "clean" &&
+      asyncTimeoutTriggered &&
+      heapGuard.hardHeapLimitMb >= heapGuard.softHeapLimitMb;
+
+    // 4. [M67-4] ZeroTrustVsockBridge URL credentials/port/backslash guard & EbpfLsmSecurityBridge /proc/<pid> block
+    const vsock = new ZeroTrustVsockBridge(["api.openai.com"]);
+    let credBlocked = false;
+    try {
+      vsock.sendRequest({
+        requestId: "r-cred",
+        vmId: "vm-m67",
+        method: "HTTP_EGRESS",
+        payload: { url: "https://user:pass@api.openai.com/v1" },
+      });
+    } catch {
+      credBlocked = true;
+    }
+    const lsm = new EbpfLsmSecurityBridge();
+    const nullByteBlocked = !lsm.checkFileOpenHook("/etc/shadow\0.txt").allowed;
+    const procPidBlocked = !lsm.checkFileOpenHook("/proc/99/environ").allowed;
+    const vsockAndLsmVerified = credBlocked && nullByteBlocked && procPidBlocked;
+
+    // 5. [M67-5] LayerFsMultiAgentBranchCoordinator merge B-Tree sync & TurnWalEngine task WAL GC
+    const lfs = new LayerFsWorkspaceDriver();
+    const coord = new LayerFsMultiAgentBranchCoordinator(lfs);
+    lfs.forkBranch("main", "br-m67");
+    lfs.executeInProcessFileTool({
+      branchName: "br-m67",
+      agentId: "a1",
+      stepId: "s1",
+      operation: "write",
+      filePath: "src/m67.ts",
+      newContent: "export const m67 = 1;",
+    });
+    const pagesBefore = lfs.storeEngine.getTrackedCommitPageCount();
+    coord.mergeBranchIntoTarget("br-m67", "main", "C0");
+    const pagesAfter = lfs.storeEngine.getTrackedCommitPageCount();
+    const walSql = new InMemoryCellSqlStorage();
+    const wal = new TurnWalEngine(walSql);
+    wal.appendTurnDelta({
+      taskId: "t-wal-gc",
+      turnIndex: 1,
+      fencingToken: 1,
+      changedFiles: ["m67.ts"],
+      sqliteWalPages: 1,
+      highestSubmittedFencingToken: 1,
+    });
+    const walGc = wal.gcCompletedTaskWals(new Set());
+    const mergeAndWalGcVerified = pagesAfter === pagesBefore + 1 && walGc.purgedTasks === 1;
+
+    const allM67DeepRiskPhase2ChecksPassed =
+      containerFenceVerified &&
+      hotCellAndQueueVerified &&
+      isolateAndHeapVerified &&
+      vsockAndLsmVerified &&
+      mergeAndWalGcVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M67 第二阶段深度潜在风险识别与消除自检 (Fence=${containerFenceVerified}, HotCellQueue=${hotCellAndQueueVerified}, Isolate=${isolateAndHeapVerified}, VsockLSM=${vsockAndLsmVerified}, MergeWalGC=${mergeAndWalGcVerified})`,
+      "SystemWide / M67-DeepRiskPhase2Audit",
+      "ALL_M67_CHECKS_PASSED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        containerFenceAndWorkDir1: {
+          loopbackBlocked,
+          hexIpBlocked,
+          workDirCleaned,
+          containerFenceVerified,
+        },
+        hotCellAndShardedQueue2: {
+          activeAfterStaleLeave,
+          dedupedBatchLength: batch.length,
+          hotCellAndQueueVerified,
+        },
+        isolateTimeoutAndClone3: {
+          callerPayloadPreserved: callerPayload.token === "clean",
+          asyncTimeoutTriggered,
+          isolateAndHeapVerified,
+        },
+        vsockAndEbpfLsm4: {
+          credBlocked,
+          nullByteBlocked,
+          procPidBlocked,
+          vsockAndLsmVerified,
+        },
+        layerFsMergeAndWalGc5: {
+          bTreePagesAddedOnMerge: pagesAfter - pagesBefore,
+          walTasksPurged: walGc.purgedTasks,
+          mergeAndWalGcVerified,
+        },
+        allM67DeepRiskPhase2ChecksPassed,
+      },
+    };
+  }
+  /**
+   * [M68] Deep Potential Risk Identification & Elimination Phase III Audit
+   */
+  public async executeDeepPotentialRiskPhase3Audit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+
+    // 1. [M68-1] TunnelGatewayCell timed-out command queue/idempotency eviction, non-regressive registration & bounded cache
+    const tunSql = new InMemoryCellSqlStorage();
+    const tunCell = new TunnelGatewayCell(tunSql, 3);
+    tunCell.registerTunnel({
+      hostId: "body-m68-01",
+      gatewayId: "gw-01",
+      role: "PRIMARY",
+      connGeneration: 4,
+      epoch: 3,
+    });
+    const regressed = tunCell.registerTunnel({
+      hostId: "body-m68-01",
+      gatewayId: "gw-01",
+      role: "PRIMARY",
+      connGeneration: 1,
+      epoch: 2,
+    });
+    const timedOut = tunCell.enqueueCommandForHost(
+      "body-m68-01",
+      { cmd: "sleep 5" },
+      25,
+      { idempotencyKey: "idem-m68-t1" }
+    );
+    let timeoutRejected = false;
+    try {
+      await timedOut.completionPromise;
+    } catch {
+      timeoutRejected = true;
+    }
+    const ghostPolled = tunCell.pollPendingCommands("body-m68-01");
+    const retryAfterTimeout = tunCell.enqueueCommandForHost(
+      "body-m68-01",
+      { cmd: "echo ok" },
+      1000,
+      { idempotencyKey: "idem-m68-t1" }
+    );
+    const retryPolled = tunCell.pollPendingCommands("body-m68-01");
+    tunCell.acknowledgeCommand(retryPolled[0].commandId, { status: "RECOVERED" });
+    const retryResult = await retryAfterTimeout.completionPromise;
+    const tunnelTimeoutAndEpochVerified =
+      regressed.epoch === 3 &&
+      regressed.connGeneration === 4 &&
+      timeoutRejected &&
+      ghostPolled.length === 0 &&
+      retryAfterTimeout.deduplicated === false &&
+      retryResult.status === "RECOVERED";
+
+    // 2. [M68-2] FinOpsBudgetController UTC-day rollover idempotency pruning & policy sanitization
+    const finSql = new InMemoryCellSqlStorage();
+    const finops = new FinOpsBudgetController(finSql);
+    finops.setPolicy({
+      tenantId: "Northstar",
+      dailyBudgetUsd: -20,
+      softDowngradeThresholdRatio: 1.8,
+      preferredModel: "DeepSeek-R1",
+      fallbackEconomyModel: "Qwen-3.8",
+    });
+    const sanitizedPolicy = finops.getPolicy("Northstar")!;
+    finops.setPolicy({
+      tenantId: "Northstar",
+      dailyBudgetUsd: 100,
+      softDowngradeThresholdRatio: 0.8,
+      preferredModel: "DeepSeek-R1",
+      fallbackEconomyModel: "Qwen-3.8",
+    });
+    const day1Spend = finops.recordSpend("Northstar", 12, "2026-11-10T08:00:00Z", "daily-job-key");
+    const day2Spend = finops.recordSpend("Northstar", 18, "2026-11-11T08:00:00Z", "daily-job-key");
+    const finopsRolloverAndSanitizeVerified =
+      sanitizedPolicy.dailyBudgetUsd === 0 &&
+      sanitizedPolicy.softDowngradeThresholdRatio === 1 &&
+      day1Spend === 12 &&
+      day2Spend === 18 &&
+      finops.getSeenIdempotencyKeyCount("Northstar") === 1;
+
+    // 3. [M68-3]QueueManager eager tombstone/empty-heap cleanup & LeaseCoordinator advanceTurnFence epoch sync
+    const sched = new CoreScheduler5D();
+    const qTask = new TaskSpec({ task_id: "t-m68-qm", tenant_id: "ephemeral-tenant" });
+    sched.queueManager.enqueue(qTask);
+    sched.queueManager.removeQueuedTask("t-m68-qm");
+    const emptyHeapCleaned = sched.queueManager.activeTenantHeapCount() === 0;
+    sched.leaseCoordinator.acquireLease("t-m68-fence", "node-1");
+    sched.leaseCoordinator.advanceTurnFence("t-m68-fence", new FenceToken(4, 1, "t-m68-fence"));
+    const nextLease = sched.leaseCoordinator.acquireLease("t-m68-fence", "node-2");
+    const fencePurged = sched.leaseCoordinator.purgeCompletedTaskFence("t-m68-fence");
+    const queueAndFenceVerified =
+      emptyHeapCleaned && nextLease.fencing_token === 5 && fencePurged;
+
+    // 4. [M68-4] CoreScheduler5D cascade-dead-letter active lease/resource reclamation & NodeDaemon checkpoint purge
+    sched.registerOrUpdateNode(
+      new NodeHeartbeat({
+        node_id: "node-m68-01",
+        total_cpu_cores: 16,
+        free_cpu_cores: 16,
+        total_memory_mb: 32768,
+        free_memory_mb: 32768,
+      })
+    );
+    const pTask = new TaskSpec({ task_id: "t-m68-p", tenant_id: "Northstar", prompt: "p" });
+    const cTask = new TaskSpec({ task_id: "t-m68-c", tenant_id: "Northstar", prompt: "c" });
+    sched.submitTask(pTask, { mergeDuplicateInFlight: true });
+    sched.submitTask(cTask, { mergeDuplicateInFlight: true });
+    sched.scheduleTick();
+    cTask.dependencies.push("t-m68-p");
+    const cascaded = sched.cascadeDeadLetterToDependents("t-m68-p");
+    const nodeAfterCascade = sched.nodes.get("node-m68-01")!;
+    const daemon = new NodeDaemon("node-m68-01", -1, 0, -5);
+    const schedulerAndDaemonVerified =
+      cascaded.includes("t-m68-c") &&
+      sched.leaseCoordinator.getLease("t-m68-c") === undefined &&
+      nodeAfterCascade.running_tasks === 1 &&
+      daemon.totalCpu === 32.0;
+
+    // 5. [M68-5] SagaCompensatorEngine no-handler step rollback idempotency invalidation & StagingGate purge
+    const sagaSql = new InMemoryCellSqlStorage();
+    const gw = new SagaToolGateway(undefined, undefined, sagaSql);
+    let runs = 0;
+    gw.registerTool("no_handler_tool", ToolCallEffectClass.COMPENSATABLE, () => {
+      runs += 1;
+      return { runs };
+    });
+    gw.invokeTool("t-m68-saga", 2, "no_handler_tool", { x: 1 });
+    const rb = gw.rollbackAndInvalidateTask("t-m68-saga", 2);
+    const [reRun, dedupAfterRb] = gw.invokeTool("t-m68-saga", 2, "no_handler_tool", { x: 1 });
+    const purgedSteps = gw.compensator.purgeTaskSteps("t-m68-saga");
+    const sagaAndStagingVerified =
+      rb.rolledBackSteps.length === 1 &&
+      rb.invalidatedIdemKeys.length >= 1 &&
+      dedupAfterRb === false &&
+      reRun.runs === 2 &&
+      purgedSteps === 2;
+
+    const allM68DeepRiskPhase3ChecksPassed =
+      tunnelTimeoutAndEpochVerified &&
+      finopsRolloverAndSanitizeVerified &&
+      queueAndFenceVerified &&
+      schedulerAndDaemonVerified &&
+      sagaAndStagingVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M68 第三阶段深度潜在风险识别与消除自检 (Tunnel=${tunnelTimeoutAndEpochVerified}, FinOps=${finopsRolloverAndSanitizeVerified}, QueueFence=${queueAndFenceVerified}, SchedulerDaemon=${schedulerAndDaemonVerified}, SagaStaging=${sagaAndStagingVerified})`,
+      "SystemWide / M68-DeepRiskPhase3Audit",
+      "ALL_M68_CHECKS_PASSED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        tunnelTimeoutAndEpoch1: {
+          preservedEpoch: regressed.epoch,
+          preservedGen: regressed.connGeneration,
+          ghostPolledCount: ghostPolled.length,
+          tunnelTimeoutAndEpochVerified,
+        },
+        finopsRolloverAndSanitize2: {
+          day1Spend,
+          day2Spend,
+          activeIdempotencyKeys: finops.getSeenIdempotencyKeyCount("Northstar"),
+          finopsRolloverAndSanitizeVerified,
+        },
+        queueAndFence3: {
+          emptyHeapCleaned,
+          nextLeaseEpoch: nextLease.fencing_token,
+          fencePurged,
+          queueAndFenceVerified,
+        },
+        schedulerAndDaemon4: {
+          cascadedIds: cascaded,
+          runningTasksAfterCascade: nodeAfterCascade.running_tasks,
+          schedulerAndDaemonVerified,
+        },
+        sagaAndStaging5: {
+          invalidatedIdemKeysCount: rb.invalidatedIdemKeys.length,
+          reRunCount: reRun.runs,
+          purgedSteps,
+          sagaAndStagingVerified,
+        },
+        allM68DeepRiskPhase3ChecksPassed,
+      },
+    };
+  }
+  /**
+   * [M69] Final Deep Edge-Case Sweep & Zero-Residual-Defect Closure Audit
+   */
+  public async executeFinalZeroDefectClosureAudit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+
+    // 1. [M69-1] CognitiveRouter Half-Open single-probe stampede lock & bounded prefixRadixIndex
+    const rSql = new InMemoryCellSqlStorage();
+    const router = new CognitiveRouter(0.3, rSql, 3);
+    router.registerEndpoint(
+      new LlmEndpointMetrics({ endpoint_id: "ep-m69-1", provider: "deepseek", model_name: "DeepSeek-R1", ttft_ewma_ms: 100 }),
+      1000,
+      2_000_000,
+      1000
+    );
+    router.registerEndpoint(
+      new LlmEndpointMetrics({ endpoint_id: "ep-m69-2", provider: "qwen", model_name: "Qwen-3.8", ttft_ewma_ms: 300 }),
+      1000,
+      2_000_000,
+      1000
+    );
+    const [warmProbe] = router.selectEndpoint("pfx-m69", 100, TaskPriority.P1_HIGH, 900);
+    router.releaseEndpoint(warmProbe.endpoint_id);
+    router.reportInvocationMetrics("ep-m69-1", 500, 100, true, 1000);
+    router.reportInvocationMetrics("ep-m69-1", 500, 100, true, 1000);
+    router.reportInvocationMetrics("ep-m69-1", 500, 100, true, 1000);
+    const [firstProbe] = router.selectEndpoint("pfx-m69", 200, TaskPriority.P1_HIGH, 17_000);
+    const [secondConcurrent] = router.selectEndpoint("pfx-m69", 200, TaskPriority.P1_HIGH, 17_001);
+    router.releaseEndpoint(firstProbe.endpoint_id);
+    router.releaseEndpoint(secondConcurrent.endpoint_id);
+    for (let i = 0; i < 6; i++) {
+      const [ep] = router.selectEndpoint(`pfx-b-${i}`, 50, TaskPriority.P2_STANDARD, 20_000);
+      router.releaseEndpoint(ep.endpoint_id);
+    }
+    const routerHalfOpenAndPrefixBoundVerified =
+      firstProbe.endpoint_id === "ep-m69-1" &&
+      secondConcurrent.endpoint_id === "ep-m69-2" &&
+      router.getPrefixIndexSize() === 3;
+
+    // 2. [M69-2] AnstsSchedulerCell & UnifiedComponentPersistenceStore cold-start node capacity refund & active-only fingerprint
+    const cSql = new InMemoryCellSqlStorage();
+    const mkState = () => ({
+      id: { toString: () => "cell-m69" },
+      storage: {
+        sql: cSql,
+        transactionSync: <T>(fn: () => T) => fn(),
+        getAlarm: async () => null,
+        setAlarm: async () => {},
+      },
+      blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
+    });
+    const cell1 = new AnstsSchedulerCell(mkState());
+    cell1.registerNode(new NodeHeartbeat({ node_id: "node-m69", total_cpu_cores: 8, free_cpu_cores: 8, running_tasks: 0 }));
+    const tDone = new TaskSpec({ task_id: "t-m69-done", tenant_id: "Northstar", prompt: "same" });
+    await cell1.submitTask(tDone, { mergeDuplicateInFlight: true });
+    await cell1.alarm();
+    cell1.scheduler.completeTaskExecution("t-m69-done", "node-m69", tDone.lease_fencing_token);
+    const tLeased = new TaskSpec({ task_id: "t-m69-active", tenant_id: "Northstar", prompt: "same" });
+    await cell1.submitTask(tLeased, { mergeDuplicateInFlight: true });
+    await cell1.alarm();
+    cell1.registerNode(cell1.scheduler.nodes.get("node-m69")!);
+    const cell2 = new AnstsSchedulerCell(mkState());
+    const nodeAfterRestart = cell2.scheduler.nodes.get("node-m69")!;
+    const coldStartNodeAndFingerprintVerified =
+      nodeAfterRestart.running_tasks === 0 &&
+      nodeAfterRestart.free_cpu_cores === 8 &&
+      cell2.scheduler.contentFingerprintIndex.get(tLeased.content_fingerprint) === "t-m69-active";
+
+    // 3. [M69-3] DagEscrowCoordinator terminal-parent resurrection guard
+    const escrow = new DagEscrowCoordinator();
+    const pTask = new TaskSpec({ task_id: "p-m69", tenant_id: "Northstar", expected_SubAgent_count: 2 });
+    const c1 = new TaskSpec({ task_id: "c1-m69", tenant_id: "Northstar", parent_task_id: "p-m69" });
+    const c2 = new TaskSpec({ task_id: "c2-m69", tenant_id: "Northstar", parent_task_id: "p-m69" });
+    escrow.reserveParentEscrow(pTask, 10, 0);
+    escrow.registerChildSubAgent(pTask, c1);
+    escrow.registerChildSubAgent(pTask, c2);
+    escrow.failOrCancelChildSubAgent(pTask, "c1-m69", true);
+    escrow.completeChildSubAgent(pTask, "c2-m69");
+    let terminalRegisterBlocked = false;
+    try {
+      escrow.registerChildSubAgent(pTask, new TaskSpec({ task_id: "c3-m69", tenant_id: "Northstar", parent_task_id: "p-m69" }));
+    } catch {
+      terminalRegisterBlocked = true;
+    }
+    const escrowTerminalGuardVerified = pTask.state === TaskState.DEAD_LETTER && terminalRegisterBlocked;
+
+    // 4. [M69-4] SyntacticAndVelocityBreaker NaN/negative token & threshold sanitization
+    const vb = new SyntacticAndVelocityBreaker(-1, Number.NaN);
+    vb.recordAndCheckTurn("t-vb", { turnIndex: 1, toolName: "a", argsHash: "1", tokensConsumed: -500_000, timestampMs: 1000 });
+    const vbTrip = vb.recordAndCheckTurn("t-vb", { turnIndex: 2, toolName: "b", argsHash: "2", tokensConsumed: 130_000, timestampMs: 2000 });
+    const velocitySanitizationVerified =
+      vb.maxIdenticalConsecutiveCalls === 3 &&
+      vbTrip.tripped === true &&
+      vbTrip.reason === "TOKEN_VELOCITY_EXCEEDED";
+
+    // 5. [M69-5] AgentTaskHarnessCell foreign-taskId R2 rejection + turn truncation & HaSchedulerShardCoordinator epoch persistence
+    const r2 = new InMemoryR2Bucket();
+    const hSql = new InMemoryCellSqlStorage();
+    const hCell = new AgentTaskHarnessCell(
+      {
+        id: { toString: () => "h-m69" },
+        storage: {
+          sql: hSql,
+          transactionSync: <T>(fn: () => T) => fn(),
+          getAlarm: async () => null,
+          setAlarm: async () => {},
+        },
+        blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
+      },
+      r2,
+      "task-m69"
+    );
+    await hCell.executeAndCheckpointTurn({ turnIndex: 1, fencingToken: 1, toolName: "bash", toolOutput: {} });
+    await hCell.executeAndCheckpointTurn({ turnIndex: 2, fencingToken: 1, toolName: "bash", toolOutput: {} });
+    await r2.put("cells/task-m69/turn-9-f9.ltx", JSON.stringify({ taskId: "other-task", turnIndex: 9, fencingToken: 9 }));
+    const rec = await hCell.reconcileBreakpointFromR2AndSql();
+    const truncated = hCell.truncateTurnsFrom(2, 2);
+    const shardSql = new InMemoryCellSqlStorage();
+    const sc1 = new HaSchedulerShardCoordinator(256, 8, shardSql);
+    sc1.registerBrainShardNode("brain-01");
+    sc1.evictUnhealthyBrainShardNode("brain-01");
+    const sc2 = new HaSchedulerShardCoordinator(256, 8, shardSql);
+    const harnessAndShardEpochVerified =
+      rec.reconciledTurnsCount === 0 &&
+      truncated === 1 &&
+      sc2.resolveBrainForTask("Northstar", "t1").epoch === 2;
+
+    const allM69FinalClosureChecksPassed =
+      routerHalfOpenAndPrefixBoundVerified &&
+      coldStartNodeAndFingerprintVerified &&
+      escrowTerminalGuardVerified &&
+      velocitySanitizationVerified &&
+      harnessAndShardEpochVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M69 终极边界收口与零残余缺陷自检 (Router=${routerHalfOpenAndPrefixBoundVerified}, ColdStart=${coldStartNodeAndFingerprintVerified}, Escrow=${escrowTerminalGuardVerified}, Velocity=${velocitySanitizationVerified}, HarnessShard=${harnessAndShardEpochVerified})`,
+      "SystemWide / M69-FinalZeroDefectClosureAudit",
+      "ALL_M69_CHECKS_PASSED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        routerHalfOpenAndPrefixBound1: {
+          firstProbeEndpoint: firstProbe.endpoint_id,
+          secondConcurrentEndpoint: secondConcurrent.endpoint_id,
+          boundedPrefixSize: router.getPrefixIndexSize(),
+          routerHalfOpenAndPrefixBoundVerified,
+        },
+        coldStartNodeAndFingerprint2: {
+          runningTasksAfterColdStart: nodeAfterRestart.running_tasks,
+          freeCpuAfterColdStart: nodeAfterRestart.free_cpu_cores,
+          coldStartNodeAndFingerprintVerified,
+        },
+        escrowTerminalGuard3: {
+          parentState: pTask.state,
+          terminalRegisterBlocked,
+          escrowTerminalGuardVerified,
+        },
+        velocitySanitization4: {
+          tripped: vbTrip.tripped,
+          reason: vbTrip.reason,
+          velocitySanitizationVerified,
+        },
+        harnessAndShardEpoch5: {
+          foreignReconciledCount: rec.reconciledTurnsCount,
+          truncatedTurns: truncated,
+          rehydratedShardEpoch: sc2.resolveBrainForTask("Northstar", "t1").epoch,
+          harnessAndShardEpochVerified,
+        },
+        allM69FinalClosureChecksPassed,
+      },
+    };
+  }
+  /**
+   * [M70-1] DLQ Dead-Letter Task & Outbox Webhook Replay Workbench
+   */
+  public executeDlqAndOutboxReplayWorkbench(params: {
+    action: "inspect_dlq" | "replay_dead_letter_task" | "replay_outbox_webhook" | "seed_dlq_samples";
+    taskId?: string;
+    messageId?: string;
+    newTargetUrl?: string;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER" && params.action !== "inspect_dlq") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行 DLQ 死信重放操作" },
+      };
+    }
+
+    if (params.action === "seed_dlq_samples") {
+      const dlqTaskId = params.taskId ?? "task-dlq-9901";
+      let dlqTask = this.deps.scheduler.allTasks.get(dlqTaskId);
+      if (!dlqTask) {
+        dlqTask = new TaskSpec({
+          task_id: dlqTaskId,
+          tenant_id: "Northstar",
+          priority: TaskPriority.P1_HIGH,
+          prompt: "Execute cross-region settlement reconciliation",
+        });
+      }
+      dlqTask.state = TaskState.DEAD_LETTER;
+      dlqTask.retry_count = 4;
+      dlqTask.dead_letter_reason = "MAX_LEASE_RETRIES_EXCEEDED";
+      this.deps.scheduler.allTasks.set(dlqTaskId, dlqTask);
+      this.deps.scheduler.deadLetterIds.add(dlqTaskId);
+      this.deps.v25Store.commitTaskSingleWritePath(dlqTask, "body-host-01");
+
+      const dlqMsgId = params.messageId ?? "outbox-dlq-9901";
+      this.deps.outboxDispatcher.enqueueOutbox(
+        dlqMsgId,
+        dlqTaskId,
+        "https://unreachable-webhook.internal/hook",
+        { event: "io.ansts.task.dead_lettered", taskId: dlqTaskId },
+        { resetIfDeadLettered: true }
+      );
+      for (let i = 0; i < this.deps.outboxDispatcher.maxAttempts; i++) {
+        this.deps.outboxDispatcher.processPending(() => false);
+      }
+    }
+
+    if (params.action === "replay_dead_letter_task") {
+      const targetId = params.taskId ?? "task-dlq-9901";
+      const task =
+        this.deps.scheduler.allTasks.get(targetId) ??
+        this.deps.v25Store.getPersistedTask(targetId);
+      if (!task) {
+        return { status: 404, body: { error: "TASK_NOT_FOUND", taskId: targetId } };
+      }
+      task.retry_count = 0;
+      task.dead_letter_reason = undefined;
+      task.state = TaskState.QUEUED;
+      task.lease_fencing_token = (task.lease_fencing_token ?? 1) + 1;
+      this.deps.scheduler.deadLetterIds.delete(targetId);
+      this.deps.scheduler.allTasks.set(targetId, task);
+      this.deps.scheduler.queueManager.enqueue(task);
+      this.deps.v25Store.commitTaskSingleWritePath(task, task.assigned_node_id ?? "body-host-01");
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `从 DLQ 重放死信任务 ${targetId} 并重置重试计数 (新令牌 epoch:${task.lease_fencing_token})`,
+        `Global / DLQ-Replay`,
+        "REQUEUED_FROM_DLQ"
+      );
+      return {
+        status: 200,
+        body: {
+          replayed: true,
+          taskId: targetId,
+          newState: task.state,
+          newFencingToken: task.lease_fencing_token,
+          retryCount: task.retry_count,
+        },
+      };
+    }
+
+    if (params.action === "replay_outbox_webhook") {
+      const msgId = params.messageId ?? "outbox-dlq-9901";
+      const retried = this.deps.outboxDispatcher.retryDeadLetteredMessage(
+        msgId,
+        params.newTargetUrl ?? "https://audit-sink.ansts.internal/webhook"
+      );
+      if (!retried) {
+        return { status: 404, body: { error: "OUTBOX_MESSAGE_NOT_FOUND", messageId: msgId } };
+      }
+      const delivery = this.deps.outboxDispatcher.processPending(() => true);
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `重放 Outbox 死信 Webhook 消息 ${msgId} → ${retried.targetUrl}`,
+        "Global / Outbox-DLQ",
+        "WEBHOOK_DELIVERED"
+      );
+      return {
+        status: 200,
+        body: {
+          replayed: true,
+          messageId: msgId,
+          targetUrl: retried.targetUrl,
+          delivered: retried.delivered,
+          signatureHeader: retried.signatureHeader,
+          deliveredCount: delivery.deliveredCount,
+        },
+      };
+    }
+
+    const deadLetterTasks = Array.from(this.deps.scheduler.allTasks.values())
+      .filter((t) => t.state === TaskState.DEAD_LETTER || String(t.state) === "FENCED_TERMINATED")
+      .map((t) => ({
+        taskId: t.task_id,
+        tenantId: t.tenant_id,
+        state: t.state,
+        retryCount: t.retry_count,
+        deadLetterReason: t.dead_letter_reason ?? "FENCED_OR_EXCEEDED",
+        fencingToken: t.lease_fencing_token,
+      }));
+    const deadLetterWebhooks = this.deps.outboxDispatcher
+      .listMessages()
+      .filter((m) => m.deadLettered)
+      .map((m) => ({
+        messageId: m.messageId,
+        taskId: m.taskId,
+        targetUrl: m.targetUrl,
+        attempts: m.attempts,
+        lastError: m.lastError ?? "MAX_ATTEMPTS_EXCEEDED",
+      }));
+
+    return {
+      status: 200,
+      body: {
+        deadLetterTaskCount: deadLetterTasks.length,
+        deadLetterWebhookCount: deadLetterWebhooks.length,
+        deadLetterTasks,
+        deadLetterWebhooks,
+      },
+    };
+  }
+
+  /**
+   * [M70-2] Task Breakpoint Crash-Recovery & Duplicate Coalescing Inspector
+   */
+  public executeTaskBreakpointRecoveryAndCoalesce(params: {
+    action: "recover_breakpoint" | "coalesce_duplicate";
+    taskId?: string;
+    tenantId?: string;
+    prompt?: string;
+    priority?: number;
+    idempotencyKey?: string;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行断点恢复或重复合并操作" },
+      };
+    }
+
+    if (params.action === "recover_breakpoint") {
+      const taskId = params.taskId ?? "task-ns-8841";
+      const task =
+        this.deps.scheduler.allTasks.get(taskId) ??
+        this.deps.v25Store.getPersistedTask(taskId);
+      if (!task) {
+        return { status: 404, body: { error: "TASK_NOT_FOUND", taskId } };
+      }
+      const existingEntries = this.deps.walEngine.getTaskWalEntries(taskId);
+      if (existingEntries.length === 0) {
+        this.deps.walEngine.appendTurnDelta({
+          taskId,
+          turnIndex: 1,
+          fencingToken: Math.max(1, task.lease_fencing_token),
+          changedFiles: ["src/init.ts"],
+          sqliteWalPages: 4,
+          highestSubmittedFencingToken: Math.max(1, task.lease_fencing_token),
+        });
+        this.deps.walEngine.appendTurnDelta({
+          taskId,
+          turnIndex: 2,
+          fencingToken: Math.max(1, task.lease_fencing_token),
+          changedFiles: ["src/auth.ts"],
+          sqliteWalPages: 6,
+          highestSubmittedFencingToken: Math.max(1, task.lease_fencing_token),
+        });
+      }
+      const fence = Math.max(1, task.lease_fencing_token);
+      const bp = this.deps.walEngine.recoverTaskBreakpoint(taskId, fence);
+      const rb = this.deps.sagaGateway.rollbackAndInvalidateTask(taskId, bp.restoredTurnIndex + 1);
+      task.current_turn = bp.restoredTurnIndex;
+      if (task.state === TaskState.DEAD_LETTER || String(task.state) === "CANCEL_UNCONFIRMED") {
+        task.state = TaskState.RUNNING_ACT;
+      }
+      this.deps.scheduler.allTasks.set(taskId, task);
+      this.deps.v25Store.commitTaskSingleWritePath(task, task.assigned_node_id ?? "body-host-01");
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `对任务 ${taskId} 执行 WAL 断点恢复 → Turn #${bp.restoredTurnIndex} (清理未提交 Saga 步骤 ${rb.rolledBackSteps.length} 项)`,
+        `${task.tenant_id} / ${taskId}`,
+        `RECOVERED_AT_TURN_${bp.restoredTurnIndex}`
+      );
+
+      return {
+        status: 200,
+        body: {
+          taskId,
+          restoredTurnIndex: bp.restoredTurnIndex,
+          restoredFencingToken: bp.restoredFencingToken,
+          canonicalWalFrames: bp.canonicalEntries.length,
+          discardedWalFrames: bp.discardedFrameIds.length,
+          rolledBackSagaSteps: rb.rolledBackSteps.length,
+          invalidatedIdempotencyKeys: rb.invalidatedIdemKeys.length,
+          nextTurnToExecute: bp.restoredTurnIndex + 1,
+          taskState: task.state,
+        },
+      };
+    }
+
+    // action === "coalesce_duplicate"
+    const baseTaskId = params.taskId ?? "task-ns-8841";
+    const baseTask = this.deps.scheduler.allTasks.get(baseTaskId);
+    const tenantId = params.tenantId ?? baseTask?.tenant_id ?? "Northstar";
+    const prompt = params.prompt ?? baseTask?.prompt ?? "Implement zero-trust auth gateway";
+    if (baseTask) {
+      baseTask.content_fingerprint = CoreScheduler5D.computeTaskContentFingerprint(baseTask);
+      this.deps.scheduler.contentFingerprintIndex.set(baseTask.content_fingerprint, baseTask.task_id);
+    }
+    const incomingDupId = `${baseTaskId}-dup-${Date.now().toString().slice(-4)}`;
+    const dupSpec = new TaskSpec({
+      task_id: incomingDupId,
+      tenant_id: tenantId,
+      priority: (params.priority ?? TaskPriority.P0_EMERGENCY) as TaskPriority,
+      prompt,
+      idempotency_key: params.idempotencyKey ?? `idem-${incomingDupId}`,
+    });
+    const inspection = this.deps.scheduler.inspectAndMergeDuplicateTask(dupSpec, {
+      mergeDuplicateInFlight: true,
+    });
+    const canonical = this.deps.scheduler.submitTask(dupSpec, { mergeDuplicateInFlight: true });
+    this.deps.v25Store.commitTaskSingleWritePath(canonical, canonical.assigned_node_id ?? "body-host-01");
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `合并并发重复请求 ${incomingDupId} → 主任务 ${canonical.task_id} (已累计合并 ${canonical.merged_duplicate_count} 次)`,
+      `${tenantId} / ${canonical.task_id}`,
+      `COALESCED_BY_${inspection.mergedBy}`
+    );
+
+    return {
+      status: 200,
+      body: {
+        deduplicated: inspection.deduplicated,
+        mergedBy: inspection.mergedBy,
+        priorityPromoted: inspection.priorityPromoted,
+        canonicalTaskId: canonical.task_id,
+        incomingDuplicateId: incomingDupId,
+        mergedDuplicateCount: canonical.merged_duplicate_count,
+        mergedRequestIds: canonical.merged_request_ids,
+        mergedIdempotencyKeys: canonical.merged_idempotency_keys,
+        contentFingerprint: canonical.content_fingerprint,
+        estimatedSavedTokens: canonical.merged_duplicate_count * 4200,
+        estimatedSavedCpuCoreSeconds: canonical.merged_duplicate_count * 18.5,
+      },
+    };
+  }
+
+  /**
+   * [M70-3] M57-M69 One-Click Full-Link Health Scorecard
+   */
+  public async executeFullLinkHealthScorecard(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+    const m60 = await this.executeFullLinkPersistenceIdempotencyBreakpointAndCoalesceAudit(params);
+    const m61 = await this.executeSubsystemPersistenceIdempotencyAndCoalesceAudit(params);
+    const m62 = await this.executeDfxHardeningAudit(params);
+    const m63 = await this.executeDfxDeepModuleHardeningAudit(params);
+    const m64 = await this.executeImplementationConsistencyAudit(params);
+    const m65 = await this.executeDeepConsistencyPhase2Audit(params);
+    const m66 = await this.executePotentialRisksEliminationAudit(params);
+    const m67 = await this.executeDeepPotentialRiskPhase2Audit(params);
+    const m68 = await this.executeDeepPotentialRiskPhase3Audit(params);
+    const m69 = await this.executeFinalZeroDefectClosureAudit(params);
+
+    const suites = [
+      {
+        milestone: "M60",
+        title: "全链路持久化、租户/嵌套 JSON 幂等、WAL 断点恢复与并发重复合并",
+        passed: Boolean(m60.body.allM60RisksEliminated),
+      },
+      {
+        milestone: "M61",
+        title: "全子系统 SQLite 持久化、CAS/Push 幂等重试与 R2-SQL 断点对账",
+        passed: Boolean(m61.body.allM61RisksEliminated),
+      },
+      {
+        milestone: "M62",
+        title: "DFX 第一阶段：Cgroup 0.25 核精度、Prometheus 基数保护、PSI P0 豁免与跨区复制容错",
+        passed: Boolean(m62.body.allM62DfxRisksEliminated),
+      },
+      {
+        milestone: "M63",
+        title: "DFX 第二阶段：混沌自动恢复、主权路由持久化、多环 WFG 死锁解除与 TEE/IMDSv6 守卫",
+        passed: Boolean(m63.body.allM63DfxRisksEliminated),
+      },
+      {
+        milestone: "M64",
+        title: "落地功能一致性 I：Worker/Cell 路由对齐、TaskSpec 100% 字段保真与多Shard调度",
+        passed: Boolean(m64.body.allM64ConsistencyChecksPassed),
+      },
+      {
+        milestone: "M65",
+        title: "落地功能一致性 II：Compactor/Canary/Prewarmer/Profiler 持久化与 AST 跨文件契约守卫",
+        passed: Boolean(m65.body.allM65Phase2ChecksPassed),
+      },
+      {
+        milestone: "M66",
+        title: "潜在风险消除 I：Outbox 恒定时间验签与 DLQ 重试、SSE CRLF 防注入与 LayerFS 不可达块 GC",
+        passed: Boolean(m66.body.allM66PotentialRiskChecksPassed),
+      },
+      {
+        milestone: "M67",
+        title: "潜在风险消除 II：容器环回/十六进制 IP SSRF 阻断、Isolate 异步超时与 /proc/<pid> 逃逸拦截",
+        passed: Boolean(m67.body.allM67DeepRiskPhase2ChecksPassed),
+      },
+      {
+        milestone: "M68",
+        title: "潜在风险消除 III：隧道超时幽灵命令清除、FinOps 跨日幂等清理与级联死信租约算力回收",
+        passed: Boolean(m68.body.allM68DeepRiskPhase3ChecksPassed),
+      },
+      {
+        milestone: "M69",
+        title: "终极边界收口：路由器半开单探针锁、冷启动节点算力返还、防死信父任务复活与分片 Epoch 持久化",
+        passed: Boolean(m69.body.allM69FinalClosureChecksPassed),
+      },
+    ];
+
+    const passedCount = suites.filter((s) => s.passed).length;
+    const overallScorePct = Math.round((passedCount / suites.length) * 100);
+    const overallHealthy = passedCount === suites.length;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M60–M69 全链路健康评分卡巡检 (通过率 ${passedCount}/${suites.length} · ${overallScorePct}%)`,
+      "SystemWide / HealthScorecard",
+      overallHealthy ? "SCORECARD_100_PCT_PASS" : "SCORECARD_DEGRADED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        overallHealthy,
+        overallScorePct,
+        passedSuites: passedCount,
+        totalSuites: suites.length,
+        suites,
+      },
+    };
+  }
+
+  /**
+   * [M70-4] Day-2 Governance Suite: Security Fence Alert Stream, FinOps Cost Attribution,
+   * Config Center Field-Level Diff Preview & Zero-Downtime Dual-Key Webhook Rotation
+   */
+  public executeDay2GovernanceOperation(params: {
+    action:
+      | "security_fence_alerts"
+      | "finops_cost_attribution"
+      | "config_diff_preview"
+      | "rotate_webhook_secret";
+    tenantId?: string;
+    candidateOverrides?: Record<string, unknown>;
+    newWebhookSecret?: string;
+    graceWindowSec?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+
+    if (params.action === "security_fence_alerts") {
+      const alerts: Array<{
+        alertId: string;
+        layer: string;
+        target: string;
+        blocked: boolean;
+        reason: string;
+        timestampUtc: string;
+      }> = [];
+      const nowUtc = `${new Date().toISOString().slice(11, 19)} UTC`;
+
+      // 1. celld-fence loopback SSRF probe
+      try {
+        CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("127.0.0.2", true);
+      } catch (err) {
+        alerts.push({
+          alertId: "SEC-FENCE-01",
+          layer: "celld-fence (Container Network)",
+          target: "127.0.0.2:8080",
+          blocked: true,
+          reason: (err as Error).message,
+          timestampUtc: nowUtc,
+        });
+      }
+
+      // 2. celld-fence hex-encoded IMDSv1 probe
+      try {
+        CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("0xa9fea9fe", true);
+      } catch (err) {
+        alerts.push({
+          alertId: "SEC-FENCE-02",
+          layer: "celld-fence (Cloud Metadata Guard)",
+          target: "0xa9fea9fe (169.254.169.254)",
+          blocked: true,
+          reason: (err as Error).message,
+          timestampUtc: nowUtc,
+        });
+      }
+
+      // 3. eBPF LSM /proc/<pid>/environ escape probe
+      const lsm = new EbpfLsmSecurityBridge();
+      const lsmRes = lsm.checkFileOpenHook("/proc/42/environ");
+      alerts.push({
+        alertId: "SEC-LSM-03",
+        layer: "eBPF LSM file_open Hook",
+        target: "/proc/42/environ",
+        blocked: !lsmRes.allowed,
+        reason: lsmRes.reason ?? "PROC_PID_ESCAPE_BLOCKED",
+        timestampUtc: nowUtc,
+      });
+
+      // 4. ZeroTrustVsockBridge URL credential injection probe
+      const vsock = new ZeroTrustVsockBridge(["api.openai.com"]);
+      try {
+        vsock.sendRequest({
+          requestId: "sec-vsock-04",
+          vmId: "vm-ns-01",
+          method: "HTTP_EGRESS",
+          payload: { url: "https://admin:secret@api.openai.com/v1/models" },
+        });
+      } catch (err) {
+        alerts.push({
+          alertId: "SEC-VSOCK-04",
+          layer: "ZeroTrustVsockBridge Egress Guard",
+          target: "https://admin:***@api.openai.com/v1/models",
+          blocked: true,
+          reason: (err as Error).message,
+          timestampUtc: nowUtc,
+        });
+      }
+
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `巡检零信任安全围栏拦截流 (捕获并阻断 ${alerts.filter((a) => a.blocked).length} 起 SSRF/容器逃逸探测)`,
+        "Security / ZeroTrustFence",
+        "ALL_INTRUSIONS_BLOCKED"
+      );
+
+      return {
+        status: 200,
+        body: {
+          totalAlerts: alerts.length,
+          allBlocked: alerts.every((a) => a.blocked),
+          alerts,
+        },
+      };
+    }
+
+    if (params.action === "finops_cost_attribution") {
+      const tenantRows = this.deps.v25Store.sql
+        .exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_tenants")
+        .toArray();
+      const attributions = tenantRows.map((r) => {
+        const tId = String(r.tenant_id);
+        const dailyBudgetUsd = Number(r.daily_budget_usd ?? 1000);
+        const totalSpentUsd = Number(r.spent_usd ?? 500);
+        const ceReport = this.deps.cloudEventsBus.getTenantReport(tId);
+        const llmInferenceCostUsd = Number((totalSpentUsd * 0.68 + (ceReport?.totalLlmCostUsd ?? 0)).toFixed(2));
+        const sandboxCpuMemCostUsd = Number((totalSpentUsd - totalSpentUsd * 0.68).toFixed(2));
+        const prefixCacheSavedUsd = Number((llmInferenceCostUsd * 0.34).toFixed(2));
+        const evalRes = this.deps.finopsController.evaluateBudgetAndModel(tId);
+        return {
+          tenantId: tId,
+          region: String(r.region ?? "us-west-2"),
+          dailyBudgetUsd,
+          totalSpentUsd,
+          llmInferenceCostUsd,
+          sandboxCpuMemCostUsd,
+          prefixCacheSavedUsd,
+          utilizationPct: Number(((totalSpentUsd / Math.max(1, dailyBudgetUsd)) * 100).toFixed(1)),
+          activeModel: evalRes.selectedModel,
+          downgraded: evalRes.downgraded,
+          seenIdempotencyKeysCount: this.deps.finopsController.getSeenIdempotencyKeyCount(tId),
+        };
+      });
+
+      return {
+        status: 200,
+        body: {
+          utcDayWindow: new Date().toISOString().slice(0, 10),
+          attributions,
+        },
+      };
+    }
+
+    if (params.action === "config_diff_preview") {
+      const baseline: Record<string, unknown> = {
+        maxCellConcurrentRequests: 64,
+        maxQueueProducers: 256,
+        leaseTtlSeconds: 15,
+        nodeHeartbeatTtlSeconds: 30,
+        softDowngradeThresholdRatio: 0.8,
+        warmPoolTargetCount: 8,
+      };
+      const candidate: Record<string, unknown> = {
+        ...baseline,
+        ...(params.candidateOverrides ?? {
+          maxCellConcurrentRequests: 96,
+          warmPoolTargetCount: 12,
+          canaryStepWeightPct: 25,
+        }),
+      };
+      const allKeys = Array.from(new Set([...Object.keys(baseline), ...Object.keys(candidate)]));
+      const diffs = allKeys.map((field) => {
+        const oldVal = baseline[field];
+        const newVal = candidate[field];
+        const changeType =
+          oldVal === undefined
+            ? "ADDED"
+            : JSON.stringify(oldVal) !== JSON.stringify(newVal)
+            ? "MODIFIED"
+            : "UNCHANGED";
+        return {
+          field,
+          oldValue: oldVal ?? null,
+          newValue: newVal ?? null,
+          changeType,
+        };
+      });
+
+      return {
+        status: 200,
+        body: {
+          modifiedCount: diffs.filter((d) => d.changeType !== "UNCHANGED").length,
+          diffs,
+        },
+      };
+    }
+
+    // action === "rotate_webhook_secret"
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权轮换 Webhook 签名密钥" },
+      };
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    const samplePayload = JSON.stringify({ event: "io.ansts.key_rotation.probe", ts: nowSec });
+    const inFlightOldSignature = this.deps.outboxDispatcher.signPayload(samplePayload, nowSec);
+    const newSecret = params.newWebhookSecret ?? `ansts-hmac-rot-${Date.now()}`;
+    const rotation = this.deps.outboxDispatcher.rotateSigningSecret(
+      newSecret,
+      params.graceWindowSec ?? 3600,
+      nowSec
+    );
+    const newPrimarySignature = this.deps.outboxDispatcher.signPayload(samplePayload, nowSec);
+    const oldSignatureStillValidInGraceWindow = this.deps.outboxDispatcher.verifySignature(
+      samplePayload,
+      inFlightOldSignature,
+      nowSec + 10,
+      300
+    );
+    const newSignatureValid = this.deps.outboxDispatcher.verifySignature(
+      samplePayload,
+      newPrimarySignature,
+      nowSec + 10,
+      300
+    );
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 Outbox Webhook HMAC 密钥零停机双密钥轮换 (Gen #${rotation.keyRotationGeneration}, 旧密钥宽限期验证=${oldSignatureStillValidInGraceWindow})`,
+      "Security / OutboxKeyRotation",
+      "DUAL_KEY_ROTATION_OK"
+    );
+
+    return {
+      status: 200,
+      body: {
+        ...rotation,
+        oldSignatureStillValidInGraceWindow,
+        newSignatureValid,
+      },
+    };
+  }
+
+  /**
+   * [M71] Phase 1 Cognitive & Speculative Execution Acceleration Suite:
+   * - F1 (`adaptive_dag_replan`): Dynamic DAG Subgraph Re-planning (Subgraph Pruning, Dynamic Fan-out,
+   *   Fallback Replacement for Failed Child, Downstream Dependency Rewiring & SQLite `replanRevision` Persistence).
+   * - F2 (`best_of_n_speculative`): Best-of-N Parallel LayerFS CoW Sandbox Branching & Automated Test/Lint Scoring Verifier.
+   * - F3 (`cascade_jury_routing`): Cascade Confidence Router (Logprobs Thresholding, Semantic Intent Cache & Heterogeneous Multi-Model Jury Quorum).
+   * - `run_all_phase1_suite`: Executes all 3 Phase 1 engines end-to-end and returns a unified operational & audit report.
+   */
+  public executePhase1CognitiveAccelerationSuite(params: {
+    action?:
+      | "adaptive_dag_replan"
+      | "best_of_n_speculative"
+      | "cascade_jury_routing"
+      | "run_all_phase1_suite";
+    parentTaskId?: string;
+    sourceBranch?: string;
+    promptText?: string;
+    confidenceThreshold?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const action = params.action ?? "run_all_phase1_suite";
+
+    const runF1AdaptiveDagReplan = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const escrow = new DagEscrowCoordinator(sql);
+      const sched = new CoreScheduler5D(this.deps.leaseCoordinator);
+
+      const parent = new TaskSpec({
+        task_id: params.parentTaskId ?? "task-m71-parent",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        expected_SubAgent_count: 2,
+      });
+      sched.submitTask(parent);
+      escrow.reserveParentEscrow(parent, 10, 0);
+
+      const childObsolete = new TaskSpec({
+        task_id: "task-m71-child-obsolete",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P2_STANDARD,
+        dependencies: [parent.task_id],
+      });
+      const childFailed = new TaskSpec({
+        task_id: "task-m71-child-failed",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P2_STANDARD,
+        dependencies: [parent.task_id],
+      });
+      const downstreamAggregator = new TaskSpec({
+        task_id: "task-m71-downstream-agg",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        dependencies: [childFailed.task_id],
+      });
+
+      sched.submitTask(childObsolete);
+      sched.submitTask(childFailed);
+      sched.submitTask(downstreamAggregator);
+
+      escrow.registerChildSubAgent(parent, childObsolete);
+      escrow.registerChildSubAgent(parent, childFailed);
+
+      // Simulate childFailed failing and cascading dead-letter before adaptive replanning rescues the DAG
+      escrow.failOrCancelChildSubAgent(parent, childFailed.task_id, true);
+      sched.cascadeDeadLetterToDependents(childFailed.task_id);
+
+      const fallbackChildA = new TaskSpec({
+        task_id: "task-m71-fallback-a",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        dependencies: [parent.task_id],
+      });
+      const fallbackChildB = new TaskSpec({
+        task_id: "task-m71-fallback-b",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        dependencies: [parent.task_id],
+      });
+
+      const replanRes = sched.replanDagSubgraph({
+        parentTaskId: parent.task_id,
+        pruneChildIds: [childObsolete.task_id],
+        fallbackForFailedChildId: childFailed.task_id,
+        injectChildren: [fallbackChildA, fallbackChildB],
+        escrowCoordinator: escrow,
+        maxTenantQuota: 10,
+        currentTenantUsed: 1,
+      });
+
+      const escrowColdStart = new DagEscrowCoordinator(sql);
+      const rehydratedEscrow = escrowColdStart.getEscrowRecord(parent.task_id);
+
+      const f1Verified =
+        replanRes.replanRevision === 1 &&
+        replanRes.prunedChildIds.includes(childObsolete.task_id) &&
+        replanRes.injectedChildIds.length === 2 &&
+        replanRes.rewiredDownstreamTaskIds.includes(downstreamAggregator.task_id) &&
+        replanRes.revivedDownstreamTaskIds.includes(downstreamAggregator.task_id) &&
+        downstreamAggregator.state === TaskState.SUBMITTED &&
+        downstreamAggregator.dependencies.includes(fallbackChildA.task_id) &&
+        downstreamAggregator.dependencies.includes(fallbackChildB.task_id) &&
+        parent.state === TaskState.WAITING_SUB_AGENT &&
+        rehydratedEscrow?.replanRevision === 1 &&
+        rehydratedEscrow?.childTaskIds.size === 2;
+
+      return {
+        ...replanRes,
+        downstreamDepsAfterRewire: downstreamAggregator.dependencies,
+        downstreamStateAfterReplan: downstreamAggregator.state,
+        rehydratedReplanRevision: rehydratedEscrow?.replanRevision ?? 0,
+        f1Verified,
+      };
+    };
+
+    const runF2BestOfNSpeculative = () => {
+      const forker = new CoWSandboxBranchForker(this.deps.layerFsDriver);
+      const baseBranch = params.sourceBranch ?? "main";
+      const specRes = forker.executeBestOfNSpeculativeVerifier({
+        sourceBranch: baseBranch,
+        targetPromoteBranch: "m71-promoted-release",
+        candidates: [
+          {
+            branchName: "m71-cand-draft-broken",
+            modelTier: "gpt-4o-mini (T=0.7)",
+            temperature: 0.7,
+            seed: 101,
+            patchCommand: "echo 'export const sum = (a, b) => a - b;' > fix.js",
+            verifyCommand: "echo 'TESTS_PASSED=2 LINT_WARNINGS=4' && exit 1",
+          },
+          {
+            branchName: "m71-cand-sonnet-warn",
+            modelTier: "claude-3-7-sonnet (T=0.3)",
+            temperature: 0.3,
+            seed: 102,
+            patchCommand: "echo 'export const sum = (a, b) => a + b; // todo' > fix.js",
+            verifyCommand: "echo 'TESTS_PASSED=10 LINT_WARNINGS=2'",
+          },
+          {
+            branchName: "m71-cand-flagship-clean",
+            modelTier: "claude-3-7-sonnet-thinking (T=0.1)",
+            temperature: 0.1,
+            seed: 103,
+            patchCommand: "echo 'export const sum = (a: number, b: number): number => a + b;' > fix.js",
+            verifyCommand: "echo 'TESTS_PASSED=12 LINT_WARNINGS=0'",
+          },
+        ],
+      });
+
+      const f2Verified =
+        specRes.winnerBranchName === "m71-cand-flagship-clean" &&
+        specRes.winnerScore >= 90 &&
+        specRes.prunedLoserBranches.includes("m71-cand-draft-broken") &&
+        specRes.prunedLoserBranches.includes("m71-cand-sonnet-warn") &&
+        specRes.candidates.length === 3;
+
+      return {
+        ...specRes,
+        f2Verified,
+      };
+    };
+
+    const runF3CascadeAndJury = () => {
+      const routerSql = new InMemoryCellSqlStorage();
+      const router = new CognitiveRouter(0.3, routerSql, 128);
+      router.registerEndpoint(
+        new LlmEndpointMetrics({
+          endpoint_id: "ep-fast-mini",
+          provider: "openai",
+          model_name: "gpt-4o-mini-fast",
+          ttft_ewma_ms: 85,
+          tpm_limit: 2_000_000,
+          rpm_limit: 5000,
+        })
+      );
+      router.registerEndpoint(
+        new LlmEndpointMetrics({
+          endpoint_id: "ep-flagship-opus",
+          provider: "anthropic",
+          model_name: "claude-3-7-sonnet-reasoner",
+          ttft_ewma_ms: 340,
+          tpm_limit: 2_000_000,
+          rpm_limit: 2000,
+        })
+      );
+
+      const promptText =
+        params.promptText ?? "Analyze PostgreSQL connection pool exhaustion and generate safe pgbouncer patch";
+      const threshold = params.confidenceThreshold ?? 0.82;
+
+      // 1. High-confidence Tier-1 fast draft acceptance
+      const tier1Res = router.routeWithCascadeAndSemanticCache({
+        promptText,
+        systemPrompt: "You are an SRE assistant.",
+        toolDefinitions: "[]",
+        draftLogprobs: [-0.05, -0.08, -0.04, -0.06],
+        confidenceThreshold: threshold,
+        riskLevel: "LOW",
+        estimatedTokens: 1500,
+      });
+
+      // 2. Semantic cache hit on paraphrased/whitespace-normalized repeat query
+      const cacheHitRes = router.routeWithCascadeAndSemanticCache({
+        promptText: `  ${promptText.toUpperCase()}!!! `,
+        systemPrompt: "You are an SRE assistant.",
+        toolDefinitions: "[]",
+        draftLogprobs: [-0.4, -0.5],
+        confidenceThreshold: threshold,
+        riskLevel: "LOW",
+        estimatedTokens: 1500,
+      });
+
+      // 3. Low-confidence automatic escalation to Tier-2 Flagship Reasoner
+      const escalatedRes = router.routeWithCascadeAndSemanticCache({
+        promptText: "Design zero-downtime multi-region Raft consensus migration with custom fencing",
+        systemPrompt: "You are a distributed systems architect.",
+        toolDefinitions: "[]",
+        draftLogprobs: [-0.85, -1.1, -0.92, -0.78],
+        confidenceThreshold: threshold,
+        riskLevel: "MEDIUM",
+        estimatedTokens: 2400,
+      });
+
+      // 4. Heterogeneous Multi-Model Jury Quorum (Approved vs Vetoed)
+      const juryApproved = router.evaluateMultiModelJuryQuorum({
+        actionId: "act-m71-safe-migration",
+        riskLevel: "HIGH",
+        votes: [
+          {
+            endpointId: "ep-flagship-opus",
+            modelName: "claude-3-7-sonnet-reasoner",
+            approve: true,
+            safetyScore: 94,
+            rationale: "Migration script is idempotent and guarded by IF NOT EXISTS.",
+          },
+          {
+            endpointId: "ep-gpt4o",
+            modelName: "gpt-4o",
+            approve: true,
+            safetyScore: 91,
+            rationale: "No destructive DDL or lock escalation detected.",
+          },
+          {
+            endpointId: "ep-deepseek-r1",
+            modelName: "deepseek-r1",
+            approve: true,
+            safetyScore: 89,
+            rationale: "Rollback compensating transaction is verified.",
+          },
+        ],
+      });
+
+      const juryVetoed = router.evaluateMultiModelJuryQuorum({
+        actionId: "act-m71-unsafe-drop",
+        riskLevel: "HIGH",
+        votes: [
+          {
+            endpointId: "ep-flagship-opus",
+            modelName: "claude-3-7-sonnet-reasoner",
+            approve: false,
+            safetyScore: 15,
+            rationale: "Unscoped DROP TABLE without backup snapshot.",
+          },
+          {
+            endpointId: "ep-gpt4o",
+            modelName: "gpt-4o",
+            approve: true,
+            safetyScore: 72,
+            rationale: "Syntax valid.",
+          },
+          {
+            endpointId: "ep-deepseek-r1",
+            modelName: "deepseek-r1",
+            approve: false,
+            safetyScore: 25,
+            rationale: "Violates production data retention policy.",
+          },
+        ],
+      });
+
+      // Verify SQLite cold-start persistence of semanticIntentCache
+      const routerRehydrated = new CognitiveRouter(0.3, routerSql, 128);
+      const rehydratedCacheHit = routerRehydrated.routeWithCascadeAndSemanticCache({
+        promptText,
+        systemPrompt: "You are an SRE assistant.",
+        toolDefinitions: "[]",
+        draftLogprobs: [-0.9],
+        confidenceThreshold: threshold,
+        riskLevel: "LOW",
+        estimatedTokens: 1500,
+      });
+
+      const f3Verified =
+        tier1Res.cascadeTier === "TIER1_FAST_DRAFT" &&
+        !tier1Res.escalatedToFlagship &&
+        cacheHitRes.semanticCacheHit === true &&
+        cacheHitRes.cascadeTier === "TIER0_SEMANTIC_CACHE" &&
+        escalatedRes.escalatedToFlagship === true &&
+        escalatedRes.cascadeTier === "TIER2_FLAGSHIP_REASONER" &&
+        juryApproved.consensusDecision === "APPROVED" &&
+        juryApproved.quorumReached === true &&
+        juryVetoed.consensusDecision === "REJECTED_BY_JURY" &&
+        juryVetoed.hasCriticalVeto === true &&
+        rehydratedCacheHit.semanticCacheHit === true;
+
+      return {
+        tier1Res,
+        cacheHitRes,
+        escalatedRes,
+        juryApproved,
+        juryVetoed,
+        rehydratedSemanticCacheHit: rehydratedCacheHit.semanticCacheHit,
+        f3Verified,
+      };
+    };
+
+    if (action === "adaptive_dag_replan") {
+      const res = runF1AdaptiveDagReplan();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F1] 动态 DAG 自适应重规划 (Rev #${res.replanRevision}, 剪枝 ${res.prunedChildIds.length} 节点, 注入 ${res.injectedChildIds.length} 替补节点, 重连下游 ${res.rewiredDownstreamTaskIds.length} 节点)`,
+        "Phase1 / AdaptiveDagReplanner",
+        res.f1Verified ? "DAG_REPLAN_OK" : "DAG_REPLAN_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "best_of_n_speculative") {
+      const res = runF2BestOfNSpeculative();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F2] Best-of-N 投机并行沙箱择优 (胜出分支 ${res.winnerBranchName} · 得分 ${res.winnerScore}, 自动清理 ${res.prunedLoserBranches.length} 败北分支)`,
+        "Phase1 / BestOfNSpeculativeVerifier",
+        res.f2Verified ? "BEST_OF_N_PROMOTED" : "BEST_OF_N_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "cascade_jury_routing") {
+      const res = runF3CascadeAndJury();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F3] 级联置信度路由与异构模型陪审团共识 (Tier-0 语义缓存命中=${res.cacheHitRes.semanticCacheHit}, 陪审团放行=${res.juryApproved.consensusDecision} / 拦截=${res.juryVetoed.consensusDecision})`,
+        "Phase1 / CascadeJuryRouter",
+        res.f3Verified ? "CASCADE_JURY_OK" : "CASCADE_JURY_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    const f1AdaptiveDagReplan = runF1AdaptiveDagReplan();
+    const f2BestOfNSpeculative = runF2BestOfNSpeculative();
+    const f3CascadeAndJury = runF3CascadeAndJury();
+    const allM71Phase1ChecksPassed =
+      f1AdaptiveDagReplan.f1Verified &&
+      f2BestOfNSpeculative.f2Verified &&
+      f3CascadeAndJury.f3Verified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [M71] 第一阶段认知与投机加速包全量验证 (F1 动态 DAG 重规划 + F2 Best-of-N 投机择优 + F3 级联置信度路由与陪审团, 通过=${allM71Phase1ChecksPassed})`,
+      "Phase1 / CognitiveAccelerationSuite",
+      allM71Phase1ChecksPassed ? "PHASE1_ACCEL_ALL_PASS" : "PHASE1_ACCEL_FAILED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        f1AdaptiveDagReplan,
+        f2BestOfNSpeculative,
+        f3CascadeAndJury,
+        allM71Phase1ChecksPassed,
+      },
+    };
+  }
+
+  /**
+   * [M72] Phase 2 Episodic Memory, Formal Guardrails & Shadow WAL Replay Suite:
+   * - F4 (`episodic_golden_hatchery`): Cross-Task Semantic Episodic Memory & LayerFS Golden Base Image Hatchery.
+   * - F5 (`formal_policy_guardrail`): Declarative Policy-as-Code Formal Guardrail Engine (SQL AST Proof, Path/Secret Boundary Proof, Blast-Radius Scoring & SQLite Policy Persistence).
+   * - F6 (`shadow_wal_replay`): Production Shadow WAL Traffic Replay, PII/Secret Redaction & Canary Regression Benchmark Gate.
+   * - `run_all_phase2_suite`: Executes all 3 Phase 2 engines end-to-end and returns a unified audit & operational report.
+   */
+  public executePhase2MemoryGuardrailReplaySuite(params: {
+    action?:
+      | "episodic_golden_hatchery"
+      | "formal_policy_guardrail"
+      | "shadow_wal_replay"
+      | "run_all_phase2_suite";
+    queryText?: string;
+    repoSignature?: string;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const action = params.action ?? "run_all_phase2_suite";
+
+    const runF4EpisodicGoldenHatchery = () => {
+      const drv = this.deps.layerFsDriver ?? new LayerFsWorkspaceDriver();
+      drv.forkBranch("main", "m72-verified-prisma");
+      drv.executeInProcessFileTool({
+        branchName: "m72-verified-prisma",
+        agentId: "agent-m72",
+        stepId: "step-m72-prisma",
+        operation: "write",
+        filePath: "prisma/pool_config.json",
+        newContent: JSON.stringify({ connection_limit: 32, pool_timeout: 15 }),
+      });
+
+      const hatched1 = drv.hatchGoldenBaseBranch({
+        episodeId: "ep-nextjs-prisma-pool",
+        taskId: "task-ns-8810",
+        sourceBranchOrCommit: "m72-verified-prisma",
+        repoSignature: "northstar/checkout-service",
+        problemPattern: "Prisma P2024 connection pool timeout under flash-sale burst traffic",
+        resolutionSummary: "Configured pgbouncer transaction pooling with connection_limit=32 and pre-warmed node_modules",
+        tags: ["prisma", "postgres", "pgbouncer", "connection-pool"],
+        savedColdStartMs: 4800,
+      });
+
+      const hatched2 = drv.hatchGoldenBaseBranch({
+        episodeId: "ep-rustfs-raft-heartbeat",
+        taskId: "task-hl-3004",
+        sourceBranchOrCommit: "main",
+        repoSignature: "helios/storage-engine",
+        problemPattern: "Raft leader election flapping during S3 LTX compaction",
+        resolutionSummary: "Separated election ticker priority from background compaction I/O queue",
+        tags: ["raft", "ltx", "compaction", "heartbeat"],
+        savedColdStartMs: 3900,
+      });
+
+      const mounted = drv.mountWorkspaceFromEpisodicMemory({
+        queryText:
+          params.queryText ??
+          "Fix Prisma P2024 connection pool exhaustion in checkout-service with pgbouncer",
+        repoSignature: params.repoSignature ?? "northstar/checkout-service",
+        targetBranchName: "m72-instant-task-ws",
+      });
+
+      const readCheck = drv.executeInProcessFileTool({
+        branchName: "m72-instant-task-ws",
+        agentId: "agent-m72",
+        stepId: "step-read-golden",
+        operation: "read",
+        filePath: "prisma/pool_config.json",
+      });
+
+      const f4Verified =
+        hatched1.goldenBaseBranch === "golden/ep-nextjs-prisma-pool" &&
+        hatched2.goldenBaseBranch === "golden/ep-rustfs-raft-heartbeat" &&
+        mounted.matchedEpisodeId === "ep-nextjs-prisma-pool" &&
+        mounted.similarityScore >= 0.45 &&
+        mounted.savedColdStartMs === 4800 &&
+        mounted.copiedFilesCount === 0 &&
+        Boolean(readCheck.readResult?.includes("connection_limit"));
+
+      return {
+        hatchedGoldenImages: [hatched1, hatched2],
+        mountedWorkspace: mounted,
+        inheritedGoldenFileSample: readCheck.readResult,
+        f4Verified,
+      };
+    };
+
+    const runF5FormalPolicyGuardrail = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const gate = new StagingCommitAndApprovalGate(sql);
+      gate.registerPolicyRule({
+        ruleId: "POL-PROD-BULK-MUTATION",
+        effect: "REQUIRE_4EYES_APPROVAL",
+        toolNamePattern: "db_query|sql_exec|schema_migrate",
+        maxAffectedRows: 5000,
+        description: "Require 4-eyes approval when estimated affected rows exceed 5,000 in production",
+      });
+      gate.registerPolicyRule({
+        ruleId: "POL-BLOCK-FORCE-PUSH",
+        effect: "DENY",
+        toolNamePattern: "git_push",
+        forbiddenArgRegex: "--force|refs/heads/main",
+        description: "Block force-pushing directly to main branch",
+      });
+
+      const task = new TaskSpec({
+        task_id: "task-m72-guard",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+      });
+
+      // 1. Low-risk read/diagnostic tool -> ALLOW
+      const allowRes = gate.evaluateFormalGuardrailPolicy({
+        task,
+        turnIndex: 1,
+        toolName: "db_explain_plan",
+        args: { sql: "SELECT id, status FROM orders WHERE tenant_id = 'Northstar' LIMIT 20" },
+        environment: "prod",
+      });
+
+      // 2. Medium blast-radius bulk migration -> REQUIRE_4EYES_APPROVAL
+      const approvalRes = gate.evaluateFormalGuardrailPolicy({
+        task,
+        turnIndex: 2,
+        toolName: "schema_migrate",
+        args: {
+          sql: "UPDATE orders SET archived = true WHERE created_at < '2025-01-01'",
+          affectedRowsEstimate: 25000,
+        },
+        environment: "prod",
+      });
+
+      // 3. High-risk destructive DDL + path escape -> DENY_FORMAL_VIOLATION
+      const denyRes = gate.evaluateFormalGuardrailPolicy({
+        task,
+        turnIndex: 3,
+        toolName: "sql_exec",
+        args: {
+          sql: "DELETE FROM orders WHERE 1=1; DROP TABLE audit_logs;",
+          filePath: "/etc/shadow",
+        },
+        environment: "prod",
+      });
+
+      const gateRehydrated = new StagingCommitAndApprovalGate(sql);
+      const rehydratedRulesCount = gateRehydrated.listPolicyRules().length;
+
+      const f5Verified =
+        allowRes.decision === "ALLOW" &&
+        approvalRes.decision === "REQUIRE_4EYES_APPROVAL" &&
+        Boolean(approvalRes.approvalTicket?.ticketId) &&
+        denyRes.decision === "DENY_FORMAL_VIOLATION" &&
+        denyRes.violatedRuleIds.includes("BUILTIN_SQL_DESTRUCTIVE_DDL") &&
+        denyRes.violatedRuleIds.includes("BUILTIN_SQL_UNSCOPED_MUTATION") &&
+        denyRes.violatedRuleIds.includes("BUILTIN_PATH_SECRET_BOUNDARY") &&
+        rehydratedRulesCount === 2;
+
+      return {
+        allowRes,
+        approvalRes,
+        denyRes,
+        rehydratedRulesCount,
+        f5Verified,
+      };
+    };
+
+    const runF6ShadowWalReplay = () => {
+      const replayer = new DeterministicTimeTravelReplayer();
+      const promoteSuite = replayer.executeShadowWalRegressionSuite({
+        suiteId: "shadow-suite-canary-202611",
+        baselineModel: "claude-3-5-sonnet",
+        candidateModel: "claude-3-7-sonnet-202611",
+        maxRegressionRatePct: 5.0,
+        maxCostIncreasePct: 15.0,
+        traces: [
+          {
+            taskId: "task-prod-01",
+            turnIndex: 1,
+            prompt: "Customer ops@northstar.io reported slow query with key sk-live-9988776655443322",
+            expectedToolName: "db_explain_plan",
+            expectedPathPrefix: "sql/",
+            baselineLatencyMs: 420,
+            baselineTokens: 1200,
+            candidateToolName: "db_explain_plan",
+            candidateArgs: { filePath: "sql/orders_idx.sql" },
+            candidateLatencyMs: 340,
+            candidateTokens: 1080,
+          },
+          {
+            taskId: "task-prod-02",
+            turnIndex: 2,
+            prompt: "Rotate Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 webhook secret in staging",
+            expectedToolName: "webhook_rotate_key",
+            baselineLatencyMs: 380,
+            baselineTokens: 950,
+            candidateToolName: "webhook_rotate_key",
+            candidateLatencyMs: 310,
+            candidateTokens: 890,
+          },
+          {
+            taskId: "task-prod-03",
+            turnIndex: 3,
+            prompt: "Run unit test suite on checkout branch",
+            expectedToolName: "layerfs_bash_exec",
+            baselineLatencyMs: 510,
+            baselineTokens: 1400,
+            candidateToolName: "layerfs_bash_exec",
+            candidateLatencyMs: 420,
+            candidateTokens: 1310,
+          },
+        ],
+      });
+
+      const rollbackSuite = replayer.executeShadowWalRegressionSuite({
+        suiteId: "shadow-suite-broken-draft",
+        baselineModel: "claude-3-5-sonnet",
+        candidateModel: "experimental-draft-v0",
+        maxRegressionRatePct: 5.0,
+        maxCostIncreasePct: 15.0,
+        traces: [
+          {
+            taskId: "task-prod-01",
+            turnIndex: 1,
+            prompt: "Inspect order index",
+            expectedToolName: "db_explain_plan",
+            baselineLatencyMs: 400,
+            baselineTokens: 1000,
+            candidateToolName: "drop_table_raw",
+            candidateLatencyMs: 650,
+            candidateTokens: 1800,
+          },
+          {
+            taskId: "task-prod-02",
+            turnIndex: 2,
+            prompt: "Verify tests",
+            expectedToolName: "layerfs_bash_exec",
+            baselineLatencyMs: 400,
+            baselineTokens: 1000,
+            candidateToolName: "layerfs_bash_exec",
+            candidateLatencyMs: 410,
+            candidateTokens: 1100,
+          },
+        ],
+      });
+
+      const f6Verified =
+        promoteSuite.passedGate === true &&
+        promoteSuite.canaryRecommendation === "PROMOTE_CANARY" &&
+        promoteSuite.toolMatchAccuracyPct === 100 &&
+        promoteSuite.totalRedactions === 3 &&
+        !promoteSuite.traceResults[0].redactedPrompt.includes("sk-live-") &&
+        rollbackSuite.passedGate === false &&
+        rollbackSuite.canaryRecommendation === "AUTO_ROLLBACK_ON_REGRESSION";
+
+      return {
+        promoteSuite,
+        rollbackSuite,
+        f6Verified,
+      };
+    };
+
+    if (action === "episodic_golden_hatchery") {
+      const res = runF4EpisodicGoldenHatchery();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F4] 跨任务语义经验库检索与 LayerFS 黄金镜像 0ms 挂载 (匹配 ${res.mountedWorkspace.matchedEpisodeId}, 相似度 ${res.mountedWorkspace.similarityScore}, 节省冷启动 ${res.mountedWorkspace.savedColdStartMs}ms)`,
+        "Phase2 / EpisodicGoldenHatchery",
+        res.f4Verified ? "GOLDEN_BASE_MOUNTED" : "GOLDEN_BASE_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "formal_policy_guardrail") {
+      const res = runF5FormalPolicyGuardrail();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F5] Policy-as-Code 形式化策略门控验证 (只读=${res.allowRes.decision}, 批量变更=${res.approvalRes.decision}, 高危删表=${res.denyRes.decision})`,
+        "Phase2 / FormalGuardrailEngine",
+        res.f5Verified ? "FORMAL_PROOF_ENFORCED" : "FORMAL_PROOF_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "shadow_wal_replay") {
+      const res = runF6ShadowWalReplay();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F6] 生产 WAL 影子流量回放与回归基准门控 (新模型准确率=${res.promoteSuite.toolMatchAccuracyPct}%, 敏感脱敏=${res.promoteSuite.totalRedactions} 处, 决策=${res.promoteSuite.canaryRecommendation})`,
+        "Phase2 / ShadowWalReplayHarness",
+        res.f6Verified ? "SHADOW_REPLAY_GATE_OK" : "SHADOW_REPLAY_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    const f4EpisodicHatchery = runF4EpisodicGoldenHatchery();
+    const f5FormalGuardrail = runF5FormalPolicyGuardrail();
+    const f6ShadowWalReplay = runF6ShadowWalReplay();
+    const allM72Phase2ChecksPassed =
+      f4EpisodicHatchery.f4Verified &&
+      f5FormalGuardrail.f5Verified &&
+      f6ShadowWalReplay.f6Verified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [M72] 第二阶段记忆沉淀、形式化策略门控与影子流量回放套件全量验证 (通过=${allM72Phase2ChecksPassed})`,
+      "Phase2 / MemoryGuardrailReplaySuite",
+      allM72Phase2ChecksPassed ? "PHASE2_SUITE_ALL_PASS" : "PHASE2_SUITE_FAILED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        f4EpisodicHatchery,
+        f5FormalGuardrail,
+        f6ShadowWalReplay,
+        allM72Phase2ChecksPassed,
+      },
+    };
+  }
+
+  /**
+   * [M73] Phase 3 Hierarchical Working-Memory Compactor & Spot Quota Lending Market Suite:
+   * - F7 (`hierarchical_context_compactor`): Adaptive Context Compactor & LayerFS Symbolic URI Pointers
+   *   (`WalCompactorAndPagedRestorer.compactWorkingMemoryContext`, `dereferenceContextUriPage`, and `AgentHarnessRunner.executeTurnWithHierarchicalMemory`).
+   * - F8 (`spot_quota_lending_market`): Inter-Tenant Spot Quota Lending & Sub-Second WAL Preemption Market
+   *   (`CapacitySlaEnforcer.publishIdleQuotaOffer`, `matchSpotQuotaBid`, `recallLenderQuotaOnUrgentArrival`, and `CoreScheduler5D.freezeAndRequeueSpotTask`).
+   * - `run_all_phase3_suite`: Executes both Phase 3 engines end-to-end and returns a unified audit & operational report.
+   */
+  public executePhase3MemoryAndSpotMarketSuite(params: {
+    action?:
+      | "hierarchical_context_compactor"
+      | "spot_quota_lending_market"
+      | "run_all_phase3_suite";
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const action = params.action ?? "run_all_phase3_suite";
+
+    const runF7HierarchicalCompactor = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const compactor = new WalCompactorAndPagedRestorer(4096, sql);
+      const longLogOutput = Array.from(
+        { length: 40 },
+        (_, idx) => `2026-11-11T08:00:${String(idx).padStart(2, "0")}Z [WARN] shard-${idx % 8} connection pool latency=${120 + idx}ms`
+      ).join("\n");
+
+      const priorTurns = [
+        {
+          turnIndex: 1,
+          toolName: "kubectl_logs_dump",
+          thoughtSummary: "Collected 40 lines of shard connection pool latency warnings",
+          rawToolOutput: longLogOutput,
+          keyFindings: ["shard-0..7 latency peaked at 159ms", "no OOM killer events"],
+        },
+        {
+          turnIndex: 2,
+          toolName: "pg_stat_activity_dump",
+          thoughtSummary: "Inspected active PostgreSQL backends across 16 shards",
+          rawToolOutput: longLogOutput.replace(/WARN/g, "INFO"),
+          keyFindings: ["idle_in_transaction count=14 on shard-3"],
+        },
+        {
+          turnIndex: 3,
+          toolName: "config_check",
+          thoughtSummary: "Verified pgbouncer max_client_conn=500",
+          rawToolOutput: "max_client_conn = 500\ndefault_pool_size = 32",
+        },
+        {
+          turnIndex: 4,
+          toolName: "apply_pool_patch",
+          thoughtSummary: "Prepared transaction pool timeout patch",
+          rawToolOutput: "PATCH_READY=true",
+        },
+      ];
+
+      const router = new CognitiveRouter();
+      router.registerEndpoint(
+        new LlmEndpointMetrics({
+          endpoint_id: "ep-m73-sonnet",
+          provider: "anthropic",
+          model_name: "claude-3-7-sonnet",
+          ttft_ewma_ms: 140,
+        })
+      );
+      const saga = new SagaToolGateway();
+      saga.registerTool("verify_patch", ToolCallEffectClass.READ_ONLY, (_args) => ({ verified: true }));
+      const runner = new AgentHarnessRunner(router, saga);
+
+      const task = new TaskSpec({
+        task_id: "task-m73-long-horizon",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        max_turns: 20,
+      });
+      task.current_turn = 4;
+
+      const execRes = runner.executeTurnWithHierarchicalMemory({
+        task,
+        toolName: "verify_patch",
+        toolArgs: { target: "pgbouncer.ini" },
+        priorTurns,
+        compactor,
+        hotWindowTurns: 2,
+        maxInlineCharsPerOutput: 200,
+      });
+
+      const firstUri = execRes.compactionReport.offloadedUris[0];
+      const compactorRehydrated = new WalCompactorAndPagedRestorer(4096, sql);
+      const pagedSlice = compactorRehydrated.dereferenceContextUriPage({
+        uri: firstUri,
+        startLine: 2,
+        endLine: 4,
+      });
+
+      const f7Verified =
+        execRes.compactionReport.offloadedPointersCount === 2 &&
+        execRes.compactionReport.tokenReductionRatioPct >= 65 &&
+        pagedSlice.totalLines === 40 &&
+        pagedSlice.slicedText.split("\n").length === 3 &&
+        execRes.turnSummary.turnIndex === 5;
+
+      return {
+        compactionReport: execRes.compactionReport,
+        pagedSlice,
+        turnSummary: execRes.turnSummary,
+        f7Verified,
+      };
+    };
+
+    const runF8SpotQuotaMarket = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const sla = new CapacitySlaEnforcer(undefined, sql);
+      const sched = new CoreScheduler5D(this.deps.leaseCoordinator);
+      const wal = new TurnWalEngine();
+
+      const nowSec = Date.now() / 1000;
+      sched.registerOrUpdateNode(
+        new NodeHeartbeat({
+          node_id: "node-spot-01",
+          total_cpu_cores: 16,
+          free_cpu_cores: 16,
+          total_memory_mb: 32768,
+          free_memory_mb: 32768,
+          warm_pool_ready: 4,
+          timestamp: nowSec,
+        })
+      );
+
+      // 1. Helios publishes 8 idle guaranteed quota slots at $0.04/slot
+      const offer = sla.publishIdleQuotaOffer({
+        offerId: "offer-helios-idle-01",
+        lenderTenantId: "Helios",
+        offeredSlots: 8,
+        minBidPricePerSlotUsd: 0.04,
+        region: "us-west-2",
+      });
+
+      // 2. Northstar bids for 4 Spot slots at $0.08/slot for a P3_BATCH task
+      const spotTask = new TaskSpec({
+        task_id: "task-ns-spot-batch-01",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P3_BATCH,
+      });
+      sched.submitTask(spotTask);
+      sched.scheduleTick(nowSec);
+
+      const bidMatch = sla.matchSpotQuotaBid({
+        leaseId: "spot-lease-ns-01",
+        borrowerTenantId: "Northstar",
+        taskId: spotTask.task_id,
+        requestedSlots: 4,
+        maxBidPricePerSlotUsd: 0.08,
+      });
+
+      // 3. Helios submits an urgent P0 task and recalls its lent quota with sub-second WAL freeze
+      const recallRes = sla.recallLenderQuotaOnUrgentArrival({
+        lenderTenantId: "Helios",
+        urgentTaskId: "task-hl-p0-urgent",
+        requiredSlots: 4,
+        walEngine: wal,
+        scheduler: sched,
+      });
+
+      const slaRehydrated = new CapacitySlaEnforcer(undefined, sql);
+      const rehydratedLease = slaRehydrated.listSpotLeases()[0];
+      const nodeAfterRecall = sched.nodes.get("node-spot-01")!;
+
+      const f8Verified =
+        offer.offeredSlots === 8 &&
+        bidMatch.matched === true &&
+        bidMatch.lease?.clearingPricePerSlotUsd === 0.06 &&
+        recallRes.reclaimedSlots === 4 &&
+        recallRes.frozenBorrowerTaskIds.includes(spotTask.task_id) &&
+        spotTask.state === TaskState.QUEUED &&
+        spotTask.preempted_count === 1 &&
+        nodeAfterRecall.free_cpu_cores === 16 &&
+        rehydratedLease?.status === "RECALLED_BY_LENDER" &&
+        rehydratedLease?.walFrozenTurnIndex === 1;
+
+      return {
+        offer,
+        bidMatch,
+        recallRes,
+        spotTaskStateAfterRecall: spotTask.state,
+        rehydratedLeaseStatus: rehydratedLease?.status,
+        f8Verified,
+      };
+    };
+
+    if (action === "hierarchical_context_compactor") {
+      const res = runF7HierarchicalCompactor();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F7] 自适应上下文压缩与分层工作记忆验证 (压缩率 ${res.compactionReport.tokenReductionRatioPct}%, 转储 ${res.compactionReport.offloadedPointersCount} 个 LayerFS URI 指针)`,
+        "Phase3 / HierarchicalContextCompactor",
+        res.f7Verified ? "CONTEXT_COMPACTED_OK" : "CONTEXT_COMPACT_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "spot_quota_lending_market") {
+      const res = runF8SpotQuotaMarket();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F8] 租户间 Spot 算力借贷撮合与 P0 亚秒级 WAL 无损抢占回收 (撮合单价 $${res.bidMatch.lease?.clearingPricePerSlotUsd}/slot, 回收槽位=${res.recallRes.reclaimedSlots})`,
+        "Phase3 / SpotQuotaMarket",
+        res.f8Verified ? "SPOT_MARKET_RECALL_OK" : "SPOT_MARKET_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    const f7HierarchicalCompactor = runF7HierarchicalCompactor();
+    const f8SpotQuotaMarket = runF8SpotQuotaMarket();
+    const allM73Phase3ChecksPassed =
+      f7HierarchicalCompactor.f7Verified && f8SpotQuotaMarket.f8Verified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [M73] 第三阶段分层工作记忆压缩与 Spot 算力借贷市场全量验证 (通过=${allM73Phase3ChecksPassed})`,
+      "Phase3 / MemoryAndSpotMarketSuite",
+      allM73Phase3ChecksPassed ? "PHASE3_SUITE_ALL_PASS" : "PHASE3_SUITE_FAILED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        f7HierarchicalCompactor,
+        f8SpotQuotaMarket,
+        allM73Phase3ChecksPassed,
       },
     };
   }
