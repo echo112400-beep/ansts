@@ -1,9 +1,34 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.A2aWaitForGraphDeadlockDetector = void 0; /**
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.A2aWaitForGraphDeadlockDetector = void 0;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/**
  * @fileoverview M23, M52-3 & M63-4: A2A Wait-For Graph (WFG) Cycle & Priority-Aware Distributed Deadlock Resolver
  * with Iterative Multi-Cycle Resolution & Self-Wait Edge Detection.
  */
 class A2aWaitForGraphDeadlockDetector {
   edges = new Map();
+  agentVectorClocks = new Map();
+  messageHistory = [];
 
   addWaitEdge(waiterAgentId, holderAgentId) {
     let targets = this.edges.get(waiterAgentId);
@@ -106,6 +131,103 @@ class A2aWaitForGraphDeadlockDetector {
       victimAgentId: evictedVictims[0] ?? null,
       evictedVictims,
       cyclePath: firstCyclePath
+    };
+  }
+
+  /**
+   * [M74-3 / N3] Updates an agent's local Lamport/Vector Clock on local event or message receipt:
+   * V_i[i] = V_i[i] + 1, and V_i[k] = max(V_i[k], V_msg[k]).
+   */
+  advanceAgentVectorClock(
+  agentId,
+  receivedClock)
+  {
+    const cur = { ...(this.agentVectorClocks.get(agentId) ?? { [agentId]: 0 }) };
+    cur[agentId] = (cur[agentId] ?? 0) + 1;
+    if (receivedClock) {
+      for (const [k, v] of Object.entries(receivedClock)) {
+        cur[k] = Math.max(cur[k] ?? 0, v);
+      }
+    }
+    this.agentVectorClocks.set(agentId, cur);
+    return { ...cur };
+  }
+
+  getAgentVectorClock(agentId) {
+    return { ...(this.agentVectorClocks.get(agentId) ?? { [agentId]: 0 }) };
+  }
+
+  recordCausalMessage(event) {
+    this.messageHistory.push(event);
+    this.advanceAgentVectorClock(event.senderAgentId, event.vectorClock);
+    if (event.recipientAgentId) {
+      this.advanceAgentVectorClock(event.recipientAgentId, event.vectorClock);
+    }
+  }
+
+  /**
+   * [M74-3 / N3] Compares two vector clocks: returns -1 if a happens-before b (a < b),
+   * 1 if b happens-before a (b < a), 0 if identical, or null if concurrent (incomparable).
+   */
+  static compareVectorClocks(a, b) {
+    const allKeys = Array.from(new Set([...Object.keys(a), ...Object.keys(b)]));
+    let aGreater = false;
+    let bGreater = false;
+    for (const k of allKeys) {
+      const va = a[k] ?? 0;
+      const vb = b[k] ?? 0;
+      if (va > vb) aGreater = true;
+      if (vb > va) bGreater = true;
+    }
+    if (!aGreater && !bGreater) return 0;
+    if (aGreater && !bGreater) return 1;
+    if (bGreater && !aGreater) return -1;
+    return null; // concurrent
+  }
+
+  /**
+   * [M74-3 / N3] Computes and verifies a Distributed Consistent Cut across multi-agent swarms:
+   * A cut C is causally consistent iff for every message m, if receive(m) in C,
+   * then send(m) in C (no message is received before it is sent).
+   */
+  captureDistributedConsistentCut(params)
+
+
+  {
+    const participatingAgents = Object.keys(params.agentCutTurns);
+    const cutVectorClock = {};
+    for (const ag of participatingAgents) {
+      const clk = this.getAgentVectorClock(ag);
+      for (const [k, v] of Object.entries(clk)) {
+        cutVectorClock[k] = Math.max(cutVectorClock[k] ?? 0, v);
+      }
+    }
+
+    const violatedCausalInversions = [];
+    for (const msg of this.messageHistory) {
+      if (
+      msg.recipientAgentId &&
+      params.agentCutTurns[msg.recipientAgentId] !== undefined &&
+      params.agentCutTurns[msg.senderAgentId] !== undefined)
+      {
+        const receivedAtCut = msg.logicalTurn <= params.agentCutTurns[msg.recipientAgentId];
+        const sentAtCut = msg.logicalTurn <= params.agentCutTurns[msg.senderAgentId];
+        if (receivedAtCut && !sentAtCut) {
+          violatedCausalInversions.push(
+          `Orphan message '${msg.eventId}': received by ${msg.recipientAgentId} at turn <= ${params.agentCutTurns[msg.recipientAgentId]}, but sender ${msg.senderAgentId} cut at earlier turn ${params.agentCutTurns[msg.senderAgentId]}`);
+
+        }
+      }
+    }
+
+    const isCausallyConsistent = violatedCausalInversions.length === 0;
+    return {
+      cutId: params.cutId,
+      participatingAgents,
+      cutVectorClock,
+      isCausallyConsistent,
+      cutTurnsByAgent: { ...params.agentCutTurns },
+      violatedCausalInversions
     };
   }
 }exports.A2aWaitForGraphDeadlockDetector = A2aWaitForGraphDeadlockDetector;

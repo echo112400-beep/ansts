@@ -1439,6 +1439,9 @@
             <button type="button" class="small" data-action="open-shadow-wal-replay">[F6] 生产 WAL 影子回放</button>
             <button type="button" class="small" data-action="open-context-compactor">[F7] 分层工作记忆压缩</button>
             <button type="button" class="small" data-action="open-spot-quota-market">[F8] Spot 算力借贷市场</button>
+<button type="button" class="small" data-action="open-contract-net">[N1] Swarm 协同竞标</button>
+            <button type="button" class="small" data-action="open-bft-consensus">[N2] BFT 黑板共识与语义合并</button>
+            <button type="button" class="small" data-action="open-causal-vector-cut">[N3] 因果一致性割截</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -2489,6 +2492,67 @@
       state.lastApiOutput = JSON.stringify(d, null, 2);
       await fetchBackendState();
       showToast("已将并发重复请求 " + (d.incomingDuplicateId || "dup") + " 合并至 " + (d.canonicalTaskId || "task-ns-8841") + " (累计合并 ×" + (d.mergedDuplicateCount || 1) + "，节省 " + (d.estimatedSavedTokens || 4200) + " Tokens)");
+      return;
+    }
+        if (action === "open-contract-net") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-swarm-governance", {
+        action: "contract_net_bidding",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const win = d.winningBid || {};
+      openDialog(
+        "[N1] Contract-Net 多智能体竞标协议 (POST /v1beta1/management/ops/phase1-swarm-governance)",
+        "<div><strong>中标智能体：</strong> <span class=\"status-pill ok\">" + (win.agentId || "agent-expert-secops") + "</span> (综合效用分：<code class=\"mono\">" + (win.finalUtilityScore || 91.5) + "</code> / 100)</div>" +
+        "<div style=\"margin-top:6px;\"><strong>报价明细：</strong> 预算报价 <code class=\"mono\">$" + (win.bidCostUsd || 0.45) + "</code> · 预估时延 <code class=\"mono\">" + (win.bidLatencyMs || 3200) + "ms</code> · 专家置信度 <code class=\"mono\">" + (win.confidence || 0.95) + "</code></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">竞标池参与者总数：<code class=\"mono\">" + (d.totalBidsEvaluated || 3) + "</code> 位 · SLA 过滤通过率：<code class=\"mono\">" + (d.conformingBidsCount || 2) + "/" + (d.totalBidsEvaluated || 3) + "</code></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-bft-consensus") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-swarm-governance", {
+        action: "bft_blackboard_and_semantic_merge",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const c = d.consensusResult || {};
+      const sc = d.semanticConflictResult || {};
+      openDialog(
+        "[N2] 声誉加权 BFT 黑板共识与代码语义合并 (POST /v1beta1/management/ops/phase1-swarm-governance)",
+        "<div><strong>黑板 CAS 状态：</strong> <span class=\"status-pill " + (c.accepted ? "ok" : "err") + "\">" + (c.accepted ? "COMMITTED" : "REJECTED") + "</span> · 声誉达成率：<code class=\"mono\">" + (c.reputationAchievedPct || 85.0) + "%</code> (&ge; " + (c.quorumThresholdPct || 66.7) + "%)</div>" +
+        "<div style=\"margin-top:6px;\"><strong>权威智能体否决权检查：</strong> <code class=\"mono\">" + (c.vetoedByCore ? "VETOED" : "ZERO-VETO PASSED") + "</code></div>" +
+        "<div style=\"margin-top:6px;\"><strong>AST 语义导出符号冲突检查：</strong> <span class=\"status-pill " + (sc.hasConflict ? "warn" : "ok") + "\">" + (sc.hasConflict ? "CONFLICT DETECTED" : "CLEAN EXPORT MERGE") + "</span> (冲突重叠导出符：<code class=\"mono\">" + ((sc.conflictingExports || []).join(", ") || "none") + "</code>)</div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-causal-vector-cut") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-swarm-governance", {
+        action: "causal_vector_clock_cut",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const cut = d.consistentCut || {};
+      openDialog(
+        "[N3] 向量时钟因果屏障与全局一致性割截 (POST /v1beta1/management/ops/phase1-swarm-governance)",
+        "<div><strong>全局一致性割截状态：</strong> <span class=\"status-pill " + (cut.isConsistent ? "ok" : "err") + "\">" + (cut.isConsistent ? "CONSISTENT CUT VALIDATED" : "INCONSISTENT CUT") + "</span></div>" +
+        "<div style=\"margin-top:6px;\"><strong>孤儿消息 (Orphan Messages) 检查：</strong> 发现 <code class=\"mono\">" + ((cut.orphanMessageIds || []).length) + "</code> 条因果倒置孤儿消息</div>" +
+        "<div style=\"margin-top:6px;\"><strong>割截向量快照：</strong> <pre class=\"mono\" style=\"margin-top:4px;padding:6px;background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:4px;font-size:11px;\">" + JSON.stringify(cut.cutVectorClocks || {}, null, 2) + "</pre></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
       return;
     }
     if (action === "open-context-compactor") {

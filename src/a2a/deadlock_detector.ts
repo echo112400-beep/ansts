@@ -1,9 +1,34 @@
+
+export type VectorClock = Record<string, number>;
+
+export interface CausalMessageEvent {
+  eventId: string;
+  senderAgentId: string;
+  recipientAgentId?: string;
+  vectorClock: VectorClock;
+  payloadType: string;
+  logicalTurn: number;
+  payloadDigest: string;
+  timestampMs: number;
+}
+
+export interface DistributedConsistentCut {
+  cutId: string;
+  participatingAgents: string[];
+  cutVectorClock: VectorClock;
+  isCausallyConsistent: boolean;
+  cutTurnsByAgent: Record<string, number>;
+  violatedCausalInversions: string[];
+}
+
 /**
  * @fileoverview M23, M52-3 & M63-4: A2A Wait-For Graph (WFG) Cycle & Priority-Aware Distributed Deadlock Resolver
  * with Iterative Multi-Cycle Resolution & Self-Wait Edge Detection.
  */
 export class A2aWaitForGraphDeadlockDetector {
   private readonly edges: Map<string, Set<string>> = new Map();
+  private readonly agentVectorClocks: Map<string, VectorClock> = new Map();
+  private readonly messageHistory: CausalMessageEvent[] = [];
 
   public addWaitEdge(waiterAgentId: string, holderAgentId: string): void {
     let targets = this.edges.get(waiterAgentId);
@@ -106,6 +131,103 @@ export class A2aWaitForGraphDeadlockDetector {
       victimAgentId: evictedVictims[0] ?? null,
       evictedVictims,
       cyclePath: firstCyclePath,
+    };
+  }
+
+  /**
+   * [M74-3 / N3] Updates an agent's local Lamport/Vector Clock on local event or message receipt:
+   * V_i[i] = V_i[i] + 1, and V_i[k] = max(V_i[k], V_msg[k]).
+   */
+  public advanceAgentVectorClock(
+    agentId: string,
+    receivedClock?: VectorClock
+  ): VectorClock {
+    const cur = { ...(this.agentVectorClocks.get(agentId) ?? { [agentId]: 0 }) };
+    cur[agentId] = (cur[agentId] ?? 0) + 1;
+    if (receivedClock) {
+      for (const [k, v] of Object.entries(receivedClock)) {
+        cur[k] = Math.max(cur[k] ?? 0, v);
+      }
+    }
+    this.agentVectorClocks.set(agentId, cur);
+    return { ...cur };
+  }
+
+  public getAgentVectorClock(agentId: string): VectorClock {
+    return { ...(this.agentVectorClocks.get(agentId) ?? { [agentId]: 0 }) };
+  }
+
+  public recordCausalMessage(event: CausalMessageEvent): void {
+    this.messageHistory.push(event);
+    this.advanceAgentVectorClock(event.senderAgentId, event.vectorClock);
+    if (event.recipientAgentId) {
+      this.advanceAgentVectorClock(event.recipientAgentId, event.vectorClock);
+    }
+  }
+
+  /**
+   * [M74-3 / N3] Compares two vector clocks: returns -1 if a happens-before b (a < b),
+   * 1 if b happens-before a (b < a), 0 if identical, or null if concurrent (incomparable).
+   */
+  public static compareVectorClocks(a: VectorClock, b: VectorClock): -1 | 0 | 1 | null {
+    const allKeys = Array.from(new Set([...Object.keys(a), ...Object.keys(b)]));
+    let aGreater = false;
+    let bGreater = false;
+    for (const k of allKeys) {
+      const va = a[k] ?? 0;
+      const vb = b[k] ?? 0;
+      if (va > vb) aGreater = true;
+      if (vb > va) bGreater = true;
+    }
+    if (!aGreater && !bGreater) return 0;
+    if (aGreater && !bGreater) return 1;
+    if (bGreater && !aGreater) return -1;
+    return null; // concurrent
+  }
+
+  /**
+   * [M74-3 / N3] Computes and verifies a Distributed Consistent Cut across multi-agent swarms:
+   * A cut C is causally consistent iff for every message m, if receive(m) in C,
+   * then send(m) in C (no message is received before it is sent).
+   */
+  public captureDistributedConsistentCut(params: {
+    cutId: string;
+    agentCutTurns: Record<string, number>;
+  }): DistributedConsistentCut {
+    const participatingAgents = Object.keys(params.agentCutTurns);
+    const cutVectorClock: VectorClock = {};
+    for (const ag of participatingAgents) {
+      const clk = this.getAgentVectorClock(ag);
+      for (const [k, v] of Object.entries(clk)) {
+        cutVectorClock[k] = Math.max(cutVectorClock[k] ?? 0, v);
+      }
+    }
+
+    const violatedCausalInversions: string[] = [];
+    for (const msg of this.messageHistory) {
+      if (
+        msg.recipientAgentId &&
+        params.agentCutTurns[msg.recipientAgentId] !== undefined &&
+        params.agentCutTurns[msg.senderAgentId] !== undefined
+      ) {
+        const receivedAtCut = msg.logicalTurn <= params.agentCutTurns[msg.recipientAgentId];
+        const sentAtCut = msg.logicalTurn <= params.agentCutTurns[msg.senderAgentId];
+        if (receivedAtCut && !sentAtCut) {
+          violatedCausalInversions.push(
+            `Orphan message '${msg.eventId}': received by ${msg.recipientAgentId} at turn <= ${params.agentCutTurns[msg.recipientAgentId]}, but sender ${msg.senderAgentId} cut at earlier turn ${params.agentCutTurns[msg.senderAgentId]}`
+          );
+        }
+      }
+    }
+
+    const isCausallyConsistent = violatedCausalInversions.length === 0;
+    return {
+      cutId: params.cutId,
+      participatingAgents,
+      cutVectorClock,
+      isCausallyConsistent,
+      cutTurnsByAgent: { ...params.agentCutTurns },
+      violatedCausalInversions,
     };
   }
 }

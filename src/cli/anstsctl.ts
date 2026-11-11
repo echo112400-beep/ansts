@@ -694,7 +694,18 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
-  if (cmd === "mgmt-phase3-market") {
+    if (cmd === "mgmt-phase1-swarm") {
+    const action = rest[0] ?? "run_all_phase1_swarm_suite";
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/phase1-swarm-governance`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+if (cmd === "mgmt-phase3-market") {
     const action = rest[0] ?? "run_all_phase3_suite";
     const resp = await fetch(`${baseUrl}/v1beta1/management/ops/phase3-memory-spot-market`, {
       method: "POST",

@@ -10027,4 +10027,343 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       },
     };
   }
+
+  /**
+   * [M74] Phase 1 Multi-Agent Swarm Governance & Causal Consistency Suite:
+   * - N1 (`contract_net_bidding`): Contract-Net Protocol (CNP) Multi-Agent Bidding & Multi-Attribute Task Allocation.
+   * - N2 (`bft_blackboard_and_semantic_merge`): Byzantine-Fault-Tolerant Reputation-Weighted Blackboard Consensus & Semantic Export-Table Conflict Analyzer.
+   * - N3 (`causal_vector_clock_cut`): Lamport/Vector Clock Causal Message Ordering & Distributed Consistent Cut Verification.
+   * - `run_all_phase1_swarm_suite`: Executes all 3 Phase 1 swarm engines end-to-end and returns a unified audit report.
+   */
+  public executePhase1SwarmGovernanceSuite(params: {
+    action?:
+      | "contract_net_bidding"
+      | "bft_blackboard_and_semantic_merge"
+      | "causal_vector_clock_cut"
+      | "run_all_phase1_swarm_suite";
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const action = params.action ?? "run_all_phase1_swarm_suite";
+
+    const runN1ContractNet = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const arbiter = new SharedBlackboardAndGitArbiter(sql);
+
+      arbiter.registerSwarmExpertAgent({
+        agentId: "agent-security-auditor",
+        specialtyRole: "SECURITY_AUDITOR",
+        supportedCapabilities: ["vulnerability_scan", "cve_patching", "rbac_verification"],
+        historicalSuccessRate: 0.98,
+        costPer1kTokensUsd: 0.003,
+        warmSandboxReady: true,
+        activeTaskCount: 1,
+        reputationScore: 96,
+      });
+
+      arbiter.registerSwarmExpertAgent({
+        agentId: "agent-db-dba",
+        specialtyRole: "DATABASE_ADMIN",
+        supportedCapabilities: ["postgres_optimization", "index_tuning", "schema_migration"],
+        historicalSuccessRate: 0.94,
+        costPer1kTokensUsd: 0.002,
+        warmSandboxReady: true,
+        activeTaskCount: 3,
+        reputationScore: 88,
+      });
+
+      arbiter.registerSwarmExpertAgent({
+        agentId: "agent-junior-coder",
+        specialtyRole: "DEVELOPER",
+        supportedCapabilities: ["unit_tests", "vulnerability_scan"],
+        historicalSuccessRate: 0.72,
+        costPer1kTokensUsd: 0.0005,
+        warmSandboxReady: false,
+        activeTaskCount: 0,
+        reputationScore: 55,
+      });
+
+      const matchRes = arbiter.matchContractNetBidding({
+        task: {
+          cfpId: "cfp-zero-day-audit-202611",
+          requiredRole: "SECURITY_AUDITOR",
+          requiredCapabilities: ["vulnerability_scan", "cve_patching"],
+          maxBudgetUsd: 0.5,
+          slaDeadlineMs: 15000,
+        },
+        bids: [
+          {
+            bidId: "bid-sec-01",
+            callForProposalId: "cfp-zero-day-audit-202611",
+            agentId: "agent-security-auditor",
+            estimatedDurationMs: 8500,
+            bidPriceUsd: 0.35,
+            confidenceScore: 0.97,
+          },
+          {
+            bidId: "bid-dba-02",
+            callForProposalId: "cfp-zero-day-audit-202611",
+            agentId: "agent-db-dba",
+            estimatedDurationMs: 12000,
+            bidPriceUsd: 0.45,
+            confidenceScore: 0.65,
+          },
+          {
+            bidId: "bid-jr-03",
+            callForProposalId: "cfp-zero-day-audit-202611",
+            agentId: "agent-junior-coder",
+            estimatedDurationMs: 25000, // SLA breached
+            bidPriceUsd: 0.1,
+            confidenceScore: 0.5,
+          },
+        ],
+      });
+
+      const arbiter2 = new SharedBlackboardAndGitArbiter(sql);
+      const rehydratedAgentsCount = arbiter2.listSwarmAgents().length;
+
+      const n1Verified =
+        matchRes.awardedAgentId === "agent-security-auditor" &&
+        matchRes.winningBidId === "bid-sec-01" &&
+        matchRes.utilityScore >= 80 &&
+        matchRes.bidsEvaluated === 3 &&
+        rehydratedAgentsCount === 3;
+
+      return {
+        matchRes,
+        rehydratedAgentsCount,
+        n1Verified,
+      };
+    };
+
+    const runN2BftAndSemantic = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const arbiter = new SharedBlackboardAndGitArbiter(sql);
+
+      arbiter.registerSwarmExpertAgent({
+        agentId: "agent-core-sec",
+        specialtyRole: "SECURITY_LEAD",
+        supportedCapabilities: ["security"],
+        historicalSuccessRate: 1.0,
+        costPer1kTokensUsd: 0.003,
+        warmSandboxReady: true,
+        activeTaskCount: 0,
+        reputationScore: 98, // Core authority
+      });
+
+      arbiter.registerSwarmExpertAgent({
+        agentId: "agent-sre",
+        specialtyRole: "SRE",
+        supportedCapabilities: ["ops"],
+        historicalSuccessRate: 0.95,
+        costPer1kTokensUsd: 0.002,
+        warmSandboxReady: true,
+        activeTaskCount: 1,
+        reputationScore: 90,
+      });
+
+      arbiter.registerSwarmExpertAgent({
+        agentId: "agent-qa",
+        specialtyRole: "QA",
+        supportedCapabilities: ["test"],
+        historicalSuccessRate: 0.9,
+        costPer1kTokensUsd: 0.001,
+        warmSandboxReady: false,
+        activeTaskCount: 0,
+        reputationScore: 80,
+      });
+
+      // 1. Approved BFT CAS write (98 + 90 + 80 = 268 total; 188 approval = 70.1% >= 66.7%)
+      const approvedRes = arbiter.putBftConsensusCas({
+        key: "arch/zero-trust-fence",
+        candidateValue: { mode: "ENFORCING", egressAllowlist: ["api.openai.com", "api.anthropic.com"] },
+        expectedVersion: 0,
+        initiatorAgentId: "agent-sre",
+        votes: [
+          { agentId: "agent-core-sec", approve: true, rationale: "Strict egress allowed" },
+          { agentId: "agent-sre", approve: true, rationale: "SRE compliant" },
+          { agentId: "agent-qa", approve: false, rationale: "Needs mock suite" },
+        ],
+      });
+
+      // 2. Vetoed BFT write by core authority (reputation >= 95 veto)
+      const vetoedRes = arbiter.putBftConsensusCas({
+        key: "arch/zero-trust-fence",
+        candidateValue: { mode: "PERMISSIVE", egressAllowlist: ["*"] },
+        expectedVersion: 1,
+        initiatorAgentId: "agent-qa",
+        votes: [
+          { agentId: "agent-qa", approve: true },
+          { agentId: "agent-sre", approve: true },
+          { agentId: "agent-core-sec", approve: false, rationale: "Wildcard egress prohibited" },
+        ],
+      });
+
+      // 3. Semantic export conflict analyzer
+      const semanticResClean = arbiter.analyzeSemanticExportConflicts({
+        filePath: "src/utils/math.ts",
+        agentPatches: [
+          { agentId: "agent-qa", patchText: "export const clamp = (v: number) => Math.min(1, v);" },
+          { agentId: "agent-sre", patchText: "export const movingAvg = (arr: number[]) => arr.reduce((a,b)=>a+b)/arr.length;" },
+        ],
+      });
+
+      const semanticResConflict = arbiter.analyzeSemanticExportConflicts({
+        filePath: "src/utils/math.ts",
+        agentPatches: [
+          { agentId: "agent-qa", patchText: "export const calculateScore = (a: number) => a * 2;" },
+          { agentId: "agent-sre", patchText: "export const calculateScore = (a: string) => Number(a);" },
+        ],
+      });
+
+      const arbiterRehydrated = new SharedBlackboardAndGitArbiter(sql);
+      const rehydratedEntry = arbiterRehydrated.get("arch/zero-trust-fence");
+
+      const n2Verified =
+        approvedRes.committed === true &&
+        approvedRes.quorumPassed === true &&
+        approvedRes.newVersion === 1 &&
+        vetoedRes.committed === false &&
+        vetoedRes.vetoedByCoreAuthority === true &&
+        semanticResClean.semanticClean === true &&
+        semanticResConflict.semanticClean === false &&
+        semanticResConflict.conflictingSymbols.includes("calculateScore") &&
+        rehydratedEntry?.version === 1;
+
+      return {
+        approvedRes,
+        vetoedRes,
+        semanticResClean,
+        semanticResConflict,
+        n2Verified,
+      };
+    };
+
+    const runN3VectorClockCut = () => {
+      const wfg = new A2aWaitForGraphDeadlockDetector();
+      const agA = "agent-alpha";
+      const agB = "agent-beta";
+
+      wfg.advanceAgentVectorClock(agA); // A: { alpha: 1 }
+      wfg.recordCausalMessage({
+        eventId: "msg-1",
+        senderAgentId: agA,
+        recipientAgentId: agB,
+        vectorClock: wfg.getAgentVectorClock(agA),
+        payloadType: "TASK_DELEGATION",
+        logicalTurn: 1,
+        payloadDigest: "dig-1",
+        timestampMs: 1700000000000,
+      });
+
+      wfg.recordCausalMessage({
+        eventId: "msg-2",
+        senderAgentId: agB,
+        recipientAgentId: agA,
+        vectorClock: wfg.getAgentVectorClock(agB),
+        payloadType: "INTERMEDIATE_RESULT",
+        logicalTurn: 2,
+        payloadDigest: "dig-2",
+        timestampMs: 1700000001000,
+      });
+
+      const cmpOrder = A2aWaitForGraphDeadlockDetector.compareVectorClocks(
+        { [agA]: 1 },
+        { [agA]: 1, [agB]: 1 }
+      ); // -1 (happens-before)
+
+      const cmpConcurrent = A2aWaitForGraphDeadlockDetector.compareVectorClocks(
+        { [agA]: 2, [agB]: 0 },
+        { [agA]: 0, [agB]: 2 }
+      ); // null (concurrent)
+
+      // Consistent cut: both agents at turn 2 (both sends and receives included)
+      const cutConsistent = wfg.captureDistributedConsistentCut({
+        cutId: "cut-consistent-t2",
+        agentCutTurns: { [agA]: 2, [agB]: 2 },
+      });
+
+      // Inconsistent cut: agent A at turn 0, agent B at turn 2 (orphan receive of msg-1 at B)
+      const cutInconsistent = wfg.captureDistributedConsistentCut({
+        cutId: "cut-inconsistent-t0",
+        agentCutTurns: { [agA]: 0, [agB]: 2 },
+      });
+
+      const n3Verified =
+        cmpOrder === -1 &&
+        cmpConcurrent === null &&
+        cutConsistent.isCausallyConsistent === true &&
+        cutInconsistent.isCausallyConsistent === false &&
+        cutInconsistent.violatedCausalInversions.length >= 1;
+
+      return {
+        cutConsistent,
+        cutInconsistent,
+        cmpOrder,
+        cmpConcurrent,
+        n3Verified,
+      };
+    };
+
+    if (action === "contract_net_bidding") {
+      const res = runN1ContractNet();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [N1] 契约网多智能体招投标分发协议 (中标智能体 ${res.matchRes.awardedAgentId}, 效用得分 ${res.matchRes.utilityScore}, 标价 $${res.matchRes.awardedPriceUsd})`,
+        "Phase1Swarm / ContractNetProtocol",
+        res.n1Verified ? "CNP_BID_AWARDED" : "CNP_BID_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "bft_blackboard_and_semantic_merge") {
+      const res = runN2BftAndSemantic();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [N2] 拜占庭信誉加权黑板共识与代码语义合并 (放行=${res.approvedRes.quorumPassed}, 否决=${res.vetoedRes.vetoedByCoreAuthority}, 语义洁净=${res.semanticResClean.semanticClean})`,
+        "Phase1Swarm / BftBlackboardAndSemanticMerge",
+        res.n2Verified ? "BFT_CONSENSUS_OK" : "BFT_CONSENSUS_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "causal_vector_clock_cut") {
+      const res = runN3VectorClockCut();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [N3] 向量时钟因果屏障与全局一致割集断点 (一致割集=${res.cutConsistent.isCausallyConsistent}, 孤儿消息因果倒置拦截=${!res.cutInconsistent.isCausallyConsistent})`,
+        "Phase1Swarm / CausalVectorClockCut",
+        res.n3Verified ? "CAUSAL_CUT_VERIFIED" : "CAUSAL_CUT_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    const n1ContractNet = runN1ContractNet();
+    const n2BftAndSemantic = runN2BftAndSemantic();
+    const n3VectorClockCut = runN3VectorClockCut();
+    const allM74Phase1SwarmChecksPassed =
+      n1ContractNet.n1Verified && n2BftAndSemantic.n2Verified && n3VectorClockCut.n3Verified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [M74] 多智能体群体协同与因果一致性套件全量验证 (N1 招投标 + N2 拜占庭黑板共识 + N3 向量时钟一致割集, 通过=${allM74Phase1SwarmChecksPassed})`,
+      "Phase1Swarm / SwarmGovernanceSuite",
+      allM74Phase1SwarmChecksPassed ? "M74_SWARM_ALL_PASS" : "M74_SWARM_FAILED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        n1ContractNet,
+        n2BftAndSemantic,
+        n3VectorClockCut,
+        allM74Phase1SwarmChecksPassed,
+      },
+    };
+  }
 }
