@@ -1,8 +1,9 @@
 /**
- * @fileoverview M17 TASK-84 & M61-5: LayerFS Dual-Path Execution Driver
+ * @fileoverview M17 TASK-84, M61-5 & M66-3: LayerFS Dual-Path Execution Driver
  * - Fast Path (`@layerfs/agent` + `@layerfs/backend`): In-process file tool ops (`read`, `write`, `edit`, `grep`) -> atomic Commit (0 container boot)
  * - Sandbox Path (`@layerfs/runtime`): Real Ephemeral Workspace (`mount -> real child_process exec -> scan diff -> commit -> unmount`)
  * - [M61-5] Step-Level Idempotent Commit Deduplication & Branch Breakpoint Rollback (`rollbackBranchToCommitOrStep`).
+ * - [M66-3] Workspace Path-Traversal Sanitization (`normalizeSafeWorkspacePath`) & Unreachable Commit/B-Tree GC (`gcUnreachableCommits`).
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -41,6 +42,35 @@ export class LayerFsWorkspaceDriver {
   constructor(storeEngine = new LayerFsContentStoreEngine()) {
     this.storeEngine = storeEngine;
     this.initMainRoot();
+  }
+
+  /**
+   * [M66-3] Normalizes and validates workspace-relative file paths, rejecting `..` path traversal,
+   * leading `/` or drive roots, and null bytes so file operations cannot escape `mountDir`.
+   */
+  public static normalizeSafeWorkspacePath(rawPath: string): string {
+    if (typeof rawPath !== "string" || rawPath.trim().length === 0 || rawPath.includes("\0")) {
+      throw new Error(`Unsafe workspace filePath rejected: '${rawPath}'`);
+    }
+    const slashed = rawPath.replace(/\\/g, "/").trim();
+    if (slashed.startsWith("/") || /^[a-zA-Z]:/.test(slashed)) {
+      throw new Error(`Unsafe workspace filePath rejected (absolute path): '${rawPath}'`);
+    }
+    const segments = slashed.split("/");
+    if (segments.some((seg) => seg === "..")) {
+      throw new Error(`Unsafe workspace filePath rejected (directory traversal): '${rawPath}'`);
+    }
+    const normalized = path.posix.normalize(slashed).replace(/^(\.\/)+/, "");
+    if (
+      !normalized ||
+      normalized === "." ||
+      normalized === ".." ||
+      normalized.startsWith("../") ||
+      normalized.startsWith("/")
+    ) {
+      throw new Error(`Unsafe workspace filePath rejected: '${rawPath}'`);
+    }
+    return normalized;
   }
 
   private initMainRoot(): void {
@@ -143,13 +173,14 @@ export class LayerFsWorkspaceDriver {
     containerSpawned: false;
     readResult?: string;
   } {
+    const safeFilePath = LayerFsWorkspaceDriver.normalizeSafeWorkspacePath(params.filePath);
     const headId = this.branchHeads.get(params.branchName);
     if (!headId) {
       throw new Error(`Branch '${params.branchName}' not found`);
     }
     const parentCommit = this.commits.get(headId)!;
     if (params.operation === "read" || params.operation === "grep") {
-      const entry = parentCommit.filesTree.get(params.filePath);
+      const entry = parentCommit.filesTree.get(safeFilePath);
       return {
         commitId: headId,
         committedNewSnapshot: false,
@@ -159,7 +190,7 @@ export class LayerFsWorkspaceDriver {
     }
 
     if (params.operation === "delete") {
-      if (!parentCommit.filesTree.has(params.filePath)) {
+      if (!parentCommit.filesTree.has(safeFilePath)) {
         return { commitId: headId, committedNewSnapshot: false, containerSpawned: false };
       }
       const nextCommit = this.createChildCommit({
@@ -170,12 +201,12 @@ export class LayerFsWorkspaceDriver {
         toolCategory: "FILE_FAST_PATH",
         mountLatencyMs: 0,
         mutations: [],
-        deletions: [params.filePath],
+        deletions: [safeFilePath],
       });
       return { commitId: nextCommit.commitId, committedNewSnapshot: true, containerSpawned: false };
     }
     const content = params.newContent ?? "";
-    const prevEntry = parentCommit.filesTree.get(params.filePath);
+    const prevEntry = parentCommit.filesTree.get(safeFilePath);
     if (prevEntry && prevEntry.content === content && (params.mode === undefined || prevEntry.mode === params.mode)) {
       return {
         commitId: headId,
@@ -193,7 +224,7 @@ export class LayerFsWorkspaceDriver {
       mountLatencyMs: 0,
       mutations: [
         {
-          filePath: params.filePath,
+          filePath: safeFilePath,
           content,
           mode: params.mode ?? prevEntry?.mode ?? 0o644,
         },
@@ -229,6 +260,11 @@ export class LayerFsWorkspaceDriver {
       throw new Error(`Branch '${params.branchName}' not found`);
     }
     const parentCommit = this.commits.get(headId)!;
+    const sanitizedOverlays = (params.overlayMutations ?? []).map((mut) => ({
+      filePath: LayerFsWorkspaceDriver.normalizeSafeWorkspacePath(mut.filePath),
+      content: mut.content,
+      mode: mut.mode,
+    }));
 
     const tMountStart = performance.now();
     const mountDir = fs.mkdtempSync(path.join(os.tmpdir(), `layerfs-ws-${params.branchName}-`));
@@ -236,7 +272,8 @@ export class LayerFsWorkspaceDriver {
     try {
       const baselineStats = new Map<string, { size: number; mode: number }>();
       for (const [relPath, fileEntry] of parentCommit.filesTree.entries()) {
-        const fullPath = path.join(mountDir, relPath);
+        const safeRel = LayerFsWorkspaceDriver.normalizeSafeWorkspacePath(relPath);
+        const fullPath = path.join(mountDir, safeRel);
         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
         fs.writeFileSync(fullPath, fileEntry.content, { encoding: "utf-8", mode: fileEntry.mode });
         try {
@@ -245,7 +282,7 @@ export class LayerFsWorkspaceDriver {
           // ignore if utimes unsupported
         }
         const st = fs.statSync(fullPath);
-        baselineStats.set(relPath, { size: st.size, mode: st.mode & 0o777 });
+        baselineStats.set(safeRel, { size: st.size, mode: st.mode & 0o777 });
       }
       const mountLatencyMs = Math.max(0.01, Number((performance.now() - tMountStart).toFixed(3)));
       const nodeModulesPreMounted = fs.existsSync(path.join(mountDir, "node_modules/react/index.js"));
@@ -256,7 +293,7 @@ export class LayerFsWorkspaceDriver {
           .toString("utf-8");
       }
 
-      for (const mut of params.overlayMutations ?? []) {
+      for (const mut of sanitizedOverlays) {
         const fullPath = path.join(mountDir, mut.filePath);
         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
         fs.writeFileSync(fullPath, mut.content, { encoding: "utf-8", mode: mut.mode ?? 0o644 });
@@ -411,6 +448,10 @@ export class LayerFsWorkspaceDriver {
     return this.commits.get(commitId);
   }
 
+  public getCommitCount(): number {
+    return this.commits.size;
+  }
+
   public getBranchHeadCommit(branchName: string): LayerFsCommitRecord {
     const headId = this.branchHeads.get(branchName);
     if (!headId || !this.commits.has(headId)) {
@@ -560,6 +601,38 @@ export class LayerFsWorkspaceDriver {
       throw new Error("Cannot delete default branch 'main'");
     }
     return this.branchHeads.delete(branchName);
+  }
+
+  /**
+   * [M66-3] Reclaims unreachable `LayerFsCommitRecord` nodes and their corresponding B-Tree directory pages
+   * after branches are deleted or rolled back.
+   */
+  public gcUnreachableCommits(): {
+    prunedCommitIds: string[];
+    prunedBTreeCommitCount: number;
+    retainedCommitCount: number;
+  } {
+    const reachableCommitIds = new Set<string>(["C0"]);
+    for (const headCommitId of this.branchHeads.values()) {
+      let cur = this.commits.get(headCommitId);
+      while (cur && !reachableCommitIds.has(cur.commitId)) {
+        reachableCommitIds.add(cur.commitId);
+        cur = cur.parentCommitId ? this.commits.get(cur.parentCommitId) : undefined;
+      }
+    }
+    const prunedCommitIds: string[] = [];
+    for (const commitId of Array.from(this.commits.keys())) {
+      if (!reachableCommitIds.has(commitId)) {
+        this.commits.delete(commitId);
+        prunedCommitIds.push(commitId);
+      }
+    }
+    const prunedBTreeCommitCount = this.storeEngine.gcUnreachableCommitPages(reachableCommitIds);
+    return {
+      prunedCommitIds,
+      prunedBTreeCommitCount,
+      retainedCommitCount: this.commits.size,
+    };
   }
 
   public listBranchesSummary(): Array<{

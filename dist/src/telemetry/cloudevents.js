@@ -1,7 +1,9 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.CloudEventsBus = void 0; /**
- * @fileoverview M6 TASK-22, M58-5 & M60-3: CloudEvents v1.0 Telemetry Bus & FinOps Cost Attribution Ledger
- * with Bounded Event Ring Buffer, Finite Non-Negative Cost Sanitization & Idempotent Event Deduplication.
+ * @fileoverview M6 TASK-22, M58-5, M60-3 & M66-2: CloudEvents v1.0 Telemetry Bus & FinOps Cost Attribution Ledger
+ * with Bounded Event Ring Buffer, Bounded Idempotency Key Cache, SQLite FinOps Persistence & Finite Cost Sanitization.
  */
+
+
 
 
 
@@ -26,15 +28,61 @@ class CloudEventsBus {
   tenantCosts = new Map();
   seenIdempotencyKeys = new Map();
   maxRetainedEvents;
+  maxIdempotencyEntries;
   eventSeq = 0;
+  sql;
 
-  constructor(maxRetainedEvents = 1000) {
-    this.maxRetainedEvents = Math.max(10, maxRetainedEvents);
+  constructor(maxRetainedEvents = 1000, sql) {
+    const rawMax = Number(maxRetainedEvents);
+    this.maxRetainedEvents =
+    Number.isFinite(rawMax) && rawMax > 0 ? Math.max(10, Math.floor(rawMax)) : 1000;
+    this.maxIdempotencyEntries = this.maxRetainedEvents * 4;
+    if (sql) {
+      this.bindSqlStorage(sql);
+    }
   }
 
   /**
-   * [M60-3] Supports optional `idempotencyKey` or `eventId`: if the same event is emitted multiple times
-   * on retry, returns the existing `CloudEventV1` without double-charging `tenantCosts`.
+   * [M66-2] Binds SQLite storage so cumulative per-tenant FinOps telemetry costs survive process restarts.
+   */
+  bindSqlStorage(sql) {
+    this.sql = sql;
+    this.sql.exec(
+    "CREATE TABLE IF NOT EXISTS persisted_cloudevents_finops (tenant_id TEXT PRIMARY KEY, total_llm_cost_usd REAL, total_sandbox_cpu_sec REAL, total_sandbox_cost_usd REAL, grand_total_usd REAL)");
+
+    const rows = this.sql.
+    exec("SELECT * FROM persisted_cloudevents_finops").
+    toArray();
+    let restored = 0;
+    for (const r of rows) {
+      const tenantId = String(r.tenant_id);
+      this.tenantCosts.set(tenantId, {
+        tenantId,
+        totalLlmCostUsd: Number(r.total_llm_cost_usd ?? 0),
+        totalSandboxCpuCoreSeconds: Number(r.total_sandbox_cpu_sec ?? 0),
+        totalSandboxCostUsd: Number(r.total_sandbox_cost_usd ?? 0),
+        grandTotalUsd: Number(r.grand_total_usd ?? 0)
+      });
+      restored += 1;
+    }
+    return restored;
+  }
+
+  persistTenantFinOps(summary) {
+    if (!this.sql) return;
+    this.sql.exec(
+    "INSERT OR REPLACE INTO persisted_cloudevents_finops (tenant_id, total_llm_cost_usd, total_sandbox_cpu_sec, total_sandbox_cost_usd, grand_total_usd) VALUES (?, ?, ?, ?, ?)",
+    summary.tenantId,
+    summary.totalLlmCostUsd,
+    summary.totalSandboxCpuCoreSeconds,
+    summary.totalSandboxCostUsd,
+    summary.grandTotalUsd);
+
+  }
+
+  /**
+   * [M60-3 & M66-2] Supports optional `idempotencyKey` or `eventId` with bounded FIFO eviction (`maxIdempotencyEntries`)
+   * so retried emissions never double-charge `tenantCosts` and long-running buses never leak memory.
    */
   emitEvent(params)
 
@@ -67,7 +115,13 @@ class CloudEventsBus {
       data: { tenantId: params.tenantId, ...(params.data ?? {}) }
     };
     if (dedupToken) {
-      this.seenIdempotencyKeys.set(`${params.tenantId}::${dedupToken}`, evt);
+      const scopedDedup = `${params.tenantId}::${dedupToken}`;
+      this.seenIdempotencyKeys.set(scopedDedup, evt);
+      while (this.seenIdempotencyKeys.size > this.maxIdempotencyEntries) {
+        const oldestKey = this.seenIdempotencyKeys.keys().next().value;
+        if (oldestKey === undefined) break;
+        this.seenIdempotencyKeys.delete(oldestKey);
+      }
     }
 
     this.events.push(evt);
@@ -96,7 +150,12 @@ class CloudEventsBus {
     (existing.totalLlmCostUsd + existing.totalSandboxCostUsd).toFixed(6));
 
     this.tenantCosts.set(params.tenantId, existing);
+    this.persistTenantFinOps(existing);
     return evt;
+  }
+
+  getIdempotencyCacheSize() {
+    return this.seenIdempotencyKeys.size;
   }
 
   getTenantReport(tenantId) {

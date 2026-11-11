@@ -1,6 +1,6 @@
 /**
- * @fileoverview M11 TASK-40 & M57-6: Length-Prefixed Binary Framing Unix Domain / virtio-vsock Host Daemon
- * with Stream Reassembly Buffer, Multi-Frame Pipelining Support & Frame Length Validation.
+ * @fileoverview M11 TASK-40, M57-6 & M66-4: Length-Prefixed Binary Framing Unix Domain / virtio-vsock Host Daemon
+ * with Stream Reassembly Buffer, Multi-Frame Pipelining Support, Frame Length Validation & Client Timeout Guard.
  */
 import * as net from "node:net";
 import * as fs from "node:fs";
@@ -15,7 +15,9 @@ export class ZeroTrustVsockHostDaemon {
     maxFrameBytes = 4 * 1024 * 1024
   ) {
     this.allowedHosts = new Set(allowedHosts);
-    this.maxFrameBytes = maxFrameBytes;
+    const rawMax = Number(maxFrameBytes);
+    this.maxFrameBytes =
+      Number.isFinite(rawMax) && rawMax > 0 ? Math.floor(rawMax) : 4 * 1024 * 1024;
   }
 
   public static encodeFrame(payload: Record<string, unknown>): Buffer {
@@ -105,17 +107,28 @@ export class ZeroTrustVsockHostDaemon {
 
   public async sendClientFrameOverUnixSocket(
     socketPath: string,
-    payload: Record<string, unknown>
+    payload: Record<string, unknown>,
+    timeoutMs = 5000
   ): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
       let rxBuf = Buffer.alloc(0);
       const client = net.createConnection(socketPath, () => {
         client.write(ZeroTrustVsockHostDaemon.encodeFrame(payload));
       });
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        client.setTimeout(timeoutMs, () => {
+          client.destroy(new Error(`Vsock client socket timed out after ${timeoutMs}ms`));
+        });
+      }
       client.on("data", (chunk: Buffer) => {
         rxBuf = Buffer.concat([rxBuf, chunk]);
         if (rxBuf.length < 4) return;
         const bodyLen = rxBuf.readUInt32BE(0);
+        if (bodyLen > this.maxFrameBytes) {
+          client.destroy();
+          reject(new Error(`Vsock response frame exceeds maxFrameBytes (${bodyLen} > ${this.maxFrameBytes})`));
+          return;
+        }
         if (rxBuf.length < 4 + bodyLen) return;
         try {
           const decoded = ZeroTrustVsockHostDaemon.decodeFrame(rxBuf.subarray(0, 4 + bodyLen));

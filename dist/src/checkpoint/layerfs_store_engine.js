@@ -2,12 +2,13 @@
 
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var zlib = _interopRequireWildcard(require("node:zlib"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M17 TASK-83 & M56-3: LayerFS Content-Addressed Store Engine (`layerfs/object/v2` Domain-Separated Digest,
- * Real `node:zlib` Deflate Compression, Cycle-Safe `FULL`/`PREFIX`/`DELTA` Reconstruction, Reference-Pinned Deletion & 8 KiB B-Tree Pages).
+ * @fileoverview M17 TASK-83, M56-3 & M66-3: LayerFS Content-Addressed Store Engine (`layerfs/object/v2` Domain-Separated Digest,
+ * Real `node:zlib` Deflate Compression, Cycle-Safe `FULL`/`PREFIX`/`DELTA` Reconstruction, Reference-Pinned Deletion,
+ * Accurate Logical-Byte Accounting & Unreachable Commit B-Tree Page GC).
  */
-
 
 
 
@@ -205,6 +206,25 @@ class LayerFsContentStoreEngine {
     };
   }
 
+  /**
+   * [M66-3] Reclaims B-Tree directory page maps belonging to commits that are no longer reachable
+   * from any active branch head.
+   */
+  gcUnreachableCommitPages(reachableCommitIds) {
+    let pruned = 0;
+    for (const commitId of Array.from(this.dirPagesByCommit.keys())) {
+      if (!reachableCommitIds.has(commitId)) {
+        this.dirPagesByCommit.delete(commitId);
+        pruned += 1;
+      }
+    }
+    return pruned;
+  }
+
+  getTrackedCommitPageCount() {
+    return this.dirPagesByCommit.size;
+  }
+
   getStorageStats()
 
 
@@ -232,9 +252,10 @@ class LayerFsContentStoreEngine {
   }
 
   /**
-   * [M56-3] Reference-pinned object deletion:
+   * [M56-3 & M66-3] Reference-pinned object deletion with accurate `logicalTotalBytes` accounting:
    * Refuses to delete `objectId` (`return 0`) if any other stored `PREFIX`/`DELTA` object still
-   * depends on `objectId` as its `baseObjectId`, preventing broken delta chains during GC sweeps.
+   * depends on `objectId` as its `baseObjectId`, and decrements both `storedCompressedBytes` and
+   * `logicalTotalBytes` when deleting unreferenced objects.
    */
   deleteObjectById(objectId) {
     const obj = this.objects.get(objectId);
@@ -246,6 +267,7 @@ class LayerFsContentStoreEngine {
     }
     const freed = obj.compressedBytes;
     this.storedCompressedBytes = Math.max(0, this.storedCompressedBytes - freed);
+    this.logicalTotalBytes = Math.max(0, this.logicalTotalBytes - obj.logicalBytes);
     this.objects.delete(objectId);
     return freed;
   }

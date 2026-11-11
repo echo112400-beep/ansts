@@ -4,8 +4,8 @@
 
 var net = _interopRequireWildcard(require("node:net"));
 var fs = _interopRequireWildcard(require("node:fs"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M11 TASK-40 & M57-6: Length-Prefixed Binary Framing Unix Domain / virtio-vsock Host Daemon
- * with Stream Reassembly Buffer, Multi-Frame Pipelining Support & Frame Length Validation.
+ * @fileoverview M11 TASK-40, M57-6 & M66-4: Length-Prefixed Binary Framing Unix Domain / virtio-vsock Host Daemon
+ * with Stream Reassembly Buffer, Multi-Frame Pipelining Support, Frame Length Validation & Client Timeout Guard.
  */class ZeroTrustVsockHostDaemon {server = null;
   allowedHosts;
   maxFrameBytes;
@@ -15,7 +15,9 @@ var fs = _interopRequireWildcard(require("node:fs"));function _getRequireWildcar
   maxFrameBytes = 4 * 1024 * 1024)
   {
     this.allowedHosts = new Set(allowedHosts);
-    this.maxFrameBytes = maxFrameBytes;
+    const rawMax = Number(maxFrameBytes);
+    this.maxFrameBytes =
+    Number.isFinite(rawMax) && rawMax > 0 ? Math.floor(rawMax) : 4 * 1024 * 1024;
   }
 
   static encodeFrame(payload) {
@@ -105,17 +107,28 @@ var fs = _interopRequireWildcard(require("node:fs"));function _getRequireWildcar
 
   async sendClientFrameOverUnixSocket(
   socketPath,
-  payload)
+  payload,
+  timeoutMs = 5000)
   {
     return new Promise((resolve, reject) => {
       let rxBuf = Buffer.alloc(0);
       const client = net.createConnection(socketPath, () => {
         client.write(ZeroTrustVsockHostDaemon.encodeFrame(payload));
       });
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        client.setTimeout(timeoutMs, () => {
+          client.destroy(new Error(`Vsock client socket timed out after ${timeoutMs}ms`));
+        });
+      }
       client.on("data", (chunk) => {
         rxBuf = Buffer.concat([rxBuf, chunk]);
         if (rxBuf.length < 4) return;
         const bodyLen = rxBuf.readUInt32BE(0);
+        if (bodyLen > this.maxFrameBytes) {
+          client.destroy();
+          reject(new Error(`Vsock response frame exceeds maxFrameBytes (${bodyLen} > ${this.maxFrameBytes})`));
+          return;
+        }
         if (rxBuf.length < 4 + bodyLen) return;
         try {
           const decoded = ZeroTrustVsockHostDaemon.decodeFrame(rxBuf.subarray(0, 4 + bodyLen));

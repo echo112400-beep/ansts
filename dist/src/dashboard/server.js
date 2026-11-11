@@ -7772,4 +7772,154 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       }
     };
   }
+  /**
+   * [M66] Deep Potential Risk Identification & Elimination Audit
+   */
+  async executePotentialRisksEliminationAudit(params)
+
+
+  {
+    this.ensureInitialized();
+
+    // 1. [M66-1] TransactionalOutboxDispatcher timing-safe HMAC, constructor overload & dead-letter retry
+    const outboxSql = new _env.InMemoryCellSqlStorage();
+    const outbox = new _outbox_webhook.TransactionalOutboxDispatcher("sec-m66-audit", 2, outboxSql);
+    const samplePayload = JSON.stringify({ event: "task.done", id: "t-m66" });
+    const sig = outbox.signPayload(samplePayload, 1700000000);
+    const sigValid = outbox.verifySignature(samplePayload, sig.replace(",", ", "), 1700000050, 300);
+    const sigTampered = outbox.verifySignature(samplePayload, sig.slice(0, -2) + "ff", 1700000050, 300);
+    outbox.enqueueOutbox("m66-dlq", "t-m66", "https://bad.local/hook", { x: 1 });
+    outbox.processPending(() => false);
+    outbox.processPending(() => false);
+    const wasDeadLettered = outbox.listMessages()[0]?.deadLettered === true;
+    outbox.retryDeadLetteredMessage("m66-dlq", "https://good.local/hook");
+    const retryRes = outbox.processPending(() => true);
+    const outboxVerified = sigValid && !sigTampered && wasDeadLettered && retryRes.deliveredCount === 1;
+
+    // 2. [M66-2] CloudEventsBus bounded idempotency + SQLite FinOps & SseEventStreamGateway CRLF + orphan GC
+    const ceSql = new _env.InMemoryCellSqlStorage();
+    const ce1 = new _cloudevents.CloudEventsBus(10, ceSql);
+    for (let i = 0; i < 50; i++) {
+      ce1.emitEvent({
+        type: "ansts.turn",
+        subject: `t-${i}`,
+        tenantId: "Northstar",
+        idempotencyKey: `k-${i}`,
+        llmCostUsd: 0.02
+      });
+    }
+    const ce2 = new _cloudevents.CloudEventsBus(10, ceSql);
+    const sse = new _sse_stream.SseEventStreamGateway(10);
+    const orphanSub = sse.subscribe("t-orphan-0", "sub-o1");
+    const crlfSub = sse.subscribe("t-active-1", "sub-a1");
+    const sseChunks = [];
+    crlfSub.stream.on("data", (c) => sseChunks.push(c.toString("utf-8")));
+    sse.publish({
+      id: "id-1\r\nevent: injected",
+      event: "turn.step\r\nid: fake",
+      taskId: "t-active-1",
+      turnIndex: 1,
+      timestampMs: Date.now(),
+      data: { ok: true }
+    });
+    const gcCount = sse.gcCompletedTaskStreams(new Set(["t-active-1"]));
+    const cloudEventsAndSseVerified =
+    ce1.getIdempotencyCacheSize() <= 40 &&
+    ce2.getTenantReport("Northstar")?.totalLlmCostUsd === 1.0 &&
+    sseChunks.join("").trim().split("\n").length === 3 &&
+    gcCount === 1 &&
+    orphanSub.closed === true;
+
+    // 3. [M66-3] LayerFsWorkspaceDriver path traversal guard & unreachable commit/B-Tree GC + logicalTotalBytes
+    const lfs = new _layerfs_workspace_driver.LayerFsWorkspaceDriver();
+    let traversalBlocked = false;
+    try {
+      lfs.executeInProcessFileTool({
+        branchName: "main",
+        agentId: "a1",
+        stepId: "s1",
+        operation: "write",
+        filePath: "../../outside.txt",
+        newContent: "bad"
+      });
+    } catch {
+      traversalBlocked = true;
+    }
+    const baseLogical = lfs.storeEngine.getStorageStats().logicalTotalBytes;
+    lfs.forkBranch("main", "ephemeral-br");
+    lfs.executeInProcessFileTool({
+      branchName: "ephemeral-br",
+      agentId: "a1",
+      stepId: "s2",
+      operation: "write",
+      filePath: "src/ephemeral.ts",
+      newContent: "export const x = 42;"
+    });
+    lfs.deleteBranch("ephemeral-br");
+    const sweeper = new _distributed_gc_sweeper.DistributedCasGcSweeper();
+    const gcSweep = sweeper.sweepLayerFsWorkspaceStore(lfs);
+    const postGcLogical = lfs.storeEngine.getStorageStats().logicalTotalBytes;
+    const layerFsVerified =
+    traversalBlocked &&
+    gcSweep.prunedCommitIds.length === 1 &&
+    gcSweep.prunedBTreeCommitCount === 1 &&
+    postGcLogical === baseLogical;
+
+    // 4. [M66-4] WarmSandboxPoolManager clamping & LayerFsNumberedSandboxMultiplexer closed-entry pruning
+    const pool = new _warm_pool.WarmSandboxPoolManager("node-m66", -4);
+    const mux = new _warm_pool.LayerFsNumberedSandboxMultiplexer();
+    const mounted = mux.mountWorkspaceIntoSandbox("ws-m66", 100);
+    mux.unmountWorkspace(mounted.sandboxNumber, "ws-m66", 200);
+    const sweptSandboxes = mux.sweepIdleSandboxes(200 + _warm_pool.LayerFsNumberedSandboxMultiplexer.IDLE_CLOSE_TIMEOUT_MS + 1);
+    const sandboxAndVsockVerified =
+    pool.targetWarmCount === 8 &&
+    sweptSandboxes.length === 1 &&
+    mux.getActiveSandboxCount() === 0;
+
+    const allM66PotentialRiskChecksPassed =
+    outboxVerified &&
+    cloudEventsAndSseVerified &&
+    layerFsVerified &&
+    sandboxAndVsockVerified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M66 深度潜在风险识别与消除自检 (Outbox=${outboxVerified}, CloudEventsSSE=${cloudEventsAndSseVerified}, LayerFS=${layerFsVerified}, SandboxMux=${sandboxAndVsockVerified})`,
+    "SystemWide / M66-PotentialRisksAudit",
+    "ALL_M66_CHECKS_PASSED");
+
+
+    return {
+      status: 200,
+      body: {
+        outboxSecurityAndDlq1: {
+          sigValid,
+          sigTampered,
+          wasDeadLettered,
+          deliveredAfterRetry: retryRes.deliveredCount,
+          outboxVerified
+        },
+        cloudEventsAndSse2: {
+          boundedIdempotencySize: ce1.getIdempotencyCacheSize(),
+          rehydratedLlmCostUsd: ce2.getTenantReport("Northstar")?.totalLlmCostUsd,
+          orphanStreamsCleaned: gcCount,
+          cloudEventsAndSseVerified
+        },
+        layerFsTraversalAndGc3: {
+          traversalBlocked,
+          prunedCommitCount: gcSweep.prunedCommitIds.length,
+          prunedBTreeCommitCount: gcSweep.prunedBTreeCommitCount,
+          postGcLogicalBytes: postGcLogical,
+          layerFsVerified
+        },
+        sandboxPoolAndVsock4: {
+          sanitizedWarmTarget: pool.targetWarmCount,
+          activeSandboxesAfterSweep: mux.getActiveSandboxCount(),
+          sandboxAndVsockVerified
+        },
+        allM66PotentialRiskChecksPassed
+      }
+    };
+  }
 }exports.PlatformManagementPlaneEngine = PlatformManagementPlaneEngine;

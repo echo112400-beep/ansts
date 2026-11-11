@@ -1,7 +1,7 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.DistributedCasGcSweeper = void 0; /**
  * @fileoverview Distributed Mark-and-Sweep CAS Object Store Garbage Collector.
  * Connected to `LayerFsWorkspaceDriver` & `LayerFsContentStoreEngine` to sweep unreferenced blocks
- * from deleted/aborted branches while preserving all active commit & delta base objects.
+ * and unreachable commit/B-Tree metadata from deleted/aborted branches while preserving all active commit & delta base objects.
  */
 
 
@@ -25,19 +25,21 @@ class DistributedCasGcSweeper {
 
   /**
    * Performs a live mark-and-sweep GC pass directly against a `LayerFsWorkspaceDriver`,
-   * preserving all objects reachable from active branch commit chains (including DELTA base objects)
+   * pruning unreachable commit records and B-Tree directory pages (`gcUnreachableCommits`),
+   * preserving all objects reachable from active branch commit chains (including DELTA base objects),
    * and physically deleting unreferenced orphan objects from `storeEngine`.
    *
-   * [M57-2] Multi-pass topological leaf-first deletion ensures that when both a derived `DELTA`/`PREFIX`
-   * object and its `FULL` base object become orphans in the same GC cycle, the derived leaf is deleted
-   * first so the base object is unpinned and reclaimed in the same sweep pass.
+   * [M57-2 & M66-3] Multi-pass topological leaf-first deletion + unreachable commit/B-Tree pruning.
    */
   sweepLayerFsWorkspaceStore(driver)
 
 
 
 
+
+
   {
+    const commitGc = driver.gcUnreachableCommits();
     const allBlobIds = driver.storeEngine.listAllObjectIds();
     const activeCommitRoots = driver.collectReachableBranchObjects();
     const { retainedBlobIds, sweptBlobIds: candidateOrphans } = this.sweepUnreferencedBlobs({
@@ -70,7 +72,9 @@ class DistributedCasGcSweeper {
       retainedBlobIds: [...retainedBlobIds, ...remaining],
       sweptBlobIds: actuallySwept,
       pinnedOrphanBlobIds: remaining,
-      reclaimedBytes
+      reclaimedBytes,
+      prunedCommitIds: commitGc.prunedCommitIds,
+      prunedBTreeCommitCount: commitGc.prunedBTreeCommitCount
     };
   }
 }exports.DistributedCasGcSweeper = DistributedCasGcSweeper;

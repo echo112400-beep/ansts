@@ -167,11 +167,15 @@ class AnstsLocalAndComposeServer {
   tickTimer = null;
   tunnelPollTimer = null;
   host;
+  defaultApiPort;
+  defaultDashboardPort;
   tickIntervalMs;
   draining = false;
 
   constructor(options = {}) {
     this.host = options.host ?? process.env.ANSTS_HOST ?? "0.0.0.0";
+    this.defaultApiPort = options.apiPort ?? Number(process.env.ANSTS_LISTEN_PORT ?? process.env.ANSTS_PORT ?? 8080);
+    this.defaultDashboardPort = options.dashboardPort ?? Number(process.env.ANSTS_DASHBOARD_PORT ?? 0);
     this.maxBodyBytes = options.maxBodyBytes ?? 4 * 1024 * 1024;
     this.nodeId = options.nodeId ?? process.env.ANSTS_NODE_ID ?? "ansts-dev-node-01";
     this.nodeRole =
@@ -244,8 +248,8 @@ class AnstsLocalAndComposeServer {
     this.dagEscrow = new _escrow.DagEscrowCoordinator(durableSql);
     this.phaseController = new _phase_controller.CgroupPhaseController();
     this.psiGuard = new _psi_guard.LinuxPsiMemoryGuard();
-    this.cloudEventsBus = new _cloudevents.CloudEventsBus();
-    this.outboxDispatcher = new _outbox_webhook.TransactionalOutboxDispatcher(undefined, durableSql);
+    this.cloudEventsBus = new _cloudevents.CloudEventsBus(1000, durableSql);
+    this.outboxDispatcher = new _outbox_webhook.TransactionalOutboxDispatcher(undefined, 4, durableSql);
 
     const brainNodes =
     Object.keys(this.peerBrainUrls).length > 0 ?
@@ -407,8 +411,8 @@ class AnstsLocalAndComposeServer {
   }
 
   async start(apiPort, dashboardPort) {
-    const targetApiPort = apiPort ?? Number(process.env.ANSTS_LISTEN_PORT ?? process.env.ANSTS_PORT ?? 8080);
-    const targetDashPort = dashboardPort ?? Number(process.env.ANSTS_DASHBOARD_PORT ?? 0);
+    const targetApiPort = apiPort ?? this.defaultApiPort;
+    const targetDashPort = dashboardPort ?? this.defaultDashboardPort;
 
     const boundApiPort = await new Promise((resolve, reject) => {
       this.apiServer = http.createServer((req, res) => {
@@ -2492,6 +2496,18 @@ class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // [M66] Deep Potential Risk Identification & Elimination Audit (`POST /v1beta1/management/system/potential-risks-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/potential-risks-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executePotentialRisksEliminationAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 

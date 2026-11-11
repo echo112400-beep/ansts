@@ -1,6 +1,7 @@
 /**
- * @fileoverview M17 TASK-83 & M56-3: LayerFS Content-Addressed Store Engine (`layerfs/object/v2` Domain-Separated Digest,
- * Real `node:zlib` Deflate Compression, Cycle-Safe `FULL`/`PREFIX`/`DELTA` Reconstruction, Reference-Pinned Deletion & 8 KiB B-Tree Pages).
+ * @fileoverview M17 TASK-83, M56-3 & M66-3: LayerFS Content-Addressed Store Engine (`layerfs/object/v2` Domain-Separated Digest,
+ * Real `node:zlib` Deflate Compression, Cycle-Safe `FULL`/`PREFIX`/`DELTA` Reconstruction, Reference-Pinned Deletion,
+ * Accurate Logical-Byte Accounting & Unreachable Commit B-Tree Page GC).
  */
 import * as crypto from "node:crypto";
 import * as zlib from "node:zlib";
@@ -205,6 +206,25 @@ export class LayerFsContentStoreEngine {
     };
   }
 
+  /**
+   * [M66-3] Reclaims B-Tree directory page maps belonging to commits that are no longer reachable
+   * from any active branch head.
+   */
+  public gcUnreachableCommitPages(reachableCommitIds: Set<string>): number {
+    let pruned = 0;
+    for (const commitId of Array.from(this.dirPagesByCommit.keys())) {
+      if (!reachableCommitIds.has(commitId)) {
+        this.dirPagesByCommit.delete(commitId);
+        pruned += 1;
+      }
+    }
+    return pruned;
+  }
+
+  public getTrackedCommitPageCount(): number {
+    return this.dirPagesByCommit.size;
+  }
+
   public getStorageStats(): {
     distinctObjects: number;
     logicalTotalBytes: number;
@@ -232,9 +252,10 @@ export class LayerFsContentStoreEngine {
   }
 
   /**
-   * [M56-3] Reference-pinned object deletion:
+   * [M56-3 & M66-3] Reference-pinned object deletion with accurate `logicalTotalBytes` accounting:
    * Refuses to delete `objectId` (`return 0`) if any other stored `PREFIX`/`DELTA` object still
-   * depends on `objectId` as its `baseObjectId`, preventing broken delta chains during GC sweeps.
+   * depends on `objectId` as its `baseObjectId`, and decrements both `storedCompressedBytes` and
+   * `logicalTotalBytes` when deleting unreferenced objects.
    */
   public deleteObjectById(objectId: string): number {
     const obj = this.objects.get(objectId);
@@ -246,6 +267,7 @@ export class LayerFsContentStoreEngine {
     }
     const freed = obj.compressedBytes;
     this.storedCompressedBytes = Math.max(0, this.storedCompressedBytes - freed);
+    this.logicalTotalBytes = Math.max(0, this.logicalTotalBytes - obj.logicalBytes);
     this.objects.delete(objectId);
     return freed;
   }

@@ -1,6 +1,7 @@
 /**
- * @fileoverview M6 TASK-23, M54-4 & M60-1: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher
- * with SQLite Durability, Per-Message Exception Isolation, Replay-Window Signature Verification & Compaction.
+ * @fileoverview M6 TASK-23, M54-4, M60-1 & M66-1: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher
+ * with SQLite Durability, Per-Message Exception Isolation, Timing-Safe Replay-Window Signature Verification,
+ * Constructor Overload/MaxAttempts Sanitization, Dead-Letter Requeue & Compaction.
  */
 import * as crypto from "node:crypto";
 import { SqlStorageLike } from "../cloudflare/env.js";
@@ -19,15 +20,32 @@ export interface OutboxWebhookMessage {
 
 export class TransactionalOutboxDispatcher {
   private readonly outbox: Map<string, OutboxWebhookMessage> = new Map();
-  private readonly maxAttempts: number;
+  public readonly maxAttempts: number;
   private readonly signingSecret: string;
   private sql?: SqlStorageLike;
 
-  constructor(signingSecret = "ansts-webhook-hmac-secret", maxAttempts = 4, sql?: SqlStorageLike) {
-    this.signingSecret = signingSecret;
-    this.maxAttempts = maxAttempts;
-    if (sql) {
-      this.bindSqlStorage(sql);
+  constructor(
+    signingSecret = "ansts-webhook-hmac-secret",
+    maxAttemptsOrSql: number | SqlStorageLike = 4,
+    sql?: SqlStorageLike
+  ) {
+    this.signingSecret = signingSecret || "ansts-webhook-hmac-secret";
+    if (
+      typeof maxAttemptsOrSql === "object" &&
+      maxAttemptsOrSql !== null &&
+      "exec" in maxAttemptsOrSql
+    ) {
+      this.maxAttempts = 4;
+      this.bindSqlStorage(maxAttemptsOrSql);
+    } else {
+      const numericMax = Number(maxAttemptsOrSql);
+      this.maxAttempts =
+        Number.isFinite(numericMax) && numericMax > 0
+          ? Math.max(1, Math.floor(numericMax))
+          : 4;
+      if (sql) {
+        this.bindSqlStorage(sql);
+      }
     }
   }
 
@@ -81,10 +99,19 @@ export class TransactionalOutboxDispatcher {
     messageId: string,
     taskId: string,
     targetUrl: string,
-    payload: Record<string, unknown>
+    payload: Record<string, unknown>,
+    options?: { resetIfDeadLettered?: boolean }
   ): OutboxWebhookMessage {
     const existing = this.outbox.get(messageId);
     if (existing) {
+      if (existing.deadLettered && options?.resetIfDeadLettered) {
+        existing.deadLettered = false;
+        existing.attempts = 0;
+        existing.lastError = undefined;
+        existing.targetUrl = targetUrl;
+        existing.payload = payload;
+        this.persistOutboxMessage(existing);
+      }
       return existing;
     }
     const msg: OutboxWebhookMessage = {
@@ -101,6 +128,26 @@ export class TransactionalOutboxDispatcher {
     return msg;
   }
 
+  /**
+   * [M66-1] Explicitly resets a dead-lettered webhook message so operators can re-drive failed deliveries
+   * after fixing downstream webhook endpoints.
+   */
+  public retryDeadLetteredMessage(
+    messageId: string,
+    newTargetUrl?: string
+  ): OutboxWebhookMessage | null {
+    const msg = this.outbox.get(messageId);
+    if (!msg || msg.delivered) return null;
+    msg.deadLettered = false;
+    msg.attempts = 0;
+    msg.lastError = undefined;
+    if (newTargetUrl) {
+      msg.targetUrl = newTargetUrl;
+    }
+    this.persistOutboxMessage(msg);
+    return msg;
+  }
+
   public listMessages(): OutboxWebhookMessage[] {
     return Array.from(this.outbox.values());
   }
@@ -112,7 +159,8 @@ export class TransactionalOutboxDispatcher {
   }
 
   /**
-   * [M54-4] Verifies HMAC-SHA256 webhook signature and enforces replay timestamp tolerance (`maxSkewSec`).
+   * [M54-4 & M66-1] Verifies HMAC-SHA256 webhook signature using constant-time `crypto.timingSafeEqual`
+   * and enforces replay timestamp tolerance (`maxSkewSec`).
    */
   public verifySignature(
     payloadJson: string,
@@ -120,16 +168,31 @@ export class TransactionalOutboxDispatcher {
     nowSec = Math.floor(Date.now() / 1000),
     maxSkewSec = 300
   ): boolean {
-    const parts = signatureHeader.split(",");
+    if (!signatureHeader || typeof signatureHeader !== "string") return false;
+    const parts = signatureHeader.split(",").map((p) => p.trim());
     const tPart = parts.find((p) => p.startsWith("t="));
     const v1Part = parts.find((p) => p.startsWith("v1="));
     if (!tPart || !v1Part) return false;
     const ts = Number(tPart.slice(2));
-    if (!Number.isFinite(ts) || Math.abs(nowSec - ts) > maxSkewSec) {
+    const tolerance = Number.isFinite(maxSkewSec) && maxSkewSec >= 0 ? maxSkewSec : 300;
+    if (!Number.isFinite(ts) || Math.abs(nowSec - ts) > tolerance) {
       return false;
     }
-    const expected = this.signPayload(payloadJson, ts);
-    return expected === signatureHeader;
+    const providedHex = v1Part.slice(3);
+    if (!/^[0-9a-fA-F]{64}$/.test(providedHex)) {
+      return false;
+    }
+    const body = `${ts}.${payloadJson}`;
+    const expectedHex = crypto
+      .createHmac("sha256", this.signingSecret)
+      .update(body, "utf-8")
+      .digest("hex");
+    const expectedBuf = Buffer.from(expectedHex, "hex");
+    const providedBuf = Buffer.from(providedHex, "hex");
+    if (expectedBuf.length !== providedBuf.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(expectedBuf, providedBuf);
   }
 
   /**

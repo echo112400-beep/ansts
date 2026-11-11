@@ -2,11 +2,12 @@
 
 
 
-var _nodeStream = require("node:stream"); /**
- * @fileoverview M1 TASK-03, M54-4 & M60-3: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer
- * with Evicted `Last-Event-ID` Fallback Replay, Completed Task Stream GC & Idempotent `envelope.id` Deduplication.
- */
 
+var _nodeStream = require("node:stream"); /**
+ * @fileoverview M1 TASK-03, M54-4, M60-3 & M66-2: Server-Sent Events (SSE) & gRPC Stream Fan-out Multiplexer
+ * with Evicted `Last-Event-ID` Fallback Replay, Completed Task Stream GC (Across History + Orphan Subscriptions),
+ * Idempotent `envelope.id` Deduplication & CRLF Frame-Injection Sanitization.
+ */
 
 
 
@@ -26,11 +27,17 @@ class ClientStreamSubscription {
     this.stream = new _nodeStream.PassThrough();
   }
 
+  /**
+   * [M66-2] Strips `\r` and `\n` characters from `id` and `event` headers before framing
+   * to prevent SSE header/frame injection attacks.
+   */
   writeSse(envelope) {
     if (this.closed) return;
+    const safeId = String(envelope.id ?? "").replace(/[\r\n]+/g, "");
+    const safeEvent = String(envelope.event ?? "message").replace(/[\r\n]+/g, "");
     const frame =
-    `id: ${envelope.id}\n` +
-    `event: ${envelope.event}\n` +
+    `id: ${safeId}\n` +
+    `event: ${safeEvent}\n` +
     `data: ${JSON.stringify(envelope)}\n\n`;
     this.stream.write(frame);
   }
@@ -50,7 +57,9 @@ class SseEventStreamGateway {
   maxHistoryPerTask;
 
   constructor(maxHistoryPerTask = 100) {
-    this.maxHistoryPerTask = maxHistoryPerTask;
+    const rawMax = Number(maxHistoryPerTask);
+    this.maxHistoryPerTask =
+    Number.isFinite(rawMax) && rawMax > 0 ? Math.max(1, Math.floor(rawMax)) : 100;
   }
 
   subscribe(taskId, subscriptionId, replayFromEventId) {
@@ -114,12 +123,18 @@ class SseEventStreamGateway {
   }
 
   /**
-   * [M54-4] Garbage-collects SSE history and closed subscriptions for terminated/completed tasks
-   * to prevent unbounded memory growth across long-running gateways.
+   * [M54-4 & M66-2] Garbage-collects SSE history, deduplication sets, and open subscriptions across
+   * the union of `historyByTask`, `subscriptionsByTask`, and `seenEventIdsByTask` so tasks that
+   * terminated with zero published events never leak open `PassThrough` streams.
    */
   gcCompletedTaskStreams(activeTaskIds) {
     let cleanedTasks = 0;
-    for (const taskId of Array.from(this.historyByTask.keys())) {
+    const candidateTaskIds = new Set([
+    ...this.historyByTask.keys(),
+    ...this.subscriptionsByTask.keys(),
+    ...this.seenEventIdsByTask.keys()]);
+
+    for (const taskId of candidateTaskIds) {
       if (!activeTaskIds.has(taskId)) {
         const subs = this.subscriptionsByTask.get(taskId);
         if (subs) {
@@ -177,5 +192,16 @@ class SseEventStreamGateway {
 
   getTaskHistory(taskId) {
     return [...(this.historyByTask.get(taskId) ?? [])];
+  }
+
+  getActiveSubscriptionCount(taskId) {
+    if (taskId !== undefined) {
+      return this.subscriptionsByTask.get(taskId)?.size ?? 0;
+    }
+    let total = 0;
+    for (const m of this.subscriptionsByTask.values()) {
+      total += m.size;
+    }
+    return total;
   }
 }exports.SseEventStreamGateway = SseEventStreamGateway;
