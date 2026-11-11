@@ -1,6 +1,7 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.LayerFsMultiAgentBranchCoordinator = exports.LayerFsMergeConflictError = void 0; /**
- * @fileoverview M17 TASK-85 & M56-2: Multi-Agent Branch Coordination (`Layer -> Branch -> Merge -> Publish`),
- * Byte-Identity Merge, Mode Preservation, `.lww` (Last-Write-Wins) Rules, Clean File Deletion Propagation & Delete/Modify Conflict Refusal.
+ * @fileoverview M17 TASK-85, M56-2 & M67-5: Multi-Agent Branch Coordination (`Layer -> Branch -> Merge -> Publish`),
+ * Byte-Identity Merge, Mode Preservation, `.lww` (Last-Write-Wins) Rules, Clean File Deletion Propagation,
+ * Delete/Modify Conflict Refusal, Idempotent Same-Commit Fast-Forward & Merge B-Tree Directory Page Sync.
  */
 
 
@@ -45,6 +46,17 @@ class LayerFsMultiAgentBranchCoordinator {
     }
     const sourceHead = this.driver.getBranchHeadCommit(sourceBranch);
     const targetHead = this.driver.getBranchHeadCommit(targetBranch);
+
+    // [M67-5] Idempotent no-op if sourceBranch and targetBranch already point to the exact same commit
+    if (sourceHead.commitId === targetHead.commitId) {
+      return {
+        mergedCommitId: targetHead.commitId,
+        autoResolvedByByteIdentity: [],
+        autoResolvedByLww: [],
+        modeMergedFiles: [],
+        deletedFiles: []
+      };
+    }
 
     const allPaths = new Set([
     ...base.filesTree.keys(),
@@ -152,12 +164,25 @@ class LayerFsMultiAgentBranchCoordinator {
 
     this.publishedLayerSeq += 1;
     const mergedCommitId = `L${this.publishedLayerSeq}-${sourceHead.commitId}-${targetHead.commitId}`;
+    const stepId = `merge:${sourceBranch}->${targetBranch}`;
+    const changedForBtree = Array.from(mergedTree.entries()).map(([pathKey, entry]) => ({
+      path: pathKey,
+      objectId: entry.objectId,
+      mode: entry.mode,
+      turnId: entry.lastStepId || stepId
+    }));
+    this.driver.storeEngine.updateDirectoryBTreePages(
+    mergedCommitId,
+    targetHead.commitId,
+    changedForBtree);
+
+
     const mergedCommit = {
       commitId: mergedCommitId,
       parentCommitId: targetHead.commitId,
       branchName: targetBranch,
       agentId: sourceHead.agentId,
-      stepId: `merge:${sourceBranch}->${targetBranch}`,
+      stepId,
       toolCategory: "FILE_FAST_PATH",
       filesTree: mergedTree,
       lineBlameMap: mergedBlame,

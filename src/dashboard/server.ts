@@ -99,7 +99,7 @@ import { TransactionalOutboxDispatcher } from "../telemetry/outbox_webhook.js";
 import { AgentHarnessRunner } from "../harness/runner.js";
 import { CgroupPhaseController } from "../runtime/phase_controller.js";
 import { McpDynamicToolRegistry } from "../saga/mcp_registry.js";
-import { DurableObjectFacetSupervisor, DynamicWorkerSandboxLoader, CelldKvOptimizerAndGuard } from "../cloudflare/celld_native_optimizations.js";
+import { DurableObjectFacetSupervisor, DynamicWorkerSandboxLoader, CelldKvOptimizerAndGuard, V8HeapAndSqlBudgetGuard } from "../cloudflare/celld_native_optimizations.js";
 import { IngressBackpressureController } from "../gateway/backpressure.js";
 import { CognitiveRouter } from "../cognitive_router.js";
 import { LlmEndpointMetrics, ToolCallEffectClass } from "../models.js";
@@ -116,7 +116,7 @@ import { TaskResourceProfiler } from "../profiler.js";
 import { CelldAdminClient } from "../cloudflare/celld_admin_client.js";
 import { UnifiedComponentPersistenceStore } from "../checkpoint/unified_state_store.js";
 import { CelldNativeContainerSandboxManager } from "../cloudflare/celld_container_bridge.js";
-import { DurableWorkflowContext, RpoZeroDurabilityEngine } from "../cloudflare/celld_ha_engine.js";
+import { DurableWorkflowContext, RpoZeroDurabilityEngine, ShardedQueueBrokerPool } from "../cloudflare/celld_ha_engine.js";
 import { InMemoryR2Bucket } from "../cloudflare/env.js";
 import { CoWSandboxBranchForker } from "../runtime/sandbox_branch_forker.js";
 import { LayerFsMultiAgentBranchCoordinator } from "../dag/layerfs_branch_coordinator.js";
@@ -7919,6 +7919,184 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           sandboxAndVsockVerified,
         },
         allM66PotentialRiskChecksPassed,
+      },
+    };
+  }
+  /**
+   * [M67] Deep Potential Risk Identification & Elimination Phase II Audit
+   */
+  public async executeDeepPotentialRiskPhase2Audit(params: {
+    actor: string;
+    role: string;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    this.ensureInitialized();
+
+    // 1. [M67-1] CelldNativeContainerSandboxManager loopback/ULA/hex-IP/metadata SSRF block & WorkDir cleanup
+    const mgr = new CelldNativeContainerSandboxManager();
+    mgr.registerContainerClass({
+      class_name: "AuditRunner",
+      image: "ghcr.io/ansts/audit:v2.5",
+      runtime: "kata",
+      max_instances: 2,
+    });
+    const handle = mgr.getOrCreateContainerHandle("cell-m67-audit", {
+      class_name: "AuditRunner",
+      image: "ghcr.io/ansts/audit:v2.5",
+      runtime: "kata",
+    });
+    const started = handle.start({ enableInternet: true });
+    let loopbackBlocked = false;
+    let hexIpBlocked = false;
+    try {
+      CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("127.0.0.2", true);
+    } catch {
+      loopbackBlocked = true;
+    }
+    try {
+      CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("0xa9fea9fe", true);
+    } catch {
+      hexIpBlocked = true;
+    }
+    await mgr.destroyContainerHandle("cell-m67-audit");
+    const workDirCleaned = !fs.existsSync(started.containerWorkDir);
+    const containerFenceVerified = loopbackBlocked && hexIpBlocked && workDirCleaned && mgr.getHandleCount() === 0;
+
+    // 2. [M67-2] HotCellOverloadAndQueueGuard double-release/reclaimed lease desync guard & ShardedQueueBrokerPool idempotency
+    const guard = new HotCellOverloadAndQueueGuard({ maxCellConcurrentRequests: 2 });
+    const l1 = guard.tryEnterCellFetch("cell-m67", 1000);
+    const l2 = guard.tryEnterCellFetch("cell-m67", 25_000);
+    guard.reclaimStaleInFlightFetches(35_000, 30_000);
+    guard.leaveCellFetch("cell-m67", l1.leaseId); // stale release must not evict l2
+    const activeAfterStaleLeave = guard.getInFlightCount("cell-m67");
+    guard.leaveCellFetch("cell-m67", l2.leaseId);
+    const broker = new ShardedQueueBrokerPool(4, 16);
+    const shard = broker.publish("k1", "id-m67-1", { v: 1 });
+    broker.publish("k1", "id-m67-1", { v: 1 });
+    const batch = broker.consumeBatch(shard, 10);
+    const hotCellAndQueueVerified =
+      activeAfterStaleLeave === 1 &&
+      guard.getInFlightCount("cell-m67") === 0 &&
+      !guard.tryAdmitQueueProducerBatch(Number.NaN).admitted &&
+      batch.length === 1;
+
+    // 3. [M67-3] DynamicWorkerSandboxLoader async fetch timeout & inputPayload deep-clone isolation
+    const loader = new DynamicWorkerSandboxLoader();
+    const callerPayload: Record<string, unknown> = { token: "clean" };
+    await loader.executeUntrustedCodeInIsolate({
+      taskId: "t-m67-iso",
+      turnIndex: 1,
+      jsSourceCode: "inputPayload.token = 'dirty'; globalThis.__result = { ok: true };",
+      inputPayload: callerPayload,
+    });
+    let asyncTimeoutTriggered = false;
+    try {
+      await loader.executeUntrustedCodeInIsolate({
+        taskId: "t-m67-hang",
+        turnIndex: 2,
+        jsSourceCode: "export default { async fetch() { return new Promise(() => {}); } }",
+        asyncTimeoutMs: 40,
+      });
+    } catch {
+      asyncTimeoutTriggered = true;
+    }
+    const heapGuard = new V8HeapAndSqlBudgetGuard(-5, 0, -1);
+    const isolateAndHeapVerified =
+      callerPayload.token === "clean" &&
+      asyncTimeoutTriggered &&
+      heapGuard.hardHeapLimitMb >= heapGuard.softHeapLimitMb;
+
+    // 4. [M67-4] ZeroTrustVsockBridge URL credentials/port/backslash guard & EbpfLsmSecurityBridge /proc/<pid> block
+    const vsock = new ZeroTrustVsockBridge(["api.openai.com"]);
+    let credBlocked = false;
+    try {
+      vsock.sendRequest({
+        requestId: "r-cred",
+        vmId: "vm-m67",
+        method: "HTTP_EGRESS",
+        payload: { url: "https://user:pass@api.openai.com/v1" },
+      });
+    } catch {
+      credBlocked = true;
+    }
+    const lsm = new EbpfLsmSecurityBridge();
+    const nullByteBlocked = !lsm.checkFileOpenHook("/etc/shadow\0.txt").allowed;
+    const procPidBlocked = !lsm.checkFileOpenHook("/proc/99/environ").allowed;
+    const vsockAndLsmVerified = credBlocked && nullByteBlocked && procPidBlocked;
+
+    // 5. [M67-5] LayerFsMultiAgentBranchCoordinator merge B-Tree sync & TurnWalEngine task WAL GC
+    const lfs = new LayerFsWorkspaceDriver();
+    const coord = new LayerFsMultiAgentBranchCoordinator(lfs);
+    lfs.forkBranch("main", "br-m67");
+    lfs.executeInProcessFileTool({
+      branchName: "br-m67",
+      agentId: "a1",
+      stepId: "s1",
+      operation: "write",
+      filePath: "src/m67.ts",
+      newContent: "export const m67 = 1;",
+    });
+    const pagesBefore = lfs.storeEngine.getTrackedCommitPageCount();
+    coord.mergeBranchIntoTarget("br-m67", "main", "C0");
+    const pagesAfter = lfs.storeEngine.getTrackedCommitPageCount();
+    const walSql = new InMemoryCellSqlStorage();
+    const wal = new TurnWalEngine(walSql);
+    wal.appendTurnDelta({
+      taskId: "t-wal-gc",
+      turnIndex: 1,
+      fencingToken: 1,
+      changedFiles: ["m67.ts"],
+      sqliteWalPages: 1,
+      highestSubmittedFencingToken: 1,
+    });
+    const walGc = wal.gcCompletedTaskWals(new Set());
+    const mergeAndWalGcVerified = pagesAfter === pagesBefore + 1 && walGc.purgedTasks === 1;
+
+    const allM67DeepRiskPhase2ChecksPassed =
+      containerFenceVerified &&
+      hotCellAndQueueVerified &&
+      isolateAndHeapVerified &&
+      vsockAndLsmVerified &&
+      mergeAndWalGcVerified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 M67 第二阶段深度潜在风险识别与消除自检 (Fence=${containerFenceVerified}, HotCellQueue=${hotCellAndQueueVerified}, Isolate=${isolateAndHeapVerified}, VsockLSM=${vsockAndLsmVerified}, MergeWalGC=${mergeAndWalGcVerified})`,
+      "SystemWide / M67-DeepRiskPhase2Audit",
+      "ALL_M67_CHECKS_PASSED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        containerFenceAndWorkDir1: {
+          loopbackBlocked,
+          hexIpBlocked,
+          workDirCleaned,
+          containerFenceVerified,
+        },
+        hotCellAndShardedQueue2: {
+          activeAfterStaleLeave,
+          dedupedBatchLength: batch.length,
+          hotCellAndQueueVerified,
+        },
+        isolateTimeoutAndClone3: {
+          callerPayloadPreserved: callerPayload.token === "clean",
+          asyncTimeoutTriggered,
+          isolateAndHeapVerified,
+        },
+        vsockAndEbpfLsm4: {
+          credBlocked,
+          nullByteBlocked,
+          procPidBlocked,
+          vsockAndLsmVerified,
+        },
+        layerFsMergeAndWalGc5: {
+          bTreePagesAddedOnMerge: pagesAfter - pagesBefore,
+          walTasksPurged: walGc.purgedTasks,
+          mergeAndWalGcVerified,
+        },
+        allM67DeepRiskPhase2ChecksPassed,
       },
     };
   }

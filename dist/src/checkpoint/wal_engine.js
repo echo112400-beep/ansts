@@ -5,8 +5,8 @@
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var _models = require("../models.js");
 var _lease_coordinator = require("../lease_coordinator.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M5 TASK-19, M53-4 & M60-1/M60-4: Turn-Level Incremental OverlayFS Snapshot & SQLite WAL Writer (`TurnWalEngine` & `TurnWalFrame`)
- * with Dual-Tuple `(fencingToken, turnIndex)` Monotonicity, Idempotent Retry, SQLite Durability & Deterministic Breakpoint Recovery.
+ * @fileoverview M5 TASK-19, M53-4, M60-1/M60-4 & M67-5: Turn-Level Incremental OverlayFS Snapshot & SQLite WAL Writer (`TurnWalEngine` & `TurnWalFrame`)
+ * with Dual-Tuple `(fencingToken, turnIndex)` Monotonicity, Idempotent Retry, SQLite Durability, Deterministic Breakpoint Recovery & Completed Task WAL GC.
  */
 
 
@@ -175,7 +175,7 @@ class TurnWalEngine {
       turn_index: params.turnIndex,
       fencing_token: params.fencingToken,
       state_hash: checksumSha256.slice(0, 16),
-      overlayfs_diff_uri: `s3://ansts-wal/${params.taskId}/turn-${params.turnIndex}.zst`,
+      overlayfs_diff_uri: `s3://ansts-wal/${params.taskId}/turn-${turnIndexValue(params.turnIndex)}.zst`,
       created_at: createdAt
     };
     const entry = {
@@ -214,6 +214,34 @@ class TurnWalEngine {
 
   getTaskWalFrames(taskId) {
     return (this.logsByTask.get(taskId) ?? []).map((e) => e.frame);
+  }
+
+  /**
+   * [M67-5] Purges WAL frames for a terminated/archived task from both memory and SQLite.
+   */
+  purgeTaskWal(taskId) {
+    const existing = this.logsByTask.get(taskId);
+    const removedCount = existing ? existing.length : 0;
+    this.logsByTask.delete(taskId);
+    if (this.sql) {
+      this.sql.exec("DELETE FROM turn_wal_entries WHERE task_id = ?", taskId);
+    }
+    return removedCount;
+  }
+
+  /**
+   * [M67-5] Garbage-collects WAL chains for tasks not present in `activeTaskIds`.
+   */
+  gcCompletedTaskWals(activeTaskIds) {
+    let purgedTasks = 0;
+    let purgedFrames = 0;
+    for (const taskId of Array.from(this.logsByTask.keys())) {
+      if (!activeTaskIds.has(taskId)) {
+        purgedFrames += this.purgeTaskWal(taskId);
+        purgedTasks += 1;
+      }
+    }
+    return { purgedTasks, purgedFrames };
   }
 
   /**
@@ -345,3 +373,7 @@ class TurnWalEngine {
     };
   }
 }exports.TurnWalEngine = TurnWalEngine;
+
+function turnIndexValue(turnIndex) {
+  return turnIndex;
+}

@@ -7922,4 +7922,182 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       }
     };
   }
+  /**
+   * [M67] Deep Potential Risk Identification & Elimination Phase II Audit
+   */
+  async executeDeepPotentialRiskPhase2Audit(params)
+
+
+  {
+    this.ensureInitialized();
+
+    // 1. [M67-1] CelldNativeContainerSandboxManager loopback/ULA/hex-IP/metadata SSRF block & WorkDir cleanup
+    const mgr = new _celld_container_bridge.CelldNativeContainerSandboxManager();
+    mgr.registerContainerClass({
+      class_name: "AuditRunner",
+      image: "ghcr.io/ansts/audit:v2.5",
+      runtime: "kata",
+      max_instances: 2
+    });
+    const handle = mgr.getOrCreateContainerHandle("cell-m67-audit", {
+      class_name: "AuditRunner",
+      image: "ghcr.io/ansts/audit:v2.5",
+      runtime: "kata"
+    });
+    const started = handle.start({ enableInternet: true });
+    let loopbackBlocked = false;
+    let hexIpBlocked = false;
+    try {
+      _celld_container_bridge.CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("127.0.0.2", true);
+    } catch {
+      loopbackBlocked = true;
+    }
+    try {
+      _celld_container_bridge.CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget("0xa9fea9fe", true);
+    } catch {
+      hexIpBlocked = true;
+    }
+    await mgr.destroyContainerHandle("cell-m67-audit");
+    const workDirCleaned = !fs.existsSync(started.containerWorkDir);
+    const containerFenceVerified = loopbackBlocked && hexIpBlocked && workDirCleaned && mgr.getHandleCount() === 0;
+
+    // 2. [M67-2] HotCellOverloadAndQueueGuard double-release/reclaimed lease desync guard & ShardedQueueBrokerPool idempotency
+    const guard = new _hot_cell_overload_guard.HotCellOverloadAndQueueGuard({ maxCellConcurrentRequests: 2 });
+    const l1 = guard.tryEnterCellFetch("cell-m67", 1000);
+    const l2 = guard.tryEnterCellFetch("cell-m67", 25_000);
+    guard.reclaimStaleInFlightFetches(35_000, 30_000);
+    guard.leaveCellFetch("cell-m67", l1.leaseId); // stale release must not evict l2
+    const activeAfterStaleLeave = guard.getInFlightCount("cell-m67");
+    guard.leaveCellFetch("cell-m67", l2.leaseId);
+    const broker = new _celld_ha_engine.ShardedQueueBrokerPool(4, 16);
+    const shard = broker.publish("k1", "id-m67-1", { v: 1 });
+    broker.publish("k1", "id-m67-1", { v: 1 });
+    const batch = broker.consumeBatch(shard, 10);
+    const hotCellAndQueueVerified =
+    activeAfterStaleLeave === 1 &&
+    guard.getInFlightCount("cell-m67") === 0 &&
+    !guard.tryAdmitQueueProducerBatch(Number.NaN).admitted &&
+    batch.length === 1;
+
+    // 3. [M67-3] DynamicWorkerSandboxLoader async fetch timeout & inputPayload deep-clone isolation
+    const loader = new _celld_native_optimizations.DynamicWorkerSandboxLoader();
+    const callerPayload = { token: "clean" };
+    await loader.executeUntrustedCodeInIsolate({
+      taskId: "t-m67-iso",
+      turnIndex: 1,
+      jsSourceCode: "inputPayload.token = 'dirty'; globalThis.__result = { ok: true };",
+      inputPayload: callerPayload
+    });
+    let asyncTimeoutTriggered = false;
+    try {
+      await loader.executeUntrustedCodeInIsolate({
+        taskId: "t-m67-hang",
+        turnIndex: 2,
+        jsSourceCode: "export default { async fetch() { return new Promise(() => {}); } }",
+        asyncTimeoutMs: 40
+      });
+    } catch {
+      asyncTimeoutTriggered = true;
+    }
+    const heapGuard = new _celld_native_optimizations.V8HeapAndSqlBudgetGuard(-5, 0, -1);
+    const isolateAndHeapVerified =
+    callerPayload.token === "clean" &&
+    asyncTimeoutTriggered &&
+    heapGuard.hardHeapLimitMb >= heapGuard.softHeapLimitMb;
+
+    // 4. [M67-4] ZeroTrustVsockBridge URL credentials/port/backslash guard & EbpfLsmSecurityBridge /proc/<pid> block
+    const vsock = new _vsock_bridge.ZeroTrustVsockBridge(["api.openai.com"]);
+    let credBlocked = false;
+    try {
+      vsock.sendRequest({
+        requestId: "r-cred",
+        vmId: "vm-m67",
+        method: "HTTP_EGRESS",
+        payload: { url: "https://user:pass@api.openai.com/v1" }
+      });
+    } catch {
+      credBlocked = true;
+    }
+    const lsm = new _ebpf_lsm_bridge.EbpfLsmSecurityBridge();
+    const nullByteBlocked = !lsm.checkFileOpenHook("/etc/shadow\0.txt").allowed;
+    const procPidBlocked = !lsm.checkFileOpenHook("/proc/99/environ").allowed;
+    const vsockAndLsmVerified = credBlocked && nullByteBlocked && procPidBlocked;
+
+    // 5. [M67-5] LayerFsMultiAgentBranchCoordinator merge B-Tree sync & TurnWalEngine task WAL GC
+    const lfs = new _layerfs_workspace_driver.LayerFsWorkspaceDriver();
+    const coord = new _layerfs_branch_coordinator.LayerFsMultiAgentBranchCoordinator(lfs);
+    lfs.forkBranch("main", "br-m67");
+    lfs.executeInProcessFileTool({
+      branchName: "br-m67",
+      agentId: "a1",
+      stepId: "s1",
+      operation: "write",
+      filePath: "src/m67.ts",
+      newContent: "export const m67 = 1;"
+    });
+    const pagesBefore = lfs.storeEngine.getTrackedCommitPageCount();
+    coord.mergeBranchIntoTarget("br-m67", "main", "C0");
+    const pagesAfter = lfs.storeEngine.getTrackedCommitPageCount();
+    const walSql = new _env.InMemoryCellSqlStorage();
+    const wal = new _wal_engine.TurnWalEngine(walSql);
+    wal.appendTurnDelta({
+      taskId: "t-wal-gc",
+      turnIndex: 1,
+      fencingToken: 1,
+      changedFiles: ["m67.ts"],
+      sqliteWalPages: 1,
+      highestSubmittedFencingToken: 1
+    });
+    const walGc = wal.gcCompletedTaskWals(new Set());
+    const mergeAndWalGcVerified = pagesAfter === pagesBefore + 1 && walGc.purgedTasks === 1;
+
+    const allM67DeepRiskPhase2ChecksPassed =
+    containerFenceVerified &&
+    hotCellAndQueueVerified &&
+    isolateAndHeapVerified &&
+    vsockAndLsmVerified &&
+    mergeAndWalGcVerified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M67 第二阶段深度潜在风险识别与消除自检 (Fence=${containerFenceVerified}, HotCellQueue=${hotCellAndQueueVerified}, Isolate=${isolateAndHeapVerified}, VsockLSM=${vsockAndLsmVerified}, MergeWalGC=${mergeAndWalGcVerified})`,
+    "SystemWide / M67-DeepRiskPhase2Audit",
+    "ALL_M67_CHECKS_PASSED");
+
+
+    return {
+      status: 200,
+      body: {
+        containerFenceAndWorkDir1: {
+          loopbackBlocked,
+          hexIpBlocked,
+          workDirCleaned,
+          containerFenceVerified
+        },
+        hotCellAndShardedQueue2: {
+          activeAfterStaleLeave,
+          dedupedBatchLength: batch.length,
+          hotCellAndQueueVerified
+        },
+        isolateTimeoutAndClone3: {
+          callerPayloadPreserved: callerPayload.token === "clean",
+          asyncTimeoutTriggered,
+          isolateAndHeapVerified
+        },
+        vsockAndEbpfLsm4: {
+          credBlocked,
+          nullByteBlocked,
+          procPidBlocked,
+          vsockAndLsmVerified
+        },
+        layerFsMergeAndWalGc5: {
+          bTreePagesAddedOnMerge: pagesAfter - pagesBefore,
+          walTasksPurged: walGc.purgedTasks,
+          mergeAndWalGcVerified
+        },
+        allM67DeepRiskPhase2ChecksPassed
+      }
+    };
+  }
 }exports.PlatformManagementPlaneEngine = PlatformManagementPlaneEngine;

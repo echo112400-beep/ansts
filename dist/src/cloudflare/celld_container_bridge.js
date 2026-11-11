@@ -2,15 +2,16 @@
 
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var childProcess = _interopRequireWildcard(require("node:child_process"));
 var fs = _interopRequireWildcard(require("node:fs"));
 var os = _interopRequireWildcard(require("node:os"));
 var path = _interopRequireWildcard(require("node:path"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M16 TASK-75, M48-2 & M58-1: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
- * `runsc`/`kata` OCI Runtime Selector, Full RFC1918/CGNAT/IPv6 `celld-fence` Blocker, Start-Time `max_instances` Cap Guard & Subprocess Exit-Code Propagation.
+ * @fileoverview M16 TASK-75, M48-2, M58-1 & M67-1: denoland/celld Native `ctx.container` Companion Sandbox Bridge,
+ * `runsc`/`kata` OCI Runtime Selector, Full RFC1918/CGNAT/Loopback/ULA/Hex-IP/Metadata `celld-fence` Blocker,
+ * Start-Time `max_instances` Cap Guard, Subprocess Exit-Code Propagation & Ephemeral WorkDir Cleanup.
  */
-
 
 
 
@@ -88,7 +89,7 @@ class CelldContainerHandle {
 
 
   {
-    if (options.hardTimeout !== undefined && options.hardTimeout <= 0) {
+    if (options.hardTimeout !== undefined && (!Number.isFinite(options.hardTimeout) || options.hardTimeout <= 0)) {
       throw new Error("ctx.container.start(): hardTimeout must be > 0");
     }
     if (!this.running && this.onBeforeStart) {
@@ -122,12 +123,24 @@ class CelldContainerHandle {
   }
 
   setInactivityTimeout(timeoutMs) {
-    this.inactivityTimeoutMs = Math.max(1000, timeoutMs);
+    const safe = Number.isFinite(timeoutMs) ? timeoutMs : 1000;
+    this.inactivityTimeoutMs = Math.max(1000, safe);
   }
+
+  cleanupWorkDir() {
+    try {
+      if (fs.existsSync(this.containerWorkDir)) {
+        fs.rmSync(this.containerWorkDir, { recursive: true, force: true });
+      }
+    } catch {
+
+      // ignore cleanup error
+    }}
 
   simulateCellMoveDestroy() {
     this.running = false;
     this.migratedOrDestroyed = true;
+    this.cleanupWorkDir();
   }
 
   getTcpPort(port)
@@ -142,6 +155,14 @@ class CelldContainerHandle {
       fetch: async (url, init) => {
         if (this.migratedOrDestroyed || !this.running) {
           throw new OperationInterruptedError(this.cellId);
+        }
+        // Validate raw hostname before URL normalization to catch hex/octal IPv4 notations too
+        const rawHostMatch = url.match(/^[a-zA-Z]+:\/\/([^/:?#]+)/);
+        if (rawHostMatch) {
+          CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget(
+          rawHostMatch[1],
+          this.enableInternet);
+
         }
         const parsed = new URL(url);
         CelldNativeContainerSandboxManager.assertCelldFenceAllowsTarget(parsed.hostname, this.enableInternet);
@@ -189,6 +210,7 @@ class CelldContainerHandle {
 
   async destroy() {
     this.running = false;
+    this.cleanupWorkDir();
   }
 }exports.CelldContainerHandle = CelldContainerHandle;
 
@@ -203,7 +225,11 @@ class CelldNativeContainerSandboxManager {
         throw new Error(`Unsupported celld containers configuration key: '${k}'`);
       }
     }
-    this.maxInstancesByClass.set(config.class_name, config.max_instances ?? 64);
+    const maxInst =
+    config.max_instances !== undefined && Number.isFinite(config.max_instances) && config.max_instances > 0 ?
+    Math.floor(config.max_instances) :
+    64;
+    this.maxInstancesByClass.set(config.class_name, maxInst);
   }
 
   assertClassCapacityAvailable(className, fallbackMax, excludeCellId) {
@@ -228,34 +254,84 @@ class CelldNativeContainerSandboxManager {
     return handle;
   }
 
+  async destroyContainerHandle(cellId) {
+    const handle = this.handles.get(cellId);
+    if (!handle) return false;
+    await handle.destroy();
+    this.handles.delete(cellId);
+    return true;
+  }
+
+  getHandleCount() {
+    return this.handles.size;
+  }
+
+  /**
+   * [M58-1 & M67-1] Enforces `celld-fence` outbound network policy:
+   * - Blocks all external traffic when `enableInternet === false` (allowing only container loopback bridge).
+   * - Blocks RFC1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64/10`), Link-Local/IMDS (`169.254/16`),
+   *   non-bridge loopback (`127.0.0.0/8` except `127.0.0.1`), IPv6 ULA (`fc00::/7`), IPv6 Link-Local (`fe80::/10`),
+   *   IPv4-mapped/compatible IPv6 (`::ffff:*`, `0:0:0:0:0:ffff:*`), hex/octal/integer IP encodings, and cloud metadata DNS names.
+   */
   static assertCelldFenceAllowsTarget(hostname, enableInternet) {
-    const cleanHost = hostname.trim().replace(/^\[|\]$/g, "").toLowerCase();
+    const cleanHost = hostname.
+    trim().
+    replace(/^\[|\]$/g, "").
+    replace(/\.+$/, "").
+    toLowerCase();
     if (cleanHost === "localhost" || cleanHost === "127.0.0.1" || cleanHost === "container.bridge.local") {
       return;
     }
     if (!enableInternet) {
       throw new Error(`celld-fence blocked outbound traffic to '${hostname}' (enableInternet: false)`);
     }
-    // Check IPv6 link-local (fe80::/10), ULA (fc00::/7 -> fc00:/fd00:), unspecified (::), loopback (::1), or IPv4-mapped IPv6 (::ffff:...)
+    // Block cloud metadata DNS aliases and wildcard DNS rebinding domains
+    if (
+    cleanHost === "metadata.google.internal" ||
+    cleanHost === "metadata.goog" ||
+    cleanHost === "instance-data" ||
+    cleanHost.endsWith(".nip.io") ||
+    cleanHost.endsWith(".sslip.io"))
+    {
+      throw new Error(`celld-fence nftables blocked metadata/rebinding hostname '${hostname}'`);
+    }
+    // Block hex/octal/integer IPv4 obfuscations (e.g. 0xa9fea9fe, 2852039166, 0177.0.0.1)
+    if (
+    /^0x[0-9a-f]+$/i.test(cleanHost) ||
+    /^\d+$/.test(cleanHost) ||
+    cleanHost.split(".").some((part) => /^0x[0-9a-f]+$/i.test(part) || /^0\d+$/.test(part) && part !== "0"))
+    {
+      throw new Error(`celld-fence nftables blocked obfuscated IP literal '${hostname}'`);
+    }
+    // Check IPv6 link-local (fe80::/10 -> fe80..febf), ULA (fc00::/7 -> fc00..fdff), unspecified (::), loopback (::1), or IPv4-mapped IPv6
     if (
     cleanHost === "::" ||
     cleanHost === "::1" ||
     cleanHost === "0.0.0.0" ||
-    cleanHost.startsWith("fe80:") ||
-    cleanHost.startsWith("fc00:") ||
-    cleanHost.startsWith("fd00:") ||
-    cleanHost.startsWith("::ffff:"))
+    /^fe[89ab][0-9a-f]:/.test(cleanHost) ||
+    /^f[cd][0-9a-f]{2}:/.test(cleanHost) ||
+    cleanHost.startsWith("::ffff:") ||
+    cleanHost.startsWith("0:0:0:0:0:ffff:"))
     {
       throw new Error(`celld-fence nftables blocked private/link-local range access to '${hostname}'`);
     }
-    // Check IPv4 private/reserved ranges: 10.0.0.0/8, 192.168.0.0/16, 169.254.0.0/16 (IMDS), 172.16.0.0/12 (172.16..31.*), 100.64.0.0/10 (100.64..127.*)
+    // Check IPv4 private/reserved/loopback ranges: 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 192.168.0.0/16, 169.254.0.0/16 (IMDS), 172.16.0.0/12, 100.64.0.0/10
     const ipv4Match = cleanHost.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
     if (ipv4Match) {
-      const o1 = Number(ipv4Match[1]);
-      const o2 = Number(ipv4Match[2]);
+      const octets = [
+      Number(ipv4Match[1]),
+      Number(ipv4Match[2]),
+      Number(ipv4Match[3]),
+      Number(ipv4Match[4])];
+
+      if (octets.some((o) => o > 255)) {
+        throw new Error(`celld-fence nftables blocked invalid IPv4 address '${hostname}'`);
+      }
+      const [o1, o2] = octets;
       const isPrivateOrReserved =
       o1 === 0 ||
       o1 === 10 ||
+      o1 === 127 ||
       o1 === 192 && o2 === 168 ||
       o1 === 169 && o2 === 254 ||
       o1 === 172 && o2 >= 16 && o2 <= 31 ||

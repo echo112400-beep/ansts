@@ -7,8 +7,8 @@ var path = _interopRequireWildcard(require("node:path"));
 var os = _interopRequireWildcard(require("node:os"));
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var childProcess = _interopRequireWildcard(require("node:child_process"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M4 TASK-15, M47-1 & M59-5: Zero-Trust virtio-vsock Host-Guest RPC Channel,
- * HTTP/HTTPS Egress Scheme & Allowlist Filter, Real Sandboxed File I/O & Hardened Subprocess Command Execution.
+ * @fileoverview M4 TASK-15, M47-1, M59-5 & M67-4: Zero-Trust virtio-vsock Host-Guest RPC Channel,
+ * HTTP/HTTPS Egress Scheme, Port, Credential & Allowlist Filter, Real Sandboxed File I/O & Hardened Subprocess Execution.
  */
 
 
@@ -39,12 +39,28 @@ class ZeroTrustVsockBridge {
       // ignore if read-only
     }}
 
-  resolveSafeVmPath(vmId, relFilePath) {
+  resolveSafeVmPath(
+  vmId,
+  relFilePath,
+  allowRootDir = false)
+  {
+    if (relFilePath.includes("\0")) {
+      throw new Error(`Vsock sandbox path traversal refused (null byte): '${relFilePath}'`);
+    }
     const safeVmId = vmId.replace(/[^a-zA-Z0-9._-]/g, "_");
     const vmDir = path.join(this.sandboxRootDir, safeVmId);
     fs.mkdirSync(vmDir, { recursive: true });
-    const normalizedRel = path.posix.normalize(relFilePath).replace(/^\/+/, "");
-    if (normalizedRel.startsWith("..") || normalizedRel.includes("/../")) {
+    const slashed = relFilePath.replace(/\\/g, "/").trim();
+    if (slashed.split("/").some((seg) => seg === "..")) {
+      throw new Error(`Vsock sandbox path traversal refused: '${relFilePath}'`);
+    }
+    const normalizedRel = path.posix.normalize(slashed).replace(/^\/+/, "");
+    if (
+    normalizedRel === ".." ||
+    normalizedRel.startsWith("../") ||
+    normalizedRel.includes("/../") ||
+    !allowRootDir && (!normalizedRel || normalizedRel === "."))
+    {
       throw new Error(`Vsock sandbox path traversal refused: '${relFilePath}'`);
     }
     const fullPath = path.join(vmDir, normalizedRel);
@@ -54,9 +70,20 @@ class ZeroTrustVsockBridge {
   sendRequest(msg) {
     if (msg.method === "HTTP_EGRESS") {
       const urlStr = String(msg.payload.url ?? "");
-      const parsed = new URL(urlStr);
+      let parsed;
+      try {
+        parsed = new URL(urlStr);
+      } catch {
+        throw new EgressPolicyViolationError(urlStr);
+      }
       if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
         throw new EgressPolicyViolationError(`${parsed.protocol}//${parsed.hostname}`);
+      }
+      if (parsed.username || parsed.password) {
+        throw new EgressPolicyViolationError(`${parsed.username}@${parsed.hostname}`);
+      }
+      if (parsed.port && parsed.port !== "80" && parsed.port !== "443") {
+        throw new EgressPolicyViolationError(`${parsed.hostname}:${parsed.port}`);
       }
       if (!this.allowedDomains.has(parsed.hostname)) {
         throw new EgressPolicyViolationError(parsed.hostname);
@@ -67,7 +94,7 @@ class ZeroTrustVsockBridge {
     if (msg.method === "WRITE_FILE") {
       const relPath = String(msg.payload.filePath ?? "workspace.txt");
       const content = String(msg.payload.content ?? "");
-      const { fullPath, normalizedRel } = this.resolveSafeVmPath(msg.vmId, relPath);
+      const { fullPath, normalizedRel } = this.resolveSafeVmPath(msg.vmId, relPath, false);
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
       const buf = Buffer.from(content, "utf-8");
       fs.writeFileSync(fullPath, buf);
@@ -84,7 +111,7 @@ class ZeroTrustVsockBridge {
 
     if (msg.method === "READ_FILE") {
       const relPath = String(msg.payload.filePath ?? "workspace.txt");
-      const { fullPath, normalizedRel } = this.resolveSafeVmPath(msg.vmId, relPath);
+      const { fullPath, normalizedRel } = this.resolveSafeVmPath(msg.vmId, relPath, false);
       const content = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, "utf-8") : "";
       const buf = Buffer.from(content, "utf-8");
       const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
@@ -105,13 +132,13 @@ class ZeroTrustVsockBridge {
       /rm\s+(?:-[a-zA-Z]+\s+)*(?:--no-preserve-root\s+)?-?[rR][fF]?\s+\/(?:\*|\s|$)|rm\s+-rf\s+--no-preserve-root/i,
       /\bmkfs\b/i,
       /:\(\)\s*\{\s*:\|:&\s*\};:/,
-      /\/etc\/shadow|\/etc\/sudoers|\/proc\/kcore|\/proc\/self\/environ|docker\.sock/,
-      /169\.254\.169\.254|metadata\.google\.internal/i];
+      /\/etc\/shadow|\/etc\/sudoers|\/proc\/kcore|\/proc\/(?:\d+|self|thread-self)\/(?:environ|mem|root)|docker\.sock|\/var\/run\/secrets/,
+      /169\.254\.169\.254|169\.254\.170\.2|fd00:ec2::254|metadata\.google\.internal/i];
 
       if (deniedRegexes.some((rx) => rx.test(command))) {
         throw new Error(`ZeroTrustVsockBridge blocked unsafe command: '${command}'`);
       }
-      const { vmDir } = this.resolveSafeVmPath(msg.vmId, ".");
+      const { vmDir } = this.resolveSafeVmPath(msg.vmId, ".", true);
       let rawStdout = "";
       let stderr = "";
       let exitCode = 0;

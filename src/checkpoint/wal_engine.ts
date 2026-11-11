@@ -1,6 +1,6 @@
 /**
- * @fileoverview M5 TASK-19, M53-4 & M60-1/M60-4: Turn-Level Incremental OverlayFS Snapshot & SQLite WAL Writer (`TurnWalEngine` & `TurnWalFrame`)
- * with Dual-Tuple `(fencingToken, turnIndex)` Monotonicity, Idempotent Retry, SQLite Durability & Deterministic Breakpoint Recovery.
+ * @fileoverview M5 TASK-19, M53-4, M60-1/M60-4 & M67-5: Turn-Level Incremental OverlayFS Snapshot & SQLite WAL Writer (`TurnWalEngine` & `TurnWalFrame`)
+ * with Dual-Tuple `(fencingToken, turnIndex)` Monotonicity, Idempotent Retry, SQLite Durability, Deterministic Breakpoint Recovery & Completed Task WAL GC.
  */
 import * as crypto from "node:crypto";
 import { CheckpointRecord, FenceToken, TurnWalFrame } from "../models.js";
@@ -175,7 +175,7 @@ export class TurnWalEngine {
       turn_index: params.turnIndex,
       fencing_token: params.fencingToken,
       state_hash: checksumSha256.slice(0, 16),
-      overlayfs_diff_uri: `s3://ansts-wal/${params.taskId}/turn-${params.turnIndex}.zst`,
+      overlayfs_diff_uri: `s3://ansts-wal/${params.taskId}/turn-${turnIndexValue(params.turnIndex)}.zst`,
       created_at: createdAt,
     };
     const entry: WalDeltaEntry = {
@@ -214,6 +214,34 @@ export class TurnWalEngine {
 
   public getTaskWalFrames(taskId: string): TurnWalFrame[] {
     return (this.logsByTask.get(taskId) ?? []).map((e) => e.frame);
+  }
+
+  /**
+   * [M67-5] Purges WAL frames for a terminated/archived task from both memory and SQLite.
+   */
+  public purgeTaskWal(taskId: string): number {
+    const existing = this.logsByTask.get(taskId);
+    const removedCount = existing ? existing.length : 0;
+    this.logsByTask.delete(taskId);
+    if (this.sql) {
+      this.sql.exec("DELETE FROM turn_wal_entries WHERE task_id = ?", taskId);
+    }
+    return removedCount;
+  }
+
+  /**
+   * [M67-5] Garbage-collects WAL chains for tasks not present in `activeTaskIds`.
+   */
+  public gcCompletedTaskWals(activeTaskIds: Set<string>): { purgedTasks: number; purgedFrames: number } {
+    let purgedTasks = 0;
+    let purgedFrames = 0;
+    for (const taskId of Array.from(this.logsByTask.keys())) {
+      if (!activeTaskIds.has(taskId)) {
+        purgedFrames += this.purgeTaskWal(taskId);
+        purgedTasks += 1;
+      }
+    }
+    return { purgedTasks, purgedFrames };
   }
 
   /**
@@ -344,4 +372,8 @@ export class TurnWalEngine {
       monotonicFenceOrdered,
     };
   }
+}
+
+function turnIndexValue(turnIndex: number): number {
+  return turnIndex;
 }

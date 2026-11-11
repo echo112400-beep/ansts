@@ -1,6 +1,6 @@
 /**
- * @fileoverview M15 TASK-67 ~ TASK-70, M56-4 & M59-2/M59-6: denoland/celld Native Durable Object Facets (`ctx.facets`),
- * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution & Bounded Spec Cache),
+ * @fileoverview M15 TASK-67 ~ TASK-70, M56-4, M59-2/M59-6 & M67-3: denoland/celld Native Durable Object Facets (`ctx.facets`),
+ * Dynamic Workers (`env.ANSTS_SANDBOX_LOADER` with real `node:vm` isolate execution, Async Fetch Timeout, Input Deep-Clone & Bounded Spec Cache),
  * KV Single-Writer Sharding with TTL Validation & V8 128MB Heap/SQL Real Wall-Clock Budget Guard.
  */
 import * as crypto from "node:crypto";
@@ -105,7 +105,8 @@ export class DynamicWorkerSandboxLoader {
 
   constructor(loader?: DynamicWorkerLoaderBindingLike, maxCachedSpecs = 256) {
     this.loader = loader;
-    this.maxCachedSpecs = Math.max(1, maxCachedSpecs);
+    const rawMax = Number(maxCachedSpecs);
+    this.maxCachedSpecs = Number.isFinite(rawMax) && rawMax > 0 ? Math.max(1, Math.floor(rawMax)) : 256;
   }
 
   public async executeUntrustedCodeInIsolate(params: {
@@ -114,6 +115,7 @@ export class DynamicWorkerSandboxLoader {
     jsSourceCode: string;
     allowInternetEgress?: boolean;
     inputPayload?: Record<string, unknown>;
+    asyncTimeoutMs?: number;
   }): Promise<{
     isolateId: string;
     globalOutboundBlocked: boolean;
@@ -124,6 +126,11 @@ export class DynamicWorkerSandboxLoader {
     const codeHash = crypto.createHash("sha256").update(params.jsSourceCode, "utf-8").digest("hex").slice(0, 12);
     const isolateId = `dyn-worker-${params.taskId}-t${params.turnIndex}-${codeHash}`;
     const globalOutboundBlocked = !(params.allowInternetEgress ?? false);
+    const clonedInput = JSON.parse(JSON.stringify(params.inputPayload ?? {})) as Record<string, unknown>;
+    const asyncTimeoutMs =
+      params.asyncTimeoutMs !== undefined && Number.isFinite(params.asyncTimeoutMs) && params.asyncTimeoutMs > 0
+        ? Math.floor(params.asyncTimeoutMs)
+        : 2000;
 
     const spec: DynamicWorkerLoaderModuleSpec = {
       compatibilityDate: "2026-01-01",
@@ -149,7 +156,7 @@ export class DynamicWorkerSandboxLoader {
       const ep = stub.getEntrypoint("default");
       const resp = await ep.fetch("http://sandbox.internal/run", {
         method: "POST",
-        body: JSON.stringify(params.inputPayload ?? {}),
+        body: JSON.stringify(clonedInput),
       });
       const out = (await resp.json()) as Record<string, unknown>;
       const coldStartLatencyMs = Number((performance.now() - t0).toFixed(3));
@@ -170,8 +177,8 @@ export class DynamicWorkerSandboxLoader {
       JSON,
       Math,
       Date,
-      inputPayload: params.inputPayload ?? {},
-      env: spec.env,
+      inputPayload: clonedInput,
+      env: { ...spec.env },
       fetch: globalOutboundBlocked
         ? async () => {
             throw new Error("DynamicWorker Egress Blocked: globalOutbound is null");
@@ -189,11 +196,24 @@ export class DynamicWorkerSandboxLoader {
     if (workerExport && typeof workerExport.fetch === "function") {
       const req = new Request("http://sandbox.internal/run", {
         method: "POST",
-        body: JSON.stringify(params.inputPayload ?? {}),
+        body: JSON.stringify(clonedInput),
       });
-      const resp = await workerExport.fetch(req, spec.env);
-      const text = await resp.text();
-      output = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      try {
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`DynamicWorker async fetch timed out after ${asyncTimeoutMs}ms`));
+          }, asyncTimeoutMs);
+        });
+        const resp = await Promise.race([
+          Promise.resolve(workerExport.fetch(req, { ...spec.env })),
+          timeoutPromise,
+        ]);
+        const text = await resp.text();
+        output = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     } else if (sandboxGlobals.__result !== undefined) {
       output = sandboxGlobals.__result as Record<string, unknown>;
     }
@@ -262,14 +282,20 @@ export class CelldKvOptimizerAndGuard {
 }
 
 export class V8HeapAndSqlBudgetGuard {
-  private readonly softHeapLimitMb: number;
-  private readonly hardHeapLimitMb: number;
-  private readonly sqlTimeoutMs: number;
+  public readonly softHeapLimitMb: number;
+  public readonly hardHeapLimitMb: number;
+  public readonly sqlTimeoutMs: number;
 
   constructor(softHeapLimitMb = 96, hardHeapLimitMb = 128, sqlTimeoutMs = 5000) {
-    this.softHeapLimitMb = softHeapLimitMb;
-    this.hardHeapLimitMb = hardHeapLimitMb;
-    this.sqlTimeoutMs = sqlTimeoutMs;
+    const safeSoft = Number.isFinite(softHeapLimitMb) && softHeapLimitMb > 0 ? softHeapLimitMb : 96;
+    const safeHard =
+      Number.isFinite(hardHeapLimitMb) && hardHeapLimitMb >= safeSoft
+        ? hardHeapLimitMb
+        : Math.max(128, safeSoft);
+    const safeTimeout = Number.isFinite(sqlTimeoutMs) && sqlTimeoutMs > 0 ? sqlTimeoutMs : 5000;
+    this.softHeapLimitMb = safeSoft;
+    this.hardHeapLimitMb = safeHard;
+    this.sqlTimeoutMs = safeTimeout;
   }
 
   public evaluateHeapPressure(currentHeapUsedMb?: number): {

@@ -2,11 +2,12 @@
 
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M8 TASK-28 ~ TASK-31 & M55-4: RPO=0 LTX Durability Engine (with Atomic SQL Rollback on CAS Conflict),
- * DurableWorkflowContext (with Single-Flight Concurrent Deduplication & Step Invalidation), Sharded Queue Broker & Safe Epoch GC.
- */
 
+var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+ * @fileoverview M8 TASK-28 ~ TASK-31, M55-4 & M67-2: RPO=0 LTX Durability Engine (with Atomic SQL Rollback on CAS Conflict),
+ * DurableWorkflowContext (with Single-Flight Concurrent Deduplication & Step Invalidation),
+ * Bounded Idempotent Sharded Queue Broker & Safe Epoch GC.
+ */
 
 
 
@@ -148,11 +149,15 @@ class DurableWorkflowContext {
 
 class ShardedQueueBrokerPool {
   shardCount;
+  maxDepthPerShard;
   queuesByShard = new Map();
 
-  constructor(shardCount = 16) {
-    this.shardCount = shardCount;
-    for (let i = 0; i < shardCount; i++) {
+  constructor(shardCount = 16, maxDepthPerShard = 4096) {
+    const rawShards = Number(shardCount);
+    const rawDepth = Number(maxDepthPerShard);
+    this.shardCount = Number.isFinite(rawShards) && rawShards > 0 ? Math.max(1, Math.floor(rawShards)) : 16;
+    this.maxDepthPerShard = Number.isFinite(rawDepth) && rawDepth > 0 ? Math.max(1, Math.floor(rawDepth)) : 4096;
+    for (let i = 0; i < this.shardCount; i++) {
       this.queuesByShard.set(i, []);
     }
   }
@@ -162,15 +167,27 @@ class ShardedQueueBrokerPool {
     return hash.readUInt32BE(0) % this.shardCount;
   }
 
+  /**
+   * [M67-2] Idempotent bounded shard publish: deduplicates in-queue messages with the same `id`
+   * and enforces `maxDepthPerShard` to prevent unbounded shard queue growth.
+   */
   publish(partitionKey, id, payload) {
     const shard = this.computeShard(partitionKey);
-    this.queuesByShard.get(shard).push({ id, payload });
+    const queue = this.queuesByShard.get(shard);
+    if (id && queue.some((item) => item.id === id)) {
+      return shard;
+    }
+    if (queue.length >= this.maxDepthPerShard) {
+      throw new Error(`Shard ${shard} queue capacity (${this.maxDepthPerShard}) exceeded`);
+    }
+    queue.push({ id, payload });
     return shard;
   }
 
   consumeBatch(shard, maxBatch = 32) {
+    const safeBatch = Number.isFinite(maxBatch) && maxBatch > 0 ? Math.floor(maxBatch) : 32;
     const q = this.queuesByShard.get(shard) ?? [];
-    return q.splice(0, maxBatch);
+    return q.splice(0, safeBatch);
   }
 }exports.ShardedQueueBrokerPool = ShardedQueueBrokerPool;
 

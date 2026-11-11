@@ -3,8 +3,8 @@
 
 
 var _models = require("../models.js"); /**
- * @fileoverview M5 TASK-21 & M55-4: Deterministic Time-Travel Debugger & Turn Forking Engine
- * with WAL Frame CRC32 Integrity Verification & Highest-Epoch Turn Deduplication.
+ * @fileoverview M5 TASK-21, M55-4 & M67-5: Deterministic Time-Travel Debugger & Turn Forking Engine
+ * with WAL Frame CRC32 Integrity Verification, Highest-Epoch Turn Deduplication & Self-Overwrite Fork Guard.
  */
 
 
@@ -27,8 +27,9 @@ class DeterministicTimeTravelReplayer {
   }
 
   /**
-   * [M55-4] Forks a task at `targetTurnIndex` after verifying every WAL frame's CRC32 integrity
-   * and deduplicating multi-epoch turn entries by selecting the highest `(fencingToken, walSeq)` per turn.
+   * [M55-4 & M67-5] Forks a task at `targetTurnIndex` after verifying every WAL frame's CRC32 integrity,
+   * rejecting self-overwriting `newTaskId === originalTask.task_id`, and deduplicating multi-epoch turn entries
+   * by selecting the highest `(fencingToken, walSeq)` per turn.
    */
   forkTaskAtTurn(
   originalTask,
@@ -37,6 +38,15 @@ class DeterministicTimeTravelReplayer {
   newTaskId,
   overriddenPrompt)
   {
+    if (!Number.isInteger(targetTurnIndex) || targetTurnIndex < 0) {
+      throw new Error(`Invalid targetTurnIndex '${targetTurnIndex}' for time-travel fork`);
+    }
+    const cleanNewTaskId = String(newTaskId ?? "").trim();
+    if (!cleanNewTaskId || cleanNewTaskId === originalTask.task_id) {
+      throw new Error(
+      `Cannot fork task '${originalTask.task_id}': newTaskId must be non-empty and distinct from originalTask.task_id`);
+
+    }
     const candidateEntries = walEntries.filter((e) => e.turnIndex <= targetTurnIndex);
     if (candidateEntries.length === 0) {
       throw new Error(`Cannot fork task '${originalTask.task_id}' at turn ${targetTurnIndex}: no WAL found`);
@@ -73,7 +83,7 @@ class DeterministicTimeTravelReplayer {
     }
 
     const forkedTask = new _models.TaskSpec({
-      task_id: newTaskId,
+      task_id: cleanNewTaskId,
       tenant_id: originalTask.tenant_id,
       priority: originalTask.priority,
       prompt: overriddenPrompt ?? originalTask.prompt,
