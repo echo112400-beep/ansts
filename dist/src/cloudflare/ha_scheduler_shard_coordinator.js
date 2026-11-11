@@ -4,16 +4,22 @@
 
 var _manual_scale_controller = require("../cluster/manual_scale_controller.js");
 var _topology_cas_coordinator = require("../cluster/topology_cas_coordinator.js"); /**
- * @fileoverview M25 & M55-2: High-Availability 256-Slot Scheduler Shard Coordinator with Epoch Lease Fencing,
- * Automatic Unhealthy Brain Shard Eviction & Last-Brain Survival Guard (preventing empty-ring deadlocks).
- */class HaSchedulerShardCoordinator {ring;
+ * @fileoverview M25, M55-2 & M64-4: High-Availability 256-Slot Scheduler Shard Coordinator with Epoch Lease Fencing,
+ * SQLite-Backed Topology CAS Coordination, Automatic Unhealthy Brain Shard Eviction & Last-Brain Survival Guard.
+ */class HaSchedulerShardCoordinator {
+  ring;
   topologyCas;
   shardEpochs = new Map();
   activeBrains = new Set();
 
-  constructor(totalSlots = 256, vnodes = 8) {
+  constructor(totalSlots = 256, vnodes = 8, sql) {
     this.ring = new _manual_scale_controller.VirtualHashSlotRingManager(totalSlots, vnodes);
-    this.topologyCas = new _topology_cas_coordinator.TopologyCasCoordinator();
+    this.topologyCas = new _topology_cas_coordinator.TopologyCasCoordinator(sql);
+    for (const member of this.topologyCas.getMembers()) {
+      this.ring.addNode(member);
+      this.activeBrains.add(member);
+      this.shardEpochs.set(member, Math.max(1, this.topologyCas.getGeneration()));
+    }
   }
 
   registerBrainShardNode(brainNodeId) {

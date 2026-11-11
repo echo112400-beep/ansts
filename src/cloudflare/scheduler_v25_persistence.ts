@@ -1,10 +1,10 @@
 /**
- * @fileoverview v2.5 Single-Write-Path Scheduler Persistence & Queue Deduplication Store (`b566a53`), M55-1 & M60-5.
+ * @fileoverview v2.5 Single-Write-Path Scheduler Persistence & Queue Deduplication Store (`b566a53`), M55-1, M60-5 & M64-2.
  * Hardened with tenant-scoped cross-task idempotency lookup, content-fingerprint mergeable duplicate coalescing,
- * priority promotion on merge, full `spec_json` fidelity rehydration, and anti-regressive RustFS S3 LTX restoration.
+ * priority promotion on merge, 100% `TaskSpec` field serialization/rehydration fidelity, and anti-regressive RustFS S3 LTX restoration.
  */
 import { InMemoryCellSqlStorage, SqlStorageLike } from "./env.js";
-import { TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
 import { CoreScheduler5D } from "../scheduler.js";
 
 export class SchedulerV25SingleWritePathStore {
@@ -156,20 +156,34 @@ export class SchedulerV25SingleWritePathStore {
     return rows.map((r) => this.rowToTaskSpec(r));
   }
 
+  /**
+   * [M64-2] Restores 100% of `TaskSpec` fields (including `resource_profile`, `prefix_Cache_hash`,
+   * `retry_count`, `preempted_count`, `last_preempted_at`, `dead_letter_reason`, and `created_at`).
+   */
   private rowToTaskSpec(r: Record<string, unknown>): TaskSpec {
     const parsed = JSON.parse(String(r.spec_json ?? "{}")) as Record<string, unknown>;
+    const rawProfile =
+      parsed.resource_profile && typeof parsed.resource_profile === "object"
+        ? (parsed.resource_profile as Partial<ResourceProfile>)
+        : undefined;
     const t = new TaskSpec({
       task_id: String(r.task_id),
       tenant_id: String(r.tenant_id),
       priority: Number(r.priority ?? TaskPriority.P2_STANDARD) as TaskPriority,
       prompt: String(parsed.prompt ?? ""),
-      idempotency_key: r.idem_key ? String(r.idem_key) : undefined,
+      idempotency_key: parsed.idempotency_key
+        ? String(parsed.idempotency_key)
+        : r.idem_key
+          ? String(r.idem_key)
+          : undefined,
       max_turns: parsed.max_turns !== undefined ? Number(parsed.max_turns) : undefined,
       timeout_seconds: parsed.timeout_seconds !== undefined ? Number(parsed.timeout_seconds) : undefined,
-      dependencies: Array.isArray(parsed.dependencies) ? (parsed.dependencies as string[]) : undefined,
+      resource_profile: rawProfile,
+      dependencies: Array.isArray(parsed.dependencies) ? parsed.dependencies.map(String) : undefined,
       parent_task_id: parsed.parent_task_id ? String(parsed.parent_task_id) : undefined,
       expected_SubAgent_count:
         parsed.expected_SubAgent_count !== undefined ? Number(parsed.expected_SubAgent_count) : undefined,
+      prefix_Cache_hash: parsed.prefix_Cache_hash ? String(parsed.prefix_Cache_hash) : "",
       content_fingerprint: parsed.content_fingerprint ? String(parsed.content_fingerprint) : undefined,
       merged_duplicate_count:
         parsed.merged_duplicate_count !== undefined ? Number(parsed.merged_duplicate_count) : 0,
@@ -183,6 +197,21 @@ export class SchedulerV25SingleWritePathStore {
     if (parsed.current_turn !== undefined) {
       t.current_turn = Number(parsed.current_turn);
     }
+    if (parsed.retry_count !== undefined) {
+      t.retry_count = Number(parsed.retry_count);
+    }
+    if (parsed.preempted_count !== undefined) {
+      t.preempted_count = Number(parsed.preempted_count);
+    }
+    if (parsed.last_preempted_at !== undefined) {
+      t.last_preempted_at = Number(parsed.last_preempted_at);
+    }
+    if (parsed.dead_letter_reason) {
+      t.dead_letter_reason = String(parsed.dead_letter_reason);
+    }
+    if (parsed.created_at !== undefined) {
+      t.created_at = Number(parsed.created_at);
+    }
     if (!t.content_fingerprint) {
       t.content_fingerprint = CoreScheduler5D.computeTaskContentFingerprint(t);
     }
@@ -190,6 +219,8 @@ export class SchedulerV25SingleWritePathStore {
     t.lease_fencing_token = Number(r.fencing_token ?? 0);
     if (r.assigned_node_id && String(r.assigned_node_id).length > 0) {
       t.assigned_node_id = String(r.assigned_node_id);
+    } else if (parsed.assigned_node_id && String(parsed.assigned_node_id).length > 0) {
+      t.assigned_node_id = String(parsed.assigned_node_id);
     }
     return t;
   }

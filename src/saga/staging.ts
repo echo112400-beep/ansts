@@ -1,6 +1,6 @@
 /**
- * @fileoverview M3 TASK-10, M54-3 & M61-2: Staging Hold-and-Commit Buffer & Human-in-the-Loop Approval Gate
- * with Idempotent Effect Staging, Coalesced Pending Approval Tickets, Terminal-State Guard, TTL Sweep & SQLite Persistence.
+ * @fileoverview M3 TASK-10, M54-3, M61-2 & M64-3: Staging Hold-and-Commit Buffer & Human-in-the-Loop Approval Gate
+ * with Idempotent Effect Staging, Turn-Accurate Commit Callback, Coalesced Pending Approval Tickets, Terminal-State Guard, TTL Sweep & SQLite Persistence.
  */
 import { TaskSpec, TaskState } from "../models.js";
 import { SqlStorageLike } from "../cloudflare/env.js";
@@ -14,6 +14,7 @@ export interface StagedSideEffect {
   args: Record<string, unknown>;
   committed: boolean;
   aborted: boolean;
+  committedOutput?: Record<string, unknown>;
 }
 
 export interface ApprovalTicket {
@@ -123,18 +124,23 @@ export class StagingCommitAndApprovalGate {
     return full;
   }
 
+  /**
+   * [M64-3] Passes `item.turnIndex` as the 3rd argument to `executor(toolName, args, turnIndex)` so committed
+   * staged side-effects are recorded at their true turn index rather than a hardcoded turn 1.
+   */
   public commitStagedEffects(
     taskId: string,
-    executor: (toolName: string, args: Record<string, unknown>) => Record<string, unknown>
-  ): Array<{ effectId: string; output: Record<string, unknown> }> {
+    executor: (toolName: string, args: Record<string, unknown>, turnIndex: number) => Record<string, unknown>
+  ): Array<{ effectId: string; turnIndex: number; output: Record<string, unknown> }> {
     const list = this.stagedByTask.get(taskId) ?? [];
-    const results: Array<{ effectId: string; output: Record<string, unknown> }> = [];
+    const results: Array<{ effectId: string; turnIndex: number; output: Record<string, unknown> }> = [];
     for (const item of list) {
       if (!item.committed && !item.aborted) {
-        const output = executor(item.toolName, item.args);
+        const output = executor(item.toolName, item.args, item.turnIndex);
         item.committed = true;
+        item.committedOutput = output;
         this.persistEffect(item);
-        results.push({ effectId: item.effectId, output });
+        results.push({ effectId: item.effectId, turnIndex: item.turnIndex, output });
       }
     }
     return results;

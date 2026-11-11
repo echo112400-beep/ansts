@@ -1,6 +1,6 @@
 /**
- * @fileoverview M7 TASK-27, M54-1 & M61-4: AgentTaskHarnessCell (Per-Task Stateful Actor with R2/RustFS LTX Snapshot Sync,
- * Cold-Start SQLite Fencing Watermark Rehydration, Idempotent Turn Checkpoint Retry & R2-to-SQLite Breakpoint Reconciliation).
+ * @fileoverview M7 TASK-27, M54-1, M61-4 & M64-1: AgentTaskHarnessCell (Per-Task Stateful Actor with R2/RustFS LTX Snapshot Sync,
+ * Cold-Start SQLite Fencing Watermark Rehydration, Idempotent Turn Checkpoint Retry, R2-to-SQLite Breakpoint Reconciliation & DO Fetch API).
  */
 import { DurableObjectStateLike, R2BucketLike } from "./env.js";
 import { SagaToolGateway } from "../saga_gateway.js";
@@ -235,5 +235,61 @@ export class AgentTaskHarnessCell {
         r2SnapshotKey: String(r.r2_key),
       }))
       .sort((a, b) => a.turnIndex - b.turnIndex);
+  }
+
+  /**
+   * [M64-1] Durable Object HTTP `fetch` entrypoint supporting `/execute-turn`, `/reconcile`, and `/history`
+   * (with or without `/v1/harness` prefix).
+   */
+  public async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const normalizedPath = url.pathname.replace(/^\/v1\/harness(?=\/|$)/, "") || "/";
+
+    if (request.method === "POST" && normalizedPath === "/execute-turn") {
+      try {
+        const body = (await request.json()) as Record<string, unknown>;
+        const record = await this.executeAndCheckpointTurn({
+          turnIndex: Number(body.turnIndex ?? 1),
+          fencingToken: Number(body.fencingToken ?? 1),
+          toolName: String(body.toolName ?? "shell_exec"),
+          toolOutput: (body.toolOutput as Record<string, unknown>) ?? {},
+          enforceTurnMonotonicity: Boolean(body.enforceTurnMonotonicity ?? false),
+        });
+        return new Response(JSON.stringify(record), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: (err as Error).message }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      }
+    }
+
+    if (request.method === "POST" && normalizedPath === "/reconcile") {
+      const reconciled = await this.reconcileBreakpointFromR2AndSql();
+      return new Response(JSON.stringify(reconciled), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (request.method === "GET" && (normalizedPath === "/history" || normalizedPath === "/")) {
+      return new Response(
+        JSON.stringify({
+          taskId: this.taskId,
+          highestTurnIndex: this.highestTurnIndex,
+          highestFencingToken: this.highestFencingToken,
+          turns: this.getTurnHistory(),
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      );
+    }
+
+    return new Response(JSON.stringify({ error: "NOT_FOUND" }), { status: 404 });
   }
 }

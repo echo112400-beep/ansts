@@ -1,20 +1,24 @@
 /**
- * @fileoverview M9 TASK-32 ~ TASK-34 & M63-2: 64-Shard Consistent Hash Partitioned Scheduler Router,
- * Dynamic Queue Auto-Sharder & Brain-Body Container Pool Scaler with Zero-Division & NaN Guards.
+ * @fileoverview M9 TASK-32 ~ TASK-34, M63-2 & M64-5: 64-Shard Consistent Hash Partitioned Scheduler Router,
+ * Dynamic Queue Auto-Sharder & Brain-Body Container Pool Scaler with Custom State Factory, Multi-Shard Node Registration,
+ * Multi-Shard Tick Scheduling & Zero-Division/NaN Guards.
  */
 import * as crypto from "node:crypto";
 import { AnstsSchedulerCell } from "./scheduler_cell.js";
-import { MockDurableObjectState } from "./env.js";
-import { TaskSpec } from "../models.js";
+import { DurableObjectStateLike, MockDurableObjectState } from "./env.js";
+import { NodeHeartbeat, TaskSpec } from "../models.js";
 
 export class PartitionedSchedulerRouter {
   public readonly numPartitions: number;
   private readonly partitions: Map<number, AnstsSchedulerCell> = new Map();
 
-  constructor(numPartitions = 64) {
+  constructor(
+    numPartitions = 64,
+    stateFactory?: (shardId: number) => DurableObjectStateLike
+  ) {
     this.numPartitions = Math.max(1, Math.floor(numPartitions));
     for (let i = 0; i < this.numPartitions; i++) {
-      const state = new MockDurableObjectState(`scheduler-shard-${i}`);
+      const state = stateFactory ? stateFactory(i) : new MockDurableObjectState(`scheduler-shard-${i}`);
       this.partitions.set(i, new AnstsSchedulerCell(state));
     }
   }
@@ -30,10 +34,35 @@ export class PartitionedSchedulerRouter {
     return { shardId, cell: this.partitions.get(shardId)! };
   }
 
-  public async routeSubmitTask(spec: TaskSpec): Promise<{ shardId: number; submitted: TaskSpec }> {
+  public registerNodeAcrossShards(hb: NodeHeartbeat): void {
+    for (const cell of this.partitions.values()) {
+      cell.registerNode(hb);
+    }
+  }
+
+  public async routeSubmitTask(
+    spec: TaskSpec,
+    options?: { mergeDuplicateInFlight?: boolean }
+  ): Promise<{ shardId: number; submitted: TaskSpec }> {
     const { shardId, cell } = this.getCellForTask(spec.tenant_id, spec.task_id);
-    const submitted = await cell.submitTask(spec);
+    const submitted = await cell.submitTask(spec, options);
     return { shardId, submitted };
+  }
+
+  public async scheduleTickAcrossShards(): Promise<{
+    totalPlacements: Array<{ shardId: number; taskId: string; nodeId: string; fencingToken: number }>;
+    totalRecoveredIds: string[];
+  }> {
+    const totalPlacements: Array<{ shardId: number; taskId: string; nodeId: string; fencingToken: number }> = [];
+    const totalRecoveredIds: string[] = [];
+    for (const [shardId, cell] of this.partitions.entries()) {
+      const { placements, recoveredIds } = await cell.alarm();
+      for (const [taskId, nodeId, fencingToken] of placements) {
+        totalPlacements.push({ shardId, taskId, nodeId, fencingToken });
+      }
+      totalRecoveredIds.push(...recoveredIds);
+    }
+    return { totalPlacements, totalRecoveredIds };
   }
 }
 

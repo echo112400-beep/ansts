@@ -5,9 +5,10 @@
 var _models = require("../models.js");
 
 var _saga_gateway = require("../saga_gateway.js"); /**
- * @fileoverview M3 TASK-10, M54-3 & M61-2: Staging Hold-and-Commit Buffer & Human-in-the-Loop Approval Gate
- * with Idempotent Effect Staging, Coalesced Pending Approval Tickets, Terminal-State Guard, TTL Sweep & SQLite Persistence.
+ * @fileoverview M3 TASK-10, M54-3, M61-2 & M64-3: Staging Hold-and-Commit Buffer & Human-in-the-Loop Approval Gate
+ * with Idempotent Effect Staging, Turn-Accurate Commit Callback, Coalesced Pending Approval Tickets, Terminal-State Guard, TTL Sweep & SQLite Persistence.
  */
+
 
 
 
@@ -123,6 +124,10 @@ class StagingCommitAndApprovalGate {
     return full;
   }
 
+  /**
+   * [M64-3] Passes `item.turnIndex` as the 3rd argument to `executor(toolName, args, turnIndex)` so committed
+   * staged side-effects are recorded at their true turn index rather than a hardcoded turn 1.
+   */
   commitStagedEffects(
   taskId,
   executor)
@@ -131,10 +136,11 @@ class StagingCommitAndApprovalGate {
     const results = [];
     for (const item of list) {
       if (!item.committed && !item.aborted) {
-        const output = executor(item.toolName, item.args);
+        const output = executor(item.toolName, item.args, item.turnIndex);
         item.committed = true;
+        item.committedOutput = output;
         this.persistEffect(item);
-        results.push({ effectId: item.effectId, output });
+        results.push({ effectId: item.effectId, turnIndex: item.turnIndex, output });
       }
     }
     return results;

@@ -19,6 +19,9 @@ var _layerfs_workspace_driver = require("./runtime/layerfs_workspace_driver.js")
 var _manual_scale_controller = require("./cluster/manual_scale_controller.js");
 var _cognitive_router = require("./cognitive_router.js");
 var _models = require("./models.js");
+var _tunnel_gateway_cell = require("./cloudflare/tunnel_gateway_cell.js");
+var _compensator = require("./saga/compensator.js");
+var _staging = require("./saga/staging.js");
 var _saga_gateway = require("./saga_gateway.js");
 var _ha_scheduler_shard_coordinator = require("./cloudflare/ha_scheduler_shard_coordinator.js");
 var _scheduler_v25_persistence = require("./cloudflare/scheduler_v25_persistence.js");
@@ -190,19 +193,23 @@ class AnstsLocalAndComposeServer {
     this.metrics = new _otel_prometheus.OtelAndPrometheusExporter();
     this.layerfs = new _layerfs_workspace_driver.LayerFsWorkspaceDriver();
     this.fleetController = new _manual_scale_controller.ManualFleetScaleController();
-    this.router = new _cognitive_router.CognitiveRouter();
-    this.sagaGateway = new _saga_gateway.SagaToolGateway();
-
-    // Ensure storageDir exists and bind DurableDiskCellSqlStorage for RPO=0 persistence
+    // Ensure storageDir exists and bind DurableDiskCellSqlStorage for RPO=0 persistence across all subsystems
     try {
       fs.mkdirSync(this.storageDir, { recursive: true });
     } catch {
 
       // ignore if read-only in restricted environments
     }const sqlFilePath = path.join(this.storageDir, "v25_scheduler.sql.json");
-    this.v25Store = new _scheduler_v25_persistence.SchedulerV25SingleWritePathStore(new _env.DurableDiskCellSqlStorage(sqlFilePath));
-    this.tunnelRouter = new _edge_tunnel_ha_router.EdgeTunnelHaRouter();
-    this.blackboard = new _blackboard_and_git_arbiter.SharedBlackboardAndGitArbiter();
+    const durableSql = new _env.DurableDiskCellSqlStorage(sqlFilePath);
+    this.v25Store = new _scheduler_v25_persistence.SchedulerV25SingleWritePathStore(durableSql);
+    this.router = new _cognitive_router.CognitiveRouter(0.3, durableSql);
+    this.sagaGateway = new _saga_gateway.SagaToolGateway(
+    new _compensator.SagaCompensatorEngine(durableSql),
+    new _staging.StagingCommitAndApprovalGate(durableSql),
+    durableSql);
+
+    this.tunnelRouter = new _edge_tunnel_ha_router.EdgeTunnelHaRouter(new _tunnel_gateway_cell.TunnelGatewayCell(durableSql));
+    this.blackboard = new _blackboard_and_git_arbiter.SharedBlackboardAndGitArbiter(durableSql);
     this.deadlockDetector = new _deadlock_detector.A2aWaitForGraphDeadlockDetector();
     this.bisectCoordinator = new _parallel_cow_bisect.ParallelCowGitBisectCoordinator();
     this.gcSweeper = new _distributed_gc_sweeper.DistributedCasGcSweeper();
@@ -211,59 +218,67 @@ class AnstsLocalAndComposeServer {
     this.teeBridge = new _confidential_tee_bridge.ConfidentialTeeAttestationBridge();
     this.securityGuard = new _zero_trust_security_guard.ZeroTrustSandboxSecurityGuard();
     this.mtlsBridge = new _mtls_tunnel_bridge.MtlsReverseTunnelBridge();
-    this.slaEnforcer = new _capacity_sla_enforcer.CapacitySlaEnforcer();
+    this.slaEnforcer = new _capacity_sla_enforcer.CapacitySlaEnforcer({ sql: durableSql });
     this.loadShedder = new _priority_load_shedder.PriorityLoadShedder();
     this.canaryController = new _canary_rollout_controller.CanaryRolloutController();
     this.prewarmer = new _predictive_prewarmer.PredictiveSandboxPrewarmer();
-    this.geoRouter = new _geo_routing.GeoSovereigntyAndLatencyRouter();
-    this.geoRouter.registerGeoRegion({ regionId: "eu-central-1", jurisdiction: "GDPR_EU", latencyMs: 18, capacityAvailable: true });
-    this.geoRouter.registerGeoRegion({ regionId: "eu-west-1", jurisdiction: "GDPR_EU", latencyMs: 26, capacityAvailable: true });
-    this.geoRouter.registerGeoRegion({ regionId: "us-west-2", jurisdiction: "US_FED", latencyMs: 12, capacityAvailable: true });
-    this.geoRouter.registerGeoRegion({ regionId: "ap-southeast-1", jurisdiction: "APAC_SG", latencyMs: 31, capacityAvailable: true });
+    this.geoRouter = new _geo_routing.GeoSovereigntyAndLatencyRouter(durableSql);
+    if (this.geoRouter.listRegions().length === 0) {
+      this.geoRouter.registerGeoRegion({ regionId: "eu-central-1", jurisdiction: "GDPR_EU", latencyMs: 18, capacityAvailable: true });
+      this.geoRouter.registerGeoRegion({ regionId: "eu-west-1", jurisdiction: "GDPR_EU", latencyMs: 26, capacityAvailable: true });
+      this.geoRouter.registerGeoRegion({ regionId: "us-west-2", jurisdiction: "US_FED", latencyMs: 12, capacityAvailable: true });
+      this.geoRouter.registerGeoRegion({ regionId: "ap-southeast-1", jurisdiction: "APAC_SG", latencyMs: 31, capacityAvailable: true });
+    }
     this.crossRegionReplicator = new _cross_region_replicator.CrossRegionAsyncReplicator();
     this.chaosDrillRunner = new _chaos_drill_runner.AutomatedChaosDrillRunner();
     this.chaosProxy = new _network_chaos_proxy.NetworkChaosFaultInjectionProxy();
     this.preflightGate = new _preflight_gate.SandboxPreflightReadinessGate();
     this.branchForker = new _sandbox_branch_forker.CoWSandboxBranchForker(this.layerfs);
-    this.finopsController = new _budget_controller.FinOpsBudgetController();
-    this.mcpRegistry = new _mcp_registry.McpDynamicToolRegistry();
-    this.walEngine = new _wal_engine.TurnWalEngine();
+    this.finopsController = new _budget_controller.FinOpsBudgetController(durableSql);
+    this.mcpRegistry = new _mcp_registry.McpDynamicToolRegistry(durableSql, this.sagaGateway);
+    this.walEngine = new _wal_engine.TurnWalEngine(durableSql);
     this.timeTravelReplayer = new _time_travel.DeterministicTimeTravelReplayer();
     this.heavyMigrator = new _live_migration.EphemeralHeavyExecutorMigrator(new _env.InMemoryR2Bucket());
-    this.velocityBreaker = new _velocity_breaker.SyntacticAndVelocityBreaker();
+    this.velocityBreaker = new _velocity_breaker.SyntacticAndVelocityBreaker(3, 120_000, durableSql);
     this.harnessRunner = new _runner.AgentHarnessRunner(this.router, this.sagaGateway, this.velocityBreaker);
-    this.dagEscrow = new _escrow.DagEscrowCoordinator();
+    this.dagEscrow = new _escrow.DagEscrowCoordinator(durableSql);
     this.phaseController = new _phase_controller.CgroupPhaseController();
     this.psiGuard = new _psi_guard.LinuxPsiMemoryGuard();
     this.cloudEventsBus = new _cloudevents.CloudEventsBus();
-    this.outboxDispatcher = new _outbox_webhook.TransactionalOutboxDispatcher();
+    this.outboxDispatcher = new _outbox_webhook.TransactionalOutboxDispatcher(undefined, durableSql);
 
     const brainNodes =
     Object.keys(this.peerBrainUrls).length > 0 ?
     Object.keys(this.peerBrainUrls) :
     ["brain-node-01", "brain-node-02", "brain-node-03"];
-    this.shardCoordinator = new _ha_scheduler_shard_coordinator.HaSchedulerShardCoordinator(256, 8);
-    for (const bId of brainNodes) {
-      this.shardCoordinator.registerBrainShardNode(bId);
+    this.shardCoordinator = new _ha_scheduler_shard_coordinator.HaSchedulerShardCoordinator(256, 8, durableSql);
+    if (this.shardCoordinator.topologyCas.getMembers().length === 0) {
+      for (const bId of brainNodes) {
+        this.shardCoordinator.registerBrainShardNode(bId);
+      }
     }
 
-    // Register default LLM endpoints & Saga tools
-    this.router.registerEndpoint(
-    new _models.LlmEndpointMetrics({
-      endpoint_id: "ep-deepseek-r1",
-      provider: "deepseek",
-      model_name: "DeepSeek",
-      ttft_ewma_ms: 180
-    }));
+    // Register default LLM endpoints (only if not already rehydrated from SQLite) & Saga tools
+    if (!this.router.getEndpoint("ep-deepseek-r1")) {
+      this.router.registerEndpoint(
+      new _models.LlmEndpointMetrics({
+        endpoint_id: "ep-deepseek-r1",
+        provider: "deepseek",
+        model_name: "DeepSeek",
+        ttft_ewma_ms: 180
+      }));
 
-    this.router.registerEndpoint(
-    new _models.LlmEndpointMetrics({
-      endpoint_id: "ep-qwen-38",
-      provider: "qwen",
-      model_name: "Qwen-3.8",
-      ttft_ewma_ms: 150
-    }));
+    }
+    if (!this.router.getEndpoint("ep-qwen-38")) {
+      this.router.registerEndpoint(
+      new _models.LlmEndpointMetrics({
+        endpoint_id: "ep-qwen-38",
+        provider: "qwen",
+        model_name: "Qwen-3.8",
+        ttft_ewma_ms: 150
+      }));
 
+    }
     this.sagaGateway.registerTool(
     "shell_exec",
     _models.ToolCallEffectClass.IDEMPOTENT_WRITE,
@@ -307,9 +322,38 @@ class AnstsLocalAndComposeServer {
       }
     }
 
-    // Rehydrate in-memory scheduler index from durable v25Store on cold start
+    // [M64-4] Rehydrate full in-memory scheduler state (tasks, fencing watermarks, idempotency, fingerprint, queue) from durable v25Store on cold start
     for (const persistedTask of this.v25Store.listPersistedTasks()) {
+      if (persistedTask.lease_fencing_token > 0) {
+        this.scheduler.leaseCoordinator.rehydrateFencingWatermark(
+        persistedTask.task_id,
+        persistedTask.lease_fencing_token);
+
+      }
       this.scheduler.allTasks.set(persistedTask.task_id, persistedTask);
+      if (persistedTask.idempotency_key) {
+        this.scheduler.idempotencyIndex.set(
+        _scheduler.CoreScheduler5D.scopeIdempotencyKey(persistedTask.tenant_id, persistedTask.idempotency_key),
+        persistedTask.task_id);
+
+      }
+      for (const mKey of persistedTask.merged_idempotency_keys) {
+        this.scheduler.idempotencyIndex.set(
+        _scheduler.CoreScheduler5D.scopeIdempotencyKey(persistedTask.tenant_id, mKey),
+        persistedTask.task_id);
+
+      }
+      if (!persistedTask.content_fingerprint) {
+        persistedTask.content_fingerprint = _scheduler.CoreScheduler5D.computeTaskContentFingerprint(persistedTask);
+      }
+      this.scheduler.contentFingerprintIndex.set(persistedTask.content_fingerprint, persistedTask.task_id);
+      if (persistedTask.state === _models.TaskState.QUEUED) {
+        this.scheduler.queueManager.enqueue(persistedTask);
+      } else if (persistedTask.state === _models.TaskState.COMPLETED) {
+        this.scheduler.completedIds.add(persistedTask.task_id);
+      } else if (persistedTask.state === _models.TaskState.DEAD_LETTER) {
+        this.scheduler.deadLetterIds.add(persistedTask.task_id);
+      }
     }
 
     const bridge = new _server.DashboardBridgeService(this.scheduler, this.fleetController);
@@ -358,8 +402,8 @@ class AnstsLocalAndComposeServer {
       maxCellConcurrentRequests: 64,
       maxQueueConcurrentProducers: 256
     });
-    this.walCompactor = new _compactor.WalCompactorAndPagedRestorer();
-    this.layerfsStoreSync = new _layerfs_remote_sync.LayerFsRemoteStoreSynchronizer(new _env.InMemoryR2Bucket(), "ansts-fleet");
+    this.walCompactor = new _compactor.WalCompactorAndPagedRestorer(4096, durableSql);
+    this.layerfsStoreSync = new _layerfs_remote_sync.LayerFsRemoteStoreSynchronizer(new _env.InMemoryR2Bucket(), "ansts-fleet", durableSql);
   }
 
   async start(apiPort, dashboardPort) {
@@ -593,6 +637,38 @@ class AnstsLocalAndComposeServer {
       try {
         const body = await this.readJsonBody(req);
         const spec = _validator.TaskSpecValidator.validateAndNormalize(body);
+        const mergeDuplicateInFlight = Boolean(
+        body.merge_duplicate ?? body.deduplicate_by_fingerprint ?? false);
+
+        // [M64-4] Pre-check duplicate/mergeable task BEFORE backpressure rejection (consistent with ApiGatewayServer)
+        const dupCheck = this.scheduler.inspectAndMergeDuplicateTask(spec, {
+          mergeDuplicateInFlight
+        });
+        if (dupCheck.deduplicated) {
+          const canonical = dupCheck.canonicalTask;
+          this.v25Store.commitTaskSingleWritePath(spec, canonical.assigned_node_id, {
+            mergeDuplicateInFlight
+          });
+          res.writeHead(202, {
+            "content-type": "application/json",
+            "X-Ansts-Deduplicated": dupCheck.mergedBy
+          });
+          res.end(
+          JSON.stringify({
+            task_id: canonical.task_id,
+            state: canonical.state,
+            assigned_node_id: canonical.assigned_node_id ?? null,
+            lease_fencing_token: canonical.lease_fencing_token,
+            deduplicated: true,
+            merged_by: dupCheck.mergedBy,
+            priority_promoted: dupCheck.priorityPromoted,
+            merged_duplicate_count: canonical.merged_duplicate_count,
+            placements: []
+          }));
+
+          return;
+        }
+
         const decision = this.backpressure.evaluateAdmission({
           priority: spec.priority,
           globalQueueDepth: this.scheduler.queueManager.totalQueued(),
@@ -610,9 +686,11 @@ class AnstsLocalAndComposeServer {
         // Strict Single-Write-Path: check existing persisted task first, then schedule and commit atomically
         const existingPersisted = this.v25Store.getPersistedTask(spec.task_id);
         if (!existingPersisted) {
-          const submitted = this.scheduler.submitTask(spec);
+          const submitted = this.scheduler.submitTask(spec, { mergeDuplicateInFlight });
           const placements = this.scheduler.scheduleTick();
-          this.v25Store.commitTaskSingleWritePath(submitted, submitted.assigned_node_id);
+          this.v25Store.commitTaskSingleWritePath(submitted, submitted.assigned_node_id, {
+            mergeDuplicateInFlight
+          });
           if (this.s3Endpoint) {
             await this.v25Store.flushLtxSnapshotToS3(this.s3Endpoint, this.nodeId);
           }
@@ -624,12 +702,16 @@ class AnstsLocalAndComposeServer {
             state: submitted.state,
             assigned_node_id: submitted.assigned_node_id ?? null,
             lease_fencing_token: submitted.lease_fencing_token,
+            deduplicated: false,
+            merged_duplicate_count: submitted.merged_duplicate_count,
             placements
           }));
 
           return;
         }
-        const preCommitted = this.v25Store.commitTaskSingleWritePath(spec);
+        const preCommitted = this.v25Store.commitTaskSingleWritePath(spec, undefined, {
+          mergeDuplicateInFlight
+        });
         res.writeHead(202, { "content-type": "application/json" });
         res.end(
         JSON.stringify({
@@ -638,6 +720,7 @@ class AnstsLocalAndComposeServer {
           assigned_node_id: preCommitted.task.assigned_node_id ?? null,
           lease_fencing_token: preCommitted.fencingToken,
           deduplicated: true,
+          merged_duplicate_count: preCommitted.task.merged_duplicate_count,
           placements: []
         }));
 
@@ -1755,9 +1838,12 @@ class AnstsLocalAndComposeServer {
       const ticket = this.sagaGateway.stagingGate.resolveApproval(ticketId, approved, decidedBy, task);
       let committedEffects = [];
       if (approved) {
-        committedEffects = this.sagaGateway.stagingGate.commitStagedEffects(taskId, (tName, tArgs) => {
-          return this.sagaGateway.invokeTool(taskId, 1, tName, tArgs)[0];
+        committedEffects = this.sagaGateway.stagingGate.commitStagedEffects(
+        taskId,
+        (tName, tArgs, tTurnIndex) => {
+          return this.sagaGateway.invokeTool(taskId, tTurnIndex, tName, tArgs)[0];
         });
+
       } else {
         this.sagaGateway.stagingGate.abortStagedEffects(taskId);
       }
@@ -1766,18 +1852,19 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M38-2] Reverse-Order LIFO Saga Compensation Rollback (`POST /v1beta1/saga/rollback`)
+    // [M38-2 & M64-3] Reverse-Order LIFO Saga Compensation Rollback & Idempotency Journal Invalidation (`POST /v1beta1/saga/rollback`)
     if (method === "POST" && pathname === "/v1beta1/saga/rollback") {
       const body = await this.readJsonBody(req);
       const taskId = String(body.taskId ?? "task-saga-01");
       const upToTurnInclusive = Number(body.upToTurnInclusive ?? 0);
-      const rolledBackSteps = this.sagaGateway.compensator.rollbackTask(taskId, upToTurnInclusive);
+      const rb = this.sagaGateway.rollbackAndInvalidateTask(taskId, upToTurnInclusive);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
       JSON.stringify({
         taskId,
-        rolledBackCount: rolledBackSteps.length,
-        rolledBackSteps: rolledBackSteps.map((s) => ({
+        rolledBackCount: rb.rolledBackSteps.length,
+        invalidatedIdemKeysCount: rb.invalidatedIdemKeys.length,
+        rolledBackSteps: rb.rolledBackSteps.map((s) => ({
           stepId: s.stepId,
           turnIndex: s.turnIndex,
           toolName: s.toolName,
@@ -2353,6 +2440,18 @@ class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // [M64] End-to-End Implementation Consistency & Authentic Feature Wiring Audit (`POST /v1beta1/management/system/implementation-consistency-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/implementation-consistency-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeImplementationConsistencyAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 

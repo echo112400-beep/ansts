@@ -1,6 +1,7 @@
 /**
- * @fileoverview M3 TASK-11, M53-1 & M60-1/M60-2: Unified Idempotent Tool Proxy & Saga Transaction Gateway
- * with Recursive Canonical Nested-JSON Hashing, SQLite-Backed Durable Execution Journal & Post-Rollback Invalidation.
+ * @fileoverview M3 TASK-11, M53-1, M60-1/M60-2 & M64-3: Unified Idempotent Tool Proxy & Saga Transaction Gateway
+ * with Recursive Canonical Nested-JSON Hashing, SQLite-Backed Durable Execution Journal, Automatic Sub-Component
+ * SQLite Binding (`compensator` & `stagingGate`), Dynamic Post-Restart Compensation Resolution & Post-Rollback Invalidation.
  */
 import * as crypto from "node:crypto";
 import { ToolCallEffectClass, ToolExecutionLog } from "./models.js";
@@ -24,6 +25,18 @@ export class SagaToolGateway {
   ) {
     this.compensator = compensator;
     this.stagingGate = stagingGate;
+    this.compensator.setToolCompensatorResolver((toolName) => {
+      const entry = this.toolRegistry.get(toolName);
+      if (!entry || !entry[2]) return undefined;
+      const compFn = entry[2];
+      return (forwardPayload: Record<string, unknown>) => {
+        const args =
+          forwardPayload.args && typeof forwardPayload.args === "object"
+            ? (forwardPayload.args as Record<string, unknown>)
+            : forwardPayload;
+        return compFn(args);
+      };
+    });
     if (sql) {
       this.bindSqlStorage(sql);
     }
@@ -42,11 +55,13 @@ export class SagaToolGateway {
   }
 
   /**
-   * [M60-1] Attaches a SQLite storage backend to persist `executionJournal` across process restarts
-   * and immediately rehydrates any previously committed tool execution logs.
+   * [M60-1 & M64-3] Attaches a SQLite storage backend to persist `executionJournal`, `compensator` (`persisted_saga_steps`),
+   * and `stagingGate` (`persisted_approval_tickets`, `persisted_staged_effects`) across process restarts.
    */
   public bindSqlStorage(sql: SqlStorageLike): number {
     this.sql = sql;
+    this.compensator.bindSqlStorage(sql);
+    this.stagingGate.bindSqlStorage(sql);
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS saga_execution_journal (idempotency_key TEXT PRIMARY KEY, task_id TEXT, turn_index INTEGER, tool_name TEXT, effect_class TEXT, status TEXT, result_json TEXT, compensation_tool TEXT, executed_at REAL)"
     );

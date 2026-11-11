@@ -1,6 +1,6 @@
 /**
- * @fileoverview M12 TASK-44, M53-2 & M61-2: Real-Time Tenant Token Budget Quota Enforcer,
- * UTC Daily Window Auto-Reset, Spend Refund Controller, Idempotent Spend/Refund Guard & SQLite Persistence.
+ * @fileoverview M12 TASK-44, M53-2, M61-2 & M64-3: Real-Time Tenant Token Budget Quota Enforcer,
+ * UTC Daily Window Auto-Reset, Spend Refund Controller, Idempotent Spend/Refund Guard & Dual-Schema SQLite Rehydration.
  */
 import { SqlStorageLike } from "../cloudflare/env.js";
 
@@ -26,8 +26,8 @@ export class FinOpsBudgetController {
   }
 
   /**
-   * [M61-2] Binds SQLite storage (`persisted_finops_ledgers`) so tenant budget policies, daily spend,
-   * active UTC day windows, and idempotency tokens survive restarts.
+   * [M61-2 & M64-3] Binds SQLite storage (`persisted_finops_ledgers`) so tenant budget policies, daily spend,
+   * active UTC day windows, and idempotency tokens survive restarts (supporting both native and management row formats).
    */
   public bindSqlStorage(sql: SqlStorageLike): number {
     this.sql = sql;
@@ -44,9 +44,19 @@ export class FinOpsBudgetController {
       if (!tenantId) continue;
       if (parsed.policy && typeof parsed.policy === "object") {
         this.policies.set(tenantId, parsed.policy as TenantBudgetPolicy);
+      } else if (parsed.daily_budget_usd !== undefined || parsed.dailyBudgetUsd !== undefined) {
+        this.policies.set(tenantId, {
+          tenantId,
+          dailyBudgetUsd: Number(parsed.daily_budget_usd ?? parsed.dailyBudgetUsd ?? 1000),
+          softDowngradeThresholdRatio: Number(parsed.softDowngradeThresholdRatio ?? 0.8),
+          preferredModel: String(parsed.preferredModel ?? "DeepSeek-R1"),
+          fallbackEconomyModel: String(parsed.fallbackEconomyModel ?? "Qwen-3.8"),
+        });
       }
       if (parsed.spendUsd !== undefined) {
         this.spendByTenantUsd.set(tenantId, Number(parsed.spendUsd ?? 0));
+      } else if (parsed.spent_usd !== undefined) {
+        this.spendByTenantUsd.set(tenantId, Number(parsed.spent_usd ?? 0));
       }
       if (parsed.activeUtcDay) {
         this.activeUtcDayByTenant.set(tenantId, String(parsed.activeUtcDay));

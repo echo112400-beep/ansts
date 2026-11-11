@@ -416,3 +416,19 @@
   - CLI 命令: `node dist/src/cli/anstsctl.js mgmt-dfx-deep-audit`
 - **全系统 CI 静态检查与集成测试**:
   - 执行命令: `env -u NODE_PATH npm run ci` (依次执行 TypeScript AST 语法检查、Wrangler 配置校验、代码构建与 56 个测试套件执行)
+
+
+## 十四、M64 落地功能如实实现一致性全链路核查与闭环修复（End-to-End Implementation Consistency & Authentic Feature Wiring Suite）
+
+| 编号 | 模块与涉及文件 | 发现的实现不一致/断链隐患 | 修复方案与测试验证 |
+| :--- | :--- | :--- | :--- |
+| **M64-1** | **Cloudflare Worker 与 Cell 路由/队列投递一致性**<br>`src/cloudflare/worker.ts`<br>`src/cloudflare/scheduler_cell.ts`<br>`src/cloudflare/harness_cell.ts` | `worker.fetch` 将 `/v1/scheduler/*` 原样转发至 `AnstsSchedulerCell.fetch`，但 Cell 内部仅匹配无前缀 `/submit` 与 `/schedule-tick`，导致经由 Worker 入口的调度请求静默落空；`worker.queue` 仅调用 `msg.ack()` 而未向 `ANSTS_SCHEDULER_CELL` 投递任务；未路由 `/v1/harness/*`。 | `AnstsSchedulerCell.fetch` 兼容带 `/v1/scheduler` 前缀与无前缀路径（含 `/submit`、`/register-node`、`/schedule-tick`、`/tasks`）；为 `AgentTaskHarnessCell` 补齐 `fetch` 接口并在 `worker.ts` 接入 `/v1/harness/*`；`worker.queue` 真正向 `ANSTS_SCHEDULER_CELL` 提交任务并在失败时触发 `msg.retry()`。 |
+| **M64-2** | **三套持久化引擎 `TaskSpec` 100% 字段保真一致性**<br>`src/cloudflare/scheduler_cell.ts`<br>`src/cloudflare/scheduler_v25_persistence.ts`<br>`src/checkpoint/unified_state_store.ts` | 三套 SQLite 存储引擎在序列化/反序列化 `TaskSpec` 时遗漏了 `resource_profile`（5D 算力需求）、`parent_task_id`、`expected_SubAgent_count`、`prefix_Cache_hash`、`retry_count`、`preempted_count`、`last_preempted_at` 等关键字段，导致重启后退化为默认值。 | 统一补全 `AnstsSchedulerCell`、`SchedulerV25SingleWritePathStore` 与 `UnifiedComponentPersistenceStore` 对 `TaskSpec` 全量字段的落盘与冷启动恢复保真。 |
+| **M64-3** | **Saga 补偿/暂存审批 Turn 精度与 MCP/Router/Escrow 持久化闭环**<br>`src/saga/compensator.ts`<br>`src/saga/staging.ts`<br>`src/saga_gateway.ts`<br>`src/saga/mcp_registry.ts`<br>`src/cognitive_router.ts`<br>`src/dag/escrow.ts` | `SagaCompensatorEngine`、`McpDynamicToolRegistry`、`CognitiveRouter` 缺少 `bindSqlStorage` 落盘能力；`StagingCommitAndApprovalGate.commitStagedEffects` 未向回调传递真实 `turnIndex`，且 `server_main.ts` 硬编码 `turnIndex = 1`，导致 Turn 3 暂存副作用在按 Turn 3 回滚时漏回滚；`DagEscrowCoordinator` 重启后丢失 `dependencyGraph` 边导致跨重启环路漏检。 | 为 `SagaCompensatorEngine`（含重启后动态补偿函数解析器与幂等记录）、`McpDynamicToolRegistry`（自动重绑 `SagaToolGateway`）、`CognitiveRouter`（含非有限值防护）及 `DagEscrowCoordinator`（持久化 `dependencyGraph` 边）全面接入 SQLite；修正 `commitStagedEffects` 传递真实 `item.turnIndex` 并由 `POST /v1beta1/saga/rollback` 调用 `rollbackAndInvalidateTask`。 |
+| **M64-4** | **主服务 `AnstsLocalAndComposeServer` 全子系统 SQLite 接线与请求合并一致性**<br>`src/server_main.ts`<br>`src/scheduler.ts`<br>`src/cloudflare/ha_scheduler_shard_coordinator.ts` | `AnstsLocalAndComposeServer` 初始化时仅将 `DurableDiskCellSqlStorage` 绑定至 `v25Store`，其余 15 个有状态子系统仍使用纯内存实例；冷启动仅恢复 `scheduler.allTasks` 而未恢复 `idempotencyIndex`/`contentFingerprintIndex`/`leaseCoordinator`/`queueManager`；`POST /v1/tasks` 缺少与 `ApiGatewayServer` 一致的跨 `task_id` 幂等与指纹合并及在途任务优先级提升。 | 在 `AnstsLocalAndComposeServer` 中将 `durableSql` 统一绑定至全部 15 个有状态子系统；补全冷启动对调度器全量索引与队列的恢复；对齐 `POST /v1/tasks` 合并去重与 `CoreScheduler5D` 在途（`LEASED`/`RUNNING`）任务的优先级提升。 |
+| **M64-5** | **`AgentHarnessRunner` 路由 Token 计量闭环与分片调度路由一致性**<br>`src/harness/runner.ts`<br>`src/cloudflare/horizontal_scaler.ts` | `AgentHarnessRunner.executeSingleTurn` 在执行完单轮工具后未调用 `router.reportInvocationMetrics()`，导致经由 Harness 执行的轮次从不更新 `CognitiveRouter` 的 `tpm_used` 与 `ttft_ewma_ms`；`PartitionedSchedulerRouter` 缺少跨分片节点注册与跨分片 `scheduleTickAcrossShards()`。 | `AgentHarnessRunner.executeSingleTurn` 在每轮完成后真实调用 `router.reportInvocationMetrics()`（幂等命中时计 0 Token）；为 `PartitionedSchedulerRouter` 增加 `stateFactory`、`registerNodeAcrossShards()` 与 `scheduleTickAcrossShards()`。 |
+
+- **验证命令**：
+  - CLI：`node dist/src/cli/anstsctl.js mgmt-consistency-audit`
+  - HTTP API：`POST /v1beta1/management/system/implementation-consistency-audit`
+  - E2E 测试套件：`tests/m64_implementation_consistency_audit.test.ts`（全仓 **57/57 测试套件，147/147 测试用例全部通过**）。

@@ -1,6 +1,7 @@
 /**
- * @fileoverview M2 TASK-05, M52-3 & M61-2: Deadlock-Free Parent-Child Sub-Agent Quota Escrow Coordinator
- * with Idempotent Parent Reservation, Idempotent Child Registration, Child-Failure Unblocking & SQLite Persistence.
+ * @fileoverview M2 TASK-05, M52-3, M61-2 & M64-3: Deadlock-Free Parent-Child Sub-Agent Quota Escrow Coordinator
+ * with Idempotent Parent Reservation, Idempotent Child Registration, Child-Failure Unblocking,
+ * Dependency Graph Cycle Persistence & SQLite Rehydration.
  */
 import { TaskSpec, TaskState } from "../models.js";
 import { SqlStorageLike } from "../cloudflare/env.js";
@@ -25,7 +26,8 @@ export class DagEscrowCoordinator {
   }
 
   /**
-   * [M61-2] Binds SQLite storage (`persisted_escrows`) to persist and rehydrate parent-child escrow records.
+   * [M61-2 & M64-3] Binds SQLite storage (`persisted_escrows`) to persist and rehydrate parent-child escrow records
+   * AND `dependencyGraph` edges so DAG cycle detection remains intact across process restarts.
    */
   public bindSqlStorage(sql: SqlStorageLike): number {
     this.sql = sql;
@@ -39,15 +41,24 @@ export class DagEscrowCoordinator {
     for (const r of rows) {
       const parentTaskId = String(r.parent_task_id ?? "");
       const parsed = JSON.parse(String(r.payload_json ?? "{}")) as Record<string, unknown>;
-      if (!parentTaskId || parsed.escrowedSlots === undefined) continue;
+      if (!parentTaskId || (parsed.escrowedSlots === undefined && parsed.escrowReserved === undefined)) continue;
+      const childIds = Array.isArray(parsed.childTaskIds) ? parsed.childTaskIds.map(String) : [];
       const rec: QuotaEscrowRecord = {
         parentTaskId,
         tenantId: String(parsed.tenantId ?? "default"),
-        escrowedSlots: Number(parsed.escrowedSlots ?? 0),
+        escrowedSlots: Number(parsed.escrowedSlots ?? parsed.escrowReserved ?? 0),
         usedSlots: Number(parsed.usedSlots ?? 0),
-        childTaskIds: new Set(Array.isArray(parsed.childTaskIds) ? parsed.childTaskIds.map(String) : []),
+        childTaskIds: new Set(childIds),
       };
       this.escrows.set(parentTaskId, rec);
+      const childDepsMap =
+        parsed.childDependencies && typeof parsed.childDependencies === "object"
+          ? (parsed.childDependencies as Record<string, unknown>)
+          : {};
+      for (const cId of childIds) {
+        const extraDeps = Array.isArray(childDepsMap[cId]) ? (childDepsMap[cId] as unknown[]).map(String) : [];
+        this.dependencyGraph.set(cId, new Set([parentTaskId, ...extraDeps]));
+      }
       restored += 1;
     }
     return restored;
@@ -55,6 +66,13 @@ export class DagEscrowCoordinator {
 
   private persistEscrow(rec: QuotaEscrowRecord): void {
     if (!this.sql) return;
+    const childDependencies: Record<string, string[]> = {};
+    for (const cId of rec.childTaskIds) {
+      const deps = this.dependencyGraph.get(cId);
+      if (deps) {
+        childDependencies[cId] = Array.from(deps);
+      }
+    }
     this.sql.exec(
       "INSERT OR REPLACE INTO persisted_escrows (parent_task_id, payload_json) VALUES (?, ?)",
       rec.parentTaskId,
@@ -64,6 +82,7 @@ export class DagEscrowCoordinator {
         escrowedSlots: rec.escrowedSlots,
         usedSlots: rec.usedSlots,
         childTaskIds: Array.from(rec.childTaskIds),
+        childDependencies,
       })
     );
   }
@@ -117,6 +136,7 @@ export class DagEscrowCoordinator {
     parent.state = TaskState.WAITING_SUB_AGENT;
     const escrow = this.escrows.get(parent.task_id);
     if (escrow && escrow.childTaskIds.has(child.task_id)) {
+      this.persistEscrow(escrow);
       return { usedEscrowSlot: true, deduplicated: true };
     }
     if (escrow && escrow.usedSlots < escrow.escrowedSlots) {
@@ -141,6 +161,7 @@ export class DagEscrowCoordinator {
     if (escrow.childTaskIds.delete(childTaskId) && escrow.usedSlots > 0) {
       escrow.usedSlots -= 1;
     }
+    this.dependencyGraph.delete(childTaskId);
     this.persistEscrow(escrow);
     if (escrow.childTaskIds.size === 0) {
       parent.state = TaskState.RUNNING_THINK;
@@ -190,6 +211,9 @@ export class DagEscrowCoordinator {
     const escrow = this.escrows.get(parentTaskId);
     if (!escrow) return 0;
     const freed = escrow.escrowedSlots;
+    for (const cId of escrow.childTaskIds) {
+      this.dependencyGraph.delete(cId);
+    }
     this.escrows.delete(parentTaskId);
     if (this.sql) {
       this.sql.exec("DELETE FROM persisted_escrows WHERE parent_task_id = ?", parentTaskId);

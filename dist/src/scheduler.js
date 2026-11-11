@@ -130,11 +130,12 @@ class CoreScheduler5D {
     }
 
     let priorityPromoted = false;
-    if (
-    incoming.priority < canonical.priority && (
-    canonical.state === _models.TaskState.QUEUED || canonical.state === _models.TaskState.SUBMITTED))
-    {
-      this.queueManager.reprioritizeQueuedTask(canonical, incoming.priority);
+    if (incoming.priority < canonical.priority && MERGEABLE_ACTIVE_STATES.has(canonical.state)) {
+      if (canonical.state === _models.TaskState.QUEUED || canonical.state === _models.TaskState.SUBMITTED) {
+        this.queueManager.reprioritizeQueuedTask(canonical, incoming.priority);
+      } else {
+        canonical.priority = incoming.priority;
+      }
       priorityPromoted = true;
     }
 

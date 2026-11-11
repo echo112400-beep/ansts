@@ -2,14 +2,15 @@
 
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var _models = require("./models.js");
 var _compensator = require("./saga/compensator.js");
 var _staging = require("./saga/staging.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M3 TASK-11, M53-1 & M60-1/M60-2: Unified Idempotent Tool Proxy & Saga Transaction Gateway
- * with Recursive Canonical Nested-JSON Hashing, SQLite-Backed Durable Execution Journal & Post-Rollback Invalidation.
+ * @fileoverview M3 TASK-11, M53-1, M60-1/M60-2 & M64-3: Unified Idempotent Tool Proxy & Saga Transaction Gateway
+ * with Recursive Canonical Nested-JSON Hashing, SQLite-Backed Durable Execution Journal, Automatic Sub-Component
+ * SQLite Binding (`compensator` & `stagingGate`), Dynamic Post-Restart Compensation Resolution & Post-Rollback Invalidation.
  */
-
 class SagaToolGateway {
   executionJournal = new Map();
   toolRegistry = new Map();
@@ -24,6 +25,18 @@ class SagaToolGateway {
   {
     this.compensator = compensator;
     this.stagingGate = stagingGate;
+    this.compensator.setToolCompensatorResolver((toolName) => {
+      const entry = this.toolRegistry.get(toolName);
+      if (!entry || !entry[2]) return undefined;
+      const compFn = entry[2];
+      return (forwardPayload) => {
+        const args =
+        forwardPayload.args && typeof forwardPayload.args === "object" ?
+        forwardPayload.args :
+        forwardPayload;
+        return compFn(args);
+      };
+    });
     if (sql) {
       this.bindSqlStorage(sql);
     }
@@ -42,11 +55,13 @@ class SagaToolGateway {
   }
 
   /**
-   * [M60-1] Attaches a SQLite storage backend to persist `executionJournal` across process restarts
-   * and immediately rehydrates any previously committed tool execution logs.
+   * [M60-1 & M64-3] Attaches a SQLite storage backend to persist `executionJournal`, `compensator` (`persisted_saga_steps`),
+   * and `stagingGate` (`persisted_approval_tickets`, `persisted_staged_effects`) across process restarts.
    */
   bindSqlStorage(sql) {
     this.sql = sql;
+    this.compensator.bindSqlStorage(sql);
+    this.stagingGate.bindSqlStorage(sql);
     this.sql.exec(
     "CREATE TABLE IF NOT EXISTS saga_execution_journal (idempotency_key TEXT PRIMARY KEY, task_id TEXT, turn_index INTEGER, tool_name TEXT, effect_class TEXT, status TEXT, result_json TEXT, compensation_tool TEXT, executed_at REAL)");
 

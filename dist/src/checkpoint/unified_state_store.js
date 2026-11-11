@@ -4,12 +4,17 @@
 
 
 
+
 var _scheduler = require("../scheduler.js");
 var _models = require("../models.js"); /**
- * @fileoverview M14 TASK-63 ~ TASK-66, M48-1, M56-1 & M60-1: Unified Component & Full-Link Persistence Store & Cold-Start Rehydration Engine
- * with Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, Interrupted In-Flight Task Recovery,
- * and End-to-End Snapshot/Rehydration across Scheduler, TurnWalEngine, SagaToolGateway & TransactionalOutboxDispatcher.
+ * @fileoverview M14 TASK-63 ~ TASK-66, M48-1, M56-1, M60-1 & M64-2/M64-3: Unified Component & Full-Link Persistence Store & Cold-Start Rehydration Engine
+ * with Monotonic Fencing Watermark Rehydration, 100% TaskSpec Field Fidelity, Tenant-Scoped Idempotency Index Restoration, Interrupted In-Flight Task Recovery,
+ * and End-to-End Snapshot/Rehydration across Scheduler, TurnWalEngine, SagaToolGateway (Journal + Compensator + StagingGate),
+ * TransactionalOutboxDispatcher, DagEscrowCoordinator, FinOpsBudgetController, CognitiveRouter & McpDynamicToolRegistry.
  */
+
+
+
 class UnifiedComponentPersistenceStore {
   sql;
 
@@ -59,10 +64,10 @@ class UnifiedComponentPersistenceStore {
   }
 
   /**
-   * [M56-1 & M60-1] Rehydrates tasks, fencing watermarks, tenant-scoped `idempotencyIndex`,
-   * `contentFingerprintIndex`, `deadLetterIds`, and merged duplicate metadata from `persisted_tasks` and `persisted_leases`.
-   * Any task that was interrupted mid-flight (`LEASED`, `RUNNING_THINK`, `RUNNING_ACT`) is safely
-   * transitioned back to `QUEUED` and enqueued so it is re-dispatched with a higher monotonic fencing token.
+   * [M56-1, M60-1 & M64-2] Rehydrates tasks with 100% `TaskSpec` field fidelity (`resource_profile`,
+   * `parent_task_id`, `expected_SubAgent_count`, `prefix_Cache_hash`, `last_preempted_at`, `created_at`),
+   * fencing watermarks, tenant-scoped `idempotencyIndex`, `contentFingerprintIndex`, `deadLetterIds`,
+   * and merged duplicate metadata from `persisted_tasks` and `persisted_leases`.
    */
   rehydrateSchedulerFromSql(
   targetScheduler,
@@ -82,6 +87,10 @@ class UnifiedComponentPersistenceStore {
     let restored = 0;
     for (const r of rows) {
       const raw = JSON.parse(String(r.payload_json));
+      const rawProfile =
+      raw.resource_profile && typeof raw.resource_profile === "object" ?
+      raw.resource_profile :
+      undefined;
       const spec = new _models.TaskSpec({
         task_id: String(raw.task_id),
         tenant_id: String(raw.tenant_id),
@@ -89,11 +98,13 @@ class UnifiedComponentPersistenceStore {
         prompt: String(raw.prompt ?? ""),
         max_turns: Number(raw.max_turns ?? 30),
         timeout_seconds: Number(raw.timeout_seconds ?? 1800),
+        resource_profile: rawProfile,
         dependencies: Array.isArray(raw.dependencies) ? raw.dependencies.map(String) : [],
         idempotency_key: raw.idempotency_key ? String(raw.idempotency_key) : undefined,
         parent_task_id: raw.parent_task_id ? String(raw.parent_task_id) : undefined,
         expected_SubAgent_count:
         raw.expected_SubAgent_count !== undefined ? Number(raw.expected_SubAgent_count) : undefined,
+        prefix_Cache_hash: raw.prefix_Cache_hash ? String(raw.prefix_Cache_hash) : "",
         content_fingerprint: raw.content_fingerprint ? String(raw.content_fingerprint) : undefined,
         merged_duplicate_count:
         raw.merged_duplicate_count !== undefined ? Number(raw.merged_duplicate_count) : 0,
@@ -113,8 +124,14 @@ class UnifiedComponentPersistenceStore {
       if (raw.preempted_count !== undefined) {
         spec.preempted_count = Number(raw.preempted_count);
       }
+      if (raw.last_preempted_at !== undefined) {
+        spec.last_preempted_at = Number(raw.last_preempted_at);
+      }
       if (raw.dead_letter_reason) {
         spec.dead_letter_reason = String(raw.dead_letter_reason);
+      }
+      if (raw.created_at !== undefined) {
+        spec.created_at = Number(raw.created_at);
       }
       spec.state = raw.state ?? _models.TaskState.QUEUED;
       spec.lease_fencing_token = Number(raw.lease_fencing_token ?? 0);
@@ -165,10 +182,14 @@ class UnifiedComponentPersistenceStore {
   }
 
   /**
-   * [M60-1] Atomically snapshots the full end-to-end execution chain (Scheduler, TurnWalEngine,
-   * SagaToolGateway journal & steps, and TransactionalOutboxDispatcher) into SQLite.
+   * [M60-1 & M64-3] Atomically snapshots the full end-to-end execution chain across all 8 unified tables
+   * plus `turn_wal_entries`, `saga_execution_journal`, and `transactional_outbox_messages`.
    */
   snapshotFullLinkState(params)
+
+
+
+
 
 
 
@@ -220,6 +241,19 @@ class UnifiedComponentPersistenceStore {
       }
     }
 
+    if (params.dagEscrow) {
+      params.dagEscrow.bindSqlStorage(this.sql);
+    }
+    if (params.finopsController) {
+      params.finopsController.bindSqlStorage(this.sql);
+    }
+    if (params.router) {
+      params.router.bindSqlStorage(this.sql);
+    }
+    if (params.mcpRegistry) {
+      params.mcpRegistry.bindSqlStorage(this.sql, params.sagaGateway);
+    }
+
     return {
       tasksSaved: schedSnap.tasksSaved,
       leasesSaved: schedSnap.leasesSaved,
@@ -230,10 +264,19 @@ class UnifiedComponentPersistenceStore {
   }
 
   /**
-   * [M60-1] Rehydrates the full end-to-end execution chain (Scheduler, TurnWalEngine, SagaToolGateway,
-   * and TransactionalOutboxDispatcher) from SQLite on process/cell cold-start.
+   * [M60-1 & M64-3] Rehydrates the full end-to-end execution chain (Scheduler, TurnWalEngine, SagaToolGateway +
+   * Compensator + StagingGate, TransactionalOutboxDispatcher, DagEscrowCoordinator, FinOpsBudgetController,
+   * CognitiveRouter, and McpDynamicToolRegistry) from SQLite on process/cell cold-start.
    */
   rehydrateFullLinkState(params)
+
+
+
+
+
+
+
+
 
 
 
@@ -253,11 +296,23 @@ class UnifiedComponentPersistenceStore {
     const outboxMessagesRestored = params.outboxDispatcher ?
     params.outboxDispatcher.bindSqlStorage(this.sql) :
     0;
+    const escrowsRestored = params.dagEscrow ? params.dagEscrow.bindSqlStorage(this.sql) : undefined;
+    const finopsLedgersRestored = params.finopsController ?
+    params.finopsController.bindSqlStorage(this.sql) :
+    undefined;
+    const routerEndpointsRestored = params.router ? params.router.bindSqlStorage(this.sql) : undefined;
+    const mcpToolsRestored = params.mcpRegistry ?
+    params.mcpRegistry.bindSqlStorage(this.sql, params.sagaGateway) :
+    undefined;
     return {
       tasksRestored,
       walEntriesRestored,
       sagaJournalRestored,
-      outboxMessagesRestored
+      outboxMessagesRestored,
+      escrowsRestored,
+      finopsLedgersRestored,
+      routerEndpointsRestored,
+      mcpToolsRestored
     };
   }
 

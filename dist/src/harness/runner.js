@@ -1,13 +1,14 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.AgentHarnessRunner = void 0;
 
 
+
 var _models = require("../models.js");
 var _cognitive_router = require("../cognitive_router.js");
 var _saga_gateway = require("../saga_gateway.js");
 var _velocity_breaker = require("./velocity_breaker.js"); /**
- * @fileoverview M4 TASK-17: In-Sandbox Agent Harness ReAct Loop Runner.
+ * @fileoverview M4 TASK-17 & M64-5: In-Sandbox Agent Harness ReAct Loop Runner
+ * with Closed-Loop `CognitiveRouter.reportInvocationMetrics()` Token & Latency Accounting.
  */
-
 
 
 
@@ -46,6 +47,7 @@ class AgentHarnessRunner {
     _cognitive_router.CognitiveRouter.computePrefixHash("system:agent-v2", "tools:default", task.prompt);
     task.prefix_Cache_hash = prefixHash;
 
+    const t0 = performance.now();
     const [endpoint, cacheHit] = this.router.selectEndpoint(prefixHash, estimatedTokens, task.priority);
     try {
       const nextTurn = task.current_turn + 1;
@@ -68,6 +70,13 @@ class AgentHarnessRunner {
       nextTurn,
       toolName,
       toolArgs);
+
+      const observedTtftMs = Math.max(1, Number((performance.now() - t0).toFixed(2)));
+      this.router.reportInvocationMetrics(
+      endpoint.endpoint_id,
+      observedTtftMs,
+      deduplicated ? 0 : estimatedTokens,
+      false);
 
       task.current_turn = nextTurn;
       return {
