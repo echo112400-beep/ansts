@@ -2558,6 +2558,22 @@ export class AnstsLocalAndComposeServer {
     }
 
     // [M70-4] Day-2 Governance Suite (`POST /v1beta1/management/ops/day2-governance`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/phase3-memory-spot-market") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.executePhase3MemoryAndSpotMarketSuite({
+        action: body.action as
+          | "hierarchical_context_compactor"
+          | "spot_quota_lending_market"
+          | "run_all_phase3_suite"
+          | undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     if (method === "POST" && pathname === "/v1beta1/management/ops/phase2-memory-guardrail-replay") {
       const body = await this.readJsonBody(req);
       const out = this.managementPlane.executePhase2MemoryGuardrailReplaySuite({

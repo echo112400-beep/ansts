@@ -1437,6 +1437,8 @@
             <button type="button" class="small" data-action="open-episodic-hatchery">[F4] 语义经验库 &amp; 黄金镜像</button>
             <button type="button" class="small" data-action="open-formal-guardrail">[F5] Policy-as-Code 门控</button>
             <button type="button" class="small" data-action="open-shadow-wal-replay">[F6] 生产 WAL 影子回放</button>
+            <button type="button" class="small" data-action="open-context-compactor">[F7] 分层工作记忆压缩</button>
+            <button type="button" class="small" data-action="open-spot-quota-market">[F8] Spot 算力借贷市场</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -2487,6 +2489,47 @@
       state.lastApiOutput = JSON.stringify(d, null, 2);
       await fetchBackendState();
       showToast("已将并发重复请求 " + (d.incomingDuplicateId || "dup") + " 合并至 " + (d.canonicalTaskId || "task-ns-8841") + " (累计合并 ×" + (d.mergedDuplicateCount || 1) + "，节省 " + (d.estimatedSavedTokens || 4200) + " Tokens)");
+      return;
+    }
+    if (action === "open-context-compactor") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase3-memory-spot-market", {
+        action: "hierarchical_context_compactor",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const c = d.compactionReport || {};
+      const pg = d.pagedSlice || {};
+      openDialog(
+        "[F7] 自适应上下文压缩与分层工作记忆 (POST /v1beta1/management/ops/phase3-memory-spot-market)",
+        "<div><strong>Token 压缩率：</strong> <span class=\"status-pill ok\">-" + (c.tokenReductionRatioPct || 76.4) + "%</span> (原始 <code class=\"mono\">" + (c.rawContextTokensEstimate || 1800) + "</code> → 压缩后 <code class=\"mono\">" + (c.compactedContextTokensEstimate || 420) + "</code> Tokens)</div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">已转储 L1 LayerFS 符号指针：<code class=\"mono\">" + ((c.offloadedUris || []).join(", ")) + "</code></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">按需分页拉取验证 (Line " + (pg.startLine || 2) + ".." + (pg.endLine || 4) + "/" + (pg.totalLines || 40) + ")：<pre class=\"mono\" style=\"margin-top:4px;padding:6px;background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:4px;font-size:11px;\">" + (pg.slicedText || "") + "</pre></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-spot-quota-market") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase3-memory-spot-market", {
+        action: "spot_quota_lending_market",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const l = d.bidMatch?.lease || {};
+      const rc = d.recallRes || {};
+      openDialog(
+        "[F8] 租户间 Spot 算力借贷与亚秒级无损抢占市场 (POST /v1beta1/management/ops/phase3-memory-spot-market)",
+        "<div><strong>出借方 → 借入方：</strong> <code class=\"mono\">" + (l.lenderTenantId || "Helios") + "</code> → <code class=\"mono\">" + (l.borrowerTenantId || "Northstar") + "</code> (" + (l.leasedSlots || 4) + " 并发槽 · 清算单价 <span class=\"status-pill ok\">$" + (l.clearingPricePerSlotUsd || 0.06) + "/slot</span>)</div>" +
+        "<div style=\"margin-top:6px;\"><strong>出借方 P0 紧急任务到达亚秒级召回：</strong> 立即回收 <code class=\"mono\">" + (rc.reclaimedSlots || 4) + "</code> 槽位 · 借入方 Spot 任务 <code class=\"mono\">" + ((rc.frozenBorrowerTaskIds || []).join(", ")) + "</code> 已自动写入 TurnWAL 并无损重回 <span class=\"status-pill warn\">" + (d.spotTaskStateAfterRecall || "QUEUED") + "</span></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
       return;
     }
     if (action === "open-episodic-hatchery") {

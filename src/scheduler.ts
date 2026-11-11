@@ -718,4 +718,49 @@ export class CoreScheduler5D {
       parentState: parent.state,
     };
   }
+
+  /**
+   * [M73-2 / F8] Gracefully freezes a leased/running Spot task when the lender tenant recalls its lent quota,
+   * refunding node CPU/memory/`running_tasks`, revoking the active lease, and re-enqueueing the task into `QUEUED`
+   * with zero data loss.
+   */
+  public freezeAndRequeueSpotTask(
+    taskId: string,
+    _reason = "SPOT_QUOTA_RECALLED_BY_LENDER",
+    nowSec = Date.now() / 1000
+  ): boolean {
+    const task = this.allTasks.get(taskId);
+    if (!task || task.state === TaskState.COMPLETED || task.state === TaskState.DEAD_LETTER) {
+      return false;
+    }
+
+    const activeLease = this.leaseCoordinator.getLease(task.task_id);
+    const nodeId = activeLease?.node_id ?? task.assigned_node_id;
+    if (nodeId && this.nodes.has(nodeId)) {
+      const node = this.nodes.get(nodeId)!;
+      node.free_cpu_cores = Math.min(
+        node.total_cpu_cores,
+        node.free_cpu_cores + task.resource_profile.think_cpu_cores
+      );
+      node.free_memory_mb = Math.min(
+        node.total_memory_mb,
+        node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25)
+      );
+      node.running_tasks = Math.max(0, node.running_tasks - 1);
+    }
+
+    this.leaseCoordinator.revokeLease(task.task_id);
+    if (LEASED_OR_RUNNING_STATES.has(task.state)) {
+      this.queueManager.completeTask(task);
+    } else if (task.state === TaskState.QUEUED) {
+      this.queueManager.removeQueuedTask(task.task_id);
+    }
+
+    task.preempted_count = (task.preempted_count ?? 0) + 1;
+    task.last_preempted_at = nowSec;
+    task.assigned_node_id = undefined;
+    task.state = TaskState.QUEUED;
+    this.queueManager.enqueue(task);
+    return true;
+  }
 }

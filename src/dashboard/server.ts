@@ -9790,4 +9790,241 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       },
     };
   }
+
+  /**
+   * [M73] Phase 3 Hierarchical Working-Memory Compactor & Spot Quota Lending Market Suite:
+   * - F7 (`hierarchical_context_compactor`): Adaptive Context Compactor & LayerFS Symbolic URI Pointers
+   *   (`WalCompactorAndPagedRestorer.compactWorkingMemoryContext`, `dereferenceContextUriPage`, and `AgentHarnessRunner.executeTurnWithHierarchicalMemory`).
+   * - F8 (`spot_quota_lending_market`): Inter-Tenant Spot Quota Lending & Sub-Second WAL Preemption Market
+   *   (`CapacitySlaEnforcer.publishIdleQuotaOffer`, `matchSpotQuotaBid`, `recallLenderQuotaOnUrgentArrival`, and `CoreScheduler5D.freezeAndRequeueSpotTask`).
+   * - `run_all_phase3_suite`: Executes both Phase 3 engines end-to-end and returns a unified audit & operational report.
+   */
+  public executePhase3MemoryAndSpotMarketSuite(params: {
+    action?:
+      | "hierarchical_context_compactor"
+      | "spot_quota_lending_market"
+      | "run_all_phase3_suite";
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const action = params.action ?? "run_all_phase3_suite";
+
+    const runF7HierarchicalCompactor = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const compactor = new WalCompactorAndPagedRestorer(4096, sql);
+      const longLogOutput = Array.from(
+        { length: 40 },
+        (_, idx) => `2026-11-11T08:00:${String(idx).padStart(2, "0")}Z [WARN] shard-${idx % 8} connection pool latency=${120 + idx}ms`
+      ).join("\n");
+
+      const priorTurns = [
+        {
+          turnIndex: 1,
+          toolName: "kubectl_logs_dump",
+          thoughtSummary: "Collected 40 lines of shard connection pool latency warnings",
+          rawToolOutput: longLogOutput,
+          keyFindings: ["shard-0..7 latency peaked at 159ms", "no OOM killer events"],
+        },
+        {
+          turnIndex: 2,
+          toolName: "pg_stat_activity_dump",
+          thoughtSummary: "Inspected active PostgreSQL backends across 16 shards",
+          rawToolOutput: longLogOutput.replace(/WARN/g, "INFO"),
+          keyFindings: ["idle_in_transaction count=14 on shard-3"],
+        },
+        {
+          turnIndex: 3,
+          toolName: "config_check",
+          thoughtSummary: "Verified pgbouncer max_client_conn=500",
+          rawToolOutput: "max_client_conn = 500\ndefault_pool_size = 32",
+        },
+        {
+          turnIndex: 4,
+          toolName: "apply_pool_patch",
+          thoughtSummary: "Prepared transaction pool timeout patch",
+          rawToolOutput: "PATCH_READY=true",
+        },
+      ];
+
+      const router = new CognitiveRouter();
+      router.registerEndpoint(
+        new LlmEndpointMetrics({
+          endpoint_id: "ep-m73-sonnet",
+          provider: "anthropic",
+          model_name: "claude-3-7-sonnet",
+          ttft_ewma_ms: 140,
+        })
+      );
+      const saga = new SagaToolGateway();
+      saga.registerTool("verify_patch", ToolCallEffectClass.READ_ONLY, (_args) => ({ verified: true }));
+      const runner = new AgentHarnessRunner(router, saga);
+
+      const task = new TaskSpec({
+        task_id: "task-m73-long-horizon",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        max_turns: 20,
+      });
+      task.current_turn = 4;
+
+      const execRes = runner.executeTurnWithHierarchicalMemory({
+        task,
+        toolName: "verify_patch",
+        toolArgs: { target: "pgbouncer.ini" },
+        priorTurns,
+        compactor,
+        hotWindowTurns: 2,
+        maxInlineCharsPerOutput: 200,
+      });
+
+      const firstUri = execRes.compactionReport.offloadedUris[0];
+      const compactorRehydrated = new WalCompactorAndPagedRestorer(4096, sql);
+      const pagedSlice = compactorRehydrated.dereferenceContextUriPage({
+        uri: firstUri,
+        startLine: 2,
+        endLine: 4,
+      });
+
+      const f7Verified =
+        execRes.compactionReport.offloadedPointersCount === 2 &&
+        execRes.compactionReport.tokenReductionRatioPct >= 65 &&
+        pagedSlice.totalLines === 40 &&
+        pagedSlice.slicedText.split("\n").length === 3 &&
+        execRes.turnSummary.turnIndex === 5;
+
+      return {
+        compactionReport: execRes.compactionReport,
+        pagedSlice,
+        turnSummary: execRes.turnSummary,
+        f7Verified,
+      };
+    };
+
+    const runF8SpotQuotaMarket = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const sla = new CapacitySlaEnforcer(undefined, sql);
+      const sched = new CoreScheduler5D(this.deps.leaseCoordinator);
+      const wal = new TurnWalEngine();
+
+      const nowSec = Date.now() / 1000;
+      sched.registerOrUpdateNode(
+        new NodeHeartbeat({
+          node_id: "node-spot-01",
+          total_cpu_cores: 16,
+          free_cpu_cores: 16,
+          total_memory_mb: 32768,
+          free_memory_mb: 32768,
+          warm_pool_ready: 4,
+          timestamp: nowSec,
+        })
+      );
+
+      // 1. Helios publishes 8 idle guaranteed quota slots at $0.04/slot
+      const offer = sla.publishIdleQuotaOffer({
+        offerId: "offer-helios-idle-01",
+        lenderTenantId: "Helios",
+        offeredSlots: 8,
+        minBidPricePerSlotUsd: 0.04,
+        region: "us-west-2",
+      });
+
+      // 2. Northstar bids for 4 Spot slots at $0.08/slot for a P3_BATCH task
+      const spotTask = new TaskSpec({
+        task_id: "task-ns-spot-batch-01",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P3_BATCH,
+      });
+      sched.submitTask(spotTask);
+      sched.scheduleTick(nowSec);
+
+      const bidMatch = sla.matchSpotQuotaBid({
+        leaseId: "spot-lease-ns-01",
+        borrowerTenantId: "Northstar",
+        taskId: spotTask.task_id,
+        requestedSlots: 4,
+        maxBidPricePerSlotUsd: 0.08,
+      });
+
+      // 3. Helios submits an urgent P0 task and recalls its lent quota with sub-second WAL freeze
+      const recallRes = sla.recallLenderQuotaOnUrgentArrival({
+        lenderTenantId: "Helios",
+        urgentTaskId: "task-hl-p0-urgent",
+        requiredSlots: 4,
+        walEngine: wal,
+        scheduler: sched,
+      });
+
+      const slaRehydrated = new CapacitySlaEnforcer(undefined, sql);
+      const rehydratedLease = slaRehydrated.listSpotLeases()[0];
+      const nodeAfterRecall = sched.nodes.get("node-spot-01")!;
+
+      const f8Verified =
+        offer.offeredSlots === 8 &&
+        bidMatch.matched === true &&
+        bidMatch.lease?.clearingPricePerSlotUsd === 0.06 &&
+        recallRes.reclaimedSlots === 4 &&
+        recallRes.frozenBorrowerTaskIds.includes(spotTask.task_id) &&
+        spotTask.state === TaskState.QUEUED &&
+        spotTask.preempted_count === 1 &&
+        nodeAfterRecall.free_cpu_cores === 16 &&
+        rehydratedLease?.status === "RECALLED_BY_LENDER" &&
+        rehydratedLease?.walFrozenTurnIndex === 1;
+
+      return {
+        offer,
+        bidMatch,
+        recallRes,
+        spotTaskStateAfterRecall: spotTask.state,
+        rehydratedLeaseStatus: rehydratedLease?.status,
+        f8Verified,
+      };
+    };
+
+    if (action === "hierarchical_context_compactor") {
+      const res = runF7HierarchicalCompactor();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F7] 自适应上下文压缩与分层工作记忆验证 (压缩率 ${res.compactionReport.tokenReductionRatioPct}%, 转储 ${res.compactionReport.offloadedPointersCount} 个 LayerFS URI 指针)`,
+        "Phase3 / HierarchicalContextCompactor",
+        res.f7Verified ? "CONTEXT_COMPACTED_OK" : "CONTEXT_COMPACT_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "spot_quota_lending_market") {
+      const res = runF8SpotQuotaMarket();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F8] 租户间 Spot 算力借贷撮合与 P0 亚秒级 WAL 无损抢占回收 (撮合单价 $${res.bidMatch.lease?.clearingPricePerSlotUsd}/slot, 回收槽位=${res.recallRes.reclaimedSlots})`,
+        "Phase3 / SpotQuotaMarket",
+        res.f8Verified ? "SPOT_MARKET_RECALL_OK" : "SPOT_MARKET_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    const f7HierarchicalCompactor = runF7HierarchicalCompactor();
+    const f8SpotQuotaMarket = runF8SpotQuotaMarket();
+    const allM73Phase3ChecksPassed =
+      f7HierarchicalCompactor.f7Verified && f8SpotQuotaMarket.f8Verified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [M73] 第三阶段分层工作记忆压缩与 Spot 算力借贷市场全量验证 (通过=${allM73Phase3ChecksPassed})`,
+      "Phase3 / MemoryAndSpotMarketSuite",
+      allM73Phase3ChecksPassed ? "PHASE3_SUITE_ALL_PASS" : "PHASE3_SUITE_FAILED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        f7HierarchicalCompactor,
+        f8SpotQuotaMarket,
+        allM73Phase3ChecksPassed,
+      },
+    };
+  }
 }

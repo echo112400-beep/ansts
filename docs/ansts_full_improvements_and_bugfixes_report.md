@@ -514,7 +514,7 @@
 | **7. [M70-4] 配置中心版本化字段级 Diff 预览** | 在热更新或回滚前对比基线配置与候选配置的逐字段差异（`MODIFIED` / `ADDED` / `UNCHANGED`），避免盲目变更。 | `POST /v1beta1/management/ops/day2-governance` (`config_diff_preview`) · `anstsctl mgmt-day2-ops config_diff_preview` | 审计与混沌视图 **「配置版本字段级 Diff 预览」** |
 | **8. [M70-1 & M70-4] Outbox Webhook 密钥零停机双密钥轮换** | 在 `TransactionalOutboxDispatcher` 中新增 `rotateSigningSecret(newPrimarySecret, graceWindowSec, nowSec)`，在宽限期内同时支持新主密钥与旧次级密钥的 `crypto.timingSafeEqual` 恒定时间验签，实现零停机平滑轮换。 | `POST /v1beta1/management/ops/day2-governance` (`rotate_webhook_secret`) · `anstsctl mgmt-day2-ops rotate_webhook_secret` | 审计与混沌视图 **「Outbox 双密钥平滑轮换」** |
 
-- **全量回归验证**：新增 `tests/m70_console_day2_ops_governance_workbench.test.ts`，全仓 **65 个测试套件（184 项子测试）100% 通过**。
+- **全量回归验证**：新增 `tests/m70_console_day2_ops_governance_workbench.test.ts`，全仓 **66 个测试套件（187 项子测试）100% 通过**。
 
 
 ## 二十一、M71 第一阶段认知与投机执行加速套件（Phase 1 Cognitive & Speculative Execution Acceleration Suite）
@@ -539,3 +539,14 @@
 | **[M72-2 / F5] 声明式 Policy-as-Code 工具形式化沙箱门控 (`Formal Guardrail Engine`)** | `src/saga/staging.ts` | 新增 `registerPolicyRule()`（持久化至 SQLite `persisted_guardrail_policies`）与 `evaluateFormalGuardrailPolicy()`：在副作用执行前联合执行 SQL AST 破坏性 DDL / 无界 `WHERE 1=1` 静态证明、文件系统敏感路径越界证明、声明式正则/行数策略匹配与冲击半径量化评分 (`0..100`)，自动分流为微秒级直通 (`ALLOW`)、自动挂起 4-Eyes 审批单 (`REQUIRE_4EYES_APPROVAL`) 与形式化违规硬阻断 (`DENY_FORMAL_VIOLATION`)。 | 已验证 (`tests/m72_phase2_episodic_guardrail_shadow_replay.test.ts` Subtest 2) |
 | **[M72-3 / F6] 生产 WAL 影子流量回放与回归基准台 (`Shadow WAL Replay & Eval Harness`)** | `src/checkpoint/time_travel.ts` | 新增 `redactSensitivePromptTokens()`（自动脱敏 `sk-...` API 密钥、`Bearer` 令牌与邮箱 PII）与 `executeShadowWalRegressionSuite()`：逐帧校验生产 `TurnWalFrame` CRC32 完整性并重放历史真实 Turn，量化计算新模型工具选择准确率、延迟变化率与 Token 成本变化率，自动输出金丝雀晋级 (`PROMOTE_CANARY`) 或回归自动回滚 (`AUTO_ROLLBACK_ON_REGRESSION`) 门控结论。 | 已验证 (`tests/m72_phase2_episodic_guardrail_shadow_replay.test.ts` Subtest 3) |
 | **[M72-4] 管理面 BFF、Console 交互台与 CLI 闭环** | `src/dashboard/server.ts`、`src/server_main.ts`、`src/cli/anstsctl.ts`、`docs/console-management/prototype.js` | 新增 `POST /v1beta1/management/ops/phase2-memory-guardrail-replay`、`anstsctl mgmt-phase2-gov` 及控制台任务治理视图顶部 **`[F4] 语义经验库 & 黄金镜像`**、**`[F5] Policy-as-Code 门控`**、**`[F6] 生产 WAL 影子回放`** 三大交互式工作台。 | 已验证 (`tests/m72_phase2_episodic_guardrail_shadow_replay.test.ts` Subtest 4，全仓 **65 个测试套件 / 184 项子测试 100% 通过**) |
+
+
+## 二十三、M73 第三阶段超长程分层工作记忆压缩与弹性 Spot 算力借贷市场套件（Phase 3 Hierarchical Working-Memory Compactor & Spot Quota Lending Market Suite）
+
+围绕下一代系统演进路线图的第三阶段（**F7 自适应上下文压缩与分层工作记忆 + F8 租户间 Spot 算力借贷与亚秒级无损抢占调度市场**），完成了全部 F1–F8 八大高阶特性的收官闭环：
+
+| 特性编号与名称 | 涉及模块 | 核心算法与工程实现细节 | 验证结果 |
+| :--- | :--- | :--- | :--- |
+| **[M73-1 / F7] 自适应上下文压缩与分层工作记忆 (`Hierarchical Context Compactor`)** | `src/checkpoint/compactor.ts`、`src/harness/runner.ts` | 新增 `WalCompactorAndPagedRestorer.compactWorkingMemoryContext()`、`dereferenceContextUriPage()`（持久化至 SQLite `persisted_context_pointers`）与 `AgentHarnessRunner.executeTurnWithHierarchicalMemory()`：将最近 `hotWindowTurns` 保持在 L0 热工作记忆内联直传，自动把早期或超长 ACT 工具原始输出卸载为内容寻址 `layerfs://context/<taskId>/turn-<n>/<hash>.txt` 符号指针（压缩率 >70%），并支持后续 Turn 按行号区间 (`startLine..endLine`) 实时分页拉取。 | 已验证 (`tests/m73_phase3_hierarchical_compactor_spot_market.test.ts` Subtest 1) |
+| **[M73-2 / F8] 租户间 Spot 算力借贷与抢占调度市场 (`Spot Quota Lending & Preemption Market`)** | `src/cluster/capacity_sla_enforcer.ts`、`src/scheduler.ts` | 新增 `CapacitySlaEnforcer.publishIdleQuotaOffer()`、`matchSpotQuotaBid()`、`recallLenderQuotaOnUrgentArrival()`（持久化至 SQLite `persisted_spot_quota_market`）与 `CoreScheduler5D.freezeAndRequeueSpotTask()`：支持低水位租户发布闲置保障配额并与突发租户 `P3_BATCH` 任务按中间价自动撮合清算；当出借方到达 `P0/P1` 紧急任务时，通过 `TurnWalEngine` 亚秒级写入检查点冻结借入方任务、释放节点 CPU/内存与租约并无损重回 `QUEUED` 队列。 | 已验证 (`tests/m73_phase3_hierarchical_compactor_spot_market.test.ts` Subtest 2) |
+| **[M73-3] 管理面 BFF、Console 交互台与 CLI 闭环** | `src/dashboard/server.ts`、`src/server_main.ts`、`src/cli/anstsctl.ts`、`docs/console-management/prototype.js` | 新增 `POST /v1beta1/management/ops/phase3-memory-spot-market`、`anstsctl mgmt-phase3-market` 及控制台任务治理视图顶部 **`[F7] 分层工作记忆压缩`** 与 **`[F8] Spot 算力借贷市场`** 交互式工作台，至此 **F1–F8 八大高阶功能全部落齐**。 | 已验证 (`tests/m73_phase3_hierarchical_compactor_spot_market.test.ts` Subtest 3，全仓 **66 个测试套件 / 187 项子测试 100% 通过**) |

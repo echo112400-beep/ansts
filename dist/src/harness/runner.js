@@ -16,6 +16,7 @@ var _velocity_breaker = require("./velocity_breaker.js"); /**
 
 
 
+
 class AgentHarnessRunner {
   router;
   sagaGateway;
@@ -90,5 +91,46 @@ class AgentHarnessRunner {
     } finally {
       this.router.releaseEndpoint(endpoint.endpoint_id);
     }
+  }
+
+  /**
+   * [M73-1 / F7] Executes an Agent ReAct turn after automatically compacting long-horizon `priorTurns`
+   * into LayerFS symbolic URI pointers via `WalCompactorAndPagedRestorer.compactWorkingMemoryContext`.
+   */
+  executeTurnWithHierarchicalMemory(params)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    const compactionReport = params.compactor.compactWorkingMemoryContext({
+      taskId: params.task.task_id,
+      currentTurnIndex: params.task.current_turn,
+      hotWindowTurns: params.hotWindowTurns,
+      maxInlineCharsPerOutput: params.maxInlineCharsPerOutput,
+      turns: params.priorTurns
+    });
+    const turnSummary = this.executeSingleTurn(
+    params.task,
+    params.toolName,
+    params.toolArgs,
+    compactionReport.compactedContextTokensEstimate);
+
+    return {
+      turnSummary,
+      compactionReport
+    };
   }
 }exports.AgentHarnessRunner = AgentHarnessRunner;

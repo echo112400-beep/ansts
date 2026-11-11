@@ -6,6 +6,7 @@ import { TaskSpec, TaskState } from "../models.js";
 import { CognitiveRouter } from "../cognitive_router.js";
 import { SagaToolGateway } from "../saga_gateway.js";
 import { SyntacticAndVelocityBreaker } from "./velocity_breaker.js";
+import { WalCompactorAndPagedRestorer } from "../checkpoint/compactor.js";
 
 export interface TurnExecutionSummary {
   taskId: string;
@@ -90,5 +91,46 @@ export class AgentHarnessRunner {
     } finally {
       this.router.releaseEndpoint(endpoint.endpoint_id);
     }
+  }
+
+  /**
+   * [M73-1 / F7] Executes an Agent ReAct turn after automatically compacting long-horizon `priorTurns`
+   * into LayerFS symbolic URI pointers via `WalCompactorAndPagedRestorer.compactWorkingMemoryContext`.
+   */
+  public executeTurnWithHierarchicalMemory(params: {
+    task: TaskSpec;
+    toolName: string;
+    toolArgs: Record<string, unknown>;
+    priorTurns: Array<{
+      turnIndex: number;
+      toolName: string;
+      thoughtSummary: string;
+      rawToolOutput: string;
+      keyFindings?: string[];
+    }>;
+    compactor: WalCompactorAndPagedRestorer;
+    hotWindowTurns?: number;
+    maxInlineCharsPerOutput?: number;
+  }): {
+    turnSummary: TurnExecutionSummary;
+    compactionReport: ReturnType<WalCompactorAndPagedRestorer["compactWorkingMemoryContext"]>;
+  } {
+    const compactionReport = params.compactor.compactWorkingMemoryContext({
+      taskId: params.task.task_id,
+      currentTurnIndex: params.task.current_turn,
+      hotWindowTurns: params.hotWindowTurns,
+      maxInlineCharsPerOutput: params.maxInlineCharsPerOutput,
+      turns: params.priorTurns,
+    });
+    const turnSummary = this.executeSingleTurn(
+      params.task,
+      params.toolName,
+      params.toolArgs,
+      compactionReport.compactedContextTokensEstimate
+    );
+    return {
+      turnSummary,
+      compactionReport,
+    };
   }
 }
