@@ -1,8 +1,8 @@
-# ANSTS v2.5 全生命周期深度改进与全量问题修复清单 (Milestones M51 ~ M61)
+# ANSTS v2.5 全生命周期深度改进与全量问题修复清单 (Milestones M51 ~ M62 DFX)
 
 > **文档版本**: v2.5.0-production-hardened  
 > **更新时间**: 2026-11-10  
-> **测试状态**: **54 / 54** 套件全部通过，**141 / 141** 项测试 100% PASS，0 失败，0 告警  
+> **测试状态**: **55 / 55** 套件全部通过，**142 / 142** 项测试 100% PASS，0 失败，0 告警  
 > **目标架构**: Cloudflare Workers / `denoland/celld` v0.6.3 + Linux Cgroup v2 / OverlayFS / MicroVM / UFFD + LayerFS + S3/R2 LTX
 
 ---
@@ -26,7 +26,7 @@
 
 ## 1. 改进与修复概览
 
-本工程在完成 ANSTS v2.5 基础架构融合的基础上，针对高并发、多租户、长时间运行 Agent 以及网络不可靠分布式边缘环境中的**Stale（陈旧状态/脏读）**、**Deadlock（死锁/悬挂阻塞）**、**Starvation（饥饿/雪崩）**、**Persistence Gap（持久化断链）**、**Idempotency Loss（非幂等重试副作用）**、**Breakpoint Resumption（断点恢复裂化）** 与 **Duplicate Concurrency（并发重复开销）** 展开了持续 11 轮（M51 ~ M61）的全面深挖与加固。
+本工程在完成 ANSTS v2.5 基础架构融合的基础上，针对高并发、多租户、长时间运行 Agent 以及网络不可靠分布式边缘环境中的**Stale（陈旧状态/脏读）**、**Deadlock（死锁/悬挂阻塞）**、**Starvation（饥饿/雪崩）**、**Persistence Gap（持久化断链）**、**Idempotency Loss（非幂等重试副作用）**、**Breakpoint Resumption（断点恢复裂化）** 与 **Duplicate Concurrency（并发重复开销）** 展开了持续 12 轮（M51 ~ M62 DFX）的全面深挖与加固。
 
 | 里程碑 | 关注核心领域 | 测试套件与通过数 | 代表性 Git 提交 |
 | :--- | :--- | :--- | :--- |
@@ -41,6 +41,7 @@
 | **M59** | SQLite 复合主键覆盖修复、DELETE 磁盘刷盘、KV TTL 物理过期、SSE 畸变帧跳过、UFFD 缓存失效 | 52 Suites / 139 Tests | `8fe14b7` |
 | **M60** | 全链路 SQLite 持久化闭环、递归深度规范化 JSON 幂等、WAL 确定性断点恢复、在途合流提权 | 53 Suites / 140 Tests | `eff8f2a` |
 | **M61** | A2A 黑板/拓扑 CAS 幂等、暂存审批/DAG/FinOps 持久化与防重、速度熔断器同轮去重、LayerFS 断点回滚 | 54 Suites / 141 Tests | `c937aa7` |
+| **M62** | DFX 全维度可靠性（CFS硬下限/目录清理）、可诊断性（基数上限/指标规范）、安全性（PSI P0/P1豁免）、可服务性（SLA预留落盘） | 55 Suites / 142 Tests | `e281d45` |
 
 ---
 
@@ -286,7 +287,29 @@
 
 ---
 
-## 13. 测试套件与自动化验证矩阵
+## 13. M62：DFX 全维度可靠性、可诊断性、可服务性与可观测性加固
+
+从 **DFX (Design for Excellence)** 维度展开深度排查与加固，涵盖可靠性（Reliability）、可维护性（Maintainability）、可诊断性（Diagnosability）、可服务性（Serviceability）、安全性（Safety）与可部署性（Deployability）：
+
+- **[M62-1] DFX-Reliability & Recoverability: `CgroupPhaseController` & `LinuxCgroupV2AndPsiDriver` CFS 最小硬下限与目录释放回收** (`src/runtime/phase_controller.ts`, `src/runtime/linux_cgroup_psi.ts`):
+  - **问题**: 在任务分配极低计算资源（如 `think_cpu_cores: 0.001`）时，计算所得 CFS 额度过小甚至为 0，导致容器进程被内核完全挂起冻死（CFS Starvation）；任务退出后，主机遗留数以万计的空 cgroup 目录，耗尽 Linux 内核 inode 与 cgroup ID 上限。
+  - **整改**: 在控制器中设置 `MIN_CPU_QUOTA_US = 5000`（即 0.05 核下限保护），确保任意任务具有最低限度的探针心跳与恢复能力；在驱动中实现 `removeTaskCgroup(taskId)`，任务终结时自动、幂等清理对应 cgroup 目录。
+- **[M62-2] DFX-Observability & Diagnosability: `OtelAndPrometheusExporter` 指标名规范化与基数上限内存保护** (`src/telemetry/otel_prometheus.ts`):
+  - **问题**: 动态生成的指标名称包含非法字符破坏 Prometheus 抓取格式；长期运行中不同租户与任务 ID 作为标签传入时导致指标基数爆炸（Metric Cardinality Explosion），引发 Node.js 进程内存无限制泄漏。
+  - **整改**: 增加 `sanitizeMetricName` 自动规范化字符；设置 `MAX_METRIC_ENTRIES = 500` 硬性指标条目上限，超出容量拒绝动态扩充并记录告警，保护长期运行可观测性子系统的内存安全。
+- **[M62-3] DFX-Safety & Fault Tolerance: `LinuxPsiMemoryGuard` 压力指标有限值清洗与 P0/P1 驱逐豁免** (`src/runtime/psi_guard.ts`):
+  - **问题**: `/proc/pressure/memory` 偶发坏数据或负数/NaN 解析值导致防线误触发；在发生紧急内存压力时，原本处于自愈与控制平面的核心高优任务（`P0_EMERGENCY` 与 `P1_HIGH`）可能被误选为受害者被强行挂起与驱逐。
+  - **整改**: 彻底清洗 PSI 指标为有限非负数值；赋予 `P0_EMERGENCY` 与 `P1_HIGH` 紧急驱逐豁免权，仅将 `P2_STANDARD` 与 `P3_BATCH` 任务纳入驱逐候选集，杜绝自愈控制流被误杀引发的集群连环雪崩。
+- **[M62-4] DFX-Operability & Serviceability: `CapacitySlaEnforcer` 应急预留状态持久化与动态调优** (`src/cluster/capacity_sla_enforcer.ts`):
+  - **问题**: 容量 SLA 违规判定遗漏了零除保护；应急预留（Emergency Headroom）标记仅存放在内存中，重启后预留状态丢失导致新流量涌入再次挤垮集群；策略阈值缺乏热更新原语。
+  - **整改**: 增加输入数值的有限区间校验；绑定 SQLite 表 `cluster_capacity_sla_state` 实时持久化与冷启动恢复应急预留激活状态；提供 `updatePolicy` 支持运行时动态调控容量水位。
+- **[M62-5] DFX-Maintainability & Deployability: `EdgeTunnelHaRouter` 幂等透传与 `CrossRegionAsyncReplicator` 异常隔离** (`src/runtime/edge_tunnel_ha_router.ts`, `src/cluster/cross_region_replicator.ts`):
+  - **问题**: 反向隧道路由器在向 Body 宿主下发异步长轮询指令时未透传幂等键，导致重试指令多次下发拉起重复容器；跨地域异步复制 S3 失败时未做隔离，网络异常直接向上抛出中断主业务事务。
+  - **整改**: 支持 `options.idempotencyKey` 全链路透传至 `TunnelGatewayCell` 合流等待；异步跨地域 S3 复制增加全面的非阻塞隔离与 URL/路径清洗，保障灾备复制故障不干扰生产运行。
+
+---
+
+## 14. 测试套件与自动化验证矩阵
 
 代码库包含 54 个端到端单元测试与混沌集成测试套件，全面覆盖以上改进：
 
@@ -342,14 +365,15 @@
 | 48 | `tests/m59_sql_kv_sse_uffd_vsock_ltx_audit.test.ts` | SQLite 复合主键/DELETE 刷盘、KV TTL 淘汰与 UFFD 缓存失效 | PASS |
 | 49 | `tests/m60_full_link_persistence_idempotency_breakpoint_coalesce_audit.test.ts` | 全链路 SQLite 持久化、深度递归规范化幂等与断点恢复 | PASS |
 | 50 | `tests/m61_subsystem_persistence_idempotency_breakpoint_coalesce_audit.test.ts` | 全子系统持久化、CAS/Push 幂等重试与同轮次熔断器合流 | PASS |
-| 51 | `tests/scheduler_authority.test.ts` | 256 虚拟槽位权威归属与跨纪元租约验证 | PASS |
-| 52 | `tests/scheduler_persistence.test.ts` | 单写路径持久化与幂等键去重提交 | PASS |
-| 53 | `tests/spec_completeness_audit.test.ts` | 规范完整性与全套组件端到端互通闭环 | PASS |
-| 54 | `tests/v23_geo_routing.test.ts` | GDPR 地理主权硬锁定与合规路由 | PASS |
+| 51 | `tests/m62_dfx_hardening_audit.test.ts` | DFX 可靠性（CFS下限/清理）、可诊断性（基数上限）、安全性（P0/P1豁免）与服务性（SLA预留落盘） | PASS |
+| 52 | `tests/scheduler_authority.test.ts` | 256 虚拟槽位权威归属与跨纪元租约验证 | PASS |
+| 53 | `tests/scheduler_persistence.test.ts` | 单写路径持久化与幂等键去重提交 | PASS |
+| 54 | `tests/spec_completeness_audit.test.ts` | 规范完整性与全套组件端到端互通闭环 | PASS |
+| 55 | `tests/v23_geo_routing.test.ts` | GDPR 地理主权硬锁定与合规路由 | PASS |
 
 ---
 
-## 14. 核心管理面端点与 CLI 命令参考
+## 15. 核心管理面端点与 CLI 命令参考
 
 本系统所有改进与修复均接入了管理面控制总线，并提供了即席审计接口与控制台命令：
 
@@ -362,5 +386,8 @@
 - **M61 跨子系统持久化与幂等合流审计**:
   - HTTP 端点: `POST /v1beta1/management/system/subsystem-persistence-idempotency-audit`
   - CLI 命令: `node dist/src/cli/anstsctl.js mgmt-subsystem-idempotency-audit`
+- **M62 DFX 全维度可靠性与可服务性加固审计**:
+  - HTTP 端点: `POST /v1beta1/management/system/dfx-hardening-audit`
+  - CLI 命令: `node dist/src/cli/anstsctl.js mgmt-dfx-audit`
 - **全系统 CI 静态检查与集成测试**:
-  - 执行命令: `env -u NODE_PATH npm run ci` (依次执行 TypeScript AST 语法检查、Wrangler 配置校验、代码构建与 54 个测试套件执行)
+  - 执行命令: `env -u NODE_PATH npm run ci` (依次执行 TypeScript AST 语法检查、Wrangler 配置校验、代码构建与 55 个测试套件执行)
