@@ -86,3 +86,7 @@ export * from "./runtime/slsa_provenance_attestor.js";
 export * from "./runtime/uffd_lazy_restorer.js";
 export * from "./runtime/zero_trust_security_guard.js";
 export * from "./storage/distributed_gc_sweeper.js";
+
+export * from "./dashboard/console_rbac_guard.js";
+export * from "./checkpoint/erasure_coder.js";
+export * from "./runtime/ebpf_network_tracker.js";

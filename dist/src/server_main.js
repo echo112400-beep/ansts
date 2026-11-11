@@ -153,6 +153,8 @@ class AnstsLocalAndComposeServer {
   phaseController;
   psiGuard;
   cloudEventsBus;
+  peerTasksCache = null;
+  peerTasksInFlight = null;
   outboxDispatcher;
   dashboardServer;
   managementPlane;
@@ -565,6 +567,73 @@ class AnstsLocalAndComposeServer {
       }}
   }
 
+  /**
+  * [M76-P2] Single-flight & TTL-cached peer Brain task aggregation with concurrency cap (max 4 concurrent requests)
+  * and 1500ms AbortSignal timeout so polling /v1beta1/console/tasks or /v1beta1/console/overview never amplifies backend load.
+  */
+  invalidatePeerTasksCache() {
+    this.peerTasksCache = null;
+  }
+
+  async fetchPeerBrainTasksCached(ttlMs = 1500) {
+    const now = Date.now();
+    if (this.peerTasksCache && now < this.peerTasksCache.expiresAtMs) {
+      return this.peerTasksCache.tasks;
+    }
+    if (this.peerTasksInFlight) {
+      return this.peerTasksInFlight;
+    }
+    const brainEntries = Object.entries(this.peerBrainUrls);
+    if (brainEntries.length === 0) {
+      return [];
+    }
+    this.peerTasksInFlight = (async () => {
+      const collected = [];
+      const concurrencyLimit = 4;
+      for (let i = 0; i < brainEntries.length; i += concurrencyLimit) {
+        const batch = brainEntries.slice(i, i + concurrencyLimit);
+        await Promise.all(
+        batch.map(async ([, bUrl]) => {
+          const ctrl = new AbortController();
+          const tid = setTimeout(() => ctrl.abort(), 1500);
+          try {
+            const resp = await fetch(`${bUrl}/internal/v1beta1/brain/tasks`, {
+              signal: ctrl.signal
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              for (const t of data.tasks ?? []) {
+                collected.push(t);
+              }
+            }
+          } catch {
+
+            // ignore unreachable brain
+          } finally {clearTimeout(tid);
+          }
+        }));
+
+      }
+      this.peerTasksCache = { expiresAtMs: Date.now() + ttlMs, tasks: collected };
+      this.peerTasksInFlight = null;
+      return collected;
+    })();
+    return this.peerTasksInFlight;
+  }
+
+  resolveAuthPrincipal(
+  req,
+  body,
+  requireExplicitIdentity = false)
+  {
+    const authHeader = req.headers["authorization"];
+    return this.managementPlane.rbacGuard.resolveRequestPrincipal({
+      authHeader,
+      body,
+      requireExplicitIdentity
+    });
+  }
+
   async readJsonBody(req) {
     return new Promise((resolve, reject) => {
       const chunks = [];
@@ -718,6 +787,7 @@ class AnstsLocalAndComposeServer {
           if (this.s3Endpoint) {
             await this.v25Store.flushLtxSnapshotToS3(this.s3Endpoint, this.nodeId);
           }
+          this.invalidatePeerTasksCache();
           this.metrics.incCounter("ansts_tasks_submitted_total", 1);
           res.writeHead(202, { "content-type": "application/json" });
           res.end(
@@ -1075,6 +1145,7 @@ class AnstsLocalAndComposeServer {
       const slotResolution = this.shardCoordinator.resolveBrainForTask(tenantId, taskId);
       const ownerBrainId = slotResolution.brainNodeId ?? "brain-node-01";
       const targetBodyHostId = String(body.targetBodyHostId ?? "body-host-01");
+      this.invalidatePeerTasksCache();
       this.metrics.incCounter("ansts_tasks_dispatched_total", 1);
 
       // Forward to live peer Brain shard owner; if unreachable, automatically evict & failover to surviving Brain shard!
@@ -1209,23 +1280,9 @@ class AnstsLocalAndComposeServer {
       for (const t of this.v25Store.listPersistedTasks()) {
         globalTaskIds.add(t.task_id);
       }
-      const brainEntries = Object.entries(this.peerBrainUrls);
-      if (brainEntries.length > 0) {
-        await Promise.all(
-        brainEntries.map(async ([, bUrl]) => {
-          try {
-            const resp = await fetch(`${bUrl}/internal/v1beta1/brain/tasks`);
-            if (resp.ok) {
-              const data = await resp.json();
-              for (const t of data.tasks ?? []) {
-                globalTaskIds.add(t.task_id);
-              }
-            }
-          } catch {
-
-            // ignore unreachable brain
-          }}));
-
+      const peerTasks = await this.fetchPeerBrainTasksCached();
+      for (const t of peerTasks) {
+        globalTaskIds.add(t.task_id);
       }
 
       res.writeHead(200, { "content-type": "application/json" });
@@ -1323,11 +1380,37 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M40] TanStack Console BFF: Interactive Brain Shard Eviction & Rebalance (`POST /v1beta1/console/shards/rebalance`)
+    // [M40 & M76] TanStack Console BFF: Interactive Brain Shard Eviction & Rebalance (`POST /v1beta1/console/shards/rebalance`)
     if (method === "POST" && pathname === "/v1beta1/console/shards/rebalance") {
       const body = await this.readJsonBody(req);
-      const action = String(body.action ?? "evict");
-      const brainNodeId = String(body.brainNodeId ?? "brain-node-02");
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (auth.role === "VIEWER") {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行分片驱逐或重平衡" }));
+        return;
+      }
+      if (
+      typeof body.action !== "string" ||
+      !["evict", "register"].includes(body.action) ||
+      typeof body.brainNodeId !== "string" ||
+      body.brainNodeId.trim().length === 0)
+      {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message: "Required parameters: action ('evict' | 'register') and non-empty brainNodeId"
+        }));
+
+        return;
+      }
+      const action = body.action;
+      const brainNodeId = body.brainNodeId.trim();
       let event = {};
       if (action === "evict") {
         event = this.shardCoordinator.evictUnhealthyBrainShardNode(brainNodeId);
@@ -1356,23 +1439,9 @@ class AnstsLocalAndComposeServer {
       for (const t of this.v25Store.listPersistedTasks()) {
         taskMap.set(t.task_id, t);
       }
-      const brainEntries = Object.entries(this.peerBrainUrls);
-      if (brainEntries.length > 0) {
-        await Promise.all(
-        brainEntries.map(async ([, bUrl]) => {
-          try {
-            const resp = await fetch(`${bUrl}/internal/v1beta1/brain/tasks`);
-            if (resp.ok) {
-              const data = await resp.json();
-              for (const t of data.tasks ?? []) {
-                taskMap.set(t.task_id, t);
-              }
-            }
-          } catch {
-
-            // ignore unreachable brain
-          }}));
-
+      const peerTasks = await this.fetchPeerBrainTasksCached();
+      for (const t of peerTasks) {
+        taskMap.set(t.task_id, t);
       }
       const tasks = Array.from(taskMap.values()).map((t) => {
         const resSlot = this.shardCoordinator.resolveBrainForTask(t.tenant_id, t.task_id);
@@ -2317,15 +2386,49 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M76] Console RBAC JWT Token Issuance & Audit Chain Verification (`POST /v1beta1/management/auth/token`)
+    if (method === "POST" && pathname === "/v1beta1/management/auth/token") {
+      const body = await this.readJsonBody(req);
+      const principalId = typeof body.principalId === "string" ? body.principalId.trim() : "chen";
+      const token = this.managementPlane.rbacGuard.issuePrincipalToken(principalId);
+      const verified = this.managementPlane.rbacGuard.verifyAuthorizationHeader(`Bearer ${token}`);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        principalId,
+        token,
+        claims: verified.claims,
+        auditChainIntegrity: this.managementPlane.rbacGuard.verifyAuditChainIntegrity()
+      }));
+
+      return;
+    }
+
     if (method === "POST" && pathname === "/v1beta1/management/tenants/config") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, true);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (typeof body.tenantId !== "string" || body.tenantId.trim().length === 0 || body.expectedVersion === undefined) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message: "Required parameters: tenantId and expectedVersion"
+        }));
+
+        return;
+      }
       const result = this.managementPlane.updateTenantConfig({
-        tenantId: String(body.tenantId ?? "Northstar"),
+        tenantId: body.tenantId.trim(),
         maxSlots: Number(body.maxSlots ?? 160),
         dailyBudgetUsd: Number(body.dailyBudgetUsd ?? 1200),
-        expectedVersion: Number(body.expectedVersion ?? 14),
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN")
+        expectedVersion: Number(body.expectedVersion),
+        actor: auth.actor,
+        role: auth.role
       });
       if (result.status === 200) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2337,12 +2440,33 @@ class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/nodes/batch") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, true);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (
+      typeof body.operation !== "string" ||
+      !["drain", "cordon", "uncordon", "prewarm"].includes(body.operation) ||
+      !Array.isArray(body.nodeIds) ||
+      body.nodeIds.length === 0)
+      {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message: "Required parameters: operation ('drain'|'cordon'|'uncordon'|'prewarm') and non-empty nodeIds array"
+        }));
+
+        return;
+      }
       const result = this.managementPlane.executeBatchNodeOperation({
-        operation: body.operation ?? "drain",
-        nodeIds: body.nodeIds ?? ["celld-brain-01", "body-host-01", "body-host-02"],
+        operation: body.operation,
+        nodeIds: body.nodeIds.map((id) => String(id).trim()),
         forceMigrateLeases: Boolean(body.forceMigrateLeases ?? false),
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN")
+        actor: auth.actor,
+        role: auth.role
       });
       await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
@@ -2352,11 +2476,32 @@ class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/tasks/cancel") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, true);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (
+      typeof body.taskId !== "string" ||
+      body.taskId.trim().length === 0 ||
+      typeof body.mode !== "string" ||
+      !["graceful", "force_fence"].includes(body.mode))
+      {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message: "Required parameters: non-empty taskId and mode ('graceful' | 'force_fence')"
+        }));
+
+        return;
+      }
       const result = this.managementPlane.cancelOrFenceTask({
-        taskId: String(body.taskId ?? "task-ns-8841"),
-        mode: body.mode ?? "graceful",
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN")
+        taskId: body.taskId.trim(),
+        mode: body.mode,
+        actor: auth.actor,
+        role: auth.role
       });
       await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
@@ -2366,11 +2511,27 @@ class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/tasks/time-travel") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, true);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (typeof body.taskId !== "string" || body.taskId.trim().length === 0 || body.targetTurnIndex === undefined) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message: "Required parameters: taskId and targetTurnIndex"
+        }));
+
+        return;
+      }
       const result = this.managementPlane.inspectAndForkTaskTurn({
-        taskId: String(body.taskId ?? "task-ns-8841"),
-        targetTurnIndex: Number(body.targetTurnIndex ?? 3),
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN")
+        taskId: body.taskId.trim(),
+        targetTurnIndex: Number(body.targetTurnIndex),
+        actor: auth.actor,
+        role: auth.role
       });
       if (result.status === 200) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2382,13 +2543,34 @@ class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/approvals/create") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, true);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (
+      typeof body.type !== "string" ||
+      body.type.trim().length === 0 ||
+      typeof body.target !== "string" ||
+      body.target.trim().length === 0)
+      {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message: "Required parameters: non-empty type and target"
+        }));
+
+        return;
+      }
       const result = this.managementPlane.createApprovalTicket({
-        type: String(body.type ?? "QUOTA_EMERGENCY_BOOST"),
-        target: String(body.target ?? "Northstar (120 → 180 并发槽)"),
+        type: body.type.trim(),
+        target: body.target.trim(),
         region: String(body.region ?? "us-west-2"),
         tenant: String(body.tenant ?? "Northstar"),
-        initiator: String(body.initiator ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        initiator: auth.actor,
+        role: auth.role,
         risk: body.risk ? String(body.risk) : undefined
       });
       if (result.status === 201) {
@@ -2401,12 +2583,33 @@ class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/approvals/decide") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, true);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (
+      typeof body.approvalId !== "string" ||
+      body.approvalId.trim().length === 0 ||
+      typeof body.decision !== "string" ||
+      !["approve", "reject"].includes(body.decision))
+      {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message: "Required parameters: approvalId and decision ('approve' | 'reject')"
+        }));
+
+        return;
+      }
       const result = this.managementPlane.decideApprovalTicket({
-        approvalId: String(body.approvalId ?? "APR-2026-091"),
+        approvalId: body.approvalId.trim(),
         initiator: body.initiator ? String(body.initiator) : undefined,
-        approver: String(body.approver ?? "zhou"),
-        role: String(body.role ?? "SRE_ADMIN"),
-        decision: body.decision ?? "approve"
+        approver: auth.actor,
+        role: auth.role,
+        decision: body.decision
       });
       if (result.status === 200) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2418,14 +2621,35 @@ class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/nodes/scale") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, true);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (
+      typeof body.action !== "string" ||
+      !["scale_out", "decommission"].includes(body.action) ||
+      typeof body.nodeId !== "string" ||
+      body.nodeId.trim().length === 0)
+      {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message: "Required parameters: action ('scale_out' | 'decommission') and non-empty nodeId"
+        }));
+
+        return;
+      }
       const result = this.managementPlane.scaleOutOrDecommissionNode({
-        action: body.action ?? "scale_out",
-        nodeId: String(body.nodeId ?? "body-host-04"),
+        action: body.action,
+        nodeId: body.nodeId.trim(),
         region: String(body.region ?? "us-west-2"),
         role: body.role === "brain" ? "brain" : "body",
         ipAddress: body.ipAddress ? String(body.ipAddress) : undefined,
-        actor: String(body.actor ?? "chen"),
-        actorRole: String(body.actorRole ?? "SRE_ADMIN")
+        actor: auth.actor,
+        actorRole: auth.role
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -3259,10 +3483,30 @@ class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/capacity/action") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, true);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (
+      typeof body.action !== "string" ||
+      !["mitigate_capacity", "rebalance_verification", "apply_budget_fallback"].includes(body.action))
+      {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+        JSON.stringify({
+          error: "MISSING_REQUIRED_PARAMETERS",
+          message:
+          "Required parameter: action ('mitigate_capacity' | 'rebalance_verification' | 'apply_budget_fallback')"
+        }));
+
+        return;
+      }
       const result = this.managementPlane.executeCapacityOrRebalanceAction({
-        action: body.action ?? "mitigate_capacity",
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN")
+        action: body.action,
+        actor: auth.actor,
+        role: auth.role
       });
       await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
@@ -3492,7 +3736,7 @@ class AnstsLocalAndComposeServer {
       const staticMap = {
         "/": { relPath: "index.html", contentType: "text/html; charset=utf-8" },
         "/index.html": { relPath: "index.html", contentType: "text/html; charset=utf-8" },
-        "/ansts_console_live.html": { relPath: "ansts_console_live.html", contentType: "text/html; charset=utf-8" },
+        "/ansts_console_live.html": { relPath: "index.html", contentType: "text/html; charset=utf-8" },
         "/ansts_console_management.html": { relPath: "ansts_console_management.html", contentType: "text/html; charset=utf-8" },
         "/management": { relPath: "ansts_console_management.html", contentType: "text/html; charset=utf-8" },
         "/console-management/prototype.css": { relPath: "console-management/prototype.css", contentType: "text/css; charset=utf-8" },

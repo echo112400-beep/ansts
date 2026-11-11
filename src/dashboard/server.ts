@@ -1,3 +1,4 @@
+import { ConsoleRbacAuthGuard, sanitizeHtmlString } from "./console_rbac_guard.js";
 import assert from "node:assert/strict";
 import { CrossRegionErasureCodedWalManager } from "../checkpoint/erasure_coder.js";
 import { EbpfSocketNetworkTrackerAndBreaker } from "../runtime/ebpf_network_tracker.js";
@@ -325,6 +326,7 @@ export class PlatformManagementPlaneEngine {
     sweptBlobIds: string[];
   } | null = null;
   private initialized = false;
+  public readonly rbacGuard: ConsoleRbacAuthGuard = new ConsoleRbacAuthGuard();
 
   constructor(deps: ManagementPlaneDeps) {
     this.deps = deps;
@@ -811,18 +813,32 @@ export class PlatformManagementPlaneEngine {
 
   public appendAudit(actor: string, role: string, action: string, scope: string, outcome: string): ManagementAuditRecord {
     this.ensureInitialized();
+    const safeActor = sanitizeHtmlString(actor);
+    const safeRole = sanitizeHtmlString(role);
+    const safeAction = sanitizeHtmlString(action);
+    const safeScope = sanitizeHtmlString(scope);
+    const safeOutcome = sanitizeHtmlString(outcome);
     const now = new Date();
     const ts = `${now.toISOString().slice(11, 19)} UTC`;
     const auditId = `aud-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    this.rbacGuard.appendChainedAudit({
+      auditId,
+      actor: safeActor,
+      role: safeRole,
+      action: safeAction,
+      scope: safeScope,
+      outcome: safeOutcome,
+      timestampUtc: ts,
+    });
     this.deps.v25Store.sql.exec(
       "INSERT OR REPLACE INTO v25_mgmt_audit_logs (audit_id, ts, actor, role, action, scope, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)",
       auditId,
       ts,
-      actor,
-      role,
-      action,
-      scope,
-      outcome
+      safeActor,
+      safeRole,
+      safeAction,
+      safeScope,
+      safeOutcome
     );
     if (this.deps.sseGateway) {
       this.deps.sseGateway.publish({
@@ -1150,6 +1166,7 @@ export class PlatformManagementPlaneEngine {
       mcpState: this.getMcpGovernanceSnapshot(),
       runtimeSandboxState: this.getRuntimeSandboxSnapshot(),
       gcSweepReport: this.lastGcSweepReport,
+      auditChainIntegrity: this.rbacGuard.verifyAuditChainIntegrity(),
       status: "HEALTHY",
     };
   }
@@ -1860,38 +1877,43 @@ export class PlatformManagementPlaneEngine {
         body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权发起高危变更申请单" },
       };
     }
+    const safeType = sanitizeHtmlString(params.type);
+    const safeTarget = sanitizeHtmlString(params.target);
+    const safeRegion = sanitizeHtmlString(params.region);
+    const safeTenant = sanitizeHtmlString(params.tenant);
+    const safeInitiator = sanitizeHtmlString(params.initiator);
     const approvalId = `APR-2026-${Math.floor(100 + Math.random() * 899)}`;
     const createdAt = `${new Date().toISOString().slice(11, 16)} UTC`;
-    const risk = params.risk ?? (params.type.includes("SAGA") ? "CRITICAL" : "HIGH");
+    const risk = sanitizeHtmlString(params.risk ?? (safeType.includes("SAGA") ? "CRITICAL" : "HIGH"));
     this.deps.v25Store.sql.exec(
       "INSERT OR REPLACE INTO v25_mgmt_approvals (approval_id, type, target, region, tenant, initiator, status, risk, created_at, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       approvalId,
-      params.type,
-      params.target,
-      params.region,
-      params.tenant,
-      params.initiator,
+      safeType,
+      safeTarget,
+      safeRegion,
+      safeTenant,
+      safeInitiator,
       "PENDING_SECOND_ADMIN",
       risk,
       createdAt,
       ""
     );
     this.appendAudit(
-      params.initiator,
+      safeInitiator,
       params.role,
-      `提交高危变更申请单 ${approvalId} (${params.type}: ${params.target})`,
-      `${params.region} / ${params.tenant}`,
+      `提交高危变更申请单 ${approvalId} (${safeType}: ${safeTarget})`,
+      `${safeRegion} / ${safeTenant}`,
       "PENDING_SECOND_ADMIN"
     );
     return {
       status: 201,
       body: {
         approvalId,
-        type: params.type,
-        target: params.target,
-        region: params.region,
-        tenant: params.tenant,
-        initiator: params.initiator,
+        type: safeType,
+        target: safeTarget,
+        region: safeRegion,
+        tenant: safeTenant,
+        initiator: safeInitiator,
         status: "PENDING_SECOND_ADMIN",
         risk,
         createdAt,

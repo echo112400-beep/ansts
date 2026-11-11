@@ -1,4 +1,5 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var _strict = _interopRequireDefault(require("node:assert/strict"));
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.PlatformManagementPlaneEngine = exports.DashboardBridgeService = exports.DashboardBackendServer = void 0;var _console_rbac_guard = require("./console_rbac_guard.js");
+var _strict = _interopRequireDefault(require("node:assert/strict"));
 var _erasure_coder = require("../checkpoint/erasure_coder.js");
 var _ebpf_network_tracker = require("../runtime/ebpf_network_tracker.js");
 var _s3_ltx_driver = require("../checkpoint/s3_ltx_driver.js");
@@ -325,6 +326,7 @@ class PlatformManagementPlaneEngine {
 
   null;
   initialized = false;
+  rbacGuard = new _console_rbac_guard.ConsoleRbacAuthGuard();
 
   constructor(deps) {
     this.deps = deps;
@@ -811,18 +813,32 @@ class PlatformManagementPlaneEngine {
 
   appendAudit(actor, role, action, scope, outcome) {
     this.ensureInitialized();
+    const safeActor = (0, _console_rbac_guard.sanitizeHtmlString)(actor);
+    const safeRole = (0, _console_rbac_guard.sanitizeHtmlString)(role);
+    const safeAction = (0, _console_rbac_guard.sanitizeHtmlString)(action);
+    const safeScope = (0, _console_rbac_guard.sanitizeHtmlString)(scope);
+    const safeOutcome = (0, _console_rbac_guard.sanitizeHtmlString)(outcome);
     const now = new Date();
     const ts = `${now.toISOString().slice(11, 19)} UTC`;
     const auditId = `aud-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    this.rbacGuard.appendChainedAudit({
+      auditId,
+      actor: safeActor,
+      role: safeRole,
+      action: safeAction,
+      scope: safeScope,
+      outcome: safeOutcome,
+      timestampUtc: ts
+    });
     this.deps.v25Store.sql.exec(
     "INSERT OR REPLACE INTO v25_mgmt_audit_logs (audit_id, ts, actor, role, action, scope, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)",
     auditId,
     ts,
-    actor,
-    role,
-    action,
-    scope,
-    outcome);
+    safeActor,
+    safeRole,
+    safeAction,
+    safeScope,
+    safeOutcome);
 
     if (this.deps.sseGateway) {
       this.deps.sseGateway.publish({
@@ -1150,6 +1166,7 @@ class PlatformManagementPlaneEngine {
       mcpState: this.getMcpGovernanceSnapshot(),
       runtimeSandboxState: this.getRuntimeSandboxSnapshot(),
       gcSweepReport: this.lastGcSweepReport,
+      auditChainIntegrity: this.rbacGuard.verifyAuditChainIntegrity(),
       status: "HEALTHY"
     };
   }
@@ -1860,38 +1877,43 @@ class PlatformManagementPlaneEngine {
         body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权发起高危变更申请单" }
       };
     }
+    const safeType = (0, _console_rbac_guard.sanitizeHtmlString)(params.type);
+    const safeTarget = (0, _console_rbac_guard.sanitizeHtmlString)(params.target);
+    const safeRegion = (0, _console_rbac_guard.sanitizeHtmlString)(params.region);
+    const safeTenant = (0, _console_rbac_guard.sanitizeHtmlString)(params.tenant);
+    const safeInitiator = (0, _console_rbac_guard.sanitizeHtmlString)(params.initiator);
     const approvalId = `APR-2026-${Math.floor(100 + Math.random() * 899)}`;
     const createdAt = `${new Date().toISOString().slice(11, 16)} UTC`;
-    const risk = params.risk ?? (params.type.includes("SAGA") ? "CRITICAL" : "HIGH");
+    const risk = (0, _console_rbac_guard.sanitizeHtmlString)(params.risk ?? (safeType.includes("SAGA") ? "CRITICAL" : "HIGH"));
     this.deps.v25Store.sql.exec(
     "INSERT OR REPLACE INTO v25_mgmt_approvals (approval_id, type, target, region, tenant, initiator, status, risk, created_at, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     approvalId,
-    params.type,
-    params.target,
-    params.region,
-    params.tenant,
-    params.initiator,
+    safeType,
+    safeTarget,
+    safeRegion,
+    safeTenant,
+    safeInitiator,
     "PENDING_SECOND_ADMIN",
     risk,
     createdAt,
     "");
 
     this.appendAudit(
-    params.initiator,
+    safeInitiator,
     params.role,
-    `提交高危变更申请单 ${approvalId} (${params.type}: ${params.target})`,
-    `${params.region} / ${params.tenant}`,
+    `提交高危变更申请单 ${approvalId} (${safeType}: ${safeTarget})`,
+    `${safeRegion} / ${safeTenant}`,
     "PENDING_SECOND_ADMIN");
 
     return {
       status: 201,
       body: {
         approvalId,
-        type: params.type,
-        target: params.target,
-        region: params.region,
-        tenant: params.tenant,
-        initiator: params.initiator,
+        type: safeType,
+        target: safeTarget,
+        region: safeRegion,
+        tenant: safeTenant,
+        initiator: safeInitiator,
         status: "PENDING_SECOND_ADMIN",
         risk,
         createdAt
