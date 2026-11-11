@@ -1,6 +1,7 @@
 /**
- * @fileoverview M4 TASK-14, M48-4 & M58-4: Linux PSI (Pressure Stall Information) Memory Guard,
- * Real `/proc/pressure/memory` + `/proc/meminfo` Kernel Probe, Non-Terminal Victim Filtering & Priority-Scoped Evictor.
+ * @fileoverview M4 TASK-14, M48-4, M58-4 & M62-3: Linux PSI (Pressure Stall Information) Memory Guard,
+ * Real `/proc/pressure/memory` + `/proc/meminfo` Kernel Probe, Non-Terminal Victim Filtering,
+ * Non-Negative / Finite PSI Sanitization & High-Priority P0/P1 Eviction Immunity.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -44,16 +45,25 @@ export class LinuxPsiMemoryGuard {
         const content = fs.readFileSync("/proc/pressure/memory", "utf-8");
         for (const line of content.split("\n")) {
           const mSome = line.match(/^some\s+avg10=([0-9.]+)/);
-          if (mSome) someAvg10Pct = parseFloat(mSome[1]);
+          if (mSome) {
+            const parsed = parseFloat(mSome[1]);
+            if (Number.isFinite(parsed) && parsed >= 0) someAvg10Pct = parsed;
+          }
           const mFull = line.match(/^full\s+avg10=([0-9.]+)/);
-          if (mFull) fullAvg10Pct = parseFloat(mFull[1]);
+          if (mFull) {
+            const parsed = parseFloat(mFull[1]);
+            if (Number.isFinite(parsed) && parsed >= 0) fullAvg10Pct = parsed;
+          }
         }
       }
       if (fs.existsSync("/proc/meminfo")) {
         const meminfo = fs.readFileSync("/proc/meminfo", "utf-8");
         const mSwap = meminfo.match(/^SwapFree:\s+(\d+)\s+kB/m);
         if (mSwap) {
-          freeSwapMb = Math.max(256, Math.round(Number(mSwap[1]) / 1024));
+          const rawKb = Number(mSwap[1]);
+          if (Number.isFinite(rawKb) && rawKb >= 0) {
+            freeSwapMb = Math.max(256, Math.round(rawKb / 1024));
+          }
         }
       }
     } catch {
@@ -70,12 +80,25 @@ export class LinuxPsiMemoryGuard {
     };
   }
 
+  /**
+   * [M58-4 & M62-3] DFX-Safety: Evaluates PSI pressure and applies defensive actions:
+   * - Sanitizes negative or NaN metrics in incoming `sample` to prevent mis-triggered emergency freezes.
+   * - Restricts critical freeze-and-checkpoint eviction to `P2_STANDARD` and `P3_BATCH` tasks only,
+   *   providing immunity to `P0_EMERGENCY` and `P1_HIGH` tasks under memory pressure so control-plane
+   *   remediation and user-critical jobs are never abruptly sacrificed.
+   */
   public evaluateAndDefend(sample: PsiSample, runningTasks: TaskSpec[]): PsiDefenseAction {
-    // [M58-4] Exclude tasks already in terminal states so eviction only targets live active tasks
+    const safeSome =
+      Number.isFinite(sample.someAvg10Pct) && sample.someAvg10Pct >= 0 ? sample.someAvg10Pct : 0;
+    const safeFull =
+      Number.isFinite(sample.fullAvg10Pct) && sample.fullAvg10Pct >= 0 ? sample.fullAvg10Pct : 0;
+    const safeSwap =
+      Number.isFinite(sample.freeSwapMb) && sample.freeSwapMb >= 0 ? sample.freeSwapMb : 1024;
+
     const liveTasks = runningTasks.filter((t) => !TERMINAL_STATES.has(t.state));
-    if (sample.fullAvg10Pct >= this.criticalPsiThresholdPct || sample.freeSwapMb < 128) {
+    if (safeFull >= this.criticalPsiThresholdPct || safeSwap < 128) {
       const evictableCandidates = liveTasks
-        .filter((t) => t.priority >= TaskPriority.P1_HIGH)
+        .filter((t) => t.priority >= TaskPriority.P2_STANDARD) // P0 & P1 have emergency immunity
         .sort((a, b) => {
           if (b.priority !== a.priority) return b.priority - a.priority;
           return b.resource_profile.act_memory_mb - a.resource_profile.act_memory_mb;
@@ -88,7 +111,7 @@ export class LinuxPsiMemoryGuard {
           : [];
       return { level: "FREEZE_AND_CHECKPOINT", evictedTaskIds: victims };
     }
-    if (sample.someAvg10Pct >= this.softPsiThresholdPct) {
+    if (safeSome >= this.softPsiThresholdPct) {
       const p3Victims = liveTasks
         .filter((t) => t.priority === TaskPriority.P3_BATCH)
         .map((t) => t.task_id);

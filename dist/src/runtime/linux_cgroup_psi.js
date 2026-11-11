@@ -4,9 +4,10 @@
 
 var fs = _interopRequireWildcard(require("node:fs"));
 var path = _interopRequireWildcard(require("node:path"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M11 TASK-38 & M58-2: Real Linux cgroup v2 (`cpu.max`, `memory.high`, `cgroup.freeze`) & `/proc/pressure/memory` Driver
- * with TaskId Path-Traversal Sanitization & Finite Resource Validation.
+ * @fileoverview M11 TASK-38, M58-2 & M62-1: Real Linux cgroup v2 (`cpu.max`, `memory.high`, `cgroup.freeze`) & `/proc/pressure/memory` Driver
+ * with TaskId Path-Traversal Sanitization, Finite Resource Validation, CFS Min-Floor & Idempotent `removeTaskCgroup` Directory Cleanup.
  */class LinuxCgroupV2AndPsiDriver {cgroupRootDir;
+  static MIN_CPU_QUOTA_US = 5000;
 
   constructor(cgroupRootDir) {
     this.cgroupRootDir = cgroupRootDir;
@@ -23,6 +24,25 @@ var path = _interopRequireWildcard(require("node:path"));function _getRequireWil
     return dir;
   }
 
+  /**
+   * [M62-1] DFX-Maintainability: Removes task cgroup directory on task completion or failure
+   * preventing thousands of dangling empty cgroups from exhausting host inode and kernel cgroup ID limits.
+   */
+  removeTaskCgroup(taskId) {
+    const safeId = taskId.trim().replace(/[^a-zA-Z0-9._-]/g, "_");
+    if (!safeId || safeId === "." || safeId === "..") return false;
+    const dir = path.join(this.cgroupRootDir, `ansts-${safeId}`);
+    if (fs.existsSync(dir)) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
   writePhaseLimits(
   taskId,
   phase,
@@ -30,11 +50,23 @@ var path = _interopRequireWildcard(require("node:path"));function _getRequireWil
   memoryHighMb,
   memoryMaxMb)
   {
-    if (!Number.isFinite(cpuCores) || cpuCores <= 0 || !Number.isFinite(memoryHighMb) || memoryHighMb <= 0 || !Number.isFinite(memoryMaxMb) || memoryMaxMb < memoryHighMb) {
-      throw new Error(`Invalid cgroup v2 phase limits: cpu=${cpuCores}, memHighMb=${memoryHighMb}, memMaxMb=${memoryMaxMb}`);
+    if (
+    !Number.isFinite(cpuCores) ||
+    cpuCores <= 0 ||
+    !Number.isFinite(memoryHighMb) ||
+    memoryHighMb <= 0 ||
+    !Number.isFinite(memoryMaxMb) ||
+    memoryMaxMb < memoryHighMb)
+    {
+      throw new Error(
+      `Invalid cgroup v2 phase limits: cpu=${cpuCores}, memHighMb=${memoryHighMb}, memMaxMb=${memoryMaxMb}`);
+
     }
     const dir = this.ensureTaskCgroup(taskId);
-    const quotaUs = Math.round(cpuCores * 100_000);
+    const quotaUs = Math.max(
+    LinuxCgroupV2AndPsiDriver.MIN_CPU_QUOTA_US,
+    Math.round(cpuCores * 100_000));
+
     const cpuMaxContent = `${quotaUs} 100000`;
     const memoryHighBytes = String(Math.round(memoryHighMb * 1024 * 1024));
     const memoryMaxBytes = String(Math.round(memoryMaxMb * 1024 * 1024));
@@ -59,9 +91,15 @@ var path = _interopRequireWildcard(require("node:path"));function _getRequireWil
     let fullAvg10 = 0;
     for (const line of content.split("\n")) {
       const mSome = line.match(/^some\s+avg10=([0-9.]+)/);
-      if (mSome) someAvg10 = parseFloat(mSome[1]);
+      if (mSome) {
+        const parsed = parseFloat(mSome[1]);
+        if (Number.isFinite(parsed) && parsed >= 0) someAvg10 = parsed;
+      }
       const mFull = line.match(/^full\s+avg10=([0-9.]+)/);
-      if (mFull) fullAvg10 = parseFloat(mFull[1]);
+      if (mFull) {
+        const parsed = parseFloat(mFull[1]);
+        if (Number.isFinite(parsed) && parsed >= 0) fullAvg10 = parsed;
+      }
     }
     return { someAvg10, fullAvg10 };
   }

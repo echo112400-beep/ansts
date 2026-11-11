@@ -2356,6 +2356,18 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M62] DFX Full-Spectrum Resiliency, Diagnosability, Testability & Operability Hardening Audit (`POST /v1beta1/management/system/dfx-hardening-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/dfx-hardening-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDfxHardeningAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M61] Full-Subsystem Persistence, Idempotent CAS/Push Retry, Breakpoint State Rollback & Coalescing Duplicate Arbitration Audit (`POST /v1beta1/management/system/subsystem-persistence-idempotency-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/subsystem-persistence-idempotency-audit") {
       const body = await this.readJsonBody(req);

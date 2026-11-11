@@ -2,11 +2,12 @@
 
 
 
-var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M12 TASK-42 & M50-4: W3C `traceparent` OpenTelemetry Span Waterfall Propagator,
- * Histogram Quantile (`p50`/`p95`/`p99`) Calculator, Multi-Window SLO Burn-Rate Evaluator & Prometheus `/metrics` Exporter.
- */
 
+var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
+ * @fileoverview M12 TASK-42, M50-4 & M62-2: W3C `traceparent` OpenTelemetry Span Waterfall Propagator,
+ * Histogram Quantile (`p50`/`p95`/`p99`) Calculator, Multi-Window SLO Burn-Rate Evaluator,
+ * Metric Label Sanitization (Preventing Cardinality Explosion) & Prometheus `/metrics` Exporter.
+ */
 
 
 
@@ -38,6 +39,7 @@ class OtelAndPrometheusExporter {
   gauges = new Map();
   histograms = new Map();
   spans = [];
+  static MAX_METRIC_ENTRIES = 500;
 
   static createTraceparent(traceId, spanId) {
     const tid = traceId ?? crypto.randomBytes(16).toString("hex");
@@ -109,28 +111,52 @@ class OtelAndPrometheusExporter {
     };
   }
 
+  /**
+   * [M62-2] DFX-Diagnosability & Bounded Memory: Sanitizes metric names and enforces an upper bound
+   * on distinct metrics to prevent unbounded cardinality memory exhaustion in long-running nodes.
+   */
+  sanitizeMetricName(name) {
+    return name.trim().replace(/[^a-zA-Z0-9_:]/g, "_");
+  }
+
   incCounter(name, delta = 1) {
-    this.counters.set(name, (this.counters.get(name) ?? 0) + delta);
+    const safeName = this.sanitizeMetricName(name);
+    if (!this.counters.has(safeName) && this.counters.size >= OtelAndPrometheusExporter.MAX_METRIC_ENTRIES) {
+      return;
+    }
+    const safeDelta = Number.isFinite(delta) && delta > 0 ? delta : 1;
+    this.counters.set(safeName, (this.counters.get(safeName) ?? 0) + safeDelta);
   }
 
   setGauge(name, val) {
-    this.gauges.set(name, val);
+    const safeName = this.sanitizeMetricName(name);
+    if (!this.gauges.has(safeName) && this.gauges.size >= OtelAndPrometheusExporter.MAX_METRIC_ENTRIES) {
+      return;
+    }
+    const safeVal = Number.isFinite(val) ? val : 0;
+    this.gauges.set(safeName, safeVal);
   }
 
   observeHistogram(name, val) {
-    let arr = this.histograms.get(name);
+    const safeName = this.sanitizeMetricName(name);
+    if (!this.histograms.has(safeName) && this.histograms.size >= OtelAndPrometheusExporter.MAX_METRIC_ENTRIES) {
+      return;
+    }
+    const safeVal = Number.isFinite(val) && val >= 0 ? val : 0;
+    let arr = this.histograms.get(safeName);
     if (!arr) {
       arr = [];
-      this.histograms.set(name, arr);
+      this.histograms.set(safeName, arr);
     }
-    arr.push(val);
+    arr.push(safeVal);
     if (arr.length > 500) {
       arr.shift();
     }
   }
 
   computeQuantiles(name) {
-    const raw = this.histograms.get(name) ?? [];
+    const safeName = this.sanitizeMetricName(name);
+    const raw = this.histograms.get(safeName) ?? [];
     if (raw.length === 0) {
       return { count: 0, sum: 0, p50: 0, p95: 0, p99: 0 };
     }
@@ -156,7 +182,7 @@ class OtelAndPrometheusExporter {
     const targetSloRatio = params.targetSloRatio ?? 0.999;
     const latencySloTargetMs = params.latencySloTargetMs ?? 250;
     const total = Math.max(1, params.totalRequests);
-    const errRatio = params.errorRequests / total;
+    const errRatio = Math.max(0, Math.min(1, params.errorRequests / total));
     const actualAvailabilityRatio = Number((1 - errRatio).toFixed(5));
     const allowedErrorRatio = Math.max(0.0001, 1 - targetSloRatio);
     const burnRate1h = Number((errRatio / allowedErrorRatio).toFixed(2));
