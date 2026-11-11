@@ -105,4 +105,175 @@ export class DeterministicTimeTravelReplayer {
       inheritedFencingToken: maxFencingToken,
     };
   }
+
+  /**
+   * [M72-3 / F6] Redacts PII, API secrets (`sk-...`), Bearer tokens, and email addresses
+   * before replaying production TurnWalFrames in shadow canary evaluation.
+   */
+  public static redactSensitivePromptTokens(rawText: string): {
+    redactedText: string;
+    redactionCount: number;
+  } {
+    let count = 0;
+    const redactedText = String(rawText ?? "")
+      .replace(/\bsk-[A-Za-z0-9_\-]{8,}\b/g, () => {
+        count += 1;
+        return "[REDACTED_API_KEY]";
+      })
+      .replace(/Bearer\s+[A-Za-z0-9._\-]{8,}/gi, () => {
+        count += 1;
+        return "Bearer [REDACTED_TOKEN]";
+      })
+      .replace(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g, () => {
+        count += 1;
+        return "[REDACTED_EMAIL]";
+      });
+    return { redactedText, redactionCount: count };
+  }
+
+  /**
+   * [M72-3 / F6] Production Shadow WAL Replay & Canary Regression Benchmark Harness:
+   * Replays historical production turns against a candidate model/prompt version, verifies WAL CRC32 integrity,
+   * redacts sensitive credentials/PII, and computes tool-selection accuracy, latency delta, token-cost delta,
+   * and an automated Canary promotion/rollback gate decision.
+   */
+  public executeShadowWalRegressionSuite(params: {
+    suiteId: string;
+    baselineModel: string;
+    candidateModel: string;
+    maxRegressionRatePct?: number;
+    maxCostIncreasePct?: number;
+    traces: Array<{
+      taskId: string;
+      turnIndex: number;
+      prompt: string;
+      expectedToolName: string;
+      expectedPathPrefix?: string;
+      baselineLatencyMs: number;
+      baselineTokens: number;
+      candidateToolName: string;
+      candidateArgs?: Record<string, unknown>;
+      candidateLatencyMs: number;
+      candidateTokens: number;
+      walFrame?: WalDeltaEntry;
+    }>;
+  }): {
+    suiteId: string;
+    baselineModel: string;
+    candidateModel: string;
+    totalTraces: number;
+    crc32VerifiedCount: number;
+    totalRedactions: number;
+    matchedTracesCount: number;
+    regressionCount: number;
+    toolMatchAccuracyPct: number;
+    avgBaselineLatencyMs: number;
+    avgCandidateLatencyMs: number;
+    latencyDeltaPct: number;
+    totalBaselineTokens: number;
+    totalCandidateTokens: number;
+    tokenCostDeltaPct: number;
+    passedGate: boolean;
+    canaryRecommendation: "PROMOTE_CANARY" | "AUTO_ROLLBACK_ON_REGRESSION";
+    traceResults: Array<{
+      taskId: string;
+      turnIndex: number;
+      redactedPrompt: string;
+      expectedToolName: string;
+      candidateToolName: string;
+      matched: boolean;
+      crc32Valid: boolean;
+    }>;
+  } {
+    const traces = Array.isArray(params.traces) ? params.traces : [];
+    if (traces.length === 0) {
+      throw new Error("executeShadowWalRegressionSuite requires at least 1 production trace");
+    }
+    const maxRegressionRatePct = params.maxRegressionRatePct ?? 5.0;
+    const maxCostIncreasePct = params.maxCostIncreasePct ?? 15.0;
+
+    let crc32VerifiedCount = 0;
+    let totalRedactions = 0;
+    let matchedTracesCount = 0;
+    let sumBaseLat = 0;
+    let sumCandLat = 0;
+    let totalBaselineTokens = 0;
+    let totalCandidateTokens = 0;
+
+    const traceResults = traces.map((tr) => {
+      let crc32Valid = true;
+      if (tr.walFrame?.frame && typeof tr.walFrame.frame.verifyIntegrity === "function") {
+        crc32Valid = tr.walFrame.frame.verifyIntegrity();
+        if (!crc32Valid) {
+          throw new Error(
+            `Shadow WAL replay aborted: corrupted WAL frame at task '${tr.taskId}' turn ${tr.turnIndex}`
+          );
+        }
+      }
+      crc32VerifiedCount += 1;
+
+      const red = DeterministicTimeTravelReplayer.redactSensitivePromptTokens(tr.prompt);
+      totalRedactions += red.redactionCount;
+
+      const toolMatched = tr.candidateToolName === tr.expectedToolName;
+      let pathMatched = true;
+      if (tr.expectedPathPrefix) {
+        const candPath = String(tr.candidateArgs?.path ?? tr.candidateArgs?.filePath ?? "");
+        pathMatched = candPath.startsWith(tr.expectedPathPrefix);
+      }
+      const matched = toolMatched && pathMatched;
+      if (matched) matchedTracesCount += 1;
+
+      sumBaseLat += Math.max(1, tr.baselineLatencyMs);
+      sumCandLat += Math.max(1, tr.candidateLatencyMs);
+      totalBaselineTokens += Math.max(1, tr.baselineTokens);
+      totalCandidateTokens += Math.max(1, tr.candidateTokens);
+
+      return {
+        taskId: tr.taskId,
+        turnIndex: tr.turnIndex,
+        redactedPrompt: red.redactedText,
+        expectedToolName: tr.expectedToolName,
+        candidateToolName: tr.candidateToolName,
+        matched,
+        crc32Valid,
+      };
+    });
+
+    const regressionCount = traces.length - matchedTracesCount;
+    const toolMatchAccuracyPct = Number(((matchedTracesCount / traces.length) * 100).toFixed(2));
+    const avgBaselineLatencyMs = Number((sumBaseLat / traces.length).toFixed(2));
+    const avgCandidateLatencyMs = Number((sumCandLat / traces.length).toFixed(2));
+    const latencyDeltaPct = Number(
+      (((avgCandidateLatencyMs - avgBaselineLatencyMs) / Math.max(1, avgBaselineLatencyMs)) * 100).toFixed(2)
+    );
+    const tokenCostDeltaPct = Number(
+      (((totalCandidateTokens - totalBaselineTokens) / Math.max(1, totalBaselineTokens)) * 100).toFixed(2)
+    );
+
+    const minAccuracyPct = 100 - maxRegressionRatePct;
+    const passedGate =
+      toolMatchAccuracyPct >= minAccuracyPct && tokenCostDeltaPct <= maxCostIncreasePct;
+
+    return {
+      suiteId: params.suiteId,
+      baselineModel: params.baselineModel,
+      candidateModel: params.candidateModel,
+      totalTraces: traces.length,
+      crc32VerifiedCount,
+      totalRedactions,
+      matchedTracesCount,
+      regressionCount,
+      toolMatchAccuracyPct,
+      avgBaselineLatencyMs,
+      avgCandidateLatencyMs,
+      latencyDeltaPct,
+      totalBaselineTokens,
+      totalCandidateTokens,
+      tokenCostDeltaPct,
+      passedGate,
+      canaryRecommendation: passedGate ? "PROMOTE_CANARY" : "AUTO_ROLLBACK_ON_REGRESSION",
+      traceResults,
+    };
+  }
 }

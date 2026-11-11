@@ -1434,6 +1434,9 @@
             <button type="button" class="small" data-action="open-adaptive-dag-replan">[F1] 动态 DAG 重规划</button>
             <button type="button" class="small" data-action="open-best-of-n-verifier">[F2] Best-of-N 投机择优</button>
             <button type="button" class="small" data-action="open-cascade-jury-router">[F3] 级联置信度路由 &amp; 陪审团</button>
+            <button type="button" class="small" data-action="open-episodic-hatchery">[F4] 语义经验库 &amp; 黄金镜像</button>
+            <button type="button" class="small" data-action="open-formal-guardrail">[F5] Policy-as-Code 门控</button>
+            <button type="button" class="small" data-action="open-shadow-wal-replay">[F6] 生产 WAL 影子回放</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -2484,6 +2487,65 @@
       state.lastApiOutput = JSON.stringify(d, null, 2);
       await fetchBackendState();
       showToast("已将并发重复请求 " + (d.incomingDuplicateId || "dup") + " 合并至 " + (d.canonicalTaskId || "task-ns-8841") + " (累计合并 ×" + (d.mergedDuplicateCount || 1) + "，节省 " + (d.estimatedSavedTokens || 4200) + " Tokens)");
+      return;
+    }
+    if (action === "open-episodic-hatchery") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-memory-guardrail-replay", {
+        action: "episodic_golden_hatchery",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const m = d.mountedWorkspace || {};
+      openDialog(
+        "[F4] 跨任务语义经验库与 LayerFS 黄金镜像孵化器 (POST /v1beta1/management/ops/phase2-memory-guardrail-replay)",
+        "<div><strong>匹配历史经验轨迹：</strong> <code class=\"mono\">" + (m.matchedEpisodeId || "ep-nextjs-prisma-pool") + "</code> · <strong>余弦相似度：</strong> <span class=\"status-pill ok\">" + (m.similarityScore || 0.85) + "</span></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">零拷贝黄金基线挂载分支：<code class=\"mono\">" + (m.mountedBranchName || "m72-instant-task-ws") + "</code> (基线 Commit=<code class=\"mono\">" + (m.baseCommitId || "C1") + "</code> · 复制文件数=<strong>0</strong>)</div>" +
+        "<div class=\"muted\" style=\"margin-top:4px;\">节省环境预热耗时：<span class=\"status-pill ok\">-" + (m.savedColdStartMs || 4800) + " ms</span></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-formal-guardrail") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-memory-guardrail-replay", {
+        action: "formal_policy_guardrail",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      openDialog(
+        "[F5] 声明式 Policy-as-Code 形式化策略沙箱门控 (POST /v1beta1/management/ops/phase2-memory-guardrail-replay)",
+        "<div><strong>只读诊断调用：</strong> <span class=\"status-pill ok\">" + (d.allowRes?.decision || "ALLOW") + " (BlastRadius=" + (d.allowRes?.blastRadiusScore || 20) + ")</span></div>" +
+        "<div style=\"margin-top:6px;\"><strong>生产批量数据变更 (25,000 行)：</strong> <span class=\"status-pill warn\">" + (d.approvalRes?.decision || "REQUIRE_4EYES_APPROVAL") + "</span> · 自动生成审批单 <code class=\"mono\">" + (d.approvalRes?.approvalTicket?.ticketId || "approval-1") + "</code></div>" +
+        "<div style=\"margin-top:6px;\"><strong>无界 DELETE 1=1 &amp; 敏感路径访问：</strong> <span class=\"status-pill danger\">" + (d.denyRes?.decision || "DENY_FORMAL_VIOLATION") + "</span> · 触发规则 <code class=\"mono\">" + ((d.denyRes?.violatedRuleIds || []).join(", ")) + "</code></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-shadow-wal-replay") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-memory-guardrail-replay", {
+        action: "shadow_wal_replay",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const pr = d.promoteSuite || {};
+      const rb = d.rollbackSuite || {};
+      openDialog(
+        "[F6] 生产 WAL 影子流量回放与金丝雀回归基准台 (POST /v1beta1/management/ops/phase2-memory-guardrail-replay)",
+        "<div><strong>候选模型 A (<code class=\"mono\">" + (pr.candidateModel || "claude-3-7-sonnet-202611") + "</code>)：</strong> 准确率=<span class=\"status-pill ok\">" + (pr.toolMatchAccuracyPct || 100) + "%</span> · 延迟变化=<code class=\"mono\">" + (pr.latencyDeltaPct || -18.2) + "%</code> · 敏感信息自动脱敏=<code class=\"mono\">" + (pr.totalRedactions || 3) + " 处</code> → <span class=\"status-pill ok\">" + (pr.canaryRecommendation || "PROMOTE_CANARY") + "</span></div>" +
+        "<div style=\"margin-top:8px;\"><strong>候选模型 B (<code class=\"mono\">" + (rb.candidateModel || "experimental-draft-v0") + "</code>)：</strong> 准确率=<span class=\"status-pill danger\">" + (rb.toolMatchAccuracyPct || 50) + "%</span> · 回归错误=<code class=\"mono\">" + (rb.regressionCount || 1) + "</code> → <span class=\"status-pill danger\">" + (rb.canaryRecommendation || "AUTO_ROLLBACK_ON_REGRESSION") + "</span></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
       return;
     }
     if (action === "open-adaptive-dag-replan") {

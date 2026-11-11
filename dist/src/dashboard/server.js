@@ -9465,4 +9465,329 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       }
     };
   }
+
+  /**
+   * [M72] Phase 2 Episodic Memory, Formal Guardrails & Shadow WAL Replay Suite:
+   * - F4 (`episodic_golden_hatchery`): Cross-Task Semantic Episodic Memory & LayerFS Golden Base Image Hatchery.
+   * - F5 (`formal_policy_guardrail`): Declarative Policy-as-Code Formal Guardrail Engine (SQL AST Proof, Path/Secret Boundary Proof, Blast-Radius Scoring & SQLite Policy Persistence).
+   * - F6 (`shadow_wal_replay`): Production Shadow WAL Traffic Replay, PII/Secret Redaction & Canary Regression Benchmark Gate.
+   * - `run_all_phase2_suite`: Executes all 3 Phase 2 engines end-to-end and returns a unified audit & operational report.
+   */
+  executePhase2MemoryGuardrailReplaySuite(params)
+
+
+
+
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    const action = params.action ?? "run_all_phase2_suite";
+
+    const runF4EpisodicGoldenHatchery = () => {
+      const drv = this.deps.layerFsDriver ?? new _layerfs_workspace_driver.LayerFsWorkspaceDriver();
+      drv.forkBranch("main", "m72-verified-prisma");
+      drv.executeInProcessFileTool({
+        branchName: "m72-verified-prisma",
+        agentId: "agent-m72",
+        stepId: "step-m72-prisma",
+        operation: "write",
+        filePath: "prisma/pool_config.json",
+        newContent: JSON.stringify({ connection_limit: 32, pool_timeout: 15 })
+      });
+
+      const hatched1 = drv.hatchGoldenBaseBranch({
+        episodeId: "ep-nextjs-prisma-pool",
+        taskId: "task-ns-8810",
+        sourceBranchOrCommit: "m72-verified-prisma",
+        repoSignature: "northstar/checkout-service",
+        problemPattern: "Prisma P2024 connection pool timeout under flash-sale burst traffic",
+        resolutionSummary: "Configured pgbouncer transaction pooling with connection_limit=32 and pre-warmed node_modules",
+        tags: ["prisma", "postgres", "pgbouncer", "connection-pool"],
+        savedColdStartMs: 4800
+      });
+
+      const hatched2 = drv.hatchGoldenBaseBranch({
+        episodeId: "ep-rustfs-raft-heartbeat",
+        taskId: "task-hl-3004",
+        sourceBranchOrCommit: "main",
+        repoSignature: "helios/storage-engine",
+        problemPattern: "Raft leader election flapping during S3 LTX compaction",
+        resolutionSummary: "Separated election ticker priority from background compaction I/O queue",
+        tags: ["raft", "ltx", "compaction", "heartbeat"],
+        savedColdStartMs: 3900
+      });
+
+      const mounted = drv.mountWorkspaceFromEpisodicMemory({
+        queryText:
+        params.queryText ??
+        "Fix Prisma P2024 connection pool exhaustion in checkout-service with pgbouncer",
+        repoSignature: params.repoSignature ?? "northstar/checkout-service",
+        targetBranchName: "m72-instant-task-ws"
+      });
+
+      const readCheck = drv.executeInProcessFileTool({
+        branchName: "m72-instant-task-ws",
+        agentId: "agent-m72",
+        stepId: "step-read-golden",
+        operation: "read",
+        filePath: "prisma/pool_config.json"
+      });
+
+      const f4Verified =
+      hatched1.goldenBaseBranch === "golden/ep-nextjs-prisma-pool" &&
+      hatched2.goldenBaseBranch === "golden/ep-rustfs-raft-heartbeat" &&
+      mounted.matchedEpisodeId === "ep-nextjs-prisma-pool" &&
+      mounted.similarityScore >= 0.45 &&
+      mounted.savedColdStartMs === 4800 &&
+      mounted.copiedFilesCount === 0 &&
+      Boolean(readCheck.readResult?.includes("connection_limit"));
+
+      return {
+        hatchedGoldenImages: [hatched1, hatched2],
+        mountedWorkspace: mounted,
+        inheritedGoldenFileSample: readCheck.readResult,
+        f4Verified
+      };
+    };
+
+    const runF5FormalPolicyGuardrail = () => {
+      const sql = new _env.InMemoryCellSqlStorage();
+      const gate = new _staging.StagingCommitAndApprovalGate(sql);
+      gate.registerPolicyRule({
+        ruleId: "POL-PROD-BULK-MUTATION",
+        effect: "REQUIRE_4EYES_APPROVAL",
+        toolNamePattern: "db_query|sql_exec|schema_migrate",
+        maxAffectedRows: 5000,
+        description: "Require 4-eyes approval when estimated affected rows exceed 5,000 in production"
+      });
+      gate.registerPolicyRule({
+        ruleId: "POL-BLOCK-FORCE-PUSH",
+        effect: "DENY",
+        toolNamePattern: "git_push",
+        forbiddenArgRegex: "--force|refs/heads/main",
+        description: "Block force-pushing directly to main branch"
+      });
+
+      const task = new _models.TaskSpec({
+        task_id: "task-m72-guard",
+        tenant_id: "Northstar",
+        priority: _models.TaskPriority.P1_HIGH
+      });
+
+      // 1. Low-risk read/diagnostic tool -> ALLOW
+      const allowRes = gate.evaluateFormalGuardrailPolicy({
+        task,
+        turnIndex: 1,
+        toolName: "db_explain_plan",
+        args: { sql: "SELECT id, status FROM orders WHERE tenant_id = 'Northstar' LIMIT 20" },
+        environment: "prod"
+      });
+
+      // 2. Medium blast-radius bulk migration -> REQUIRE_4EYES_APPROVAL
+      const approvalRes = gate.evaluateFormalGuardrailPolicy({
+        task,
+        turnIndex: 2,
+        toolName: "schema_migrate",
+        args: {
+          sql: "UPDATE orders SET archived = true WHERE created_at < '2025-01-01'",
+          affectedRowsEstimate: 25000
+        },
+        environment: "prod"
+      });
+
+      // 3. High-risk destructive DDL + path escape -> DENY_FORMAL_VIOLATION
+      const denyRes = gate.evaluateFormalGuardrailPolicy({
+        task,
+        turnIndex: 3,
+        toolName: "sql_exec",
+        args: {
+          sql: "DELETE FROM orders WHERE 1=1; DROP TABLE audit_logs;",
+          filePath: "/etc/shadow"
+        },
+        environment: "prod"
+      });
+
+      const gateRehydrated = new _staging.StagingCommitAndApprovalGate(sql);
+      const rehydratedRulesCount = gateRehydrated.listPolicyRules().length;
+
+      const f5Verified =
+      allowRes.decision === "ALLOW" &&
+      approvalRes.decision === "REQUIRE_4EYES_APPROVAL" &&
+      Boolean(approvalRes.approvalTicket?.ticketId) &&
+      denyRes.decision === "DENY_FORMAL_VIOLATION" &&
+      denyRes.violatedRuleIds.includes("BUILTIN_SQL_DESTRUCTIVE_DDL") &&
+      denyRes.violatedRuleIds.includes("BUILTIN_SQL_UNSCOPED_MUTATION") &&
+      denyRes.violatedRuleIds.includes("BUILTIN_PATH_SECRET_BOUNDARY") &&
+      rehydratedRulesCount === 2;
+
+      return {
+        allowRes,
+        approvalRes,
+        denyRes,
+        rehydratedRulesCount,
+        f5Verified
+      };
+    };
+
+    const runF6ShadowWalReplay = () => {
+      const replayer = new _time_travel.DeterministicTimeTravelReplayer();
+      const promoteSuite = replayer.executeShadowWalRegressionSuite({
+        suiteId: "shadow-suite-canary-202611",
+        baselineModel: "claude-3-5-sonnet",
+        candidateModel: "claude-3-7-sonnet-202611",
+        maxRegressionRatePct: 5.0,
+        maxCostIncreasePct: 15.0,
+        traces: [
+        {
+          taskId: "task-prod-01",
+          turnIndex: 1,
+          prompt: "Customer ops@northstar.io reported slow query with key sk-live-9988776655443322",
+          expectedToolName: "db_explain_plan",
+          expectedPathPrefix: "sql/",
+          baselineLatencyMs: 420,
+          baselineTokens: 1200,
+          candidateToolName: "db_explain_plan",
+          candidateArgs: { filePath: "sql/orders_idx.sql" },
+          candidateLatencyMs: 340,
+          candidateTokens: 1080
+        },
+        {
+          taskId: "task-prod-02",
+          turnIndex: 2,
+          prompt: "Rotate Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 webhook secret in staging",
+          expectedToolName: "webhook_rotate_key",
+          baselineLatencyMs: 380,
+          baselineTokens: 950,
+          candidateToolName: "webhook_rotate_key",
+          candidateLatencyMs: 310,
+          candidateTokens: 890
+        },
+        {
+          taskId: "task-prod-03",
+          turnIndex: 3,
+          prompt: "Run unit test suite on checkout branch",
+          expectedToolName: "layerfs_bash_exec",
+          baselineLatencyMs: 510,
+          baselineTokens: 1400,
+          candidateToolName: "layerfs_bash_exec",
+          candidateLatencyMs: 420,
+          candidateTokens: 1310
+        }]
+
+      });
+
+      const rollbackSuite = replayer.executeShadowWalRegressionSuite({
+        suiteId: "shadow-suite-broken-draft",
+        baselineModel: "claude-3-5-sonnet",
+        candidateModel: "experimental-draft-v0",
+        maxRegressionRatePct: 5.0,
+        maxCostIncreasePct: 15.0,
+        traces: [
+        {
+          taskId: "task-prod-01",
+          turnIndex: 1,
+          prompt: "Inspect order index",
+          expectedToolName: "db_explain_plan",
+          baselineLatencyMs: 400,
+          baselineTokens: 1000,
+          candidateToolName: "drop_table_raw",
+          candidateLatencyMs: 650,
+          candidateTokens: 1800
+        },
+        {
+          taskId: "task-prod-02",
+          turnIndex: 2,
+          prompt: "Verify tests",
+          expectedToolName: "layerfs_bash_exec",
+          baselineLatencyMs: 400,
+          baselineTokens: 1000,
+          candidateToolName: "layerfs_bash_exec",
+          candidateLatencyMs: 410,
+          candidateTokens: 1100
+        }]
+
+      });
+
+      const f6Verified =
+      promoteSuite.passedGate === true &&
+      promoteSuite.canaryRecommendation === "PROMOTE_CANARY" &&
+      promoteSuite.toolMatchAccuracyPct === 100 &&
+      promoteSuite.totalRedactions === 3 &&
+      !promoteSuite.traceResults[0].redactedPrompt.includes("sk-live-") &&
+      rollbackSuite.passedGate === false &&
+      rollbackSuite.canaryRecommendation === "AUTO_ROLLBACK_ON_REGRESSION";
+
+      return {
+        promoteSuite,
+        rollbackSuite,
+        f6Verified
+      };
+    };
+
+    if (action === "episodic_golden_hatchery") {
+      const res = runF4EpisodicGoldenHatchery();
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [F4] 跨任务语义经验库检索与 LayerFS 黄金镜像 0ms 挂载 (匹配 ${res.mountedWorkspace.matchedEpisodeId}, 相似度 ${res.mountedWorkspace.similarityScore}, 节省冷启动 ${res.mountedWorkspace.savedColdStartMs}ms)`,
+      "Phase2 / EpisodicGoldenHatchery",
+      res.f4Verified ? "GOLDEN_BASE_MOUNTED" : "GOLDEN_BASE_WARN");
+
+      return { status: 200, body: res };
+    }
+
+    if (action === "formal_policy_guardrail") {
+      const res = runF5FormalPolicyGuardrail();
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [F5] Policy-as-Code 形式化策略门控验证 (只读=${res.allowRes.decision}, 批量变更=${res.approvalRes.decision}, 高危删表=${res.denyRes.decision})`,
+      "Phase2 / FormalGuardrailEngine",
+      res.f5Verified ? "FORMAL_PROOF_ENFORCED" : "FORMAL_PROOF_WARN");
+
+      return { status: 200, body: res };
+    }
+
+    if (action === "shadow_wal_replay") {
+      const res = runF6ShadowWalReplay();
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [F6] 生产 WAL 影子流量回放与回归基准门控 (新模型准确率=${res.promoteSuite.toolMatchAccuracyPct}%, 敏感脱敏=${res.promoteSuite.totalRedactions} 处, 决策=${res.promoteSuite.canaryRecommendation})`,
+      "Phase2 / ShadowWalReplayHarness",
+      res.f6Verified ? "SHADOW_REPLAY_GATE_OK" : "SHADOW_REPLAY_WARN");
+
+      return { status: 200, body: res };
+    }
+
+    const f4EpisodicHatchery = runF4EpisodicGoldenHatchery();
+    const f5FormalGuardrail = runF5FormalPolicyGuardrail();
+    const f6ShadowWalReplay = runF6ShadowWalReplay();
+    const allM72Phase2ChecksPassed =
+    f4EpisodicHatchery.f4Verified &&
+    f5FormalGuardrail.f5Verified &&
+    f6ShadowWalReplay.f6Verified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 [M72] 第二阶段记忆沉淀、形式化策略门控与影子流量回放套件全量验证 (通过=${allM72Phase2ChecksPassed})`,
+    "Phase2 / MemoryGuardrailReplaySuite",
+    allM72Phase2ChecksPassed ? "PHASE2_SUITE_ALL_PASS" : "PHASE2_SUITE_FAILED");
+
+
+    return {
+      status: 200,
+      body: {
+        f4EpisodicHatchery,
+        f5FormalGuardrail,
+        f6ShadowWalReplay,
+        allM72Phase2ChecksPassed
+      }
+    };
+  }
 }exports.PlatformManagementPlaneEngine = PlatformManagementPlaneEngine;

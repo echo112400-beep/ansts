@@ -2558,6 +2558,25 @@ class AnstsLocalAndComposeServer {
     }
 
     // [M70-4] Day-2 Governance Suite (`POST /v1beta1/management/ops/day2-governance`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/phase2-memory-guardrail-replay") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.executePhase2MemoryGuardrailReplaySuite({
+        action: body.action,
+
+
+
+
+
+        queryText: typeof body.queryText === "string" ? body.queryText : undefined,
+        repoSignature: typeof body.repoSignature === "string" ? body.repoSignature : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     if (method === "POST" && pathname === "/v1beta1/management/ops/phase1-cognitive-acceleration") {
       const body = await this.readJsonBody(req);
       const out = this.managementPlane.executePhase1CognitiveAccelerationSuite({

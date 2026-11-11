@@ -35,6 +35,24 @@ export class LayerFsContentStoreEngine {
 
   private readonly objects: Map<string, LayerFsStoredObject> = new Map();
   private readonly dirPagesByCommit: Map<string, Map<number, LayerFsDirectoryPage>> = new Map();
+  private readonly episodicMemories: Map<
+    string,
+    {
+      episodeId: string;
+      taskId: string;
+      repoSignature: string;
+      problemPattern: string;
+      resolutionSummary: string;
+      verifiedCommitId: string;
+      goldenBaseBranch: string;
+      reusableFilePaths: string[];
+      tags: string[];
+      savedColdStartMs: number;
+      createdAtMs: number;
+      tokenWeights: Map<string, number>;
+    }
+  > = new Map();
+  private readonly pinnedGoldenCommitIds: Set<string> = new Set();
   private logicalTotalBytes = 0;
   private storedCompressedBytes = 0;
 
@@ -213,7 +231,7 @@ export class LayerFsContentStoreEngine {
   public gcUnreachableCommitPages(reachableCommitIds: Set<string>): number {
     let pruned = 0;
     for (const commitId of Array.from(this.dirPagesByCommit.keys())) {
-      if (!reachableCommitIds.has(commitId)) {
+      if (!reachableCommitIds.has(commitId) && !this.pinnedGoldenCommitIds.has(commitId)) {
         this.dirPagesByCommit.delete(commitId);
         pruned += 1;
       }
@@ -270,5 +288,171 @@ export class LayerFsContentStoreEngine {
     this.logicalTotalBytes = Math.max(0, this.logicalTotalBytes - obj.logicalBytes);
     this.objects.delete(objectId);
     return freed;
+  }
+
+  /**
+   * [M72-1 / F4] Computes a normalized sparse token-weight vector (unigrams + character 3-grams for CJK/identifiers)
+   * for semantic episodic trajectory retrieval.
+   */
+  public static computeEpisodicVector(text: string): Map<string, number> {
+    const cleaned = String(text ?? "")
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}_\-\s]/gu, " ")
+      .trim();
+    const tokens = cleaned.split(/\s+/).filter((t) => t.length >= 2);
+    const weights = new Map<string, number>();
+    for (const tok of tokens) {
+      weights.set(tok, (weights.get(tok) ?? 0) + 1.0);
+      if (tok.length >= 4) {
+        for (let i = 0; i <= tok.length - 3; i++) {
+          const trigram = `g3:${tok.slice(i, i + 3)}`;
+          weights.set(trigram, (weights.get(trigram) ?? 0) + 0.35);
+        }
+      }
+    }
+    let normSq = 0;
+    for (const v of weights.values()) {
+      normSq += v * v;
+    }
+    const norm = Math.sqrt(normSq) || 1;
+    for (const [k, v] of weights.entries()) {
+      weights.set(k, v / norm);
+    }
+    return weights;
+  }
+
+  public static cosineSimilarity(a: Map<string, number>, b: Map<string, number>): number {
+    let dot = 0;
+    const [smaller, larger] = a.size <= b.size ? [a, b] : [b, a];
+    for (const [k, v] of smaller.entries()) {
+      const other = larger.get(k);
+      if (other !== undefined) {
+        dot += v * other;
+      }
+    }
+    return Number(Math.max(0, Math.min(1, dot)).toFixed(4));
+  }
+
+  /**
+   * [M72-1 / F4] Records a verified successful task trajectory into the Episodic Memory Store
+   * and pins `verifiedCommitId` as an immutable Golden Base Image (`pinnedGoldenCommitIds`).
+   */
+  public recordEpisodicTrajectory(params: {
+    episodeId: string;
+    taskId: string;
+    repoSignature: string;
+    problemPattern: string;
+    resolutionSummary: string;
+    verifiedCommitId: string;
+    goldenBaseBranch?: string;
+    reusableFilePaths?: string[];
+    tags?: string[];
+    savedColdStartMs?: number;
+  }): {
+    episodeId: string;
+    verifiedCommitId: string;
+    goldenBaseBranch: string;
+    pinnedGoldenCommitsCount: number;
+  } {
+    const tags = params.tags ?? [];
+    const combinedText = `${params.repoSignature} ${params.problemPattern} ${params.resolutionSummary} ${tags.join(" ")}`;
+    const tokenWeights = LayerFsContentStoreEngine.computeEpisodicVector(combinedText);
+    const goldenBaseBranch = params.goldenBaseBranch ?? `golden/${params.episodeId}`;
+    this.pinnedGoldenCommitIds.add(params.verifiedCommitId);
+    this.episodicMemories.set(params.episodeId, {
+      episodeId: params.episodeId,
+      taskId: params.taskId,
+      repoSignature: params.repoSignature,
+      problemPattern: params.problemPattern,
+      resolutionSummary: params.resolutionSummary,
+      verifiedCommitId: params.verifiedCommitId,
+      goldenBaseBranch,
+      reusableFilePaths: params.reusableFilePaths ?? [],
+      tags,
+      savedColdStartMs: params.savedColdStartMs ?? 4200,
+      createdAtMs: Date.now(),
+      tokenWeights,
+    });
+    return {
+      episodeId: params.episodeId,
+      verifiedCommitId: params.verifiedCommitId,
+      goldenBaseBranch,
+      pinnedGoldenCommitsCount: this.pinnedGoldenCommitIds.size,
+    };
+  }
+
+  /**
+   * [M72-1 / F4] Retrieves top-K semantically similar historical episodes and the best matching
+   * Golden Base Commit for 0ms instant workspace mounting.
+   */
+  public retrieveSimilarEpisodesAndGoldenBase(params: {
+    queryText: string;
+    repoSignature?: string;
+    topK?: number;
+    minSimilarity?: number;
+  }): {
+    recommendedGoldenBaseBranch: string | null;
+    recommendedGoldenCommitId: string | null;
+    estimatedSavedColdStartMs: number;
+    matches: Array<{
+      episodeId: string;
+      taskId: string;
+      repoSignature: string;
+      problemPattern: string;
+      resolutionSummary: string;
+      verifiedCommitId: string;
+      goldenBaseBranch: string;
+      similarityScore: number;
+      savedColdStartMs: number;
+    }>;
+  } {
+    const queryVec = LayerFsContentStoreEngine.computeEpisodicVector(
+      `${params.repoSignature ?? ""} ${params.queryText}`
+    );
+    const minSim = params.minSimilarity ?? 0.1;
+    const topK = Math.max(1, params.topK ?? 3);
+
+    const scored: Array<{
+      episodeId: string;
+      taskId: string;
+      repoSignature: string;
+      problemPattern: string;
+      resolutionSummary: string;
+      verifiedCommitId: string;
+      goldenBaseBranch: string;
+      similarityScore: number;
+      savedColdStartMs: number;
+    }> = [];
+
+    for (const ep of this.episodicMemories.values()) {
+      let sim = LayerFsContentStoreEngine.cosineSimilarity(queryVec, ep.tokenWeights);
+      if (params.repoSignature && ep.repoSignature === params.repoSignature) {
+        sim = Number(Math.min(1, sim + 0.15).toFixed(4));
+      }
+      if (sim >= minSim) {
+        scored.push({
+          episodeId: ep.episodeId,
+          taskId: ep.taskId,
+          repoSignature: ep.repoSignature,
+          problemPattern: ep.problemPattern,
+          resolutionSummary: ep.resolutionSummary,
+          verifiedCommitId: ep.verifiedCommitId,
+          goldenBaseBranch: ep.goldenBaseBranch,
+          similarityScore: sim,
+          savedColdStartMs: ep.savedColdStartMs,
+        });
+      }
+    }
+
+    scored.sort((a, b) => b.similarityScore - a.similarityScore);
+    const matches = scored.slice(0, topK);
+    const best = matches[0] ?? null;
+
+    return {
+      recommendedGoldenBaseBranch: best ? best.goldenBaseBranch : null,
+      recommendedGoldenCommitId: best ? best.verifiedCommitId : null,
+      estimatedSavedColdStartMs: best ? best.savedColdStartMs : 0,
+      matches,
+    };
   }
 }

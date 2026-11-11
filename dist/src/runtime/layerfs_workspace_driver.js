@@ -695,4 +695,84 @@ class LayerFsWorkspaceDriver {
     }
     return result;
   }
+
+  /**
+   * [M72-1 / F4] Promotes a verified branch/commit into an immutable Golden Base Image (`golden/<episodeId>`),
+   * records its trajectory in `storeEngine.recordEpisodicTrajectory`, and enables 0ms CoW mounting for future tasks.
+   */
+  hatchGoldenBaseBranch(params)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    const goldenBaseBranch = `golden/${params.episodeId}`;
+    const forked = this.forkBranch(params.sourceBranchOrCommit, goldenBaseBranch);
+    const commitRec = this.commits.get(forked.headCommitId);
+    const reusableFilePaths = Array.from(commitRec.filesTree.keys());
+    this.storeEngine.recordEpisodicTrajectory({
+      episodeId: params.episodeId,
+      taskId: params.taskId,
+      repoSignature: params.repoSignature,
+      problemPattern: params.problemPattern,
+      resolutionSummary: params.resolutionSummary,
+      verifiedCommitId: forked.headCommitId,
+      goldenBaseBranch,
+      reusableFilePaths,
+      tags: params.tags,
+      savedColdStartMs: params.savedColdStartMs ?? 4500
+    });
+    return {
+      episodeId: params.episodeId,
+      goldenBaseBranch,
+      goldenCommitId: forked.headCommitId,
+      pinnedFilesCount: reusableFilePaths.length,
+      savedColdStartMs: params.savedColdStartMs ?? 4500
+    };
+  }
+
+  /**
+   * [M72-1 / F4] Queries Episodic Memory for a matching Golden Base Image and forks `targetBranchName`
+   * in O(1) (0ms cold-start, 0 copied bytes) from the recommended golden commit.
+   */
+  mountWorkspaceFromEpisodicMemory(params)
+
+
+
+
+
+
+
+
+
+
+  {
+    const retrieval = this.storeEngine.retrieveSimilarEpisodesAndGoldenBase({
+      queryText: params.queryText,
+      repoSignature: params.repoSignature,
+      topK: 3,
+      minSimilarity: 0.1
+    });
+    const best = retrieval.matches[0];
+    const sourceRef = best ? best.goldenBaseBranch : "main";
+    const forked = this.forkBranch(sourceRef, params.targetBranchName);
+    return {
+      mountedBranchName: forked.branchName,
+      baseCommitId: forked.headCommitId,
+      matchedEpisodeId: best ? best.episodeId : null,
+      similarityScore: best ? best.similarityScore : 0,
+      savedColdStartMs: best ? best.savedColdStartMs : 0,
+      copiedFilesCount: 0
+    };
+  }
 }exports.LayerFsWorkspaceDriver = LayerFsWorkspaceDriver;

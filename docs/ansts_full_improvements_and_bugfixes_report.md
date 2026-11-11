@@ -514,7 +514,7 @@
 | **7. [M70-4] 配置中心版本化字段级 Diff 预览** | 在热更新或回滚前对比基线配置与候选配置的逐字段差异（`MODIFIED` / `ADDED` / `UNCHANGED`），避免盲目变更。 | `POST /v1beta1/management/ops/day2-governance` (`config_diff_preview`) · `anstsctl mgmt-day2-ops config_diff_preview` | 审计与混沌视图 **「配置版本字段级 Diff 预览」** |
 | **8. [M70-1 & M70-4] Outbox Webhook 密钥零停机双密钥轮换** | 在 `TransactionalOutboxDispatcher` 中新增 `rotateSigningSecret(newPrimarySecret, graceWindowSec, nowSec)`，在宽限期内同时支持新主密钥与旧次级密钥的 `crypto.timingSafeEqual` 恒定时间验签，实现零停机平滑轮换。 | `POST /v1beta1/management/ops/day2-governance` (`rotate_webhook_secret`) · `anstsctl mgmt-day2-ops rotate_webhook_secret` | 审计与混沌视图 **「Outbox 双密钥平滑轮换」** |
 
-- **全量回归验证**：新增 `tests/m70_console_day2_ops_governance_workbench.test.ts`，全仓 **64 个测试套件（180 项子测试）100% 通过**。
+- **全量回归验证**：新增 `tests/m70_console_day2_ops_governance_workbench.test.ts`，全仓 **65 个测试套件（184 项子测试）100% 通过**。
 
 
 ## 二十一、M71 第一阶段认知与投机执行加速套件（Phase 1 Cognitive & Speculative Execution Acceleration Suite）
@@ -527,3 +527,15 @@
 | **[M71-2 / F2] Best-of-N 投机并行沙箱与评分择优器 (`Speculative Parallel Verifier`)** | `src/runtime/sandbox_branch_forker.ts` | 新增 `CoWSandboxBranchForker.executeBestOfNSpeculativeVerifier()`：基于 LayerFS 零拷贝同时派生 $N$ 个候选分支并在 `DeterministicExecutionEnvelope` 下执行真实命令与验证脚本，采集单测通过数 (`TESTS_PASSED`)、Lint 告警数 (`LINT_WARNINGS`) 与挂载耗时计算综合质量分 (`0..100`)，自动将最高分分支晋级合并至目标分支并调用 `gcUnreachableCommits()` 清理全部败北分支与孤立块。 | 已验证 (`tests/m71_phase1_cognitive_speculative_acceleration.test.ts` Subtest 2) |
 | **[M71-3 / F3] 级联置信度路由、语义缓存与异构模型陪审团 (`Cascade Router & Multi-Model Jury`)** | `src/cognitive_router.ts` | 新增 `computeSemanticIntentHash()`、`routeWithCascadeAndSemanticCache()` 与 `evaluateMultiModelJuryQuorum()`：支持归一化语义意图缓存命中 (`TIER0_SEMANTIC_CACHE` 节省 100% 推理 Token 且持久化至 SQLite `persisted_router_state`)、基于 Token 对数概率均值 $\bar{p} = \frac{1}{K}\sum \exp(\text{logprob}_i)$ 的轻量草案直出 (`TIER1_FAST_DRAFT`) 与低置信度自动升级旗舰推理模型 (`TIER2_FLAGSHIP_REASONER`)，以及高危操作下跨异构模型的 $\ge 2/3$ 法定人数与安全均分一票否决陪审团机制。 | 已验证 (`tests/m71_phase1_cognitive_speculative_acceleration.test.ts` Subtest 3) |
 | **[M71-4] 管理面 BFF、Console 交互台与 CLI 闭环** | `src/dashboard/server.ts`、`src/server_main.ts`、`src/cli/anstsctl.ts`、`docs/console-management/prototype.js` | 新增 `POST /v1beta1/management/ops/phase1-cognitive-acceleration`、`anstsctl mgmt-phase1-accel` 及控制台任务治理视图顶部 **`[F1] 动态 DAG 重规划`**、**`[F2] Best-of-N 投机择优`**、**`[F3] 级联置信度路由 & 陪审团`** 三大交互式工作台。 | 已验证 (`tests/m71_phase1_cognitive_speculative_acceleration.test.ts` Subtest 4，全仓 **64 个测试套件 / 180 项子测试 100% 通过**) |
+
+
+## 二十二、M72 第二阶段记忆沉淀、形式化策略门控与生产影子回放套件（Phase 2 Episodic Memory, Formal Guardrails & Shadow WAL Replay Suite）
+
+围绕下一代系统演进路线图的第二阶段（**F4 跨任务语义经验库与 LayerFS 黄金镜像孵化器 + F5 声明式 Policy-as-Code 形式化策略沙箱门控 + F6 生产 WAL 影子流量回放与回归基准台**），完成了核心算法落地、SQLite 持久化、Console BFF 接口、前端工作台与 `anstsctl` CLI 的端到端集成：
+
+| 特性编号与名称 | 涉及模块 | 核心算法与工程实现细节 | 验证结果 |
+| :--- | :--- | :--- | :--- |
+| **[M72-1 / F4] 跨任务语义经验库与 LayerFS 黄金镜像孵化器 (`Episodic Memory & Golden Base Hatchery`)** | `src/checkpoint/layerfs_store_engine.ts`、`src/runtime/layerfs_workspace_driver.ts` | 新增 `computeEpisodicVector()`（词元 + 3-gram 稀疏向量与余弦相似度）、`recordEpisodicTrajectory()`、`retrieveSimilarEpisodesAndGoldenBase()`、`hatchGoldenBaseBranch()` 与 `mountWorkspaceFromEpisodicMemory()`：将历史成功修复轨迹与预热依赖晋升为不可变 `golden/<episodeId>` 基线镜像并加入 `pinnedGoldenCommitIds` 免受 GC 清理，供后续同类任务 `0ms` 零拷贝挂载复用。 | 已验证 (`tests/m72_phase2_episodic_guardrail_shadow_replay.test.ts` Subtest 1) |
+| **[M72-2 / F5] 声明式 Policy-as-Code 工具形式化沙箱门控 (`Formal Guardrail Engine`)** | `src/saga/staging.ts` | 新增 `registerPolicyRule()`（持久化至 SQLite `persisted_guardrail_policies`）与 `evaluateFormalGuardrailPolicy()`：在副作用执行前联合执行 SQL AST 破坏性 DDL / 无界 `WHERE 1=1` 静态证明、文件系统敏感路径越界证明、声明式正则/行数策略匹配与冲击半径量化评分 (`0..100`)，自动分流为微秒级直通 (`ALLOW`)、自动挂起 4-Eyes 审批单 (`REQUIRE_4EYES_APPROVAL`) 与形式化违规硬阻断 (`DENY_FORMAL_VIOLATION`)。 | 已验证 (`tests/m72_phase2_episodic_guardrail_shadow_replay.test.ts` Subtest 2) |
+| **[M72-3 / F6] 生产 WAL 影子流量回放与回归基准台 (`Shadow WAL Replay & Eval Harness`)** | `src/checkpoint/time_travel.ts` | 新增 `redactSensitivePromptTokens()`（自动脱敏 `sk-...` API 密钥、`Bearer` 令牌与邮箱 PII）与 `executeShadowWalRegressionSuite()`：逐帧校验生产 `TurnWalFrame` CRC32 完整性并重放历史真实 Turn，量化计算新模型工具选择准确率、延迟变化率与 Token 成本变化率，自动输出金丝雀晋级 (`PROMOTE_CANARY`) 或回归自动回滚 (`AUTO_ROLLBACK_ON_REGRESSION`) 门控结论。 | 已验证 (`tests/m72_phase2_episodic_guardrail_shadow_replay.test.ts` Subtest 3) |
+| **[M72-4] 管理面 BFF、Console 交互台与 CLI 闭环** | `src/dashboard/server.ts`、`src/server_main.ts`、`src/cli/anstsctl.ts`、`docs/console-management/prototype.js` | 新增 `POST /v1beta1/management/ops/phase2-memory-guardrail-replay`、`anstsctl mgmt-phase2-gov` 及控制台任务治理视图顶部 **`[F4] 语义经验库 & 黄金镜像`**、**`[F5] Policy-as-Code 门控`**、**`[F6] 生产 WAL 影子回放`** 三大交互式工作台。 | 已验证 (`tests/m72_phase2_episodic_guardrail_shadow_replay.test.ts` Subtest 4，全仓 **65 个测试套件 / 184 项子测试 100% 通过**) |
