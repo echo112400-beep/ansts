@@ -1,10 +1,11 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.StaleFenceError = exports.LeaseCoordinator = void 0;
 
 
+
 var _models = require("./models.js"); /**
- * @fileoverview M2 TASK-07 & M52-1: Monotonic Fencing Token & Dual-Tuple `FenceToken` Lease Coordinator with `StaleFenceError` (HTTP 409) Split-Brain Rejection.
- */class StaleFenceError extends Error {
-  statusCode = 409;
+ * @fileoverview M2 TASK-07, M52-1 & M68-3: Monotonic Fencing Token & Dual-Tuple `FenceToken` Lease Coordinator
+ * with `StaleFenceError` (HTTP 409) Split-Brain Rejection, `advanceTurnFence` Epoch Watermark Synchronization & Completed-Task Fence Purge.
+ */class StaleFenceError extends Error {statusCode = 409;
   taskId;
   attemptedFence;
   currentHighestFence;
@@ -35,7 +36,8 @@ class LeaseCoordinator {
   dualTupleFencesByTask = new Map();
 
   constructor(leaseTtlSeconds = 15.0) {
-    this.leaseTtlSeconds = leaseTtlSeconds;
+    this.leaseTtlSeconds =
+    Number.isFinite(leaseTtlSeconds) && leaseTtlSeconds > 0 ? leaseTtlSeconds : 15.0;
   }
 
   activeLeaseCount() {
@@ -50,20 +52,25 @@ class LeaseCoordinator {
   }
 
   seedHighestFencingToken(taskId, token) {
+    if (!Number.isFinite(token) || token <= 0) return;
+    const safeToken = Math.floor(token);
     const curr = this.highestTokenByTask.get(taskId) ?? 0;
-    if (token > curr) {
-      this.highestTokenByTask.set(taskId, token);
-      this.dualTupleFencesByTask.set(taskId, new _models.FenceToken(token, 0, taskId));
+    if (safeToken > curr) {
+      this.highestTokenByTask.set(taskId, safeToken);
+      const prevDual = this.dualTupleFencesByTask.get(taskId);
+      if (!prevDual || prevDual.epoch < safeToken) {
+        this.dualTupleFencesByTask.set(taskId, new _models.FenceToken(safeToken, 0, taskId));
+      }
     }
   }
 
   acquireLease(taskId, nodeId, nowSec = Date.now() / 1000) {
-    const prevToken = this.highestTokenByTask.get(taskId) ?? 0;
+    const prevDual = this.dualTupleFencesByTask.get(taskId);
+    const prevToken = Math.max(this.highestTokenByTask.get(taskId) ?? 0, prevDual?.epoch ?? 0);
     const nextToken = prevToken + 1;
     this.highestTokenByTask.set(taskId, nextToken);
 
-    const prevDual = this.dualTupleFencesByTask.get(taskId);
-    const nextDual = prevDual ? prevDual.nextEpoch() : new _models.FenceToken(nextToken, 0, taskId);
+    const nextDual = new _models.FenceToken(nextToken, 0, taskId);
     this.dualTupleFencesByTask.set(taskId, nextDual);
 
     const now = nowSec;
@@ -85,6 +92,15 @@ class LeaseCoordinator {
 
   }
 
+  getHighestFencingToken(taskId) {
+    return this.highestTokenByTask.get(taskId) ?? 0;
+  }
+
+  /**
+   * [M68-3] Advances the turn-sequence component of the dual-tuple fence and synchronizes
+   * `highestTokenByTask` whenever `callerFence.epoch` exceeds the recorded scalar watermark,
+   * preventing subsequent `acquireLease` / `validateFencingToken` calls from regressing to a stale epoch.
+   */
   advanceTurnFence(taskId, callerFence) {
     const current = this.getDualTupleFence(taskId);
     if (callerFence.isStrictlyOlderThan(current)) {
@@ -92,6 +108,10 @@ class LeaseCoordinator {
     }
     const next = callerFence.nextTurn();
     this.dualTupleFencesByTask.set(taskId, next);
+    const prevHighest = this.highestTokenByTask.get(taskId) ?? 0;
+    if (next.epoch > prevHighest) {
+      this.highestTokenByTask.set(taskId, next.epoch);
+    }
     return next;
   }
 
@@ -128,6 +148,20 @@ class LeaseCoordinator {
 
   revokeLease(taskId) {
     this.activeLeases.delete(taskId);
+  }
+
+  /**
+   * [M68-3] Purges all lease and fencing watermark records for a permanently archived/purged task.
+   */
+  purgeCompletedTaskFence(taskId) {
+    const hadAny =
+    this.activeLeases.has(taskId) ||
+    this.highestTokenByTask.has(taskId) ||
+    this.dualTupleFencesByTask.has(taskId);
+    this.activeLeases.delete(taskId);
+    this.highestTokenByTask.delete(taskId);
+    this.dualTupleFencesByTask.delete(taskId);
+    return hadAny;
   }
 
   getLease(taskId) {

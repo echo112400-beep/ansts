@@ -2,13 +2,14 @@
 
 
 
+
 var _models = require("../models.js");
 
 var _saga_gateway = require("../saga_gateway.js"); /**
- * @fileoverview M3 TASK-10, M54-3, M61-2 & M64-3: Staging Hold-and-Commit Buffer & Human-in-the-Loop Approval Gate
- * with Idempotent Effect Staging, Turn-Accurate Commit Callback, Coalesced Pending Approval Tickets, Terminal-State Guard, TTL Sweep & SQLite Persistence.
+ * @fileoverview M3 TASK-10, M54-3, M61-2, M64-3 & M68-5: Staging Hold-and-Commit Buffer & Human-in-the-Loop Approval Gate
+ * with Idempotent Effect Staging, Turn-Accurate Commit Callback, Coalesced Pending Approval Tickets,
+ * Terminal-State Guard, TTL Sweep, Completed-Task Staging Purge & SQLite Persistence.
  */
-
 
 
 
@@ -157,6 +158,43 @@ class StagingCommitAndApprovalGate {
       }
     }
     return count;
+  }
+
+  /**
+   * [M68-5] Purges committed/aborted staged side-effects and terminal approval tickets for a completed
+   * or archived task from both in-memory maps and SQLite tables.
+   */
+  purgeCompletedTaskStaging(taskId) {
+    const list = this.stagedByTask.get(taskId) ?? [];
+    let purgedEffects = 0;
+    const remainingEffects = [];
+    for (const eff of list) {
+      if (eff.committed || eff.aborted) {
+        purgedEffects += 1;
+        if (this.sql) {
+          this.sql.exec("DELETE FROM persisted_staged_effects WHERE effect_id = ?", eff.effectId);
+        }
+      } else {
+        remainingEffects.push(eff);
+      }
+    }
+    if (remainingEffects.length > 0) {
+      this.stagedByTask.set(taskId, remainingEffects);
+    } else {
+      this.stagedByTask.delete(taskId);
+    }
+
+    let purgedTickets = 0;
+    for (const [ticketId, ticket] of Array.from(this.tickets.entries())) {
+      if (ticket.taskId === taskId && ticket.status !== "PENDING") {
+        this.tickets.delete(ticketId);
+        purgedTickets += 1;
+        if (this.sql) {
+          this.sql.exec("DELETE FROM persisted_approval_tickets WHERE ticket_id = ?", ticketId);
+        }
+      }
+    }
+    return { purgedEffects, purgedTickets };
   }
 
   getStagedEffects(taskId) {

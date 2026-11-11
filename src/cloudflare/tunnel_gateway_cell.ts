@@ -1,8 +1,9 @@
 /**
- * @fileoverview v2.5, M52-4, M61-4 & M65-4: Dual-Homed Reverse Tunnel Gateway Cell (`TunnelGatewayCell`).
+ * @fileoverview v2.5, M52-4, M61-4, M65-4 & M68-1: Dual-Homed Reverse Tunnel Gateway Cell (`TunnelGatewayCell`).
  * Supports NAT-traversal outbound reverse tunnel command queueing, long-poll retrieval,
  * command execution acknowledgement, stale-heartbeat tunnel auto-demotion, in-flight command re-queueing,
- * Idempotent In-Flight/Completed Command Coalescing, SQLite Persistence & Durable Object `fetch` API.
+ * Idempotent In-Flight/Completed Command Coalescing, Timed-Out Command Queue/Idempotency Eviction,
+ * Non-Regressive Epoch/Generation Registration Guard, Bounded Idempotency Retention, SQLite Persistence & Durable Object `fetch` API.
  */
 import { DurableObjectStateLike, SqlStorageLike } from "./env.js";
 
@@ -45,10 +46,18 @@ export class TunnelGatewayCell {
   > = new Map();
   private readonly commandByIdempotencyKey: Map<string, QueuedTunnelCommand> = new Map();
   private readonly completedResultsByIdempotencyKey: Map<string, Record<string, unknown>> = new Map();
+  private readonly maxRetainedIdempotentCommands: number;
   private cmdSeq = 0;
   private sql?: SqlStorageLike;
 
-  constructor(sqlOrState?: SqlStorageLike | DurableObjectStateLike) {
+  constructor(
+    sqlOrState?: SqlStorageLike | DurableObjectStateLike,
+    maxRetainedIdempotentCommands = 2048
+  ) {
+    this.maxRetainedIdempotentCommands =
+      Number.isFinite(maxRetainedIdempotentCommands) && maxRetainedIdempotentCommands >= 1
+        ? Math.floor(maxRetainedIdempotentCommands)
+        : 2048;
     if (sqlOrState) {
       this.bindSqlStorage(isDurableObjectStateLike(sqlOrState) ? sqlOrState.storage.sql : sqlOrState);
     }
@@ -82,10 +91,13 @@ export class TunnelGatewayCell {
       const cmd = JSON.parse(String(r.payload_json ?? "{}")) as QueuedTunnelCommand;
       const idemKey = r.idempotency_key ? String(r.idempotency_key) : cmd.idempotencyKey;
       if (status === "COMPLETED" && idemKey) {
+        const scopedIdem = `${cmd.hostId}::${idemKey}`;
         this.completedResultsByIdempotencyKey.set(
-          `${cmd.hostId}::${idemKey}`,
+          scopedIdem,
           JSON.parse(String(r.result_json ?? "{}")) as Record<string, unknown>
         );
+        this.commandByIdempotencyKey.set(scopedIdem, cmd);
+        this.enforceIdempotencyCacheBound();
         commandsRestored += 1;
       } else if (status === "PENDING" || status === "IN_FLIGHT") {
         const q = this.pendingCommandsByHost.get(cmd.hostId) ?? [];
@@ -129,15 +141,58 @@ export class TunnelGatewayCell {
     );
   }
 
+  private deletePersistedCommand(commandId: string): void {
+    if (!this.sql) return;
+    this.sql.exec("DELETE FROM tunnel_gateway_commands WHERE command_id = ?", commandId);
+  }
+
+  /**
+   * [M68-1] Bounds `completedResultsByIdempotencyKey` and `commandByIdempotencyKey` to `maxRetainedIdempotentCommands`
+   * using FIFO eviction so long-lived Gateway Cells never leak unbounded memory.
+   */
+  private enforceIdempotencyCacheBound(): void {
+    while (this.completedResultsByIdempotencyKey.size > this.maxRetainedIdempotentCommands) {
+      const oldestScopedKey = this.completedResultsByIdempotencyKey.keys().next().value;
+      if (oldestScopedKey === undefined) break;
+      this.completedResultsByIdempotencyKey.delete(oldestScopedKey);
+      const evictedCmd = this.commandByIdempotencyKey.get(oldestScopedKey);
+      this.commandByIdempotencyKey.delete(oldestScopedKey);
+      if (evictedCmd) {
+        this.deletePersistedCommand(evictedCmd.commandId);
+      }
+    }
+  }
+
+  /**
+   * [M68-1] Non-regressive tunnel registration guard: prevents out-of-order network registration packets
+   * with an older `(epoch, connGeneration)` tuple from downgrading an already-registered `(hostId, gatewayId)` binding.
+   */
   public registerTunnel(binding: Omit<ReverseTunnelBinding, "healthy">, nowMs = Date.now()): ReverseTunnelBinding {
+    const safeEpoch =
+      Number.isFinite(binding.epoch) && binding.epoch >= 1 ? Math.floor(binding.epoch) : 1;
+    const safeGen =
+      Number.isFinite(binding.connGeneration) && binding.connGeneration >= 1
+        ? Math.floor(binding.connGeneration)
+        : 1;
+
+    const existingList = this.tunnelsByHost.get(binding.hostId) ?? [];
+    const existing = existingList.find((b) => b.gatewayId === binding.gatewayId);
+    if (
+      existing &&
+      (safeEpoch < existing.epoch ||
+        (safeEpoch === existing.epoch && safeGen < existing.connGeneration))
+    ) {
+      return existing;
+    }
+
     const full: ReverseTunnelBinding = {
       ...binding,
+      epoch: safeEpoch,
+      connGeneration: safeGen,
       healthy: true,
       lastHeartbeatMs: binding.lastHeartbeatMs ?? nowMs,
     };
-    const list = (this.tunnelsByHost.get(binding.hostId) ?? []).filter(
-      (b) => b.gatewayId !== binding.gatewayId
-    );
+    const list = existingList.filter((b) => b.gatewayId !== binding.gatewayId);
     list.push(full);
     this.tunnelsByHost.set(binding.hostId, list);
     this.persistTunnel(full);
@@ -190,6 +245,9 @@ export class TunnelGatewayCell {
         const q = this.pendingCommandsByHost.get(cmd.hostId) ?? [];
         q.push(requeued);
         this.pendingCommandsByHost.set(cmd.hostId, q);
+        if (requeued.idempotencyKey) {
+          this.commandByIdempotencyKey.set(`${requeued.hostId}::${requeued.idempotencyKey}`, requeued);
+        }
         this.persistCommand(requeued, "PENDING");
         requeuedCommandIds.push(cmdId);
       }
@@ -208,10 +266,13 @@ export class TunnelGatewayCell {
   }
 
   /**
-   * [M61-4] Supports idempotent & coalesced command queueing via `options.idempotencyKey` (or `payload.idempotency_key`):
+   * [M61-4 & M68-1] Supports idempotent & coalesced command queueing via `options.idempotencyKey` (or `payload.idempotency_key`):
    * - If the command already completed, returns the cached completion result immediately (`deduplicated: true`).
    * - If the command is currently pending or in-flight, coalesces onto the existing command's `completionPromise`
    *   without enqueueing a duplicate command to the Body host.
+   * - [M68-1] When a command times out before completion, evicts it from `pendingCommandsByHost`, `inFlightCommands`,
+   *   `commandByIdempotencyKey`, and SQLite so timed-out unpolled commands never execute as ghost commands on a later
+   *   host poll and subsequent retries with the same `idempotencyKey` can cleanly re-enqueue.
    */
   public enqueueCommandForHost(
     hostId: string,
@@ -247,6 +308,8 @@ export class TunnelGatewayCell {
             deduplicated: true,
           };
         }
+        // Stale or timed-out previous command without an active waiter or completed result: clean up before re-enqueueing
+        this.commandByIdempotencyKey.delete(scopedIdem);
       }
     }
 
@@ -271,6 +334,7 @@ export class TunnelGatewayCell {
     }
     this.persistCommand(command, "PENDING");
 
+    const safeTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5000;
     let resolveFn!: (result: Record<string, unknown>) => void;
     let timerRef!: ReturnType<typeof setTimeout>;
     const completionPromise = new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -278,8 +342,25 @@ export class TunnelGatewayCell {
       timerRef = setTimeout(() => {
         this.commandWaiters.delete(commandId);
         this.inFlightCommands.delete(commandId);
-        reject(new Error(`Reverse tunnel command '${commandId}' for host '${hostId}' timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+        const hostQueue = this.pendingCommandsByHost.get(hostId);
+        if (hostQueue) {
+          const filtered = hostQueue.filter((c) => c.commandId !== commandId);
+          if (filtered.length > 0) {
+            this.pendingCommandsByHost.set(hostId, filtered);
+          } else {
+            this.pendingCommandsByHost.delete(hostId);
+          }
+        }
+        if (
+          scopedIdem &&
+          this.commandByIdempotencyKey.get(scopedIdem)?.commandId === commandId &&
+          !this.completedResultsByIdempotencyKey.has(scopedIdem)
+        ) {
+          this.commandByIdempotencyKey.delete(scopedIdem);
+        }
+        this.deletePersistedCommand(commandId);
+        reject(new Error(`Reverse tunnel command '${commandId}' for host '${hostId}' timed out after ${safeTimeoutMs}ms`));
+      }, safeTimeoutMs);
     });
     this.commandWaiters.set(commandId, {
       promise: completionPromise,
@@ -300,7 +381,7 @@ export class TunnelGatewayCell {
     }
     const q = this.pendingCommandsByHost.get(hostId) ?? [];
     if (q.length === 0) return [];
-    this.pendingCommandsByHost.set(hostId, []);
+    this.pendingCommandsByHost.delete(hostId);
     for (const cmd of q) {
       this.inFlightCommands.set(cmd.commandId, cmd);
       this.persistCommand(cmd, "IN_FLIGHT");
@@ -316,6 +397,7 @@ export class TunnelGatewayCell {
         const scopedIdem = `${cmd.hostId}::${cmd.idempotencyKey}`;
         this.completedResultsByIdempotencyKey.set(scopedIdem, result);
         this.commandByIdempotencyKey.set(scopedIdem, cmd);
+        this.enforceIdempotencyCacheBound();
       }
       this.persistCommand(cmd, "COMPLETED", result);
     }

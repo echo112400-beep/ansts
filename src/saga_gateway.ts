@@ -1,7 +1,8 @@
 /**
- * @fileoverview M3 TASK-11, M53-1, M60-1/M60-2 & M64-3: Unified Idempotent Tool Proxy & Saga Transaction Gateway
+ * @fileoverview M3 TASK-11, M53-1, M60-1/M60-2, M64-3 & M68-5: Unified Idempotent Tool Proxy & Saga Transaction Gateway
  * with Recursive Canonical Nested-JSON Hashing, SQLite-Backed Durable Execution Journal, Automatic Sub-Component
- * SQLite Binding (`compensator` & `stagingGate`), Dynamic Post-Restart Compensation Resolution & Post-Rollback Invalidation.
+ * SQLite Binding (`compensator` & `stagingGate`), Dynamic Post-Restart Compensation Resolution,
+ * Unconditional `COMPENSATABLE` Step Recording & Post-Rollback Invalidation.
  */
 import * as crypto from "node:crypto";
 import { ToolCallEffectClass, ToolExecutionLog } from "./models.js";
@@ -283,7 +284,11 @@ export class SagaToolGateway {
       );
     }
 
-    if (compensateHandler) {
+    if (
+      compensateHandler ||
+      effectClass === ToolCallEffectClass.COMPENSATABLE ||
+      effectClass === ToolCallEffectClass.COMPENSATABLE_WRITE
+    ) {
       this.compensator.recordForwardStep({
         stepId: idemKey.slice(0, 16),
         taskId,

@@ -1,6 +1,7 @@
 /**
- * @fileoverview M12 TASK-44, M53-2, M61-2 & M64-3: Real-Time Tenant Token Budget Quota Enforcer,
- * UTC Daily Window Auto-Reset, Spend Refund Controller, Idempotent Spend/Refund Guard & Dual-Schema SQLite Rehydration.
+ * @fileoverview M12 TASK-44, M53-2, M61-2, M64-3 & M68-2: Real-Time Tenant Token Budget Quota Enforcer,
+ * UTC Daily Window Auto-Reset with Per-Tenant Idempotency Key Pruning, Spend Refund Controller,
+ * Policy Parameter Sanitization, Idempotent Spend/Refund Guard & Dual-Schema SQLite Rehydration.
  */
 import { SqlStorageLike } from "../cloudflare/env.js";
 
@@ -25,6 +26,23 @@ export class FinOpsBudgetController {
     }
   }
 
+  private static sanitizePolicy(policy: TenantBudgetPolicy): TenantBudgetPolicy {
+    const safeDailyBudgetUsd =
+      Number.isFinite(policy.dailyBudgetUsd) && policy.dailyBudgetUsd >= 0
+        ? policy.dailyBudgetUsd
+        : 0;
+    const safeThresholdRatio = Number.isFinite(policy.softDowngradeThresholdRatio)
+      ? Math.min(1, Math.max(0, policy.softDowngradeThresholdRatio))
+      : 0.8;
+    return {
+      tenantId: policy.tenantId,
+      dailyBudgetUsd: safeDailyBudgetUsd,
+      softDowngradeThresholdRatio: safeThresholdRatio,
+      preferredModel: policy.preferredModel || "DeepSeek-R1",
+      fallbackEconomyModel: policy.fallbackEconomyModel || "Qwen-3.8",
+    };
+  }
+
   /**
    * [M61-2 & M64-3] Binds SQLite storage (`persisted_finops_ledgers`) so tenant budget policies, daily spend,
    * active UTC day windows, and idempotency tokens survive restarts (supporting both native and management row formats).
@@ -43,15 +61,21 @@ export class FinOpsBudgetController {
       const parsed = JSON.parse(String(r.payload_json ?? "{}")) as Record<string, unknown>;
       if (!tenantId) continue;
       if (parsed.policy && typeof parsed.policy === "object") {
-        this.policies.set(tenantId, parsed.policy as TenantBudgetPolicy);
-      } else if (parsed.daily_budget_usd !== undefined || parsed.dailyBudgetUsd !== undefined) {
-        this.policies.set(tenantId, {
+        this.policies.set(
           tenantId,
-          dailyBudgetUsd: Number(parsed.daily_budget_usd ?? parsed.dailyBudgetUsd ?? 1000),
-          softDowngradeThresholdRatio: Number(parsed.softDowngradeThresholdRatio ?? 0.8),
-          preferredModel: String(parsed.preferredModel ?? "DeepSeek-R1"),
-          fallbackEconomyModel: String(parsed.fallbackEconomyModel ?? "Qwen-3.8"),
-        });
+          FinOpsBudgetController.sanitizePolicy(parsed.policy as TenantBudgetPolicy)
+        );
+      } else if (parsed.daily_budget_usd !== undefined || parsed.dailyBudgetUsd !== undefined) {
+        this.policies.set(
+          tenantId,
+          FinOpsBudgetController.sanitizePolicy({
+            tenantId,
+            dailyBudgetUsd: Number(parsed.daily_budget_usd ?? parsed.dailyBudgetUsd ?? 1000),
+            softDowngradeThresholdRatio: Number(parsed.softDowngradeThresholdRatio ?? 0.8),
+            preferredModel: String(parsed.preferredModel ?? "DeepSeek-R1"),
+            fallbackEconomyModel: String(parsed.fallbackEconomyModel ?? "Qwen-3.8"),
+          })
+        );
       }
       if (parsed.spendUsd !== undefined) {
         this.spendByTenantUsd.set(tenantId, Number(parsed.spendUsd ?? 0));
@@ -98,12 +122,23 @@ export class FinOpsBudgetController {
     return new Date(ts).toISOString().slice(0, 10);
   }
 
+  /**
+   * [M53-2 & M68-2] Resets `spendByTenantUsd` AND prunes `${tenantId}::*` entries from
+   * `seenLedgerIdempotencyKeys` when the UTC day window rolls over so cross-day idempotency sets
+   * never leak unbounded memory/SQLite payload size or block recurring daily jobs on the new day.
+   */
   private ensureUtcDayWindow(tenantId: string, dayOrTime?: string | number): boolean {
     const utcDayKey = FinOpsBudgetController.resolveUtcDayKey(dayOrTime);
     const prevDay = this.activeUtcDayByTenant.get(tenantId);
     if (prevDay && prevDay !== utcDayKey) {
       this.spendByTenantUsd.set(tenantId, 0);
       this.activeUtcDayByTenant.set(tenantId, utcDayKey);
+      const prefix = `${tenantId}::`;
+      for (const k of Array.from(this.seenLedgerIdempotencyKeys)) {
+        if (k.startsWith(prefix)) {
+          this.seenLedgerIdempotencyKeys.delete(k);
+        }
+      }
       this.persistTenantLedger(tenantId);
       return true;
     }
@@ -114,8 +149,23 @@ export class FinOpsBudgetController {
   }
 
   public setPolicy(policy: TenantBudgetPolicy): void {
-    this.policies.set(policy.tenantId, policy);
-    this.persistTenantLedger(policy.tenantId);
+    const sanitized = FinOpsBudgetController.sanitizePolicy(policy);
+    this.policies.set(sanitized.tenantId, sanitized);
+    this.persistTenantLedger(sanitized.tenantId);
+  }
+
+  public getPolicy(tenantId: string): TenantBudgetPolicy | undefined {
+    return this.policies.get(tenantId);
+  }
+
+  public getSeenIdempotencyKeyCount(tenantId?: string): number {
+    if (!tenantId) return this.seenLedgerIdempotencyKeys.size;
+    const prefix = `${tenantId}::`;
+    let count = 0;
+    for (const k of this.seenLedgerIdempotencyKeys) {
+      if (k.startsWith(prefix)) count += 1;
+    }
+    return count;
   }
 
   public configureTenant(params: {

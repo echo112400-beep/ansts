@@ -1,6 +1,7 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.SagaCompensatorEngine = void 0; /**
- * @fileoverview M3 TASK-09, M53-1 & M64-3: Fault-Tolerant Reverse-Order (LIFO) Saga Compensation Rollback Engine
- * with SQLite Persistence (`persisted_saga_steps`), Idempotent Forward-Step Recording & Dynamic Compensation Resolver Across Restarts.
+ * @fileoverview M3 TASK-09, M53-1, M64-3 & M68-5: Fault-Tolerant Reverse-Order (LIFO) Saga Compensation Rollback Engine
+ * with SQLite Persistence (`persisted_saga_steps`), Idempotent Forward-Step Recording, Dynamic Compensation Resolver,
+ * No-Handler Rollback Idempotency Invalidation & Completed-Task Step Purge.
  */
 
 
@@ -145,25 +146,32 @@ class SagaCompensatorEngine {
   }
 
   /**
-   * [M53-1 & M64-3] Fault-tolerant LIFO rollback: isolates per-step exceptions so a failing
+   * [M53-1, M64-3 & M68-5] Fault-tolerant LIFO rollback: isolates per-step exceptions so a failing
    * compensation hook on step K never blocks steps K-1 .. 0 from rolling back, resolves
    * `compensateHandler` dynamically after restarts, persists updated status to SQLite,
-   * and notifies `SagaToolGateway` to invalidate stale idempotency keys for rolled-back turns.
+   * and even when no `compensateHandler` is registered for a step at `turnIndex >= upToTurnInclusive`,
+   * marks the step rolled back and invokes `onStepCompensatedCallback` so `SagaToolGateway` always
+   * invalidates the rolled-back turn's idempotency key.
    */
   rollbackTask(taskId, upToTurnInclusive = 0) {
     const list = this.stepsByTask.get(taskId) ?? [];
     const rolledBack = [];
     for (let i = list.length - 1; i >= 0; i--) {
       const step = list[i];
-      const handler =
-      step.compensateHandler ?? (
-      this.toolCompensatorResolver ? this.toolCompensatorResolver(step.toolName) : undefined);
-      if (!step.compensated && step.turnIndex >= upToTurnInclusive && handler) {
-        try {
-          step.compensationResult = handler(step.forwardPayload);
-          step.compensated = true;
-        } catch (err) {
-          step.compensationError = err.message;
+      if (!step.compensated && step.turnIndex >= upToTurnInclusive) {
+        const handler =
+        step.compensateHandler ?? (
+        this.toolCompensatorResolver ? this.toolCompensatorResolver(step.toolName) : undefined);
+        if (handler) {
+          try {
+            step.compensationResult = handler(step.forwardPayload);
+            step.compensated = true;
+          } catch (err) {
+            step.compensationError = err.message;
+            step.compensated = true;
+          }
+        } else {
+          step.compensationResult = { skippedNoHandler: true };
           step.compensated = true;
         }
         this.persistStep(step);
@@ -174,6 +182,21 @@ class SagaCompensatorEngine {
       }
     }
     return rolledBack;
+  }
+
+  /**
+   * [M68-5] Purges all recorded Saga steps for an archived/completed task from memory and SQLite.
+   */
+  purgeTaskSteps(taskId) {
+    const list = this.stepsByTask.get(taskId) ?? [];
+    if (list.length === 0) return 0;
+    this.stepsByTask.delete(taskId);
+    if (this.sql) {
+      for (const s of list) {
+        this.sql.exec("DELETE FROM persisted_saga_steps WHERE step_id = ?", s.stepId);
+      }
+    }
+    return list.length;
   }
 
   getTaskSteps(taskId) {

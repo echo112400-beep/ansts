@@ -8,9 +8,9 @@ var _lease_coordinator = require("./lease_coordinator.js");
 var _models = require("./models.js");
 var _profiler = require("./profiler.js");
 var _queue_manager = require("./queue_manager.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M2 TASK-08, M51 & M60: 5D Weighted Scoring Engine, Anti-Stale Heartbeat TTL,
- * Head-of-Line Non-Blocking Dispatch, Cascading DAG Dead-Letter Propagation, Fair Preemption,
- * Tenant-Scoped Idempotency & Mergeable Duplicate In-Flight Coalescing Core Scheduler.
+ * @fileoverview M2 TASK-08, M51, M60 & M68-4: 5D Weighted Scoring Engine, Anti-Stale Heartbeat TTL,
+ * Head-of-Line Non-Blocking Dispatch, Cascading DAG Dead-Letter Propagation with Active Lease/Resource Reclamation,
+ * Fair Preemption, Tenant-Scoped Idempotency, Terminal Content-Fingerprint Release & Mergeable Duplicate In-Flight Coalescing Core Scheduler.
  */
 
 
@@ -19,6 +19,14 @@ var _queue_manager = require("./queue_manager.js");function _getRequireWildcardC
 const MERGEABLE_ACTIVE_STATES = new Set([
 _models.TaskState.SUBMITTED,
 _models.TaskState.QUEUED,
+_models.TaskState.LEASED,
+_models.TaskState.RUNNING_THINK,
+_models.TaskState.RUNNING_ACT,
+_models.TaskState.WAITING_SUB_AGENT,
+_models.TaskState.SUSPENDED_APPROVAL]);
+
+
+const LEASED_OR_RUNNING_STATES = new Set([
 _models.TaskState.LEASED,
 _models.TaskState.RUNNING_THINK,
 _models.TaskState.RUNNING_ACT,
@@ -71,6 +79,15 @@ class CoreScheduler5D {
     const sortedDeps = [...(task.dependencies ?? [])].sort().join(",");
     const canonical = `${task.tenant_id}::${task.parent_task_id ?? ""}::${sortedDeps}::${(task.prompt ?? "").trim()}`;
     return crypto.createHash("sha256").update(canonical, "utf-8").digest("hex");
+  }
+
+  releaseContentFingerprintIfOwned(task) {
+    if (
+    task.content_fingerprint &&
+    this.contentFingerprintIndex.get(task.content_fingerprint) === task.task_id)
+    {
+      this.contentFingerprintIndex.delete(task.content_fingerprint);
+    }
   }
 
   resolveTaskByIdempotencyKey(tenantId, idempotencyKey) {
@@ -207,7 +224,6 @@ class CoreScheduler5D {
         task.merged_idempotency_keys.push(task.idempotency_key);
       }
     }
-    this.contentFingerprintIndex.set(task.content_fingerprint, task.task_id);
 
     // [M51-2 / Deadlock-2 Fix] If any upstream dependency is already in DEAD_LETTER, immediately fail fast
     const failedDep = task.dependencies.find(
@@ -219,6 +235,8 @@ class CoreScheduler5D {
       this.deadLetterIds.add(task.task_id);
       return task;
     }
+
+    this.contentFingerprintIndex.set(task.content_fingerprint, task.task_id);
 
     if (this.dependenciesSatisfied(task)) {
       task.state = _models.TaskState.QUEUED;
@@ -393,12 +411,15 @@ class CoreScheduler5D {
       return false;
     }
     const task = this.allTasks.get(taskId);
-    if (!task) return false;
+    if (!task || task.state === _models.TaskState.COMPLETED || task.state === _models.TaskState.DEAD_LETTER) {
+      return false;
+    }
 
     task.state = _models.TaskState.COMPLETED;
     this.completedIds.add(taskId);
     this.leaseCoordinator.revokeLease(taskId);
     this.queueManager.completeTask(task);
+    this.releaseContentFingerprintIfOwned(task);
     this.profiler.recordExecutionMetrics(task, observedPeakCpu, observedPeakMemoryMb);
 
     const node = this.nodes.get(nodeId);
@@ -424,11 +445,16 @@ class CoreScheduler5D {
   }
 
   /**
-   * [M51-2 / Deadlock-2 Fix] Cascades `DEAD_LETTER` state to all transitive downstream dependents
-   * so child tasks never hang forever in `SUBMITTED` when a parent/dependency dies.
+   * [M51-2 / Deadlock-2 Fix & M68-4] Cascades `DEAD_LETTER` state to all transitive downstream dependents
+   * so child tasks never hang forever in `SUBMITTED` when a parent/dependency dies, AND reclaims any active
+   * lease, node CPU/memory/`running_tasks`, and `tenantActiveCount` if a dependent task was already leased or running.
    */
   cascadeDeadLetterToDependents(failedTaskId) {
     this.deadLetterIds.add(failedTaskId);
+    const failedRoot = this.allTasks.get(failedTaskId);
+    if (failedRoot) {
+      this.releaseContentFingerprintIfOwned(failedRoot);
+    }
     const cascadedIds = [];
     let progress = true;
     while (progress) {
@@ -440,11 +466,32 @@ class CoreScheduler5D {
         candidate.dependencies.some((depId) => this.deadLetterIds.has(depId)))
         {
           const triggerDep = candidate.dependencies.find((depId) => this.deadLetterIds.has(depId));
-          if (candidate.state === _models.TaskState.QUEUED) {
+          const activeLease = this.leaseCoordinator.getLease(candidate.task_id);
+          if (activeLease || LEASED_OR_RUNNING_STATES.has(candidate.state)) {
+            const nodeIdToRelease = activeLease?.node_id ?? candidate.assigned_node_id;
+            if (nodeIdToRelease) {
+              const node = this.nodes.get(nodeIdToRelease);
+              if (node) {
+                node.free_cpu_cores = Math.min(
+                node.total_cpu_cores,
+                node.free_cpu_cores + candidate.resource_profile.think_cpu_cores);
+
+                node.free_memory_mb = Math.min(
+                node.total_memory_mb,
+                node.free_memory_mb + Math.floor(candidate.resource_profile.act_memory_mb * 0.25));
+
+                node.running_tasks = Math.max(0, node.running_tasks - 1);
+              }
+            }
+            this.leaseCoordinator.revokeLease(candidate.task_id);
+            this.queueManager.completeTask(candidate);
+            candidate.assigned_node_id = undefined;
+          } else if (candidate.state === _models.TaskState.QUEUED) {
             this.queueManager.removeQueuedTask(candidate.task_id);
           }
           candidate.state = _models.TaskState.DEAD_LETTER;
           candidate.dead_letter_reason = `UPSTREAM_DEPENDENCY_DEAD_LETTER:${triggerDep}`;
+          this.releaseContentFingerprintIfOwned(candidate);
           this.deadLetterIds.add(candidate.task_id);
           cascadedIds.push(candidate.task_id);
           progress = true;
@@ -486,6 +533,7 @@ class CoreScheduler5D {
         task.state = _models.TaskState.DEAD_LETTER;
         task.dead_letter_reason = "MAX_LEASE_RETRIES_EXCEEDED";
         task.assigned_node_id = undefined;
+        this.releaseContentFingerprintIfOwned(task);
         this.cascadeDeadLetterToDependents(task.task_id);
       } else {
         task.state = _models.TaskState.QUEUED;

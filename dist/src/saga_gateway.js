@@ -3,15 +3,16 @@
 
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var _models = require("./models.js");
 var _compensator = require("./saga/compensator.js");
 var _staging = require("./saga/staging.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M3 TASK-11, M53-1, M60-1/M60-2 & M64-3: Unified Idempotent Tool Proxy & Saga Transaction Gateway
+ * @fileoverview M3 TASK-11, M53-1, M60-1/M60-2, M64-3 & M68-5: Unified Idempotent Tool Proxy & Saga Transaction Gateway
  * with Recursive Canonical Nested-JSON Hashing, SQLite-Backed Durable Execution Journal, Automatic Sub-Component
- * SQLite Binding (`compensator` & `stagingGate`), Dynamic Post-Restart Compensation Resolution & Post-Rollback Invalidation.
- */
-class SagaToolGateway {
+ * SQLite Binding (`compensator` & `stagingGate`), Dynamic Post-Restart Compensation Resolution,
+ * Unconditional `COMPENSATABLE` Step Recording & Post-Rollback Invalidation.
+ */class SagaToolGateway {
   executionJournal = new Map();
   toolRegistry = new Map();
   compensator;
@@ -283,7 +284,11 @@ class SagaToolGateway {
 
     }
 
-    if (compensateHandler) {
+    if (
+    compensateHandler ||
+    effectClass === _models.ToolCallEffectClass.COMPENSATABLE ||
+    effectClass === _models.ToolCallEffectClass.COMPENSATABLE_WRITE)
+    {
       this.compensator.recordForwardStep({
         stepId: idemKey.slice(0, 16),
         taskId,

@@ -1,6 +1,6 @@
 /**
- * @fileoverview M4 TASK-18, M57-4 & M60-4: NodeDaemon Runtime Agent with Turn-Level WAL Checkpointing,
- * Cross-Node Turn Monotonicity Guard, Max-Turns Enforcement, Failure State Rollback & Deterministic Breakpoint Crash-Recovery.
+ * @fileoverview M4 TASK-18, M57-4, M60-4 & M68-4: NodeDaemon Runtime Agent with Turn-Level WAL Checkpointing,
+ * Cross-Node Turn Monotonicity Guard, Max-Turns Enforcement, Failure State Rollback, Deterministic Breakpoint Crash-Recovery & Task Checkpoint Purge.
  */
 import { CheckpointRecord, NodeHeartbeat, TaskSpec, TaskState } from "./models.js";
 import { StaleFenceError } from "./lease_coordinator.js";
@@ -25,22 +25,36 @@ export class NodeDaemon {
 
   constructor(nodeId: string, totalCpu = 32.0, totalMemMb = 65536, warmPoolSize = 8) {
     this.nodeId = nodeId;
-    this.totalCpu = totalCpu;
-    this.totalMemMb = totalMemMb;
-    this.warmPoolSize = warmPoolSize;
+    this.totalCpu = Number.isFinite(totalCpu) && totalCpu > 0 ? totalCpu : 32.0;
+    this.totalMemMb = Number.isFinite(totalMemMb) && totalMemMb > 0 ? totalMemMb : 65536;
+    this.warmPoolSize =
+      Number.isFinite(warmPoolSize) && warmPoolSize >= 0 ? Math.floor(warmPoolSize) : 8;
   }
 
   public emitHeartbeat(runningTasks = 0): NodeHeartbeat {
+    const safeRunning = Number.isFinite(runningTasks) && runningTasks >= 0 ? Math.floor(runningTasks) : 0;
     return new NodeHeartbeat({
       node_id: this.nodeId,
       total_cpu_cores: this.totalCpu,
-      free_cpu_cores: Math.max(0.0, this.totalCpu - runningTasks * 0.5),
+      free_cpu_cores: Math.max(0.0, this.totalCpu - safeRunning * 0.5),
       total_memory_mb: this.totalMemMb,
-      free_memory_mb: Math.max(0, this.totalMemMb - runningTasks * 1024),
+      free_memory_mb: Math.max(0, this.totalMemMb - safeRunning * 1024),
       warm_pool_ready: this.warmPoolSize,
       psi_memory_some_avg10: this.psiMemorySomeAvg10,
-      running_tasks: runningTasks,
+      running_tasks: safeRunning,
     });
+  }
+
+  /**
+   * [M68-4] Purges retained in-memory checkpoint records for a completed, dead-lettered, or migrated task
+   * so `checkpointStore` never leaks unbounded memory across long-running `NodeDaemon` instances.
+   */
+  public purgeTaskCheckpoints(taskId: string): number {
+    const existing = this.checkpointStore.get(taskId);
+    if (!existing) return 0;
+    const count = existing.length;
+    this.checkpointStore.delete(taskId);
+    return count;
   }
 
   /**

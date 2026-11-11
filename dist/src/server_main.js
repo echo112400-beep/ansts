@@ -2499,6 +2499,18 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M68] Deep Potential Risk Identification & Elimination Phase III Audit (`POST /v1beta1/management/system/deep-risk-phase3-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/deep-risk-phase3-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDeepPotentialRiskPhase3Audit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M67] Deep Potential Risk Identification & Elimination Phase II Audit (`POST /v1beta1/management/system/deep-risk-phase2-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/deep-risk-phase2-audit") {
       const body = await this.readJsonBody(req);

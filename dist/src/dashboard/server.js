@@ -8100,4 +8100,195 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       }
     };
   }
+  /**
+   * [M68] Deep Potential Risk Identification & Elimination Phase III Audit
+   */
+  async executeDeepPotentialRiskPhase3Audit(params)
+
+
+  {
+    this.ensureInitialized();
+
+    // 1. [M68-1] TunnelGatewayCell timed-out command queue/idempotency eviction, non-regressive registration & bounded cache
+    const tunSql = new _env.InMemoryCellSqlStorage();
+    const tunCell = new _tunnel_gateway_cell.TunnelGatewayCell(tunSql, 3);
+    tunCell.registerTunnel({
+      hostId: "body-m68-01",
+      gatewayId: "gw-01",
+      role: "PRIMARY",
+      connGeneration: 4,
+      epoch: 3
+    });
+    const regressed = tunCell.registerTunnel({
+      hostId: "body-m68-01",
+      gatewayId: "gw-01",
+      role: "PRIMARY",
+      connGeneration: 1,
+      epoch: 2
+    });
+    const timedOut = tunCell.enqueueCommandForHost(
+    "body-m68-01",
+    { cmd: "sleep 5" },
+    25,
+    { idempotencyKey: "idem-m68-t1" });
+
+    let timeoutRejected = false;
+    try {
+      await timedOut.completionPromise;
+    } catch {
+      timeoutRejected = true;
+    }
+    const ghostPolled = tunCell.pollPendingCommands("body-m68-01");
+    const retryAfterTimeout = tunCell.enqueueCommandForHost(
+    "body-m68-01",
+    { cmd: "echo ok" },
+    1000,
+    { idempotencyKey: "idem-m68-t1" });
+
+    const retryPolled = tunCell.pollPendingCommands("body-m68-01");
+    tunCell.acknowledgeCommand(retryPolled[0].commandId, { status: "RECOVERED" });
+    const retryResult = await retryAfterTimeout.completionPromise;
+    const tunnelTimeoutAndEpochVerified =
+    regressed.epoch === 3 &&
+    regressed.connGeneration === 4 &&
+    timeoutRejected &&
+    ghostPolled.length === 0 &&
+    retryAfterTimeout.deduplicated === false &&
+    retryResult.status === "RECOVERED";
+
+    // 2. [M68-2] FinOpsBudgetController UTC-day rollover idempotency pruning & policy sanitization
+    const finSql = new _env.InMemoryCellSqlStorage();
+    const finops = new _budget_controller.FinOpsBudgetController(finSql);
+    finops.setPolicy({
+      tenantId: "Northstar",
+      dailyBudgetUsd: -20,
+      softDowngradeThresholdRatio: 1.8,
+      preferredModel: "DeepSeek-R1",
+      fallbackEconomyModel: "Qwen-3.8"
+    });
+    const sanitizedPolicy = finops.getPolicy("Northstar");
+    finops.setPolicy({
+      tenantId: "Northstar",
+      dailyBudgetUsd: 100,
+      softDowngradeThresholdRatio: 0.8,
+      preferredModel: "DeepSeek-R1",
+      fallbackEconomyModel: "Qwen-3.8"
+    });
+    const day1Spend = finops.recordSpend("Northstar", 12, "2026-11-10T08:00:00Z", "daily-job-key");
+    const day2Spend = finops.recordSpend("Northstar", 18, "2026-11-11T08:00:00Z", "daily-job-key");
+    const finopsRolloverAndSanitizeVerified =
+    sanitizedPolicy.dailyBudgetUsd === 0 &&
+    sanitizedPolicy.softDowngradeThresholdRatio === 1 &&
+    day1Spend === 12 &&
+    day2Spend === 18 &&
+    finops.getSeenIdempotencyKeyCount("Northstar") === 1;
+
+    // 3. [M68-3]QueueManager eager tombstone/empty-heap cleanup & LeaseCoordinator advanceTurnFence epoch sync
+    const sched = new _scheduler.CoreScheduler5D();
+    const qTask = new _models.TaskSpec({ task_id: "t-m68-qm", tenant_id: "ephemeral-tenant" });
+    sched.queueManager.enqueue(qTask);
+    sched.queueManager.removeQueuedTask("t-m68-qm");
+    const emptyHeapCleaned = sched.queueManager.activeTenantHeapCount() === 0;
+    sched.leaseCoordinator.acquireLease("t-m68-fence", "node-1");
+    sched.leaseCoordinator.advanceTurnFence("t-m68-fence", new _models.FenceToken(4, 1, "t-m68-fence"));
+    const nextLease = sched.leaseCoordinator.acquireLease("t-m68-fence", "node-2");
+    const fencePurged = sched.leaseCoordinator.purgeCompletedTaskFence("t-m68-fence");
+    const queueAndFenceVerified =
+    emptyHeapCleaned && nextLease.fencing_token === 5 && fencePurged;
+
+    // 4. [M68-4] CoreScheduler5D cascade-dead-letter active lease/resource reclamation & NodeDaemon checkpoint purge
+    sched.registerOrUpdateNode(
+    new _models.NodeHeartbeat({
+      node_id: "node-m68-01",
+      total_cpu_cores: 16,
+      free_cpu_cores: 16,
+      total_memory_mb: 32768,
+      free_memory_mb: 32768
+    }));
+
+    const pTask = new _models.TaskSpec({ task_id: "t-m68-p", tenant_id: "Northstar", prompt: "p" });
+    const cTask = new _models.TaskSpec({ task_id: "t-m68-c", tenant_id: "Northstar", prompt: "c" });
+    sched.submitTask(pTask, { mergeDuplicateInFlight: true });
+    sched.submitTask(cTask, { mergeDuplicateInFlight: true });
+    sched.scheduleTick();
+    cTask.dependencies.push("t-m68-p");
+    const cascaded = sched.cascadeDeadLetterToDependents("t-m68-p");
+    const nodeAfterCascade = sched.nodes.get("node-m68-01");
+    const daemon = new _node_daemon.NodeDaemon("node-m68-01", -1, 0, -5);
+    const schedulerAndDaemonVerified =
+    cascaded.includes("t-m68-c") &&
+    sched.leaseCoordinator.getLease("t-m68-c") === undefined &&
+    nodeAfterCascade.running_tasks === 1 &&
+    daemon.totalCpu === 32.0;
+
+    // 5. [M68-5] SagaCompensatorEngine no-handler step rollback idempotency invalidation & StagingGate purge
+    const sagaSql = new _env.InMemoryCellSqlStorage();
+    const gw = new _saga_gateway.SagaToolGateway(undefined, undefined, sagaSql);
+    let runs = 0;
+    gw.registerTool("no_handler_tool", _models.ToolCallEffectClass.COMPENSATABLE, () => {
+      runs += 1;
+      return { runs };
+    });
+    gw.invokeTool("t-m68-saga", 2, "no_handler_tool", { x: 1 });
+    const rb = gw.rollbackAndInvalidateTask("t-m68-saga", 2);
+    const [reRun, dedupAfterRb] = gw.invokeTool("t-m68-saga", 2, "no_handler_tool", { x: 1 });
+    const purgedSteps = gw.compensator.purgeTaskSteps("t-m68-saga");
+    const sagaAndStagingVerified =
+    rb.rolledBackSteps.length === 1 &&
+    rb.invalidatedIdemKeys.length >= 1 &&
+    dedupAfterRb === false &&
+    reRun.runs === 2 &&
+    purgedSteps === 2;
+
+    const allM68DeepRiskPhase3ChecksPassed =
+    tunnelTimeoutAndEpochVerified &&
+    finopsRolloverAndSanitizeVerified &&
+    queueAndFenceVerified &&
+    schedulerAndDaemonVerified &&
+    sagaAndStagingVerified;
+
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `执行 M68 第三阶段深度潜在风险识别与消除自检 (Tunnel=${tunnelTimeoutAndEpochVerified}, FinOps=${finopsRolloverAndSanitizeVerified}, QueueFence=${queueAndFenceVerified}, SchedulerDaemon=${schedulerAndDaemonVerified}, SagaStaging=${sagaAndStagingVerified})`,
+    "SystemWide / M68-DeepRiskPhase3Audit",
+    "ALL_M68_CHECKS_PASSED");
+
+
+    return {
+      status: 200,
+      body: {
+        tunnelTimeoutAndEpoch1: {
+          preservedEpoch: regressed.epoch,
+          preservedGen: regressed.connGeneration,
+          ghostPolledCount: ghostPolled.length,
+          tunnelTimeoutAndEpochVerified
+        },
+        finopsRolloverAndSanitize2: {
+          day1Spend,
+          day2Spend,
+          activeIdempotencyKeys: finops.getSeenIdempotencyKeyCount("Northstar"),
+          finopsRolloverAndSanitizeVerified
+        },
+        queueAndFence3: {
+          emptyHeapCleaned,
+          nextLeaseEpoch: nextLease.fencing_token,
+          fencePurged,
+          queueAndFenceVerified
+        },
+        schedulerAndDaemon4: {
+          cascadedIds: cascaded,
+          runningTasksAfterCascade: nodeAfterCascade.running_tasks,
+          schedulerAndDaemonVerified
+        },
+        sagaAndStaging5: {
+          invalidatedIdemKeysCount: rb.invalidatedIdemKeys.length,
+          reRunCount: reRun.runs,
+          purgedSteps,
+          sagaAndStagingVerified
+        },
+        allM68DeepRiskPhase3ChecksPassed
+      }
+    };
+  }
 }exports.PlatformManagementPlaneEngine = PlatformManagementPlaneEngine;

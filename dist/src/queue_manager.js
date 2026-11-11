@@ -3,8 +3,8 @@
 
 
 var _models = require("./models.js"); /**
- * @fileoverview M2 TASK-06, M16 TASK-80, M51-3 & M60-5: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging/Preemption-Compensation
- * Tournament Queue Manager with Idempotent Enqueue & In-Place Priority Promotion on Duplicate Coalescing.
+ * @fileoverview M2 TASK-06, M16 TASK-80, M51-3, M60-5 & M68-3: Unified Per-Tenant Binary Max-Heap + Dynamic DRF/Aging/Preemption-Compensation
+ * Tournament Queue Manager with Idempotent Enqueue, In-Place Priority Promotion & Eager Tombstone/Empty-Heap Cleanup.
  */
 
 
@@ -17,8 +17,12 @@ class HierarchicalQueueManager {
   preemptionCompensationBoost;
 
   constructor(agingBoostPerSec = 0.05, preemptionCompensationBoost = 120.0) {
-    this.agingBoostPerSec = agingBoostPerSec;
-    this.preemptionCompensationBoost = preemptionCompensationBoost;
+    this.agingBoostPerSec =
+    Number.isFinite(agingBoostPerSec) && agingBoostPerSec >= 0 ? agingBoostPerSec : 0.05;
+    this.preemptionCompensationBoost =
+    Number.isFinite(preemptionCompensationBoost) && preemptionCompensationBoost >= 0 ?
+    preemptionCompensationBoost :
+    120.0;
   }
 
   getBasePriorityScore(priority) {
@@ -76,8 +80,43 @@ class HierarchicalQueueManager {
     return true;
   }
 
+  /**
+   * [M68-3] Eagerly removes `taskId` from both `queuedTasks` and the owning tenant's binary heap,
+   * and deletes empty tenant heap arrays so cancelled/dead-lettered tasks never linger as zombie heap nodes.
+   */
   removeQueuedTask(taskId) {
+    const existing = this.queuedTasks.get(taskId);
     this.queuedTasks.delete(taskId);
+    if (existing) {
+      const heap = this.tenantHeaps.get(existing.tenant_id);
+      if (heap) {
+        const filtered = heap.filter((n) => n.task.task_id !== taskId);
+        if (filtered.length === 0) {
+          this.tenantHeaps.delete(existing.tenant_id);
+        } else if (filtered.length !== heap.length) {
+          heap.length = 0;
+          for (const item of filtered) {
+            this.heapPush(heap, item);
+          }
+        }
+      }
+      return;
+    }
+    for (const [tenantId, heap] of this.tenantHeaps.entries()) {
+      const filtered = heap.filter((n) => n.task.task_id !== taskId);
+      if (filtered.length === 0) {
+        this.tenantHeaps.delete(tenantId);
+      } else if (filtered.length !== heap.length) {
+        heap.length = 0;
+        for (const item of filtered) {
+          this.heapPush(heap, item);
+        }
+      }
+    }
+  }
+
+  activeTenantHeapCount() {
+    return this.tenantHeaps.size;
   }
 
   getTenantActiveCount(tenantId) {
@@ -99,17 +138,23 @@ class HierarchicalQueueManager {
   }
 
   popNext() {
-    if (this.queuedTasks.size === 0) return null;
+    if (this.queuedTasks.size === 0) {
+      this.tenantHeaps.clear();
+      return null;
+    }
     const nowSec = Date.now() / 1000;
 
     let winningTenantId = null;
     let winningScore = -Infinity;
 
-    for (const [tenantId, heap] of this.tenantHeaps.entries()) {
+    for (const [tenantId, heap] of Array.from(this.tenantHeaps.entries())) {
       while (heap.length > 0 && !this.queuedTasks.has(heap[0].task.task_id)) {
         this.heapPop(heap);
       }
-      if (heap.length === 0) continue;
+      if (heap.length === 0) {
+        this.tenantHeaps.delete(tenantId);
+        continue;
+      }
       const topTask = heap[0].task;
       const dynamicScore = this.computeEffectiveScore(topTask, nowSec);
       if (dynamicScore > winningScore) {
@@ -121,6 +166,9 @@ class HierarchicalQueueManager {
     if (!winningTenantId) return null;
     const winningHeap = this.tenantHeaps.get(winningTenantId);
     const poppedNode = this.heapPop(winningHeap);
+    if (winningHeap.length === 0) {
+      this.tenantHeaps.delete(winningTenantId);
+    }
     const bestTask = poppedNode.task;
 
     this.queuedTasks.delete(bestTask.task_id);
@@ -132,10 +180,12 @@ class HierarchicalQueueManager {
   }
 
   completeTask(task) {
-    this.queuedTasks.delete(task.task_id);
+    this.removeQueuedTask(task.task_id);
     const curr = this.getTenantActiveCount(task.tenant_id);
-    if (curr > 0) {
+    if (curr > 1) {
       this.tenantActiveCount.set(task.tenant_id, curr - 1);
+    } else {
+      this.tenantActiveCount.delete(task.tenant_id);
     }
   }
 
