@@ -29,5 +29,10 @@
     "@types/node": "^20.11.0",
     "js-yaml": "^4.1.0",
     "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@tanstack/ai": "1.4.0",
+    "@tanstack/ai-openai": "1.1.1",
+    "zod": "4.6.7"
   }
 }

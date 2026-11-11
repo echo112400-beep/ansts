@@ -860,6 +860,34 @@ dialog#dialog::backdrop {
 }
 
 /* Toast */
+.agent-open {
+  position: fixed;
+  right: 20px;
+  bottom: 72px;
+  z-index: 70;
+}
+.agent-panel {
+  position: fixed;
+  right: 16px;
+  bottom: 112px;
+  z-index: 70;
+  width: min(420px, calc(100vw - 32px));
+  max-height: min(560px, calc(100vh - 140px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: #12161f;
+  color: #e8edf5;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+}
+.agent-panel header, .agent-panel form, .agent-card .btn-row { display: flex; gap: 8px; align-items: center; }
+.agent-log { overflow: auto; display: flex; flex-direction: column; gap: 8px; min-height: 180px; }
+.agent-card, .agent-bubble { border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px; padding: 8px; white-space: pre-wrap; }
+.agent-panel input { flex: 1; }
+
 .toast {
   position: fixed;
   right: 20px;
@@ -898,6 +926,18 @@ dialog#dialog::backdrop {
 <footer class="page-footer"><span>ANSTS 平台管理与运行控制台 (v2.5)</span><span>RPO=0 SQLite + RustFS S3 LTX · 真实后端接口直连</span><a href="#" id="design-doc-link" data-action="open-design-doc">功能与接口映射文档</a></footer>
 </div>
 <dialog id="dialog" aria-labelledby="dialog-title"><form id="dialog-form"><header><div><div class="eyebrow">ANSTS 真实后端事务操作</div><h2 id="dialog-title"></h2></div><button type="button" data-action="close-dialog" class="quiet">关闭</button></header><div class="dialog-body" id="dialog-body"></div><div id="dialog-error" role="alert"></div><footer><button type="button" data-action="close-dialog">取消</button><button type="submit" class="primary" id="dialog-submit">确认</button></footer></form></dialog>
+<button type="button" class="primary agent-open" id="agent-open">集群对话</button>
+<section id="agent-panel" class="agent-panel" hidden>
+  <header>
+    <strong>集群对话</strong>
+    <button type="button" class="small" id="agent-close">关闭</button>
+  </header>
+  <div id="agent-log" class="agent-log"></div>
+  <form id="agent-form">
+    <input id="agent-input" type="text" maxlength="2000" placeholder="询问集群状态，或提出变更" />
+    <button type="submit" class="primary" id="agent-send">发送</button>
+  </form>
+</section>
 <div class="toast" id="toast" role="status" hidden></div><div class="sr-only" id="announcer" aria-live="polite"></div>
 <script>
 /**
@@ -2967,7 +3007,144 @@ dialog#dialog::backdrop {
     tools.appendChild(label);
   }
 
+  function mountConsoleAgent() {
+    const openBtn = document.getElementById('agent-open');
+    const panel = document.getElementById('agent-panel');
+    const log = document.getElementById('agent-log');
+    const form = document.getElementById('agent-form');
+    const input = document.getElementById('agent-input');
+    const sendBtn = document.getElementById('agent-send');
+    if (!openBtn || !panel || !log || !form || !input || !sendBtn) return;
+    const threadId = 'console-' + Date.now();
+    let messages = [];
+    let pending = null;
+    let abort = null;
+
+    function addBubble(text) {
+      const el = document.createElement('div');
+      el.className = 'agent-bubble';
+      el.textContent = text;
+      log.appendChild(el);
+      log.scrollTop = log.scrollHeight;
+      return el;
+    }
+
+    openBtn.addEventListener('click', () => { panel.hidden = false; });
+    document.getElementById('agent-close').addEventListener('click', () => { panel.hidden = true; });
+
+    async function postAgent(body) {
+      abort = new AbortController();
+      const headers = { 'content-type': 'application/json', accept: 'text/event-stream' };
+      const token = consoleToken();
+      if (token) headers.authorization = 'Bearer ' + token;
+      const response = await fetch(getBackendOrigin() + '/v1beta1/console/agent/chat', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: abort.signal
+      });
+      if (!response.ok || !response.body) {
+        const text = await response.text();
+        addBubble(response.status + ' ' + text.slice(0, 500));
+        return;
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let bubble = null;
+      while (true) {
+        const step = await reader.read();
+        if (step.done) break;
+        buffer += decoder.decode(step.value, { stream: true });
+        const frames = buffer.split('\n\n');
+        buffer = frames.pop() || '';
+        for (const frame of frames) {
+          const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n');
+          if (!data) continue;
+          let event;
+          try { event = JSON.parse(data); } catch (_err) { continue; }
+          if (event.type === 'TEXT_MESSAGE_CONTENT') {
+            if (!bubble) bubble = addBubble('');
+            bubble.textContent += event.delta || '';
+          } else if (event.type === 'TOOL_CALL_START') {
+            addBubble('工具 ' + (event.toolCallName || ''));
+          } else if (event.type === 'TOOL_CALL_RESULT') {
+            addBubble('工具结果 ' + (event.content || ''));
+          } else if (event.type === 'MESSAGES_SNAPSHOT' && Array.isArray(event.messages)) {
+            messages = event.messages;
+          } else if (event.type === 'RUN_FINISHED' && event.outcome && event.outcome.type === 'interrupt') {
+            (event.outcome.interrupts || []).forEach((interrupt) => showApproval(interrupt));
+          } else if (event.type === 'RUN_ERROR') {
+            addBubble(event.message || '对话失败');
+          }
+        }
+      }
+    }
+
+    function showApproval(interrupt) {
+      const meta = interrupt.metadata || {};
+      const card = document.createElement('div');
+      card.className = 'agent-card';
+      const title = document.createElement('strong');
+      title.textContent = '确认后才会执行：' + (meta.toolName || '');
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify(meta.input || {}, null, 2);
+      const row = document.createElement('div');
+      row.className = 'btn-row';
+      const approve = document.createElement('button');
+      approve.type = 'button';
+      approve.className = 'small primary';
+      approve.textContent = '确认执行';
+      const deny = document.createElement('button');
+      deny.type = 'button';
+      deny.className = 'small danger';
+      deny.textContent = '拒绝';
+      approve.addEventListener('click', () => answer(interrupt, true, card));
+      deny.addEventListener('click', () => answer(interrupt, false, card));
+      row.appendChild(approve);
+      row.appendChild(deny);
+      card.appendChild(title);
+      card.appendChild(pre);
+      card.appendChild(row);
+      log.appendChild(card);
+    }
+
+    async function answer(interrupt, approved, card) {
+      card.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+      await postAgent({
+        threadId,
+        runId: 'run-' + Date.now(),
+        parentRunId: pending,
+        messages,
+        tools: [],
+        context: [],
+        resume: [{ interruptId: interrupt.id, status: 'resolved', payload: { approved } }]
+      });
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      const userMessage = { id: 'user-' + Date.now(), role: 'user', content: [{ type: 'text', text }] };
+      messages = messages.concat([userMessage]);
+      const runId = 'run-' + Date.now();
+      pending = runId;
+      addBubble('你：' + text);
+      sendBtn.disabled = true;
+      try {
+        await postAgent({ threadId, runId, messages, tools: [], context: [] });
+      } catch (err) {
+        addBubble(err && err.name === 'AbortError' ? '已停止' : '后端不可达，对话没有执行');
+      } finally {
+        sendBtn.disabled = false;
+      }
+    });
+  }
+
   async function init() {
+    mountConsoleAgent();
     mountTokenField();
     populateTenantFilter();
     updateHeaderAndRail();
