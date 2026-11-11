@@ -2,26 +2,48 @@
 
 
 
+
 var crypto = _interopRequireWildcard(require("node:crypto"));
 var _models = require("./models.js");
 var _breaker_limiter = require("./router/breaker_limiter.js");function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M3 TASK-08, M52-2 & M64-3: Prefix-Cache Aware Cognitive Router with Sliding-Window Quota Decay,
- * Half-Open Circuit-Breaker Auto-Recovery, Accurate Fallback Concurrency Accounting, Finite Metric Guards & SQLite Persistence.
- */class CognitiveRouter {
-  endpoints = new Map();
+ * @fileoverview M3 TASK-08, M52-2, M64-3 & M69-1: Prefix-Cache Aware Cognitive Router with Sliding-Window Quota Decay,
+ * Half-Open Circuit-Breaker Single-Probe Stampede Guard, Bounded Prefix-Radix Index FIFO Eviction,
+ * Accurate Fallback Concurrency Accounting, Finite Metric Guards & SQLite Persistence.
+ */class CognitiveRouter {endpoints = new Map();
   prefixRadixIndex = new Map();
   breakers = new Map();
   limiters = new Map();
   lastWindowResetMs = new Map();
   rateLimitDegradedSet = new Set();
   ewmaAlpha;
+  maxPrefixCacheEntries;
   sql;
 
-  constructor(ewmaAlpha = 0.3, sql) {
+  constructor(ewmaAlpha = 0.3, sql, maxPrefixCacheEntries = 4096) {
     this.ewmaAlpha = Number.isFinite(ewmaAlpha) && ewmaAlpha > 0 && ewmaAlpha <= 1 ? ewmaAlpha : 0.3;
+    this.maxPrefixCacheEntries =
+    Number.isFinite(maxPrefixCacheEntries) && maxPrefixCacheEntries >= 1 ?
+    Math.floor(maxPrefixCacheEntries) :
+    4096;
     if (sql) {
       this.bindSqlStorage(sql);
     }
+  }
+
+  enforcePrefixIndexBound() {
+    while (this.prefixRadixIndex.size > this.maxPrefixCacheEntries) {
+      const oldestKey = this.prefixRadixIndex.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.prefixRadixIndex.delete(oldestKey);
+    }
+  }
+
+  getPrefixIndexSize() {
+    return this.prefixRadixIndex.size;
+  }
+
+  getEndpointBreaker(endpointId) {
+    return this.breakers.get(endpointId);
   }
 
   /**
@@ -51,6 +73,7 @@ var _breaker_limiter = require("./router/breaker_limiter.js");function _getRequi
             this.prefixRadixIndex.set(k, v);
           }
         }
+        this.enforcePrefixIndexBound();
         continue;
       }
       const ep = new _models.LlmEndpointMetrics({
@@ -203,6 +226,11 @@ var _breaker_limiter = require("./router/breaker_limiter.js");function _getRequi
     this.persistEndpointState(endpointId);
   }
 
+  /**
+   * [M69-1] Acquires the Half-Open single-probe lock (`breaker.tryAcquireRequestSlot(nowMs)`) ONLY on the
+   * winning endpoint so concurrent requests during `HALF_OPEN` recovery never stampede the recovering endpoint,
+   * and enforces FIFO eviction on `prefixRadixIndex` (`maxPrefixCacheEntries`).
+   */
   selectEndpoint(
   prefixHash,
   estimatedTokens,
@@ -221,12 +249,16 @@ var _breaker_limiter = require("./router/breaker_limiter.js");function _getRequi
 
 
     if (candidates.length === 0) {
-      const fallback = Array.from(this.endpoints.values()).filter((ep) => ep.healthy);
-      if (fallback.length === 0) {
+      const fallback = Array.from(this.endpoints.values()).filter(
+      (ep) => ep.healthy && (this.breakers.get(ep.endpoint_id)?.canPass(nowMs) ?? true));
+
+      const pool = fallback.length > 0 ? fallback : Array.from(this.endpoints.values()).filter((ep) => ep.healthy);
+      if (pool.length === 0) {
         throw new Error("All LLM endpoints in CognitiveRouter are unhealthy");
       }
-      fallback.sort((a, b) => a.active_requests - b.active_requests);
-      const chosen = fallback[0];
+      pool.sort((a, b) => a.active_requests - b.active_requests);
+      const chosen = pool[0];
+      this.breakers.get(chosen.endpoint_id)?.tryAcquireRequestSlot(nowMs);
       chosen.active_requests += 1;
       chosen.rpm_used += 1;
       this.persistEndpointState(chosen.endpoint_id);
@@ -255,8 +287,15 @@ var _breaker_limiter = require("./router/breaker_limiter.js");function _getRequi
       }
     }
 
+    // Lock the Half-Open single-probe slot on the selected endpoint
+    this.breakers.get(bestEp.endpoint_id)?.tryAcquireRequestSlot(nowMs);
+
     const isCacheHit = bestEp.endpoint_id === cachedEpId;
+    if (this.prefixRadixIndex.has(prefixHash)) {
+      this.prefixRadixIndex.delete(prefixHash);
+    }
     this.prefixRadixIndex.set(prefixHash, bestEp.endpoint_id);
+    this.enforcePrefixIndexBound();
     bestEp.active_requests += 1;
     bestEp.rpm_used += 1;
     this.persistEndpointState(bestEp.endpoint_id);
@@ -268,6 +307,7 @@ var _breaker_limiter = require("./router/breaker_limiter.js");function _getRequi
     const ep = this.endpoints.get(endpointId);
     if (ep) {
       ep.active_requests = Math.max(0, ep.active_requests - 1);
+      this.breakers.get(endpointId)?.releaseHalfOpenProbe();
       this.persistEndpointState(endpointId);
     }
   }

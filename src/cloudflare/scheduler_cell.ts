@@ -1,11 +1,21 @@
 /**
- * @fileoverview M7 TASK-26, M52-1, M60-1 & M64-1/M64-2: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
- * Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, 100% TaskSpec Field Fidelity,
- * Interrupted-Lease Recovery, Alarm Renewal & Worker Prefix-Aware Route Matching).
+ * @fileoverview M7 TASK-26, M52-1, M60-1, M64-1/M64-2 & M69-2: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
+ * Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, Active-Only Content-Fingerprint Rehydration,
+ * Interrupted-Lease Node Capacity Reclamation, 100% TaskSpec Field Fidelity, Alarm Renewal & Worker Prefix-Aware Route Matching).
  */
 import { DurableObjectStateLike } from "./env.js";
 import { CoreScheduler5D } from "../scheduler.js";
 import { NodeHeartbeat, ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
+
+const ACTIVE_FINGERPRINT_STATES = new Set<TaskState>([
+  TaskState.SUBMITTED,
+  TaskState.QUEUED,
+  TaskState.LEASED,
+  TaskState.RUNNING_THINK,
+  TaskState.RUNNING_ACT,
+  TaskState.WAITING_SUB_AGENT,
+  TaskState.SUSPENDED_APPROVAL,
+]);
 
 export class AnstsSchedulerCell {
   private readonly ctx: DurableObjectStateLike;
@@ -46,9 +56,10 @@ export class AnstsSchedulerCell {
   }
 
   /**
-   * [M52-1, M60-1 & M64-2] Rehydrates registered nodes, monotonic fencing token watermarks, tenant-scoped `idempotencyIndex`,
-   * `contentFingerprintIndex`, full `TaskSpec` fields (`resource_profile`, `parent_task_id`, `expected_SubAgent_count`, `prefix_Cache_hash`),
-   * `current_turn` breakpoint progress, and interrupted LEASED tasks.
+   * [M52-1, M60-1, M64-2 & M69-2] Rehydrates registered nodes, monotonic fencing token watermarks, tenant-scoped `idempotencyIndex`,
+   * active-only `contentFingerprintIndex`, full `TaskSpec` fields (`resource_profile`, `parent_task_id`, `expected_SubAgent_count`, `prefix_Cache_hash`),
+   * `current_turn` breakpoint progress, and interrupted LEASED tasks (refunding pre-crash node CPU/memory/`running_tasks` so rehydrated nodes
+   * never suffer permanent phantom capacity loss).
    */
   public rehydrateFromSql(): number {
     const nodeRows = this.ctx.storage.sql
@@ -140,6 +151,20 @@ export class AnstsSchedulerCell {
         spec.state === TaskState.RUNNING_ACT
       ) {
         if (!this.scheduler.leaseCoordinator.getLease(spec.task_id)) {
+          if (spec.assigned_node_id) {
+            const oldNode = this.scheduler.nodes.get(spec.assigned_node_id);
+            if (oldNode) {
+              oldNode.free_cpu_cores = Math.min(
+                oldNode.total_cpu_cores,
+                oldNode.free_cpu_cores + spec.resource_profile.think_cpu_cores
+              );
+              oldNode.free_memory_mb = Math.min(
+                oldNode.total_memory_mb,
+                oldNode.free_memory_mb + Math.floor(spec.resource_profile.act_memory_mb * 0.25)
+              );
+              oldNode.running_tasks = Math.max(0, oldNode.running_tasks - 1);
+            }
+          }
           spec.state = TaskState.QUEUED;
           spec.assigned_node_id = undefined;
         }
@@ -158,7 +183,9 @@ export class AnstsSchedulerCell {
           spec.task_id
         );
       }
-      this.scheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+      if (ACTIVE_FINGERPRINT_STATES.has(spec.state)) {
+        this.scheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+      }
 
       if (spec.state === TaskState.QUEUED) {
         this.scheduler.queueManager.enqueue(spec);

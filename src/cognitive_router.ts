@@ -1,6 +1,7 @@
 /**
- * @fileoverview M3 TASK-08, M52-2 & M64-3: Prefix-Cache Aware Cognitive Router with Sliding-Window Quota Decay,
- * Half-Open Circuit-Breaker Auto-Recovery, Accurate Fallback Concurrency Accounting, Finite Metric Guards & SQLite Persistence.
+ * @fileoverview M3 TASK-08, M52-2, M64-3 & M69-1: Prefix-Cache Aware Cognitive Router with Sliding-Window Quota Decay,
+ * Half-Open Circuit-Breaker Single-Probe Stampede Guard, Bounded Prefix-Radix Index FIFO Eviction,
+ * Accurate Fallback Concurrency Accounting, Finite Metric Guards & SQLite Persistence.
  */
 import * as crypto from "node:crypto";
 import { LlmEndpointMetrics, TaskPriority } from "./models.js";
@@ -15,13 +16,34 @@ export class CognitiveRouter {
   private readonly lastWindowResetMs: Map<string, number> = new Map();
   private readonly rateLimitDegradedSet: Set<string> = new Set();
   private readonly ewmaAlpha: number;
+  private readonly maxPrefixCacheEntries: number;
   private sql?: SqlStorageLike;
 
-  constructor(ewmaAlpha = 0.3, sql?: SqlStorageLike) {
+  constructor(ewmaAlpha = 0.3, sql?: SqlStorageLike, maxPrefixCacheEntries = 4096) {
     this.ewmaAlpha = Number.isFinite(ewmaAlpha) && ewmaAlpha > 0 && ewmaAlpha <= 1 ? ewmaAlpha : 0.3;
+    this.maxPrefixCacheEntries =
+      Number.isFinite(maxPrefixCacheEntries) && maxPrefixCacheEntries >= 1
+        ? Math.floor(maxPrefixCacheEntries)
+        : 4096;
     if (sql) {
       this.bindSqlStorage(sql);
     }
+  }
+
+  private enforcePrefixIndexBound(): void {
+    while (this.prefixRadixIndex.size > this.maxPrefixCacheEntries) {
+      const oldestKey = this.prefixRadixIndex.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.prefixRadixIndex.delete(oldestKey);
+    }
+  }
+
+  public getPrefixIndexSize(): number {
+    return this.prefixRadixIndex.size;
+  }
+
+  public getEndpointBreaker(endpointId: string): ThreeStateCircuitBreaker | undefined {
+    return this.breakers.get(endpointId);
   }
 
   /**
@@ -51,6 +73,7 @@ export class CognitiveRouter {
             this.prefixRadixIndex.set(k, v);
           }
         }
+        this.enforcePrefixIndexBound();
         continue;
       }
       const ep = new LlmEndpointMetrics({
@@ -203,6 +226,11 @@ export class CognitiveRouter {
     this.persistEndpointState(endpointId);
   }
 
+  /**
+   * [M69-1] Acquires the Half-Open single-probe lock (`breaker.tryAcquireRequestSlot(nowMs)`) ONLY on the
+   * winning endpoint so concurrent requests during `HALF_OPEN` recovery never stampede the recovering endpoint,
+   * and enforces FIFO eviction on `prefixRadixIndex` (`maxPrefixCacheEntries`).
+   */
   public selectEndpoint(
     prefixHash: string,
     estimatedTokens: number,
@@ -221,12 +249,16 @@ export class CognitiveRouter {
     );
 
     if (candidates.length === 0) {
-      const fallback = Array.from(this.endpoints.values()).filter((ep) => ep.healthy);
-      if (fallback.length === 0) {
+      const fallback = Array.from(this.endpoints.values()).filter(
+        (ep) => ep.healthy && (this.breakers.get(ep.endpoint_id)?.canPass(nowMs) ?? true)
+      );
+      const pool = fallback.length > 0 ? fallback : Array.from(this.endpoints.values()).filter((ep) => ep.healthy);
+      if (pool.length === 0) {
         throw new Error("All LLM endpoints in CognitiveRouter are unhealthy");
       }
-      fallback.sort((a, b) => a.active_requests - b.active_requests);
-      const chosen = fallback[0];
+      pool.sort((a, b) => a.active_requests - b.active_requests);
+      const chosen = pool[0];
+      this.breakers.get(chosen.endpoint_id)?.tryAcquireRequestSlot(nowMs);
       chosen.active_requests += 1;
       chosen.rpm_used += 1;
       this.persistEndpointState(chosen.endpoint_id);
@@ -255,8 +287,15 @@ export class CognitiveRouter {
       }
     }
 
+    // Lock the Half-Open single-probe slot on the selected endpoint
+    this.breakers.get(bestEp.endpoint_id)?.tryAcquireRequestSlot(nowMs);
+
     const isCacheHit = bestEp.endpoint_id === cachedEpId;
+    if (this.prefixRadixIndex.has(prefixHash)) {
+      this.prefixRadixIndex.delete(prefixHash);
+    }
     this.prefixRadixIndex.set(prefixHash, bestEp.endpoint_id);
+    this.enforcePrefixIndexBound();
     bestEp.active_requests += 1;
     bestEp.rpm_used += 1;
     this.persistEndpointState(bestEp.endpoint_id);
@@ -268,6 +307,7 @@ export class CognitiveRouter {
     const ep = this.endpoints.get(endpointId);
     if (ep) {
       ep.active_requests = Math.max(0, ep.active_requests - 1);
+      this.breakers.get(endpointId)?.releaseHalfOpenProbe();
       this.persistEndpointState(endpointId);
     }
   }

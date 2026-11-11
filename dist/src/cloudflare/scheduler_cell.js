@@ -6,10 +6,20 @@
 
 var _scheduler = require("../scheduler.js");
 var _models = require("../models.js"); /**
- * @fileoverview M7 TASK-26, M52-1, M60-1 & M64-1/M64-2: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
- * Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, 100% TaskSpec Field Fidelity,
- * Interrupted-Lease Recovery, Alarm Renewal & Worker Prefix-Aware Route Matching).
- */class AnstsSchedulerCell {ctx;scheduler;
+ * @fileoverview M7 TASK-26, M52-1, M60-1, M64-1/M64-2 & M69-2: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
+ * Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, Active-Only Content-Fingerprint Rehydration,
+ * Interrupted-Lease Node Capacity Reclamation, 100% TaskSpec Field Fidelity, Alarm Renewal & Worker Prefix-Aware Route Matching).
+ */const ACTIVE_FINGERPRINT_STATES = new Set([_models.TaskState.SUBMITTED, _models.TaskState.QUEUED,
+_models.TaskState.LEASED,
+_models.TaskState.RUNNING_THINK,
+_models.TaskState.RUNNING_ACT,
+_models.TaskState.WAITING_SUB_AGENT,
+_models.TaskState.SUSPENDED_APPROVAL]);
+
+
+class AnstsSchedulerCell {
+  ctx;
+  scheduler;
 
   constructor(ctx) {
     this.ctx = ctx;
@@ -46,9 +56,10 @@ var _models = require("../models.js"); /**
   }
 
   /**
-   * [M52-1, M60-1 & M64-2] Rehydrates registered nodes, monotonic fencing token watermarks, tenant-scoped `idempotencyIndex`,
-   * `contentFingerprintIndex`, full `TaskSpec` fields (`resource_profile`, `parent_task_id`, `expected_SubAgent_count`, `prefix_Cache_hash`),
-   * `current_turn` breakpoint progress, and interrupted LEASED tasks.
+   * [M52-1, M60-1, M64-2 & M69-2] Rehydrates registered nodes, monotonic fencing token watermarks, tenant-scoped `idempotencyIndex`,
+   * active-only `contentFingerprintIndex`, full `TaskSpec` fields (`resource_profile`, `parent_task_id`, `expected_SubAgent_count`, `prefix_Cache_hash`),
+   * `current_turn` breakpoint progress, and interrupted LEASED tasks (refunding pre-crash node CPU/memory/`running_tasks` so rehydrated nodes
+   * never suffer permanent phantom capacity loss).
    */
   rehydrateFromSql() {
     const nodeRows = this.ctx.storage.sql.
@@ -140,6 +151,20 @@ var _models = require("../models.js"); /**
       spec.state === _models.TaskState.RUNNING_ACT)
       {
         if (!this.scheduler.leaseCoordinator.getLease(spec.task_id)) {
+          if (spec.assigned_node_id) {
+            const oldNode = this.scheduler.nodes.get(spec.assigned_node_id);
+            if (oldNode) {
+              oldNode.free_cpu_cores = Math.min(
+              oldNode.total_cpu_cores,
+              oldNode.free_cpu_cores + spec.resource_profile.think_cpu_cores);
+
+              oldNode.free_memory_mb = Math.min(
+              oldNode.total_memory_mb,
+              oldNode.free_memory_mb + Math.floor(spec.resource_profile.act_memory_mb * 0.25));
+
+              oldNode.running_tasks = Math.max(0, oldNode.running_tasks - 1);
+            }
+          }
           spec.state = _models.TaskState.QUEUED;
           spec.assigned_node_id = undefined;
         }
@@ -158,7 +183,9 @@ var _models = require("../models.js"); /**
         spec.task_id);
 
       }
-      this.scheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+      if (ACTIVE_FINGERPRINT_STATES.has(spec.state)) {
+        this.scheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+      }
 
       if (spec.state === _models.TaskState.QUEUED) {
         this.scheduler.queueManager.enqueue(spec);

@@ -1,6 +1,7 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.SyntacticAndVelocityBreaker = void 0; /**
- * @fileoverview M4 TASK-16, M55-3 & M61-3: Semantic Loop Detector, Token Velocity Breaker & JSON AST Validator
- * with Bounded Sliding-Window Pruning, Same-Turn Retry Coalescing, SQLite Persistence & Streak-Safe Breakpoint Reset.
+ * @fileoverview M4 TASK-16, M55-3, M61-3 & M69-4: Semantic Loop Detector, Token Velocity Breaker & JSON AST Validator
+ * with Bounded Sliding-Window Pruning, Same-Turn Retry Coalescing, Non-Negative Finite Token & Threshold Sanitization,
+ * SQLite Persistence & Streak-Safe Breakpoint Reset.
  */
 
 
@@ -24,8 +25,14 @@ class SyntacticAndVelocityBreaker {
   maxTokensPerMinutePerTask = 120_000,
   sql)
   {
-    this.maxIdenticalConsecutiveCalls = maxIdenticalConsecutiveCalls;
-    this.maxTokensPerMinutePerTask = maxTokensPerMinutePerTask;
+    this.maxIdenticalConsecutiveCalls =
+    Number.isFinite(maxIdenticalConsecutiveCalls) && maxIdenticalConsecutiveCalls >= 1 ?
+    Math.floor(maxIdenticalConsecutiveCalls) :
+    3;
+    this.maxTokensPerMinutePerTask =
+    Number.isFinite(maxTokensPerMinutePerTask) && maxTokensPerMinutePerTask > 0 ?
+    maxTokensPerMinutePerTask :
+    120_000;
     if (sql) {
       this.bindSqlStorage(sql);
     }
@@ -79,9 +86,9 @@ class SyntacticAndVelocityBreaker {
   }
 
   /**
-   * [M61-3] Coalesces retries at the exact same `turnIndex` (when `!d.streakCleared`) in-place
-   * so retrying a single turn due to network timeout or pre-checkpoint crash recovery never
-   * double-counts tokens or falsely trips `SEMANTIC_DEAD_LOOP`.
+   * [M61-3 & M69-4] Coalesces retries at the exact same `turnIndex` (when `!d.streakCleared`) in-place
+   * and sanitizes `tokensConsumed` + `timestampMs` against `NaN`/negative values so malformed telemetry
+   * can never poison the 60-second sliding token sum or bypass `TOKEN_VELOCITY_EXCEEDED`.
    */
   recordAndCheckTurn(
   taskId,
@@ -91,6 +98,17 @@ class SyntacticAndVelocityBreaker {
 
 
   {
+    const safeTokens =
+    Number.isFinite(diag.tokensConsumed) && diag.tokensConsumed > 0 ?
+    Math.floor(diag.tokensConsumed) :
+    0;
+    const safeTs = Number.isFinite(diag.timestampMs) && diag.timestampMs > 0 ? diag.timestampMs : Date.now();
+    const sanitizedDiag = {
+      ...diag,
+      tokensConsumed: safeTokens,
+      timestampMs: safeTs
+    };
+
     let list = this.historyByTask.get(taskId);
     if (!list) {
       list = [];
@@ -99,16 +117,16 @@ class SyntacticAndVelocityBreaker {
 
     let coalescedSameTurnRetry = false;
     const existingSameTurnIdx = list.findIndex(
-    (d) => !d.streakCleared && d.turnIndex === diag.turnIndex);
+    (d) => !d.streakCleared && d.turnIndex === sanitizedDiag.turnIndex);
 
     if (existingSameTurnIdx >= 0) {
-      list[existingSameTurnIdx] = diag;
+      list[existingSameTurnIdx] = sanitizedDiag;
       coalescedSameTurnRetry = true;
     } else {
-      list.push(diag);
+      list.push(sanitizedDiag);
     }
 
-    const windowStart = diag.timestampMs - 60_000;
+    const windowStart = safeTs - 60_000;
     if (list.length > this.maxIdenticalConsecutiveCalls * 2) {
       const tailToKeep = list.slice(-this.maxIdenticalConsecutiveCalls);
       const withinWindow = list.filter((d) => d.timestampMs >= windowStart);
@@ -121,7 +139,7 @@ class SyntacticAndVelocityBreaker {
     if (activeStreakPool.length >= this.maxIdenticalConsecutiveCalls) {
       const recent = activeStreakPool.slice(-this.maxIdenticalConsecutiveCalls);
       const allSame = recent.every(
-      (d) => d.toolName === diag.toolName && d.argsHash === diag.argsHash);
+      (d) => d.toolName === sanitizedDiag.toolName && d.argsHash === sanitizedDiag.argsHash);
 
       if (allSame) {
         return { tripped: true, reason: "SEMANTIC_DEAD_LOOP", coalescedSameTurnRetry };
@@ -130,7 +148,7 @@ class SyntacticAndVelocityBreaker {
 
     const tokensInLastMin = list.
     filter((d) => d.timestampMs >= windowStart).
-    reduce((acc, d) => acc + d.tokensConsumed, 0);
+    reduce((acc, d) => acc + (Number.isFinite(d.tokensConsumed) && d.tokensConsumed > 0 ? d.tokensConsumed : 0), 0);
     if (tokensInLastMin > this.maxTokensPerMinutePerTask) {
       return { tripped: true, reason: "TOKEN_VELOCITY_EXCEEDED", coalescedSameTurnRetry };
     }

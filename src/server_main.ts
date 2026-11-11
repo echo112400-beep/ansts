@@ -2499,6 +2499,18 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M69] Final Deep Edge-Case Sweep & Zero-Residual-Defect Closure Audit (`POST /v1beta1/management/system/final-closure-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/final-closure-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeFinalZeroDefectClosureAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M68] Deep Potential Risk Identification & Elimination Phase III Audit (`POST /v1beta1/management/system/deep-risk-phase3-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/deep-risk-phase3-audit") {
       const body = await this.readJsonBody(req);

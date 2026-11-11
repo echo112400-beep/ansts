@@ -150,6 +150,20 @@ export class UnifiedComponentPersistenceStore {
           spec.state === TaskState.RUNNING_THINK ||
           spec.state === TaskState.RUNNING_ACT)
       ) {
+        if (spec.assigned_node_id) {
+          const oldNode = targetScheduler.nodes.get(spec.assigned_node_id);
+          if (oldNode) {
+            oldNode.free_cpu_cores = Math.min(
+              oldNode.total_cpu_cores,
+              oldNode.free_cpu_cores + spec.resource_profile.think_cpu_cores
+            );
+            oldNode.free_memory_mb = Math.min(
+              oldNode.total_memory_mb,
+              oldNode.free_memory_mb + Math.floor(spec.resource_profile.act_memory_mb * 0.25)
+            );
+            oldNode.running_tasks = Math.max(0, oldNode.running_tasks - 1);
+          }
+        }
         spec.state = TaskState.QUEUED;
         spec.assigned_node_id = undefined;
       }
@@ -167,7 +181,15 @@ export class UnifiedComponentPersistenceStore {
           spec.task_id
         );
       }
-      targetScheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+      if (
+        spec.state !== TaskState.COMPLETED &&
+        spec.state !== TaskState.SUCCEEDED &&
+        spec.state !== TaskState.FAILED &&
+        spec.state !== TaskState.DEAD_LETTER &&
+        spec.state !== TaskState.CANCELLED
+      ) {
+        targetScheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
+      }
 
       if (spec.state === TaskState.QUEUED) {
         targetScheduler.queueManager.enqueue(spec);

@@ -4,14 +4,22 @@
 
 
 var _models = require("../models.js"); /**
- * @fileoverview M2 TASK-05, M52-3, M61-2 & M64-3: Deadlock-Free Parent-Child Sub-Agent Quota Escrow Coordinator
- * with Idempotent Parent Reservation, Idempotent Child Registration, Child-Failure Unblocking,
- * Dependency Graph Cycle Persistence & SQLite Rehydration.
+ * @fileoverview M2 TASK-05, M52-3, M61-2, M64-3 & M69-3: Deadlock-Free Parent-Child Sub-Agent Quota Escrow Coordinator
+ * with Idempotent Parent Reservation, Idempotent Child Registration, Terminal-Parent Resurrection Guard,
+ * Child-Failure Unblocking, Dependency Graph Cycle Persistence & SQLite Rehydration.
  */
 
 
 
 
+
+
+const TERMINAL_PARENT_STATES = new Set([
+_models.TaskState.COMPLETED,
+_models.TaskState.SUCCEEDED,
+_models.TaskState.FAILED,
+_models.TaskState.DEAD_LETTER,
+_models.TaskState.CANCELLED]);
 
 
 class DagEscrowCoordinator {
@@ -126,10 +134,17 @@ class DagEscrowCoordinator {
   }
 
   /**
-   * [M61-2] Idempotent child registration: if `child.task_id` is already registered under `parent.task_id`,
-   * returns `{ usedEscrowSlot: true, deduplicated: true }` without consuming a second escrow slot.
+   * [M61-2 & M69-3] Idempotent child registration with terminal-parent guard:
+   * - Rejects child registration if `parent` is already in a terminal state (`COMPLETED`, `DEAD_LETTER`, `FAILED`, `CANCELLED`).
+   * - If `child.task_id` is already registered under `parent.task_id`, returns `{ usedEscrowSlot: true, deduplicated: true }`
+   *   without consuming a second escrow slot.
    */
   registerChildSubAgent(parent, child) {
+    if (TERMINAL_PARENT_STATES.has(parent.state)) {
+      throw new Error(
+      `Cannot register child sub-agent '${child.task_id}' under parent '${parent.task_id}' in terminal state '${parent.state}'`);
+
+    }
     this.assertNoCycle(child.task_id, new Set([parent.task_id, ...child.dependencies]));
     this.dependencyGraph.set(child.task_id, new Set([parent.task_id, ...child.dependencies]));
 
@@ -152,10 +167,16 @@ class DagEscrowCoordinator {
     return { usedEscrowSlot: false, deduplicated: false };
   }
 
+  /**
+   * [M69-3] Completes a child sub-agent without resurrecting `parent.state` if `parent` has already
+   * transitioned to a terminal state (such as `DEAD_LETTER` after an earlier sibling failure).
+   */
   completeChildSubAgent(parent, childTaskId) {
     const escrow = this.escrows.get(parent.task_id);
     if (!escrow) {
-      parent.state = _models.TaskState.RUNNING_THINK;
+      if (!TERMINAL_PARENT_STATES.has(parent.state)) {
+        parent.state = _models.TaskState.RUNNING_THINK;
+      }
       return true;
     }
     if (escrow.childTaskIds.delete(childTaskId) && escrow.usedSlots > 0) {
@@ -164,7 +185,9 @@ class DagEscrowCoordinator {
     this.dependencyGraph.delete(childTaskId);
     this.persistEscrow(escrow);
     if (escrow.childTaskIds.size === 0) {
-      parent.state = _models.TaskState.RUNNING_THINK;
+      if (!TERMINAL_PARENT_STATES.has(parent.state)) {
+        parent.state = _models.TaskState.RUNNING_THINK;
+      }
       return true;
     }
     return false;
@@ -198,7 +221,9 @@ class DagEscrowCoordinator {
     }
 
     if (!escrow || escrow.childTaskIds.size === 0) {
-      parent.state = _models.TaskState.RUNNING_THINK;
+      if (!TERMINAL_PARENT_STATES.has(parent.state)) {
+        parent.state = _models.TaskState.RUNNING_THINK;
+      }
       return { parentUnblocked: true, parentState: parent.state, reclaimedEscrowSlots: reclaimed };
     }
     return { parentUnblocked: false, parentState: parent.state, reclaimedEscrowSlots: reclaimed };
