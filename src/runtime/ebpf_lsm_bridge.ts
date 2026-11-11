@@ -63,3 +63,5 @@ export class EbpfLsmSecurityBridge {
     return { seccompMode, cgroupV2UnifiedMounted, noNewPrivs };
   }
 }
+
+export { EbpfSocketNetworkTrackerAndBreaker } from "./ebpf_network_tracker.js";

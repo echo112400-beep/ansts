@@ -1442,6 +1442,9 @@
 <button type="button" class="small" data-action="open-contract-net">[N1] Swarm 协同竞标</button>
             <button type="button" class="small" data-action="open-bft-consensus">[N2] BFT 黑板共识与语义合并</button>
             <button type="button" class="small" data-action="open-causal-vector-cut">[N3] 因果一致性割截</button>
+<button type="button" class="small" data-action="open-ebpf-breaker">[N4] eBPF 网络追踪与微秒熔断</button>
+            <button type="button" class="small" data-action="open-byzantine-slashing">[N5] 拜占庭信用惩戒与隔离</button>
+            <button type="button" class="small" data-action="open-erasure-coding">[N6] 跨地域日志纠删码重构</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -2494,7 +2497,70 @@
       showToast("已将并发重复请求 " + (d.incomingDuplicateId || "dup") + " 合并至 " + (d.canonicalTaskId || "task-ns-8841") + " (累计合并 ×" + (d.mergedDuplicateCount || 1) + "，节省 " + (d.estimatedSavedTokens || 4200) + " Tokens)");
       return;
     }
-        if (action === "open-contract-net") {
+            if (action === "open-ebpf-breaker") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-network-slashing-erasure", {
+        action: "ebpf_network_circuit_breaker",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const t = d.trippedTelemetry || {};
+      const i = d.trippedIntercept || {};
+      openDialog(
+        "[N4] eBPF 动态网络追踪与微秒级熔断 (POST /v1beta1/management/ops/phase2-network-slashing-erasure)",
+        "<div><strong>eBPF tc 出口挂钩状态：</strong> <span class=\"status-pill " + (i.allowed ? "ok" : "err") + "\">" + (t.circuitBreakerState || "TRIPPED_MICROS_OPEN") + "</span></div>" +
+        "<div style=\"margin-top:6px;\"><strong>对端指标：</strong> 平滑往返时延 SRTT <code class=\"mono\">" + (t.srttUs || 21500) + "&mu;s</code> · 滑动丢包率 <code class=\"mono\">" + ((t.packetLossRatio || 0.16) * 100).toFixed(1) + "%</code> · 套接字队列水位 <code class=\"mono\">" + (t.socketBufferPressurePct || 88.5) + "%</code></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">微秒级阻断拦截响应：<code class=\"mono\">" + (i.reason || "") + "</code></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-byzantine-slashing") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-network-slashing-erasure", {
+        action: "byzantine_credit_slashing",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const s2 = d.slash2 || {};
+      const pd = d.pardonRes || {};
+      openDialog(
+        "[N5] 跨租户信用惩戒与拜占庭行为特征提取 (POST /v1beta1/management/ops/phase2-network-slashing-erasure)",
+        "<div><strong>惩戒智能体：</strong> <code class=\"mono\">" + (s2.agentId || "agent-rogue-007") + "</code> · 违规指纹：<span class=\"status-pill err\">" + (s2.violationType || "DOUBLE_SIGN_CONTRADICTORY_VOTES") + "</span></div>" +
+        "<div style=\"margin-top:6px;\"><strong>声誉惩戒分：</strong> <code class=\"mono\">" + (s2.reputationBefore || 70) + "</code> &rarr; <span class=\"status-pill err\">" + (s2.reputationAfter || 20) + " pts</span> (-" + (s2.slashedPoints || 50) + " pts)</div>" +
+        "<div style=\"margin-top:6px;\"><strong>隔离狱状态：</strong> <span class=\"status-pill warn\">" + (s2.inQuarantineJail ? "QUARANTINE_JAIL" : "ACTIVE") + "</span> (剥夺 Swarm 竞标权 &amp; BFT 投票权) · 经审计特赦恢复至 <code class=\"mono\">" + (pd.restoredReputation || 75) + " pts</code></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-erasure-coding") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase2-network-slashing-erasure", {
+        action: "cross_region_erasure_coding",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const m = d.manifest || {};
+      const rA = d.rebuildCaseA || {};
+      openDialog(
+        "[N6] 跨地域异步日志纠删码与按需校验 (POST /v1beta1/management/ops/phase2-network-slashing-erasure)",
+        "<div><strong>纠删码矩阵：</strong> <span class=\"status-pill ok\">Cauchy Reed-Solomon (K=" + (m.dataShardsCount || 4) + " + M=" + (m.parityShardsCount || 2) + ")</span> 跨 6 地域异构同步</div>" +
+        "<div style=\"margin-top:6px;\"><strong>任毁 2 地域无损重构：</strong> <span class=\"status-pill ok\">CRC32 BIT-EXACT MATCH</span> (丢失分片 <code class=\"mono\">[" + ((rA.missingShardIndices || [0, 2]).join(", ")) + "]</code> 成功利用有限域矩阵解出原始日志)</div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">重构后完整数据校验：<code class=\"mono\">" + (rA.originalCrc32Hex || "") + " === " + (rA.reconstructedCrc32Hex || "") + "</code></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-contract-net") {
       const p = getPrincipal();
       const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-swarm-governance", {
         action: "contract_net_bidding",

@@ -43,10 +43,34 @@ var _saga_gateway = require("../saga_gateway.js");function _getRequireWildcardCa
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 class SharedBlackboardAndGitArbiter {
   board = new Map();
   consecutiveConflictsByAgent = new Map();
   swarmAgents = new Map();
+  byzantineSlashingRecords = new Map();
   bftVoteLogs =
 
 
@@ -101,9 +125,35 @@ class SharedBlackboardAndGitArbiter {
       this.consecutiveConflictsByAgent.set(String(cr.agent_id), Number(cr.conflict_count ?? 0));
     }
     this.sql.exec(
+    "CREATE TABLE IF NOT EXISTS a2a_byzantine_slashing_records (record_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, tenant_id TEXT NOT NULL, violation_type TEXT NOT NULL, slashed_points INTEGER NOT NULL, reputation_before INTEGER NOT NULL, reputation_after INTEGER NOT NULL, in_quarantine INTEGER NOT NULL, quarantine_expires_ms INTEGER NOT NULL, evidence_json TEXT NOT NULL, timestamp_ms INTEGER NOT NULL)");
+
+    this.sql.exec(
     "CREATE TABLE IF NOT EXISTS a2a_swarm_agents (agent_id TEXT PRIMARY KEY, payload_json TEXT)");
 
-    for (const ar of this.sql.exec("SELECT * FROM a2a_swarm_agents").toArray()) {
+    try {
+      const slashRows = this.sql.exec(
+      "SELECT record_id, agent_id, tenant_id, violation_type, slashed_points, reputation_before, reputation_after, in_quarantine, quarantine_expires_ms, evidence_json, timestamp_ms FROM a2a_byzantine_slashing_records").
+      toArray();
+      for (const sr of slashRows) {
+        const rec = {
+          recordId: String(sr.record_id),
+          agentId: String(sr.agent_id),
+          tenantId: String(sr.tenant_id),
+          violationType: sr.violation_type,
+          slashedPoints: Number(sr.slashed_points),
+          reputationBefore: Number(sr.reputation_before),
+          reputationAfter: Number(sr.reputation_after),
+          inQuarantineJail: Number(sr.in_quarantine) === 1,
+          quarantineExpiresAtMs: Number(sr.quarantine_expires_ms),
+          evidenceSummary: String(sr.evidence_json),
+          timestampMs: Number(sr.timestamp_ms)
+        };
+        this.byzantineSlashingRecords.set(rec.recordId, rec);
+      }
+    } catch {
+
+      // Table may be empty
+    }for (const ar of this.sql.exec("SELECT * FROM a2a_swarm_agents").toArray()) {
       const parsed = JSON.parse(String(ar.payload_json ?? "{}"));
       if (parsed && parsed.agentId) {
         this.swarmAgents.set(parsed.agentId, parsed);
@@ -329,7 +379,8 @@ class SharedBlackboardAndGitArbiter {
       matchedCaps / params.task.requiredCapabilities.length :
       1.0;
 
-      const passedBudget = bid.bidPriceUsd <= params.task.maxBudgetUsd;
+      const isQuarantined = Boolean(agent.isQuarantined && (agent.quarantineUntilMs ?? 0) > Date.now());
+      const passedBudget = !isQuarantined && bid.bidPriceUsd <= params.task.maxBudgetUsd;
       const passedSla = bid.estimatedDurationMs <= params.task.slaDeadlineMs;
       const passedSlaAndBudget = passedBudget && passedSla && capRatio >= 0.5;
 
@@ -549,5 +600,128 @@ class SharedBlackboardAndGitArbiter {
       mergedExportSymbols,
       agentContributions
     };
+  }
+  /**
+   * [M75-2 / N5] Byzantine Behavioral Fingerprinting & Progressive Credit Slashing:
+   * Slashes reputation points for malicious behaviors, confines rogue agents to Quarantine Jail,
+   * and blocks them from swarm bidding and BFT voting.
+   */
+  recordByzantineViolation(params)
+
+
+
+
+
+  {
+    const nowMs = params.timestampMs ?? Date.now();
+    let agent = this.swarmAgents.get(params.agentId);
+    if (!agent) {
+      agent = {
+        agentId: params.agentId,
+        specialtyRole: "UNKNOWN_ROGUE",
+        supportedCapabilities: [],
+        historicalSuccessRate: 0.5,
+        costPer1kTokensUsd: 0.001,
+        warmSandboxReady: false,
+        activeTaskCount: 0,
+        reputationScore: 50
+      };
+      this.swarmAgents.set(params.agentId, agent);
+    }
+
+    const slashPointsMap = {
+      DOUBLE_SIGN_CONTRADICTORY_VOTES: 50,
+      INVALID_MALICIOUS_CAS_PAYLOAD: 30,
+      REPUTATION_POISONING: 25,
+      SLA_DEFECT_SPAM: 15
+    };
+
+    const quarantineDurationMap = {
+      DOUBLE_SIGN_CONTRADICTORY_VOTES: 300_000, // 5 min
+      INVALID_MALICIOUS_CAS_PAYLOAD: 180_000, // 3 min
+      REPUTATION_POISONING: 120_000, // 2 min
+      SLA_DEFECT_SPAM: 60_000 // 1 min
+    };
+
+    const slashedPoints = slashPointsMap[params.violationType] ?? 20;
+    const repBefore = agent.reputationScore;
+    const repAfter = Math.max(0, repBefore - slashedPoints);
+    agent.reputationScore = repAfter;
+
+    const inQuarantineJail =
+    repAfter <= 35 ||
+    params.violationType === "DOUBLE_SIGN_CONTRADICTORY_VOTES" ||
+    params.violationType === "INVALID_MALICIOUS_CAS_PAYLOAD";
+
+    const quarantineDuration = quarantineDurationMap[params.violationType] ?? 60_000;
+    const quarantineExpiresAtMs = inQuarantineJail ? nowMs + quarantineDuration : 0;
+
+    agent.isQuarantined = inQuarantineJail;
+    agent.quarantineUntilMs = quarantineExpiresAtMs;
+    agent.quarantineReason = inQuarantineJail ?
+    `Byzantine violation: ${params.violationType} (Slashed ${slashedPoints} pts)` :
+    undefined;
+
+    const recordId = `slash-${params.agentId}-${nowMs}-${Math.random().toString(36).slice(2, 6)}`;
+    const record = {
+      recordId,
+      agentId: params.agentId,
+      tenantId: params.tenantId,
+      violationType: params.violationType,
+      slashedPoints,
+      reputationBefore: repBefore,
+      reputationAfter: repAfter,
+      inQuarantineJail,
+      quarantineExpiresAtMs,
+      evidenceSummary: JSON.stringify(params.evidence),
+      timestampMs: nowMs
+    };
+
+    this.byzantineSlashingRecords.set(recordId, record);
+    this.registerSwarmExpertAgent(agent);
+
+    if (this.sql) {
+      this.sql.exec(
+      `INSERT OR REPLACE INTO a2a_byzantine_slashing_records
+         (record_id, agent_id, tenant_id, violation_type, slashed_points, reputation_before, reputation_after, in_quarantine, quarantine_expires_ms, evidence_json, timestamp_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      record.recordId,
+      record.agentId,
+      record.tenantId,
+      record.violationType,
+      record.slashedPoints,
+      record.reputationBefore,
+      record.reputationAfter,
+      record.inQuarantineJail ? 1 : 0,
+      record.quarantineExpiresAtMs,
+      record.evidenceSummary,
+      record.timestampMs);
+
+    }
+
+    return record;
+  }
+
+  pardonQuarantinedAgent(
+  agentId,
+  operatorReason,
+  restoredScore = 65)
+  {
+    const agent = this.swarmAgents.get(agentId);
+    if (!agent) {
+      return { pardoned: false, agentId, restoredReputation: 0 };
+    }
+
+    agent.isQuarantined = false;
+    agent.quarantineUntilMs = 0;
+    agent.quarantineReason = undefined;
+    agent.reputationScore = Math.max(agent.reputationScore, restoredScore);
+    this.registerSwarmExpertAgent(agent);
+
+    return { pardoned: true, agentId, restoredReputation: agent.reputationScore };
+  }
+
+  listByzantineSlashingRecords() {
+    return Array.from(this.byzantineSlashingRecords.values());
   }
 }exports.SharedBlackboardAndGitArbiter = SharedBlackboardAndGitArbiter;

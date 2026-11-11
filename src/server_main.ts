@@ -2557,7 +2557,25 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
-        // [M74] Multi-Agent Swarm Governance & Causal Consistency Suite (`POST /v1beta1/management/ops/phase1-swarm-governance`)
+            // [M75] Phase 2 eBPF Network Tracing, Byzantine Slashing & Erasure Coding Suite (`POST /v1beta1/management/ops/phase2-network-slashing-erasure`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/phase2-network-slashing-erasure") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.executePhase2NetworkSlashingErasureSuite({
+        action: body.action as
+          | "ebpf_network_circuit_breaker"
+          | "byzantine_credit_slashing"
+          | "cross_region_erasure_coding"
+          | "run_all_phase2_suite"
+          | undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+// [M74] Multi-Agent Swarm Governance & Causal Consistency Suite (`POST /v1beta1/management/ops/phase1-swarm-governance`)
     if (method === "POST" && pathname === "/v1beta1/management/ops/phase1-swarm-governance") {
       const body = await this.readJsonBody(req);
       const out = this.managementPlane.executePhase1SwarmGovernanceSuite({

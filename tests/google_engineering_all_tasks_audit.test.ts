@@ -19,7 +19,7 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
       return out;
     };
     const srcFiles = walk(path.join(process.cwd(), "src"));
-    assert.equal(srcFiles.length, 86);
+    assert.equal(srcFiles.length, 88);
     for (const f of srcFiles) {
       const content = fs.readFileSync(f, "utf-8");
       assert.ok(content.includes("@fileoverview"), `Missing @fileoverview in ${f}`);

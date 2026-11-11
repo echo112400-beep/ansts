@@ -1,3 +1,6 @@
+import assert from "node:assert/strict";
+import { CrossRegionErasureCodedWalManager } from "../checkpoint/erasure_coder.js";
+import { EbpfSocketNetworkTrackerAndBreaker } from "../runtime/ebpf_network_tracker.js";
 import { RustFsS3LtxDriver } from "../checkpoint/s3_ltx_driver.js";
 import { DurableDiskCellSqlStorage, InMemoryKvNamespace, InMemoryCellSqlStorage } from "../cloudflare/env.js";
 import { ZeroTrustSandboxSecurityGuard } from "../runtime/zero_trust_security_guard.js";
@@ -10363,6 +10366,296 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         n2BftAndSemantic,
         n3VectorClockCut,
         allM74Phase1SwarmChecksPassed,
+      },
+    };
+  }
+  /**
+   * [M75] Phase 2 eBPF Network Tracing, Byzantine Slashing & Erasure Coding Suite
+   * - [N4] eBPF Dynamic Network Tracing & Microsecond Circuit Breaker
+   * - [N5] Byzantine Behavioral Fingerprinting, Credit Slashing & Quarantine Jail
+   * - [N6] Cross-Region Reed-Solomon Erasure-Coded WAL & Lossless Rebuild
+   */
+  public executePhase2NetworkSlashingErasureSuite(params: {
+    action?:
+      | "ebpf_network_circuit_breaker"
+      | "byzantine_credit_slashing"
+      | "cross_region_erasure_coding"
+      | "run_all_phase2_suite";
+    actor: string;
+    role: string;
+  }): { status: number; body: any } {
+    const action = params.action ?? "run_all_phase2_suite";
+
+    const runN4EbpfBreaker = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const tracker = new EbpfSocketNetworkTrackerAndBreaker(sql, {
+        p99LatencyThresholdUs: 20_000,
+        packetLossThresholdRatio: 0.15,
+        bufferPressureThresholdPct: 80.0,
+        cooldownDurationUs: 100_000, // 100ms
+      });
+
+      const peer = "10.244.2.88:9443";
+      // 1. Initial healthy samples
+      for (let i = 0; i < 5; i++) {
+        tracker.recordSocketSample({
+          peerEndpoint: peer,
+          rttUs: 1200 + i * 50,
+          retransmitted: false,
+          bufferBytes: 4096,
+          maxBufferBytes: 65536,
+        });
+      }
+
+      const initialIntercept = tracker.interceptOutboundSocketTransfer(peer);
+
+      // 2. Heavy congestion / packet loss spike
+      for (let i = 0; i < 6; i++) {
+        tracker.recordSocketSample({
+          peerEndpoint: peer,
+          rttUs: 35_000 + i * 2000,
+          retransmitted: true,
+          bufferBytes: 58000,
+          maxBufferBytes: 65536,
+        });
+      }
+
+      const trippedTelemetry = tracker.getSocketTelemetry(peer);
+      const trippedIntercept = tracker.interceptOutboundSocketTransfer(peer);
+
+      // 3. Test cooldown
+      const futureUs = Date.now() * 1000 + 150_000; // +150ms > 100ms cooldown
+      const halfOpenIntercept = tracker.interceptOutboundSocketTransfer(peer, futureUs);
+
+      // 4. Rehydration check
+      const tracker2 = new EbpfSocketNetworkTrackerAndBreaker(sql);
+      const rehydratedTel = tracker2.getSocketTelemetry(peer);
+
+      const n4Verified =
+        initialIntercept.allowed === true &&
+        initialIntercept.circuitBreakerState === "CLOSED" &&
+        trippedIntercept.circuitBreakerState === "TRIPPED_MICROS_OPEN" && (trippedTelemetry?.totalTripsCount ?? 0) >= 1 &&
+        trippedIntercept.allowed === false &&
+        trippedIntercept.reason.includes("eBPF_TC_EGRESS_CIRCUIT_TRIPPED") &&
+        halfOpenIntercept.allowed === true &&
+        halfOpenIntercept.circuitBreakerState === "HALF_OPEN" &&
+        rehydratedTel?.peerEndpoint === peer;
+
+      return {
+        initialIntercept,
+        trippedTelemetry,
+        trippedIntercept,
+        halfOpenIntercept,
+        n4Verified,
+      };
+    };
+
+    const runN5ByzantineSlashing = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const arbiter = new SharedBlackboardAndGitArbiter(sql);
+
+      const agentId = "agent-rogue-007";
+      arbiter.registerSwarmExpertAgent({
+        agentId,
+        specialtyRole: "WORKER",
+        supportedCapabilities: ["code_gen"],
+        historicalSuccessRate: 0.88,
+        costPer1kTokensUsd: 0.001,
+        warmSandboxReady: true,
+        activeTaskCount: 1,
+        reputationScore: 85,
+      });
+
+      // 1. First violation: SLA_DEFECT_SPAM (-15 pts) -> 85 - 15 = 70 (not jailed yet)
+      const slash1 = arbiter.recordByzantineViolation({
+        agentId,
+        tenantId: "tenant-delta",
+        violationType: "SLA_DEFECT_SPAM",
+        evidence: { missedDeadlines: 3, cfpId: "cfp-spam-1" },
+      });
+
+      // 2. Second severe violation: DOUBLE_SIGN_CONTRADICTORY_VOTES (-50 pts) -> 70 - 50 = 20 (Quarantined!)
+      const slash2 = arbiter.recordByzantineViolation({
+        agentId,
+        tenantId: "tenant-delta",
+        violationType: "DOUBLE_SIGN_CONTRADICTORY_VOTES",
+        evidence: { conflictingSigs: ["sigA", "sigB"], proposalVersion: 3 },
+      });
+
+      arbiter.registerSwarmExpertAgent({
+        agentId: "agent-healthy-peer",
+        specialtyRole: "WORKER",
+        supportedCapabilities: ["code_gen"],
+        historicalSuccessRate: 0.95,
+        costPer1kTokensUsd: 0.002,
+        warmSandboxReady: true,
+        activeTaskCount: 0,
+        reputationScore: 88,
+      });
+
+      // 3. Quarantined agent should be rejected in bidding while conforming peer is awarded
+      const biddingRes = arbiter.matchContractNetBidding({
+        task: {
+          cfpId: "cfp-vip-task",
+          requiredRole: "WORKER",
+          requiredCapabilities: ["code_gen"],
+          maxBudgetUsd: 1.0,
+          slaDeadlineMs: 10000,
+        },
+        bids: [
+          {
+            bidId: "bid-rogue",
+            callForProposalId: "cfp-vip-task",
+            agentId,
+            estimatedDurationMs: 3000,
+            bidPriceUsd: 0.1,
+            confidenceScore: 0.99,
+          },
+          {
+            bidId: "bid-peer-ok",
+            callForProposalId: "cfp-vip-task",
+            agentId: "agent-healthy-peer",
+            estimatedDurationMs: 4000,
+            bidPriceUsd: 0.25,
+            confidenceScore: 0.95,
+          },
+        ],
+      });
+
+      // 4. Operator pardon restores agent
+      const pardonRes = arbiter.pardonQuarantinedAgent(agentId, "Remediated container and renewed key", 75);
+
+      // 5. Rehydration check
+      const arbiter2 = new SharedBlackboardAndGitArbiter(sql);
+      const rehydratedAgent = arbiter2.getSwarmExpertAgent(agentId);
+      const rehydratedRecords = arbiter2.listByzantineSlashingRecords();
+
+      const n5Verified =
+        slash1.slashedPoints === 15 &&
+        slash1.inQuarantineJail === false &&
+        slash2.slashedPoints === 50 &&
+        slash2.reputationAfter === 20 &&
+        slash2.inQuarantineJail === true &&
+        biddingRes.awardedAgentId === "agent-healthy-peer" && Boolean(biddingRes.bidRankings.find((b: any) => b.agentId === agentId && !b.passedSlaAndBudget)) &&
+        pardonRes.pardoned === true &&
+        pardonRes.restoredReputation === 75 &&
+        rehydratedAgent?.reputationScore === 75 &&
+        rehydratedRecords.length === 2;
+
+      return {
+        slash1,
+        slash2,
+        biddingRes,
+        pardonRes,
+        n5Verified,
+      };
+    };
+
+    const runN6ErasureCoding = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const manager = new CrossRegionErasureCodedWalManager(sql);
+
+      const walId = "wal-prod-core-0941";
+      const sampleText = "ANSTS-V3.5-SWARM-WAL-FRAME-TRANSACTION-DATA-BLOCK-CAUCHY-REED-SOLOMON-VERIFY-1234567890-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      const manifest = manager.encodeWal(walId, sampleText);
+
+      // Verify 6 shards created across 6 regions
+      assert.equal(manifest.shards.length, 6);
+
+      // 1. Lossless rebuild when 2 arbitrary shards are lost (e.g. shard 0 and shard 2)
+      const survivingShardsCaseA = manifest.shards.filter((s) => s.shardIndex !== 0 && s.shardIndex !== 2);
+      const rebuildCaseA = manager.reconstructWal(walId, survivingShardsCaseA);
+
+      // 2. Lossless rebuild when 1 data shard and 1 parity shard are lost (shard 1 and shard 4)
+      const survivingShardsCaseB = manifest.shards.filter((s) => s.shardIndex !== 1 && s.shardIndex !== 4);
+      const rebuildCaseB = manager.reconstructWal(walId, survivingShardsCaseB);
+
+      // 3. Failed rebuild when 3 shards are lost (> 2 parity limit)
+      const survivingShardsCaseC = manifest.shards.filter((s) => s.shardIndex === 0 || s.shardIndex === 1 || s.shardIndex === 2);
+      const rebuildCaseC = manager.reconstructWal(walId, survivingShardsCaseC);
+
+      // 4. Rehydration check
+      const manager2 = new CrossRegionErasureCodedWalManager(sql);
+      const rehydratedManifest = manager2.getManifest(walId);
+
+      const n6Verified =
+        manifest.dataShardsCount === 4 &&
+        manifest.parityShardsCount === 2 &&
+        rebuildCaseA.rebuiltSuccessfully === true &&
+        rebuildCaseA.crc32Match === true &&
+        rebuildCaseA.reconstructedDataText === sampleText &&
+        rebuildCaseB.rebuiltSuccessfully === true &&
+        rebuildCaseB.crc32Match === true &&
+        rebuildCaseB.reconstructedDataText === sampleText &&
+        rebuildCaseC.rebuiltSuccessfully === false &&
+        rehydratedManifest?.walId === walId;
+
+      return {
+        manifest,
+        rebuildCaseA,
+        rebuildCaseB,
+        rebuildCaseC,
+        n6Verified,
+      };
+    };
+
+    if (action === "ebpf_network_circuit_breaker") {
+      const res = runN4EbpfBreaker();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [N4] eBPF 动态网络追踪与微秒级熔断检测 (放行=${res.initialIntercept.allowed}, 熔断=${res.trippedTelemetry?.circuitBreakerState}, 冷却探测=${res.halfOpenIntercept.allowed})`,
+        "Phase2Network / EbpfCircuitBreaker",
+        res.n4Verified ? "EBPF_BREAKER_OK" : "EBPF_BREAKER_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "byzantine_credit_slashing") {
+      const res = runN5ByzantineSlashing();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [N5] 拜占庭行为特征提取与信用惩戒 (扣分1=-${res.slash1.slashedPoints}, 扣分2=-${res.slash2.slashedPoints}, 隔离入狱=${res.slash2.inQuarantineJail}, 特赦恢复=${res.pardonRes.pardoned})`,
+        "Phase2Network / ByzantineSlashing",
+        res.n5Verified ? "BYZANTINE_SLASH_OK" : "BYZANTINE_SLASH_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "cross_region_erasure_coding") {
+      const res = runN6ErasureCoding();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [N6] 跨地域日志纠删码与按需校验重构 (K=4, M=2, 丢失2分片无损重构=${res.rebuildCaseA.crc32Match}, 丢失3分片正确拒重构=${!res.rebuildCaseC.rebuiltSuccessfully})`,
+        "Phase2Network / ErasureCoding",
+        res.n6Verified ? "ERASURE_REBUILD_OK" : "ERASURE_REBUILD_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    const n4EbpfBreaker = runN4EbpfBreaker();
+    const n5ByzantineSlashing = runN5ByzantineSlashing();
+    const n6ErasureCoding = runN6ErasureCoding();
+    const allM75Phase2ChecksPassed =
+      n4EbpfBreaker.n4Verified && n5ByzantineSlashing.n5Verified && n6ErasureCoding.n6Verified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [M75] 第二阶段网络追踪、拜占庭惩戒与日志纠删码套件全量验证 (N4 eBPF熔断 + N5 拜占庭隔离 + N6 跨地域纠删码, 通过=${allM75Phase2ChecksPassed})`,
+      "Phase2Network / SwarmNetworkAndSlashingSuite",
+      allM75Phase2ChecksPassed ? "M75_PHASE2_ALL_PASS" : "M75_PHASE2_FAILED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        n4EbpfBreaker,
+        n5ByzantineSlashing,
+        n6ErasureCoding,
+        allM75Phase2ChecksPassed,
       },
     };
   }
