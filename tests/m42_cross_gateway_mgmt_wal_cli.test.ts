@@ -2,6 +2,7 @@
  * @fileoverview M42 End-to-End Verification: Cross-Gateway S3 Management State Sync,
  * Real Turn WAL CRC32 Inspector, Dynamic Approval Creation & `anstsctl` Management CLI.
  */
+import { consoleTokens } from "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as http from "node:http";
@@ -111,6 +112,7 @@ describe("M42 Cross-Gateway Management S3 Sync, Turn WAL CRC32 Inspector & Manag
       const createdTicket = (await createAprResp.json()) as { approvalId: string };
       assert.ok(createdTicket.approvalId.startsWith("APR-2026-"));
 
+      process.env.ANSTS_CONSOLE_TOKEN = consoleTokens.zhou;
       const cliApproveOut = await runAnstsCtlRemote(
         ["mgmt-approve", createdTicket.approvalId, "zhou", "approve"],
         gw2Url

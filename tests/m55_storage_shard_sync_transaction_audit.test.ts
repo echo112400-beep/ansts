@@ -2,6 +2,7 @@
  * @fileoverview M55 Deep Persistence, Shard Last-Brain Survival Guard, LayerFS Rule D9 Pull-State Sync,
  * Time-Travel CRC32 Verification, Velocity Breaker Recovery & RPO=0 Atomic Rollback Verification Suite.
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { InMemoryCellSqlStorage, InMemoryR2Bucket } from "../src/cloudflare/env.js";

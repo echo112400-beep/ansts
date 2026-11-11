@@ -5,6 +5,7 @@
  * `TurnWalEngine`, `DeterministicTimeTravelReplayer`, `LayerFsWorkspaceDriver`, `FinOpsBudgetController`,
  * `CapacitySlaEnforcer`) rather than stateless stubs.
  */
+import { consoleTokens } from "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -68,8 +69,8 @@ describe("M41 Platform Management Console Prototype & Real Backend BFF Suite", (
       // 3. Verify POST /v1beta1/management/tenants/config mutates SQLite & FinOpsBudgetController and enforces CAS
       const viewerResp = await fetch(`${baseUrl}/v1beta1/management/tenants/config`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ role: "VIEWER", tenantId: "Northstar", expectedVersion: 14, maxSlots: 160 }),
+        headers: { "content-type": "application/json", authorization: `Bearer ${consoleTokens.viewer}` },
+        body: JSON.stringify({ tenantId: "Northstar", expectedVersion: 14, maxSlots: 160 }),
       });
       assert.equal(viewerResp.status, 403);
 
@@ -200,11 +201,9 @@ describe("M41 Platform Management Console Prototype & Real Backend BFF Suite", (
 
       const peerApproveResp = await fetch(`${baseUrl}/v1beta1/management/approvals/decide`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization: `Bearer ${consoleTokens.zhou}` },
         body: JSON.stringify({
           approvalId: "APR-2026-091",
-          approver: "zhou",
-          role: "SRE_ADMIN",
           decision: "approve",
         }),
       });

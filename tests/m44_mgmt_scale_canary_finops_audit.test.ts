@@ -3,6 +3,7 @@
  * Closed-Loop Approval Execution Engine, Progressive Canary Rollout Controller,
  * Live Tenant FinOps/Escrow Metering, Interactive Task Turn Stepping & Searchable Audit Explorer.
  */
+import { consoleTokens } from "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -77,11 +78,9 @@ describe("M44 Management Plane Deep Frontend & Backend Optimization Suite", () =
 
       const decideDrainApr = await fetch(`${baseUrl}/v1beta1/management/approvals/decide`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization: `Bearer ${consoleTokens.zhou}` },
         body: JSON.stringify({
           approvalId: drainTicket.approvalId,
-          approver: "zhou",
-          role: "SRE_ADMIN",
           decision: "approve",
         }),
       });

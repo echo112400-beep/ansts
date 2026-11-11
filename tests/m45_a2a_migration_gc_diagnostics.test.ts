@@ -4,6 +4,7 @@
  * Live Heavy Task Cross-Node Migration, LayerFS Line-Level Blame Inspector,
  * Distributed CAS Two-Phase Mark-and-Sweep GC + Epoch GC Audit, and Rolling-Upgrade Fleet Diagnostics.
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";

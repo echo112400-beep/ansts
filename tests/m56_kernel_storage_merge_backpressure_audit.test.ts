@@ -2,6 +2,7 @@
  * @fileoverview M56 Unified Cold-Start Lease/Fencing Rehydration, LayerFS 3-Way Merge Deletion & Base-Object Pinning,
  * P0 Emergency Ingress Headroom, CelldAdmin Epoch Guard & Facet/Isolate Memory Leak Elimination Verification Suite.
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { InMemoryCellSqlStorage, InMemoryR2Bucket } from "../src/cloudflare/env.js";

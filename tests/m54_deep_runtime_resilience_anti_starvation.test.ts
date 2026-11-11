@@ -2,6 +2,7 @@
  * @fileoverview M54 Deep Runtime Resilience, Cold-Start Fencing, Half-Open Stampede Guard,
  * Approval TTL, Hot-Cell Leak Reclamation, Outbox/SSE Resilience & A2A Anti-Starvation Suite.
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { InMemoryR2Bucket, MockDurableObjectState } from "../src/cloudflare/env.js";

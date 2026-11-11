@@ -7,6 +7,7 @@
  * 4. [Wal-Stale-4] `TurnWalEngine.appendTurnDelta` enforces dual-tuple `(fencingToken, turnIndex)` monotonicity when `enforceTurnMonotonicity: true` and `verifyTaskWalChainIntegrity` validates full-chain CRC32 + monotonic order.
  * 5. [DrainToken-Deadlock-5] `CelldStateAwareFleetAutoscaler.initiateNodeShutdown` automatically expires and reclaims a stale `activeDrainTokenHolder` after `shutdownTotalMs` TTL so a crashed draining node never deadlocks fleet rolling shutdowns.
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { SagaToolGateway } from "../src/saga_gateway.js";

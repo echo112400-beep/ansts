@@ -7,6 +7,7 @@
  * 3. [M50-3] Deep Runtime Engine Optimization (`AnstsSchedulerCell` `js_rpc` + `FleetReplicatedDurabilityEngine` + `HotCellOverloadAndQueueGuard` + `WalCompactorAndPagedRestorer` + `LayerFsRemoteStoreSynchronizer`) (`POST /v1beta1/management/runtime/celld-engine`).
  * 4. [M50-4] Closed-Loop SRE Observability, Histogram Quantiles (`p50`/`p95`/`p99`), W3C Distributed Trace Waterfall, SLO Burn-Rate Alerting & Automated Self-Healing Runbook (`POST /v1beta1/management/ops/observability`).
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
