@@ -432,3 +432,19 @@
   - CLI：`node dist/src/cli/anstsctl.js mgmt-consistency-audit`
   - HTTP API：`POST /v1beta1/management/system/implementation-consistency-audit`
   - E2E 测试套件：`tests/m64_implementation_consistency_audit.test.ts`（全仓 **57/57 测试套件，147/147 测试用例全部通过**）。
+
+
+## 十五、M65 落地功能如实实现一致性深度核查第二阶段（Deep Implementation Consistency Phase II）
+
+| 编号 | 模块与涉及文件 | 发现的实现不一致/断链隐患 | 修复方案与测试验证 |
+| :--- | :--- | :--- | :--- |
+| **M65-1** | **`WalCompactorAndPagedRestorer` 与 `LayerFsRemoteStoreSynchronizer` 构造函数契约与 SQLite 持久化对齐**<br>`src/checkpoint/compactor.ts`<br>`src/checkpoint/layerfs_remote_sync.ts` | `server_main.ts` 向 `WalCompactorAndPagedRestorer(4096, durableSql)` 与 `LayerFsRemoteStoreSynchronizer(bucket, projectId, durableSql)` 传入了 `durableSql`，但两个类构造函数未声明 `sql` 参数且未持久化压缩快照与 Rule D9 代际状态，导致重启后 `restoreViaUserfaultfd` 退化为默认 100 页、`remoteGeneration` 归零。 | 为 `WalCompactorAndPagedRestorer` 新增 `constructor(pageSizeBytes = 4096, sql?: SqlStorageLike)` 与 `persisted_compacted_snapshots` 表持久化；为 `LayerFsRemoteStoreSynchronizer` 新增第三参数 `sql?: SqlStorageLike` 与 `layerfs_remote_sync_state` 表持久化。 |
+| **M65-2** | **灰度控制器回滚锁、预热器 EWMA 与资源画像器 SQLite 持久化恢复**<br>`src/cluster/canary_rollout_controller.ts`<br>`src/runtime/predictive_prewarmer.ts`<br>`src/profiler.ts` | `CanaryRolloutController` 触发 `ROLLED_BACK` 后若进程重启，状态重置为 `CANARY_ACTIVE`，绕过了 M58-4 回滚锁守卫；`PredictiveSandboxPrewarmer` 与 `TaskResourceProfiler` 学习到的 EWMA 到达率与租户资源画像在重启后丢失。 | 为 `CanaryRolloutController`（`persisted_canary_state`）、`PredictiveSandboxPrewarmer`（`persisted_prewarmer_state`）与 `TaskResourceProfiler`（`persisted_profiler_history`）全面补齐 SQLite 持久化与冷启动自动恢复，并在 `server_main.ts` 绑定 `durableSql`。 |
+| **M65-3** | **主服务在线路由状态变更与 `v25Store` / `TurnWalEngine` 实时落盘同步**<br>`src/server_main.ts` | `/v1beta1/harness/run-turn`、`/v1beta1/saga/execute`、`/v1beta1/saga/approve`、`/v1beta1/dag/escrow` 及后台 `tickTimer` 修改内存中 `task.current_turn` 或 `task.state` 后未同步回写 `v25_scheduler_tasks`，且 `/v1beta1/dag/escrow` 缺少 `failChild` 分支。 | 新增 `syncTaskToV25Store` 并在上述所有路由与后台 `tickTimer` 状态变更后实时同步落盘；在 `/v1beta1/harness/run-turn` 完成后自动追加 `TurnWalEngine` 帧；在 `/v1beta1/dag/escrow` 中补齐 `failChild` 动作。 |
+| **M65-4** | **`TunnelGatewayCell` 标准 DO `fetch` 接口与 Worker `/v1/tunnel/*` 路由闭环**<br>`src/cloudflare/tunnel_gateway_cell.ts`<br>`src/cloudflare/env.ts`<br>`src/cloudflare/worker.ts` | `worker.ts` 导出了 `TunnelGatewayCell`，但 `TunnelGatewayCell` 缺少 Durable Object `fetch(request)` 方法，`worker.ts` 也未将 `/v1/tunnel/*` 转发至 `ANSTS_TUNNEL_CELL`。 | 在 `CloudflareCelldEnv` 声明 `ANSTS_TUNNEL_CELL`，为 `TunnelGatewayCell` 实现支持 `/register`、`/poll`、`/ack`、`/health`、`/evict-stale` 的 `fetch` 方法，并在 `worker.ts` 完成 `/v1/tunnel/*` 路由挂载。 |
+| **M65-5** | **CI 流水线跨文件 AST 导出与构造函数参数契约静态守卫**<br>`scripts/ci_check.mjs` | `scripts/ci_check.mjs` 原本仅逐文件编译，无法在编译期拦截跨文件导入缺失或 `new ClassName(...)` 参数数量与构造函数签名不一致的问题。 | 在 `scripts/ci_check.mjs` Stage 1 中基于 `@babel/parser` 增加全仓 144 个模块的跨文件 `import/export` 符号核验与 `new ClassName(...)` 构造函数参数数量边界静态守卫。 |
+
+- **验证命令**：
+  - CLI：`node dist/src/cli/anstsctl.js mgmt-consistency-phase2-audit`
+  - HTTP API：`POST /v1beta1/management/system/deep-consistency-phase2-audit`
+  - E2E 测试套件：`tests/m65_deep_implementation_consistency_phase2_audit.test.ts`（全仓 **58/58 测试套件，151/151 测试用例全部通过**）。

@@ -1,5 +1,5 @@
 /**
- * @fileoverview M7 TASK-27B & M64-1: Cloudflare Workers / denoland/celld Default Fetch, Queue & Durable Object Class Entrypoint.
+ * @fileoverview M7 TASK-27B, M64-1 & M65-4: Cloudflare Workers / denoland/celld Default Fetch, Queue & Durable Object Class Entrypoint.
  * Routes `/v1/scheduler/*`, `/v1/harness/*`, and `/v1/tunnel/*` to their respective stateful cells,
  * and dispatches queued task messages in `queue(batch, env)` to `ANSTS_SCHEDULER_CELL` with retry-on-failure semantics.
  */
@@ -31,6 +31,12 @@ export default {
       const taskId = url.searchParams.get("taskId") ?? "task-default";
       const id = env.ANSTS_HARNESS_CELL.idFromName(taskId);
       const stub = env.ANSTS_HARNESS_CELL.get(id);
+      return stub.fetch(request);
+    }
+    if (url.pathname.startsWith("/v1/tunnel") && env.ANSTS_TUNNEL_CELL) {
+      const hostId = url.searchParams.get("hostId") ?? "body-host-01";
+      const id = env.ANSTS_TUNNEL_CELL.idFromName(hostId);
+      const stub = env.ANSTS_TUNNEL_CELL.get(id);
       return stub.fetch(request);
     }
     return new Response(JSON.stringify({ error: "NOT_FOUND" }), { status: 404 });

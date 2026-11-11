@@ -104,19 +104,113 @@ function runLint() {
     throw new Error("No TypeScript files found in src/ or tests/");
   }
 
+  const exportsByFile = new Map();
+  const classesByName = new Map();
+  const parsedAsts = new Map();
+
   for (const f of tsFiles) {
     const rel = path.relative(ROOT_DIR, f);
     const code = fs.readFileSync(f, "utf8");
     if (babelParser) {
-      babelParser.parse(code, {
+      const ast = babelParser.parse(code, {
         sourceType: "module",
         plugins: ["typescript"],
       });
+      parsedAsts.set(f, ast);
+      const exp = new Set();
+      for (const node of ast.program.body) {
+        if (node.type === "ExportNamedDeclaration") {
+          if (node.declaration) {
+            const d = node.declaration;
+            if (d.id && d.id.name) exp.add(d.id.name);
+            if (d.declarations) {
+              for (const decl of d.declarations) {
+                if (decl.id && decl.id.name) exp.add(decl.id.name);
+              }
+            }
+            if (d.type === "ClassDeclaration" && d.id) {
+              let ctor = { min: 0, max: 0 };
+              for (const m of d.body.body) {
+                if (m.type === "ClassMethod" && m.kind === "constructor") {
+                  let min = 0, max = m.params.length;
+                  for (const p of m.params) {
+                    if (p.type === "RestElement") max = Infinity;
+                    else if (p.type !== "AssignmentPattern" && !p.optional) min++;
+                  }
+                  ctor = { min, max };
+                }
+              }
+              classesByName.set(d.id.name, { file: rel, ctor, superClass: d.superClass?.name });
+            }
+          }
+          if (node.specifiers) {
+            for (const s of node.specifiers) {
+              exp.add(s.exported.name || s.exported.value);
+            }
+          }
+        } else if (node.type === "ExportDefaultDeclaration") {
+          exp.add("default");
+        } else if (node.type === "ExportAllDeclaration") {
+          exp.add("*");
+        }
+      }
+      exportsByFile.set(path.resolve(f), exp);
     } else {
       const jsCode = compileTsToCommonJs(code, f);
       new vm.Script(jsCode, { filename: f });
     }
     console.log(`  [TS AST OK] ${rel}`);
+  }
+
+  if (babelParser) {
+    for (const [f, ast] of parsedAsts.entries()) {
+      const rel = path.relative(ROOT_DIR, f);
+      for (const node of ast.program.body) {
+        if (node.type === "ImportDeclaration") {
+          const src = node.source.value;
+          if (src.startsWith(".")) {
+            const targetTs = path.resolve(path.dirname(f), src.replace(/\.js$/, ".ts"));
+            const targetExp = exportsByFile.get(targetTs);
+            if (!targetExp) {
+              throw new Error(`[CROSS-FILE IMPORT ERROR] ${rel} imports from missing module ${src}`);
+            }
+            if (!targetExp.has("*")) {
+              for (const s of node.specifiers) {
+                if (s.type === "ImportSpecifier") {
+                  const importedName = s.imported.name || s.imported.value;
+                  if (!targetExp.has(importedName)) {
+                    throw new Error(`[CROSS-FILE EXPORT ERROR] ${rel} imports "${importedName}" from ${src}, which is not exported`);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      function visitNew(n) {
+        if (!n || typeof n !== "object") return;
+        if (n.type === "NewExpression" && n.callee.type === "Identifier") {
+          const cname = n.callee.name;
+          const cinfo = classesByName.get(cname);
+          if (cinfo && !cinfo.superClass) {
+            const argc = n.arguments.length;
+            if (argc < cinfo.ctor.min || argc > cinfo.ctor.max) {
+              throw new Error(
+                `[CTOR ARITY ERROR] ${rel}:${n.loc?.start.line} new ${cname}(${argc} args) outside [${cinfo.ctor.min}..${cinfo.ctor.max}] (${cinfo.file})`
+              );
+            }
+          }
+        }
+        for (const k of Object.keys(n)) {
+          if (k === "loc" || k === "start" || k === "end") continue;
+          const v = n[k];
+          if (Array.isArray(v)) v.forEach(visitNew);
+          else if (v && typeof v === "object") visitNew(v);
+        }
+      }
+      visitNew(ast.program);
+    }
+    console.log("  [CROSS-FILE AST CONTRACT OK] All imports, exports & constructor signatures verified");
   }
 
   const specYamlPath = path.join(ROOT_DIR, "specs", "taskspec_v1beta1_example.yaml");

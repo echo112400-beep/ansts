@@ -1,10 +1,10 @@
 /**
- * @fileoverview v2.5, M52-4 & M61-4: Dual-Homed Reverse Tunnel Gateway Cell (`TunnelGatewayCell`).
+ * @fileoverview v2.5, M52-4, M61-4 & M65-4: Dual-Homed Reverse Tunnel Gateway Cell (`TunnelGatewayCell`).
  * Supports NAT-traversal outbound reverse tunnel command queueing, long-poll retrieval,
  * command execution acknowledgement, stale-heartbeat tunnel auto-demotion, in-flight command re-queueing,
- * Idempotent In-Flight/Completed Command Coalescing, and SQLite Persistence.
+ * Idempotent In-Flight/Completed Command Coalescing, SQLite Persistence & Durable Object `fetch` API.
  */
-import { SqlStorageLike } from "./env.js";
+import { DurableObjectStateLike, SqlStorageLike } from "./env.js";
 
 export interface ReverseTunnelBinding {
   hostId: string;
@@ -27,6 +27,10 @@ export interface QueuedTunnelCommand {
   idempotencyKey?: string;
 }
 
+function isDurableObjectStateLike(x: unknown): x is DurableObjectStateLike {
+  return Boolean(x && typeof x === "object" && "storage" in x && (x as DurableObjectStateLike).storage?.sql);
+}
+
 export class TunnelGatewayCell {
   private readonly tunnelsByHost: Map<string, ReverseTunnelBinding[]> = new Map();
   private readonly pendingCommandsByHost: Map<string, QueuedTunnelCommand[]> = new Map();
@@ -44,9 +48,9 @@ export class TunnelGatewayCell {
   private cmdSeq = 0;
   private sql?: SqlStorageLike;
 
-  constructor(sql?: SqlStorageLike) {
-    if (sql) {
-      this.bindSqlStorage(sql);
+  constructor(sqlOrState?: SqlStorageLike | DurableObjectStateLike) {
+    if (sqlOrState) {
+      this.bindSqlStorage(isDurableObjectStateLike(sqlOrState) ? sqlOrState.storage.sql : sqlOrState);
     }
   }
 
@@ -325,5 +329,86 @@ export class TunnelGatewayCell {
 
   public listHostTunnels(hostId: string): ReverseTunnelBinding[] {
     return [...(this.tunnelsByHost.get(hostId) ?? [])];
+  }
+
+  /**
+   * [M65-4] Durable Object HTTP `fetch` entrypoint supporting `/register`, `/poll`, `/ack`, `/health`, and `/evict-stale`
+   * (with or without `/v1/tunnel` or `/internal/v1beta1/tunnel` prefix).
+   */
+  public async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const normalizedPath =
+      url.pathname
+        .replace(/^\/internal\/v1beta1\/tunnel(?=\/|$)/, "")
+        .replace(/^\/v1\/tunnel(?=\/|$)/, "") || "/";
+
+    if (request.method === "POST" && normalizedPath === "/register") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const hostId = String(body.hostId ?? "body-host-01");
+      const gatewayId = String(body.gatewayId ?? "celld-gw-01");
+      const role = (body.role === "SECONDARY" ? "SECONDARY" : "PRIMARY") as "PRIMARY" | "SECONDARY";
+      const connGeneration = Number(body.connGeneration ?? 1);
+      const epoch = Number(body.epoch ?? 1);
+      this.registerTunnel({ hostId, gatewayId, role, connGeneration, epoch });
+      const active = this.selectActiveTunnel(hostId);
+      return new Response(
+        JSON.stringify({
+          registered: true,
+          hostId,
+          gatewayId,
+          role,
+          activeGatewayId: active.gatewayId,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+
+    if (request.method === "GET" && normalizedPath === "/poll") {
+      const hostId = url.searchParams.get("hostId") ?? "body-host-01";
+      const gatewayId = url.searchParams.get("gatewayId") ?? undefined;
+      const commands = this.pollPendingCommands(hostId, gatewayId);
+      return new Response(JSON.stringify({ hostId, commands }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (request.method === "POST" && normalizedPath === "/ack") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const commandId = String(body.commandId ?? "");
+      const result = (body.result as Record<string, unknown>) ?? {};
+      const acknowledged = this.acknowledgeCommand(commandId, result);
+      return new Response(JSON.stringify({ acknowledged, commandId }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (request.method === "POST" && normalizedPath === "/health") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const hostId = String(body.hostId ?? "body-host-01");
+      const gatewayId = String(body.gatewayId ?? "celld-gw-01");
+      const healthy = Boolean(body.healthy ?? true);
+      this.markGatewayHealth(hostId, gatewayId, healthy);
+      const active = this.selectActiveTunnel(hostId);
+      return new Response(
+        JSON.stringify({ hostId, activeGatewayId: active.gatewayId, activeRole: active.role }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+
+    if (request.method === "POST" && normalizedPath === "/evict-stale") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const out = this.evictStaleTunnelsAndRequeueInFlight(
+        body.nowMs !== undefined ? Number(body.nowMs) : Date.now(),
+        body.heartbeatTtlMs !== undefined ? Number(body.heartbeatTtlMs) : 30_000
+      );
+      return new Response(JSON.stringify(out), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    return new Response(JSON.stringify({ error: "NOT_FOUND" }), { status: 404 });
   }
 }

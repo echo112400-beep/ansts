@@ -123,6 +123,7 @@ export interface DynamicWorkerLoaderBindingLike {
 export interface CloudflareCelldEnv {
   ANSTS_SCHEDULER_CELL: DurableObjectNamespaceLike;
   ANSTS_HARNESS_CELL: DurableObjectNamespaceLike;
+  ANSTS_TUNNEL_CELL?: DurableObjectNamespaceLike;
   ANSTS_IDEMPOTENCY_KV: KvNamespaceLike;
   ANSTS_CHECKPOINT_BUCKET: R2BucketLike;
   ANSTS_TASK_DISPATCH_QUEUE: QueueProducerLike;

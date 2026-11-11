@@ -220,8 +220,8 @@ class AnstsLocalAndComposeServer {
     this.mtlsBridge = new _mtls_tunnel_bridge.MtlsReverseTunnelBridge();
     this.slaEnforcer = new _capacity_sla_enforcer.CapacitySlaEnforcer({ sql: durableSql });
     this.loadShedder = new _priority_load_shedder.PriorityLoadShedder();
-    this.canaryController = new _canary_rollout_controller.CanaryRolloutController();
-    this.prewarmer = new _predictive_prewarmer.PredictiveSandboxPrewarmer();
+    this.canaryController = new _canary_rollout_controller.CanaryRolloutController(durableSql);
+    this.prewarmer = new _predictive_prewarmer.PredictiveSandboxPrewarmer(0.4, durableSql);
     this.geoRouter = new _geo_routing.GeoSovereigntyAndLatencyRouter(durableSql);
     if (this.geoRouter.listRegions().length === 0) {
       this.geoRouter.registerGeoRegion({ regionId: "eu-central-1", jurisdiction: "GDPR_EU", latencyMs: 18, capacityAvailable: true });
@@ -442,14 +442,34 @@ class AnstsLocalAndComposeServer {
 
     this.tickTimer = setInterval(() => {
       if (!this.draining) {
-        this.scheduler.reconcileOrphanedLeases();
-        this.scheduler.scheduleTick();
+        const recovered = this.scheduler.reconcileOrphanedLeases();
+        const placements = this.scheduler.scheduleTick();
+        if (recovered.length > 0 || placements.length > 0) {
+          for (const t of this.scheduler.allTasks.values()) {
+            this.syncTaskToV25Store(t);
+          }
+        }
         this.metrics.setGauge("ansts_queued_tasks", this.scheduler.queueManager.totalQueued());
         this.metrics.setGauge("ansts_Registered_nodes", this.scheduler.nodes.size);
       }
     }, this.tickIntervalMs);
 
     return { apiPort: boundApiPort, dashboardPort: boundDashPort };
+  }
+
+  syncTaskToV25Store(task) {
+    const idemKey = task.idempotency_key ?? `idem:${task.tenant_id}:${task.task_id}`;
+    this.v25Store.sql.exec(
+    "INSERT OR REPLACE INTO v25_scheduler_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, idem_key, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    task.task_id,
+    task.tenant_id,
+    task.priority,
+    task.state,
+    task.lease_fencing_token,
+    task.assigned_node_id ?? "",
+    idemKey,
+    JSON.stringify(task));
+
   }
 
   async registerOutboundReverseTunnels() {
@@ -1807,12 +1827,14 @@ class AnstsLocalAndComposeServer {
           args
         });
         const ticket = this.sagaGateway.stagingGate.requestHumanApproval(task, toolName, args);
+        this.syncTaskToV25Store(task);
         res.writeHead(202, { "content-type": "application/json" });
         res.end(JSON.stringify({ status: "PENDING_APPROVAL", stagedEffectId: staged.effectId, ticket }));
         return;
       }
 
       const [output, deduplicated] = this.sagaGateway.invokeTool(taskId, turnIndex, toolName, args);
+      this.syncTaskToV25Store(task);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "EXECUTED", taskId, turnIndex, toolName, deduplicated, output }));
       return;
@@ -1847,6 +1869,7 @@ class AnstsLocalAndComposeServer {
       } else {
         this.sagaGateway.stagingGate.abortStagedEffects(taskId);
       }
+      this.syncTaskToV25Store(task);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ticket, taskState: task.state, committedEffects }));
       return;
@@ -1994,7 +2017,21 @@ class AnstsLocalAndComposeServer {
         estimatedTokens);
 
         const actCgroup = this.phaseController.applyActPhase(taskId, task.resource_profile);
+        this.syncTaskToV25Store(task);
+        try {
+          const fTok = Math.max(1, task.lease_fencing_token);
+          this.walEngine.appendTurnDelta({
+            taskId,
+            turnIndex: turnSummary.turnIndex,
+            fencingToken: fTok,
+            changedFiles: [`harness/${taskId}-turn-${turnSummary.turnIndex}.json`],
+            sqliteWalPages: 4,
+            highestSubmittedFencingToken: fTok
+          });
+        } catch {
 
+          // ignore if WAL already has this turn
+        }
         let psiDefense = null;
         if (body.psiSample) {
           const sample = body.psiSample;
@@ -2034,6 +2071,7 @@ class AnstsLocalAndComposeServer {
       } catch (err) {
         const msg = err.message;
         if (msg.includes("Velocity breaker tripped")) {
+          this.syncTaskToV25Store(task);
           res.writeHead(429, { "content-type": "application/json" });
           res.end(
           JSON.stringify({
@@ -2074,6 +2112,7 @@ class AnstsLocalAndComposeServer {
         Number(body.maxTenantQuota ?? 10),
         Number(body.currentTenantUsed ?? 1));
 
+        this.syncTaskToV25Store(parentTask);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
         JSON.stringify({
@@ -2099,6 +2138,8 @@ class AnstsLocalAndComposeServer {
         try {
           const out = this.dagEscrow.registerChildSubAgent(parentTask, childTask);
           this.scheduler.allTasks.set(childId, childTask);
+          this.syncTaskToV25Store(parentTask);
+          this.syncTaskToV25Store(childTask);
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ ...out, parentState: parentTask.state, childTaskId: childId }));
         } catch (err) {
@@ -2115,8 +2156,19 @@ class AnstsLocalAndComposeServer {
       if (action === "completeChild") {
         const childId = String(body.childTaskId ?? "task-child-01");
         const allChildrenDone = this.dagEscrow.completeChildSubAgent(parentTask, childId);
+        this.syncTaskToV25Store(parentTask);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ allChildrenDone, parentState: parentTask.state }));
+        return;
+      }
+
+      if (action === "failChild") {
+        const childId = String(body.childTaskId ?? "task-child-01");
+        const abortParent = body.abortParentOnChildFailure !== undefined ? Boolean(body.abortParentOnChildFailure) : true;
+        const failRes = this.dagEscrow.failOrCancelChildSubAgent(parentTask, childId, abortParent);
+        this.syncTaskToV25Store(parentTask);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(failRes));
         return;
       }
     }
@@ -2440,6 +2492,18 @@ class AnstsLocalAndComposeServer {
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(result));
+      return;
+    }
+
+    // [M65] Deep Implementation Consistency Phase II Audit (`POST /v1beta1/management/system/deep-consistency-phase2-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/deep-consistency-phase2-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDeepConsistencyPhase2Audit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
       return;
     }
 

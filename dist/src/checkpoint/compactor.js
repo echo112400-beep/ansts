@@ -1,10 +1,12 @@
 "use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.WalCompactorAndPagedRestorer = void 0;
 
 
+
 var _nodePerf_hooks = require("node:perf_hooks");
 
 var _uffd_lazy_restorer = require("../runtime/uffd_lazy_restorer.js"); /**
- * @fileoverview M5 TASK-20, M16 TASK-79 & M47-2: Async Layer Compactor & Real Userfaultfd 4KiB SHA-256 Page Restorer.
+ * @fileoverview M5 TASK-20, M16 TASK-79, M47-2 & M65-1: Async Layer Compactor & Real Userfaultfd 4KiB SHA-256 Page Restorer
+ * with SQLite Persistence (`persisted_compacted_snapshots`) & Constructor Contract Alignment.
  */
 
 
@@ -16,7 +18,45 @@ var _uffd_lazy_restorer = require("../runtime/uffd_lazy_restorer.js"); /**
 
 class WalCompactorAndPagedRestorer {
   compactedByTask = new Map();
+  pageSizeBytes;
   uffdRestorer = new _uffd_lazy_restorer.UffdLazyPageFaultRestorer();
+  sql;
+
+  constructor(pageSizeBytes = 4096, sql) {
+    this.pageSizeBytes =
+    Number.isInteger(pageSizeBytes) && pageSizeBytes > 0 ? pageSizeBytes : 4096;
+    if (sql) {
+      this.bindSqlStorage(sql);
+    }
+  }
+
+  /**
+   * [M65-1] Binds SQLite storage (`persisted_compacted_snapshots`) so compacted WAL snapshot
+   * metadata (`totalSqlitePages`, `mergedFileSet`, `upToTurnIndex`) survives process restarts.
+   */
+  bindSqlStorage(sql) {
+    this.sql = sql;
+    this.sql.exec(
+    "CREATE TABLE IF NOT EXISTS persisted_compacted_snapshots (task_id TEXT PRIMARY KEY, payload_json TEXT)");
+
+    const rows = this.sql.
+    exec("SELECT * FROM persisted_compacted_snapshots").
+    toArray();
+    let restored = 0;
+    for (const r of rows) {
+      const taskId = String(r.task_id ?? "");
+      const parsed = JSON.parse(String(r.payload_json ?? "{}"));
+      if (taskId && parsed && parsed.snapshotId) {
+        this.compactedByTask.set(taskId, parsed);
+        restored += 1;
+      }
+    }
+    return restored;
+  }
+
+  getCompactedSnapshot(taskId) {
+    return this.compactedByTask.get(taskId);
+  }
 
   compactLayers(taskId, entries) {
     if (entries.length === 0) {
@@ -46,6 +86,13 @@ class WalCompactorAndPagedRestorer {
       compactionRatio: ratio
     };
     this.compactedByTask.set(taskId, snap);
+    if (this.sql) {
+      this.sql.exec(
+      "INSERT OR REPLACE INTO persisted_compacted_snapshots (task_id, payload_json) VALUES (?, ?)",
+      taskId,
+      JSON.stringify(snap));
+
+    }
     return snap;
   }
 
@@ -97,7 +144,7 @@ class WalCompactorAndPagedRestorer {
 
 
   {
-    const walSizeMb = params.walSizePages * 4096 / (1024 * 1024);
+    const walSizeMb = params.walSizePages * this.pageSizeBytes / (1024 * 1024);
     const shouldTruncateWalAtCheckpoint =
     params.dbSizeMb <= 4.0 ? params.walSizePages >= 128 : walSizeMb > params.dbSizeMb;
     const pagedMinMb = params.pagedMinMb ?? 256;
@@ -132,7 +179,7 @@ class WalCompactorAndPagedRestorer {
 
     const faultedPageDigests = [];
     for (let i = 0; i < eagerPagesLoaded; i++) {
-      const pageBuf = Buffer.alloc(4096);
+      const pageBuf = Buffer.alloc(this.pageSizeBytes);
       pageBuf.write(`SQLite format 3\0${taskId}:page-${i}`, 0, "utf-8");
       this.uffdRestorer.stageRemoteSnapshotPage(i, new Uint8Array(pageBuf));
       const faulted = this.uffdRestorer.handlePageFault(i);
