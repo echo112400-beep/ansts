@@ -2499,6 +2499,88 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M70-1] DLQ Dead-Letter Task & Outbox Webhook Replay Workbench (`POST /v1beta1/management/ops/dlq-replay`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/dlq-replay") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeDlqAndOutboxReplayWorkbench({
+        action: (body.action ?? "inspect_dlq") as
+          | "inspect_dlq"
+          | "replay_dead_letter_task"
+          | "replay_outbox_webhook"
+          | "seed_dlq_samples",
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        messageId: body.messageId ? String(body.messageId) : undefined,
+        newTargetUrl: body.newTargetUrl ? String(body.newTargetUrl) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M70-2] Task Breakpoint Crash-Recovery & Duplicate Coalescing Inspector (`POST /v1beta1/management/tasks/breakpoint-recover` & `/coalesce-inspect`)
+    if (
+      method === "POST" &&
+      (pathname === "/v1beta1/management/tasks/breakpoint-recover" ||
+        pathname === "/v1beta1/management/tasks/coalesce-inspect")
+    ) {
+      const body = await this.readJsonBody(req);
+      const defaultAction =
+        pathname === "/v1beta1/management/tasks/coalesce-inspect"
+          ? "coalesce_duplicate"
+          : "recover_breakpoint";
+      const result = this.managementPlane.executeTaskBreakpointRecoveryAndCoalesce({
+        action: (body.action ?? defaultAction) as "recover_breakpoint" | "coalesce_duplicate",
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        tenantId: body.tenantId ? String(body.tenantId) : undefined,
+        prompt: body.prompt ? String(body.prompt) : undefined,
+        priority: body.priority !== undefined ? Number(body.priority) : undefined,
+        idempotencyKey: body.idempotencyKey ? String(body.idempotencyKey) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M70-3] M57-M69 One-Click Full-Link Health Scorecard (`POST /v1beta1/management/ops/health-scorecard`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/health-scorecard") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeFullLinkHealthScorecard({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
+    // [M70-4] Day-2 Governance Suite (`POST /v1beta1/management/ops/day2-governance`)
+    if (method === "POST" && pathname === "/v1beta1/management/ops/day2-governance") {
+      const body = await this.readJsonBody(req);
+      const result = this.managementPlane.executeDay2GovernanceOperation({
+        action: (body.action ?? "security_fence_alerts") as
+          | "security_fence_alerts"
+          | "finops_cost_attribution"
+          | "config_diff_preview"
+          | "rotate_webhook_secret",
+        tenantId: body.tenantId ? String(body.tenantId) : undefined,
+        candidateOverrides:
+          body.candidateOverrides && typeof body.candidateOverrides === "object"
+            ? (body.candidateOverrides as Record<string, unknown>)
+            : undefined,
+        newWebhookSecret: body.newWebhookSecret ? String(body.newWebhookSecret) : undefined,
+        graceWindowSec: body.graceWindowSec !== undefined ? Number(body.graceWindowSec) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M69] Final Deep Edge-Case Sweep & Zero-Residual-Defect Closure Audit (`POST /v1beta1/management/system/final-closure-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/final-closure-audit") {
       const body = await this.readJsonBody(req);

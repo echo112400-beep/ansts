@@ -368,6 +368,35 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-day2-ops") {
+    const subAction = rest[0] ?? "health-scorecard";
+    if (subAction === "health-scorecard") {
+      const resp = await fetch(`${baseUrl}/v1beta1/management/ops/health-scorecard`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
+      });
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    if (subAction === "dlq-replay") {
+      const resp = await fetch(`${baseUrl}/v1beta1/management/ops/dlq-replay`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: rest[1] ?? "inspect_dlq", actor: "chen", role: "SRE_ADMIN" }),
+      });
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/day2-governance`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: subAction, actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-final-closure-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/system/final-closure-audit`, {
       method: "POST",

@@ -4,9 +4,9 @@
 
 
 var crypto = _interopRequireWildcard(require("node:crypto"));function _getRequireWildcardCache(nodeInterop) {if (typeof WeakMap !== "function") return null;var cacheBabelInterop = new WeakMap();var cacheNodeInterop = new WeakMap();return (_getRequireWildcardCache = function (nodeInterop) {return nodeInterop ? cacheNodeInterop : cacheBabelInterop;})(nodeInterop);}function _interopRequireWildcard(obj, nodeInterop) {if (!nodeInterop && obj && obj.__esModule) {return obj;}if (obj === null || typeof obj !== "object" && typeof obj !== "function") {return { default: obj };}var cache = _getRequireWildcardCache(nodeInterop);if (cache && cache.has(obj)) {return cache.get(obj);}var newObj = {};var hasPropertyDescriptor = Object.defineProperty && Object.getOwnPropertyDescriptor;for (var key in obj) {if (key !== "default" && Object.prototype.hasOwnProperty.call(obj, key)) {var desc = hasPropertyDescriptor ? Object.getOwnPropertyDescriptor(obj, key) : null;if (desc && (desc.get || desc.set)) {Object.defineProperty(newObj, key, desc);} else {newObj[key] = obj[key];}}}newObj.default = obj;if (cache) {cache.set(obj, newObj);}return newObj;} /**
- * @fileoverview M6 TASK-23, M54-4, M60-1 & M66-1: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher
+ * @fileoverview M6 TASK-23, M54-4, M60-1, M66-1 & M70-1: Transactional Outbox & HMAC-SHA256 Signed Webhook Dispatcher
  * with SQLite Durability, Per-Message Exception Isolation, Timing-Safe Replay-Window Signature Verification,
- * Constructor Overload/MaxAttempts Sanitization, Dead-Letter Requeue & Compaction.
+ * Zero-Downtime Dual-Key Secret Rotation (Primary + Grace-Window Secondary), Constructor Overload Sanitization, Dead-Letter Requeue & Compaction.
  */
 
 
@@ -22,6 +22,9 @@ class TransactionalOutboxDispatcher {
   outbox = new Map();
   maxAttempts;
   signingSecret;
+  secondarySecret;
+  secondarySecretExpiresAtSec = 0;
+  keyRotationGeneration = 1;
   sql;
 
   constructor(
@@ -47,6 +50,49 @@ class TransactionalOutboxDispatcher {
         this.bindSqlStorage(sql);
       }
     }
+  }
+
+  /**
+   * [M70-1] Rotates the active HMAC signing secret without downtime by retaining the previous primary secret
+   * as `secondarySecret` for `graceWindowSec` seconds so in-flight webhook deliveries signed immediately prior
+   * to key rotation continue to pass `verifySignature`.
+   */
+  rotateSigningSecret(
+  newPrimarySecret,
+  graceWindowSec = 3600,
+  nowSec = Math.floor(Date.now() / 1000))
+
+
+
+
+  {
+    if (!newPrimarySecret || typeof newPrimarySecret !== "string" || newPrimarySecret.trim().length < 4) {
+      throw new Error("New webhook signing secret must be at least 4 characters");
+    }
+    const safeGrace = Number.isFinite(graceWindowSec) && graceWindowSec >= 0 ? Math.floor(graceWindowSec) : 3600;
+    if (newPrimarySecret !== this.signingSecret) {
+      this.secondarySecret = this.signingSecret;
+      this.secondarySecretExpiresAtSec = nowSec + safeGrace;
+      this.signingSecret = newPrimarySecret;
+      this.keyRotationGeneration += 1;
+    }
+    return {
+      keyRotationGeneration: this.keyRotationGeneration,
+      secondaryActive: Boolean(this.secondarySecret && this.secondarySecretExpiresAtSec > nowSec),
+      secondaryExpiresAtSec: this.secondarySecretExpiresAtSec
+    };
+  }
+
+  getKeyRotationStatus(nowSec = Math.floor(Date.now() / 1000))
+
+
+
+  {
+    return {
+      keyRotationGeneration: this.keyRotationGeneration,
+      secondaryActive: Boolean(this.secondarySecret && nowSec <= this.secondarySecretExpiresAtSec),
+      secondaryExpiresAtSec: this.secondarySecretExpiresAtSec
+    };
   }
 
   /**
@@ -159,8 +205,8 @@ class TransactionalOutboxDispatcher {
   }
 
   /**
-   * [M54-4 & M66-1] Verifies HMAC-SHA256 webhook signature using constant-time `crypto.timingSafeEqual`
-   * and enforces replay timestamp tolerance (`maxSkewSec`).
+   * [M54-4, M66-1 & M70-1] Verifies HMAC-SHA256 webhook signature using constant-time `crypto.timingSafeEqual`,
+   * enforces replay timestamp tolerance (`maxSkewSec`), and supports dual-key verification during grace-window rotation.
    */
   verifySignature(
   payloadJson,
@@ -182,17 +228,32 @@ class TransactionalOutboxDispatcher {
     if (!/^[0-9a-fA-F]{64}$/.test(providedHex)) {
       return false;
     }
+    const providedBuf = Buffer.from(providedHex, "hex");
     const body = `${ts}.${payloadJson}`;
-    const expectedHex = crypto.
+
+    const primaryHex = crypto.
     createHmac("sha256", this.signingSecret).
     update(body, "utf-8").
     digest("hex");
-    const expectedBuf = Buffer.from(expectedHex, "hex");
-    const providedBuf = Buffer.from(providedHex, "hex");
-    if (expectedBuf.length !== providedBuf.length) {
-      return false;
+    const primaryBuf = Buffer.from(primaryHex, "hex");
+    if (primaryBuf.length === providedBuf.length && crypto.timingSafeEqual(primaryBuf, providedBuf)) {
+      return true;
     }
-    return crypto.timingSafeEqual(expectedBuf, providedBuf);
+
+    if (this.secondarySecret && nowSec <= this.secondarySecretExpiresAtSec) {
+      const secondaryHex = crypto.
+      createHmac("sha256", this.secondarySecret).
+      update(body, "utf-8").
+      digest("hex");
+      const secondaryBuf = Buffer.from(secondaryHex, "hex");
+      if (
+      secondaryBuf.length === providedBuf.length &&
+      crypto.timingSafeEqual(secondaryBuf, providedBuf))
+      {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

@@ -1357,6 +1357,9 @@
             <h2 class="panel-title">多租户 DRF 配额、DAG 并发担保与 FinOps 预算门控 (对接 SQLite v25_mgmt_tenants &amp; FinOpsBudgetController)</h2>
             <p class="panel-subtitle">调用 <code>POST /v1beta1/management/tenants/config</code> 修改配额与预算，强制执行乐观锁 CAS 版本校验 (expectedVersion)。</p>
           </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="open-finops-attribution">FinOps 多维成本归因 (LLM 推理 vs 沙箱核时)</button>
+          </div>
         </div>
         <div class="table-wrap">
           <table class="data-table">
@@ -1426,6 +1429,8 @@
               <option value="CANCEL_UNCONFIRMED" ${state.taskFilterState === 'CANCEL_UNCONFIRMED' ? 'selected' : ''}>CANCEL_UNCONFIRMED</option>
               <option value="FENCED_TERMINATED" ${state.taskFilterState === 'FENCED_TERMINATED' ? 'selected' : ''}>FENCED_TERMINATED</option>
             </select>
+            <button type="button" class="small" data-action="coalesce-duplicate-task" ${!permGlobal.ok ? 'disabled' : ''} title="模拟相同指纹/幂等键并发请求合并与提权">+ 合并并发重复请求演练</button>
+            <button type="button" class="small warn" data-action="open-dlq-workbench">DLQ 死信与 Outbox 重放工作台</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -1456,7 +1461,7 @@
                 const pillCls = isUnconfirmed ? 'warn' : isFenced ? 'danger' : 'ok';
                 return `
                   <tr>
-                    <td class="mono"><strong>${t.id}</strong></td>
+                    <td class="mono"><strong>${t.id}</strong>${t.mergedDuplicateCount > 0 ? ` <span class="status-pill ok" title="已合并重复请求: ${(t.mergedRequestIds || []).join(", ")}">合并×${t.mergedDuplicateCount}</span>` : ""}</td>
                     <td>${t.tenant} · <span class="mono">${t.region}</span></td>
                     <td class="mono">${t.priority} · Slot #${t.shardSlot ?? 0}</td>
                     <td class="mono">${t.brain} → ${t.body}</td>
@@ -1466,6 +1471,7 @@
                     <td>
                       <div class="btn-row">
                         <button type="button" class="small primary" data-action="step-task-turn" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>+推进回合</button>
+                        <button type="button" class="small" data-action="recover-task-breakpoint" data-task="${t.id}" ${!perm.ok ? 'disabled' : ''} title="从 TurnWalEngine 断点恢复并自动回滚未提交 Saga 副作用">断点恢复</button>
                         <button type="button" class="small" data-action="migrate-task-node" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''} title="调用 EphemeralHeavyExecutorMigrator 跨节点热迁移并推进 Fencing Token">热迁移节点</button>
                         <button type="button" class="small" data-action="open-turn-history-dialog" data-task="${t.id}">回合历史 / 分叉 / Blame</button>
                         <button type="button" class="small" data-action="graceful-stop-task" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>
@@ -1655,6 +1661,17 @@
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-runtime-audit" data-op="deep_runtime_m54_audit">深层运行时防惊群/防死锁/反饥饿自检 (Harness/Breaker/Staging/HotCell/Outbox/A2A · M54)</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/storage-ha-audit" data-op="storage_ha_m55_audit">存储/分片存活/LayerFS同步/事务回滚自检 (Persistence/Shard/D9/TimeTravel/RPO0 · M55)</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/runtime-edge-audit" data-op="kernel_storage_m56_audit">全表冷启恢复/三路合并删改冲突/P0突发准入/内存防泄漏自检 (M56)</button>
+          <button class="btn primary" data-action="run-health-scorecard">★ M60–M69 全链路持久化 / DFX / 零残余缺陷一键健康评分卡 (Scorecard)</button>
+          <button class="btn" data-action="open-dlq-workbench">DLQ 死信任务 &amp; Outbox Webhook 失败重放工作台</button>
+          <button class="btn" data-action="open-security-fence-alerts">零信任安全围栏 (celld-fence / eBPF LSM / Vsock) 实时拦截流</button>
+          <button class="btn" data-action="open-finops-attribution">FinOps 多维成本归因 (LLM 推理 vs 沙箱核时 + Cache 节省)</button>
+          <button class="btn" data-action="open-config-diff-preview">配置中心字段级 JSON Diff 对比预览</button>
+          <button class="btn" data-action="open-dual-key-rotation">Outbox Webhook 签名密钥零停机双密钥平滑轮换</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/persistence-idempotency-recovery-audit" data-op="m60_audit">全链路持久化/幂等/断点恢复/重复合并自检 (M60)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/dfx-deep-audit" data-op="m63_audit">深度 DFX 可靠性/主权路由/多环死锁自检 (M63)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-consistency-phase2-audit" data-op="m65_audit">全子系统实现一致性与 AST 契约自检 (M65)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/deep-risk-phase3-audit" data-op="m68_audit">深度潜在风险消除 I–III 自检 (M66–M68)</button>
+          <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/final-closure-audit" data-op="m69_audit">终极边界收口与零残余缺陷自检 (M69)</button>
           </div>
           <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
         </div>
@@ -2431,6 +2448,194 @@
       showToast('已加载分支 ' + (res.data.branchName || '') + ' 的 LayerFS 行级代码溯源');
       return;
     }
+    if (action === "recover-task-breakpoint") {
+      const taskId = target.getAttribute("data-task") || "task-ns-8841";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/tasks/breakpoint-recover", {
+        action: "recover_breakpoint",
+        taskId,
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      await fetchBackendState();
+      openDialog(
+        "任务 WAL 断点恢复与未提交 Saga 清理报告 · " + taskId,
+        "<div><strong>恢复断点回合：</strong> <span class=\"status-pill ok\">Turn #" + (d.restoredTurnIndex ?? 1) + " (Fence epoch:" + (d.restoredFencingToken ?? 1) + ")</span></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">权威 WAL 帧数: <code class=\"mono\">" + (d.canonicalWalFrames ?? 1) + "</code> · 丢弃未提交帧: <code class=\"mono\">" + (d.discardedWalFrames ?? 0) + "</code> · 逆序回滚未提交 Saga 步骤: <code class=\"mono\">" + (d.rolledBackSagaSteps ?? 0) + "</code> · 下一步待执行回合: <code class=\"mono\">Turn #" + (d.nextTurnToExecute ?? 2) + "</code></div>",
+        "完成恢复确认",
+        () => closeDialog()
+      );
+      return;
+    }
+    if (action === "coalesce-duplicate-task") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/tasks/coalesce-inspect", {
+        action: "coalesce_duplicate",
+        taskId: "task-ns-8841",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      await fetchBackendState();
+      showToast("已将并发重复请求 " + (d.incomingDuplicateId || "dup") + " 合并至 " + (d.canonicalTaskId || "task-ns-8841") + " (累计合并 ×" + (d.mergedDuplicateCount || 1) + "，节省 " + (d.estimatedSavedTokens || 4200) + " Tokens)");
+      return;
+    }
+    if (action === "open-dlq-workbench") {
+      const p = getPrincipal();
+      await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+        action: "seed_dlq_samples",
+        actor: p.id,
+        role: p.role
+      });
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+        action: "inspect_dlq",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { deadLetterTasks: [], deadLetterWebhooks: [] };
+      openDialog(
+        "死信队列 (DLQ) 任务与 Outbox Webhook 失败重放工作台 (POST /v1beta1/management/ops/dlq-replay)",
+        "<div><strong>死信任务 (" + (d.deadLetterTaskCount ?? 0) + ")：</strong></div>" +
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>任务 ID</th><th>租户</th><th>死信原因</th><th>重试次数</th><th>Fencing Token</th></tr></thead><tbody>" +
+        (d.deadLetterTasks || []).map((t) => "<tr><td class=\"mono\"><strong>" + t.taskId + "</strong></td><td>" + t.tenantId + "</td><td class=\"mono\">" + t.deadLetterReason + "</td><td class=\"mono\">" + t.retryCount + "</td><td class=\"mono\">epoch:" + t.fencingToken + "</td></tr>").join("") +
+        "</tbody></table></div>" +
+        "<div style=\"margin-top:8px;\"><strong>Outbox 死信 Webhook 消息 (" + (d.deadLetterWebhookCount ?? 0) + ")：</strong></div>" +
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>消息 ID</th><th>关联任务</th><th>目标 URL</th><th>失败尝试</th><th>最后错误</th></tr></thead><tbody>" +
+        (d.deadLetterWebhooks || []).map((m) => "<tr><td class=\"mono\"><strong>" + m.messageId + "</strong></td><td class=\"mono\">" + m.taskId + "</td><td class=\"mono\">" + m.targetUrl + "</td><td class=\"mono\">" + m.attempts + "</td><td class=\"mono\">" + m.lastError + "</td></tr>").join("") +
+        "</tbody></table></div>",
+        "一键重放全部死信任务与 Outbox Webhook",
+        async () => {
+          await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+            action: "replay_dead_letter_task",
+            taskId: "task-dlq-9901",
+            actor: p.id,
+            role: p.role
+          });
+          await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+            action: "replay_outbox_webhook",
+            messageId: "outbox-dlq-9901",
+            newTargetUrl: "https://audit-sink.ansts.internal/webhook",
+            actor: p.id,
+            role: p.role
+          });
+          closeDialog();
+          await fetchBackendState();
+          showToast("已完成死信任务 task-dlq-9901 重新入队与 Outbox Webhook 重放投递");
+        }
+      );
+      return;
+    }
+    if (action === "run-health-scorecard") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/health-scorecard", {
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { suites: [], overallScorePct: 100 };
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "M60–M69 全链路持久化 / 幂等 / 断点恢复 / DFX / 零残余缺陷一键健康评分卡",
+        "<div><strong>综合健康得分：</strong> <span class=\"status-pill ok\">" + (d.overallScorePct ?? 100) + "% (" + (d.passedSuites ?? 10) + "/" + (d.totalSuites ?? 10) + " 专项全部通过)</span></div>" +
+        "<div class=\"table-wrap\" style=\"margin-top:8px;\"><table class=\"data-table\"><thead><tr><th>里程碑</th><th>核查专项内容</th><th>状态</th></tr></thead><tbody>" +
+        (d.suites || []).map((s) => "<tr><td class=\"mono\"><strong>" + s.milestone + "</strong></td><td>" + s.title + "</td><td><span class=\"status-pill " + (s.passed ? "ok" : "danger") + "\">" + (s.passed ? "PASS" : "FAIL") + "</span></td></tr>").join("") +
+        "</tbody></table></div>",
+        "关闭评分卡",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-security-fence-alerts") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/day2-governance", {
+        action: "security_fence_alerts",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { alerts: [] };
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "零信任安全围栏 (celld-fence / eBPF LSM / Vsock) 实时拦截告警流",
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>告警 ID</th><th>拦截层</th><th>目标载荷</th><th>拦截原因</th><th>状态</th></tr></thead><tbody>" +
+        (d.alerts || []).map((a) => "<tr><td class=\"mono\"><strong>" + a.alertId + "</strong></td><td>" + a.layer + "</td><td class=\"mono\">" + a.target + "</td><td class=\"mono\">" + a.reason + "</td><td><span class=\"status-pill ok\">BLOCKED</span></td></tr>").join("") +
+        "</tbody></table></div>",
+        "确认安全拦截日志",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-finops-attribution") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/day2-governance", {
+        action: "finops_cost_attribution",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { attributions: [] };
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "FinOps 多维成本归因与 UTC 日切幂等状态 (" + (d.utcDayWindow || "UTC") + ")",
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>租户</th><th>LLM 推理费用</th><th>沙箱核时费用</th><th>Prefix Cache 节省</th><th>总消耗 / 日预算</th><th>当日幂等键数</th></tr></thead><tbody>" +
+        (d.attributions || []).map((a) => "<tr><td><strong>" + a.tenantId + "</strong></td><td class=\"mono\">$" + a.llmInferenceCostUsd + "</td><td class=\"mono\">$" + a.sandboxCpuMemCostUsd + "</td><td class=\"mono\"><span class=\"status-pill ok\">-$" + a.prefixCacheSavedUsd + "</span></td><td class=\"mono\">$" + a.totalSpentUsd + " / $" + a.dailyBudgetUsd + " (" + a.utilizationPct + "%)</td><td class=\"mono\">" + a.seenIdempotencyKeysCount + "</td></tr>").join("") +
+        "</tbody></table></div>",
+        "关闭成本归因报告",
+        () => closeDialog()
+      );
+      return;
+    }
+    if (action === "open-config-diff-preview") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/day2-governance", {
+        action: "config_diff_preview",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || { diffs: [] };
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "配置中心版本变更字段级 Diff 对比预览 (POST /v1beta1/management/ops/day2-governance)",
+        "<div class=\"table-wrap\"><table class=\"data-table\"><thead><tr><th>配置项 (Field)</th><th>当前基线值</th><th>待发布候选值</th><th>变更类型</th></tr></thead><tbody>" +
+        (d.diffs || []).map((df) => "<tr><td class=\"mono\"><strong>" + df.field + "</strong></td><td class=\"mono\">" + JSON.stringify(df.oldValue) + "</td><td class=\"mono\">" + JSON.stringify(df.newValue) + "</td><td><span class=\"status-pill " + (df.changeType === "UNCHANGED" ? "ok" : "warn") + "\">" + df.changeType + "</span></td></tr>").join("") +
+        "</tbody></table></div>",
+        "应用配置变更并记录 CAS 版本",
+        async () => {
+          await callBackendApi("POST", "/v1beta1/management/config/center", {
+            action: "validate_and_apply_config",
+            runtimeOverrides: { maxCellConcurrentRequests: 96 },
+            actor: p.id,
+            role: p.role
+          });
+          closeDialog();
+          await fetchBackendState();
+          showToast("已通过 Diff 复核并热更新配置中心版本");
+        }
+      );
+      return;
+    }
+    if (action === "open-dual-key-rotation") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/day2-governance", {
+        action: "rotate_webhook_secret",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      openDialog(
+        "Outbox Webhook HMAC 密钥零停机双密钥平滑轮换 (Primary + Grace-Window Secondary)",
+        "<div><strong>当前密钥代次 (Generation)：</strong> <span class=\"status-pill ok\">Gen #" + (d.keyRotationGeneration ?? 2) + "</span></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">旧主密钥转入次级宽限窗口 (Secondary Active): <code class=\"mono\">" + Boolean(d.secondaryActive) + "</code> · 飞行中旧签名验证通过: <code class=\"mono\">" + Boolean(d.oldSignatureStillValidInGraceWindow) + "</code> · 新主密钥签名验证通过: <code class=\"mono\">" + Boolean(d.newSignatureValid) + "</code></div>",
+        "完成密钥轮换确认",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+
     if (action === 'm50-op') {
       const method = target.getAttribute('data-method') || 'POST';
       const ep = target.getAttribute('data-endpoint') || '/v1beta1/management/ops/observability';
