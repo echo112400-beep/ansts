@@ -1,6 +1,7 @@
 /**
- * @fileoverview M22, M36 & M57-6: Zero-Trust Sandbox Security Guard (Seccomp-BPF, Landlock, Shell Command & Egress Policy)
- * with Root Glob (`/*`), `--no-preserve-root`, Docker Socket & Cloud IMDS (`169.254.169.254`) Blocking.
+ * @fileoverview M22, M36, M57-6 & M63-5: Zero-Trust Sandbox Security Guard (Seccomp-BPF, Landlock, Shell Command & Egress Policy)
+ * with Root Glob (`/*`), `--no-preserve-root`, Docker Socket, Block-Device Format/Wipe (`mkfs`, `dd of=/dev/`),
+ * and IPv4/IPv6/ECS Cloud IMDS (`169.254.169.254`, `::ffff:169.254.169.254`, `169.254.170.2`, `fd00:ec2::254`) Blocking.
  */
 import { EbpfLsmSecurityBridge } from "./ebpf_lsm_bridge.js";
 import { ZeroTrustVsockBridge } from "./vsock_bridge.js";
@@ -16,11 +17,18 @@ export class ZeroTrustSandboxSecurityGuard {
     },
     { pattern: /:\(\)\s*\{\s*:\|:&\s*\};:/, reason: "FORK_BOMB_BLOCKED" },
     {
-      pattern: /\/etc\/shadow|\/proc\/kcore|\/var\/run\/docker\.sock|docker\.sock/,
+      pattern: /\/etc\/shadow|\/proc\/kcore|\/proc\/self\/environ|\/var\/run\/docker\.sock|docker\.sock/,
       reason: "SENSITIVE_KERNEL_FILE_ACCESS_BLOCKED",
     },
     { pattern: /\/dev\/tcp\//, reason: "RAW_TCP_REVERSE_SHELL_BLOCKED" },
-    { pattern: /169\.254\.169\.254|metadata\.google\.internal/i, reason: "CLOUD_IMDS_METADATA_BLOCKED" },
+    {
+      pattern: /169\.254\.169\.254|169\.254\.170\.2|fd00:ec2::254|::ffff:169\.254\.169\.254|metadata\.google\.internal/i,
+      reason: "CLOUD_IMDS_METADATA_BLOCKED",
+    },
+    {
+      pattern: /\bmkfs(?:\.[a-z0-9]+)?\b|\bdd\s+[^;|&\n]*\bof=\/dev\/(?:sd|nvme|vd|xvda|loop)/i,
+      reason: "BLOCK_DEVICE_DESTRUCTION_BLOCKED",
+    },
   ];
 
   public evaluateAction(params: {
@@ -52,6 +60,9 @@ export class ZeroTrustSandboxSecurityGuard {
   }
 
   public evaluateShellCommand(command: string): { allowed: boolean; reason?: string } {
+    if (typeof command !== "string" || command.includes("\0")) {
+      return { allowed: false, reason: "NULL_BYTE_COMMAND_INJECTION_BLOCKED" };
+    }
     for (const rule of this.blockedCommandPatterns) {
       if (rule.pattern.test(command)) {
         return { allowed: false, reason: rule.reason };

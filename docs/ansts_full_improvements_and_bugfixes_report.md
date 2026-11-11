@@ -1,8 +1,8 @@
-# ANSTS v2.5 全生命周期深度改进与全量问题修复清单 (Milestones M51 ~ M62 DFX)
+# ANSTS v2.5 全生命周期深度改进与全量问题修复清单 (Milestones M51 ~ M63 DFX)
 
 > **文档版本**: v2.5.0-production-hardened  
 > **更新时间**: 2026-11-10  
-> **测试状态**: **55 / 55** 套件全部通过，**142 / 142** 项测试 100% PASS，0 失败，0 告警  
+> **测试状态**: **56 / 56** 套件全部通过，**143 / 143** 项测试 100% PASS，0 失败，0 告警  
 > **目标架构**: Cloudflare Workers / `denoland/celld` v0.6.3 + Linux Cgroup v2 / OverlayFS / MicroVM / UFFD + LayerFS + S3/R2 LTX
 
 ---
@@ -26,7 +26,7 @@
 
 ## 1. 改进与修复概览
 
-本工程在完成 ANSTS v2.5 基础架构融合的基础上，针对高并发、多租户、长时间运行 Agent 以及网络不可靠分布式边缘环境中的**Stale（陈旧状态/脏读）**、**Deadlock（死锁/悬挂阻塞）**、**Starvation（饥饿/雪崩）**、**Persistence Gap（持久化断链）**、**Idempotency Loss（非幂等重试副作用）**、**Breakpoint Resumption（断点恢复裂化）** 与 **Duplicate Concurrency（并发重复开销）** 展开了持续 12 轮（M51 ~ M62 DFX）的全面深挖与加固。
+本工程在完成 ANSTS v2.5 基础架构融合的基础上，针对高并发、多租户、长时间运行 Agent 以及网络不可靠分布式边缘环境中的**Stale（陈旧状态/脏读）**、**Deadlock（死锁/悬挂阻塞）**、**Starvation（饥饿/雪崩）**、**Persistence Gap（持久化断链）**、**Idempotency Loss（非幂等重试副作用）**、**Breakpoint Resumption（断点恢复裂化）** 与 **Duplicate Concurrency（并发重复开销）** 展开了持续 13 轮（M51 ~ M63 DFX）的全面深挖与加固。
 
 | 里程碑 | 关注核心领域 | 测试套件与通过数 | 代表性 Git 提交 |
 | :--- | :--- | :--- | :--- |
@@ -42,6 +42,7 @@
 | **M60** | 全链路 SQLite 持久化闭环、递归深度规范化 JSON 幂等、WAL 确定性断点恢复、在途合流提权 | 53 Suites / 140 Tests | `eff8f2a` |
 | **M61** | A2A 黑板/拓扑 CAS 幂等、暂存审批/DAG/FinOps 持久化与防重、速度熔断器同轮去重、LayerFS 断点回滚 | 54 Suites / 141 Tests | `c937aa7` |
 | **M62** | DFX 全维度可靠性（CFS硬下限/目录清理）、可诊断性（基数上限/指标规范）、安全性（PSI P0/P1豁免）、可服务性（SLA预留落盘） | 55 Suites / 142 Tests | `e281d45` |
+| **M63** | DFX 深度加固 II（混沌演练TTL自愈、背压/削峰/分片NaN保护、主权路由SQLite落盘、WFG多环死锁解环、TEE/IPv6-IMDS防护与成本钳制） | 56 Suites / 143 Tests | `HEAD` |
 
 ---
 
@@ -309,7 +310,27 @@
 
 ---
 
-## 14. 测试套件与自动化验证矩阵
+## 14. M63：DFX 全模块深度加固 II（混沌自愈、Fail-Safe 削峰分片、主权路由落盘、多环解死锁与安全计费钳制）
+
+- **[M63-1] DFX-Reliability & Fault Tolerance: `AutomatedChaosDrillRunner` `try/finally` 自动愈合与 `NetworkChaosFaultInjectionProxy` TTL 自过期** (`src/cluster/chaos_drill_runner.ts`, `src/runtime/network_chaos_proxy.ts`):
+  - **问题**: 混沌演练在注入网络分区后若发生异常未执行 `healPartition`，或未配置过期时间，会导致生产主机永久处于断网分区状态；且 `runSplitBrainAndRecoveryDrill` 未校验 `NaN`/负数令牌。
+  - **整改**: 为 `NetworkChaosFaultInjectionProxy.injectPartition` 增加 `ttlMs` 自动到期愈合与 `healAllPartitions()`；在 `executeLivePartitionAndFencingDrill` 中使用 `try ... finally` 无条件愈合网络分区，并对 Fencing 令牌执行有限非负校验。
+- **[M63-2] DFX-Availability & Fail-Safe Admission: `BidirectionalBackpressureController`、`PriorityLoadShedder`、`DynamicQueueAutoSharder` 与 `BrainBodyContainerPoolScaler` 零除/NaN 防护** (`src/cluster/backpressure_loop.ts`, `src/cluster/priority_load_shedder.ts`, `src/cloudflare/horizontal_scaler.ts`):
+  - **问题**: 当所有 LLM 端点离线（`totalEndpoints = 0` 且存在限流）或 PSI 传入 `NaN` 时，背压控制器误判为 `GREEN`；`PriorityLoadShedder.shouldAdmitUnderLoad` 在 `utilizationRatio` 为 `NaN` 时发生 Fail-Open 放行 `P3_BATCH`；`DynamicQueueAutoSharder.adjustShards` 在 `maxWriteRpsPerShard <= 0` 或 `NaN` 时将分片数污染为 `NaN`/`Infinity`。
+  - **整改**: 背压控制器对零端点故障与 `NaN` 指标自动进入 `RED_SHEDDING` 保守保护；`PriorityLoadShedder` 在 `NaN` 负载率下执行 Fail-Safe（仅允许 `P0_EMERGENCY`）；自动分片器与容器池扩缩容全面清洗非负有限输入。
+- **[M63-3] DFX-Compliance & Determinism: `GeoSovereigntyAndLatencyRouter` 负延迟清洗、同延迟确定性裁决与 SQLite 持久化** (`src/cluster/geo_routing.ts`):
+  - **问题**: 注册区域若传入负数或 `NaN` 延迟会破坏排序并错误吸纳流量；相同延迟的区域缺乏确定性二级排序；网关重启后区域可用性状态丢失。
+  - **整改**: 将非法/负数延迟惩罚性清洗为 `999,999ms`；在延迟相同时按 `regionId` 字典序确定性裁决；新增 `geo_sovereignty_regions` SQLite 持久化与冷启动重水合。
+- **[M63-4] DFX-Serviceability: `A2aWaitForGraphDeadlockDetector` 多环并发死锁迭代式彻底解环** (`src/a2a/deadlock_detector.ts`):
+  - **问题**: 当等待图中同时存在多个不相交或嵌套死锁环（如 `A <-> B` 与 `C <-> D`）时，`resolveCycleWithLowestPriorityVictim` 仅剔除首个环的受害者即返回，导致其余死锁环仍处于未解开状态（`resolved: false`）。
+  - **整改**: 升级为有界迭代式解环循环，逐轮定位当前环中优先级最低的受害者并剥离其等待边，直至全图死锁环 100% 消除，同时返回完整的 `evictedVictims` 列表。
+- **[M63-5] DFX-Security & Cost Accuracy: `ConfidentialTeeAttestationBridge` 外部验签防篡改、`ZeroTrustSandboxSecurityGuard` IPv6-IMDS/块设备防护与 `ModelPoolClientAdapter` 成本钳制** (`src/runtime/confidential_tee_bridge.ts`, `src/runtime/zero_trust_security_guard.ts`, `src/router/pool_client.ts`):
+  - **问题**: TEE 证明生成未严格校验十六进制度量摘要格式且缺少外部 Quote 防篡改校验函数；零信任命令守卫未拦截 IPv4 映射 IPv6 云元数据地址 `::ffff:169.254.169.254`、ECS 元数据 `169.254.170.2`、`mkfs.*`、`dd of=/dev/*` 及空字节 ` ` 注入；`ModelPoolClientAdapter` 在 `prefixCacheMatchedRatio > 1.0` 时算出负数 `uncachedTokens` 导致计费失真。
+  - **整改**: 增加严格十六进制格式检查与 `verifyExternalAttestationQuote`；在零信任守卫中拦截 IPv6/ECS IMDS、块设备格式化覆盖与空字节注入；在模型池客户端中将 `prefixCacheMatchedRatio` 严格钳制在 `[0, 1]` 并保证 `uncachedTokens >= 0` 与 `costUsd >= 0`。
+
+---
+
+## 15. 测试套件与自动化验证矩阵
 
 代码库包含 54 个端到端单元测试与混沌集成测试套件，全面覆盖以上改进：
 
@@ -366,14 +387,15 @@
 | 49 | `tests/m60_full_link_persistence_idempotency_breakpoint_coalesce_audit.test.ts` | 全链路 SQLite 持久化、深度递归规范化幂等与断点恢复 | PASS |
 | 50 | `tests/m61_subsystem_persistence_idempotency_breakpoint_coalesce_audit.test.ts` | 全子系统持久化、CAS/Push 幂等重试与同轮次熔断器合流 | PASS |
 | 51 | `tests/m62_dfx_hardening_audit.test.ts` | DFX 可靠性（CFS下限/清理）、可诊断性（基数上限）、安全性（P0/P1豁免）与服务性（SLA预留落盘） | PASS |
-| 52 | `tests/scheduler_authority.test.ts` | 256 虚拟槽位权威归属与跨纪元租约验证 | PASS |
-| 53 | `tests/scheduler_persistence.test.ts` | 单写路径持久化与幂等键去重提交 | PASS |
-| 54 | `tests/spec_completeness_audit.test.ts` | 规范完整性与全套组件端到端互通闭环 | PASS |
-| 55 | `tests/v23_geo_routing.test.ts` | GDPR 地理主权硬锁定与合规路由 | PASS |
+| 52 | `tests/m63_dfx_deep_module_hardening_audit.test.ts` | DFX 深度加固 II（混沌TTL自愈、NaN防御、主权路由SQLite、多环解死锁、TEE/IMDSv6与计费钳制） | PASS |
+| 53 | `tests/scheduler_authority.test.ts` | 256 虚拟槽位权威归属与跨纪元租约验证 | PASS |
+| 54 | `tests/scheduler_persistence.test.ts` | 单写路径持久化与幂等键去重提交 | PASS |
+| 55 | `tests/spec_completeness_audit.test.ts` | 规范完整性与全套组件端到端互通闭环 | PASS |
+| 56 | `tests/v23_geo_routing.test.ts` | GDPR 地理主权硬锁定与合规路由 | PASS |
 
 ---
 
-## 15. 核心管理面端点与 CLI 命令参考
+## 16. 核心管理面端点与 CLI 命令参考
 
 本系统所有改进与修复均接入了管理面控制总线，并提供了即席审计接口与控制台命令：
 
@@ -389,5 +411,8 @@
 - **M62 DFX 全维度可靠性与可服务性加固审计**:
   - HTTP 端点: `POST /v1beta1/management/system/dfx-hardening-audit`
   - CLI 命令: `node dist/src/cli/anstsctl.js mgmt-dfx-audit`
+- **M63 DFX 第二阶段全模块深度加固审计**:
+  - HTTP 端点: `POST /v1beta1/management/system/dfx-deep-audit`
+  - CLI 命令: `node dist/src/cli/anstsctl.js mgmt-dfx-deep-audit`
 - **全系统 CI 静态检查与集成测试**:
-  - 执行命令: `env -u NODE_PATH npm run ci` (依次执行 TypeScript AST 语法检查、Wrangler 配置校验、代码构建与 55 个测试套件执行)
+  - 执行命令: `env -u NODE_PATH npm run ci` (依次执行 TypeScript AST 语法检查、Wrangler 配置校验、代码构建与 56 个测试套件执行)

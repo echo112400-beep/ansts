@@ -3,12 +3,13 @@
 
 
 
+
 var _live_llm_adapter = require("./live_llm_adapter.js");
 var _breaker_limiter = require("./breaker_limiter.js"); /**
- * @fileoverview M3 TASK-06 & M57-1: Multi-Provider LLM Pool Client Adapter with Token Accounting,
- * SSE Stream Assembly (`LiveOpenAiCompatibleSseAdapter`), Sliding-Window Token Bucket, and 3-State Circuit Breaker.
+ * @fileoverview M3 TASK-06, M57-1 & M63-5: Multi-Provider LLM Pool Client Adapter with Token Accounting,
+ * SSE Stream Assembly (`LiveOpenAiCompatibleSseAdapter`), Sliding-Window Token Bucket, 3-State Circuit Breaker,
+ * and Cache-Ratio / Token-Count Clamping (Preventing Negative Uncached Tokens & Cost Underbilling).
  */
-
 
 
 
@@ -39,8 +40,10 @@ class ModelPoolClientAdapter {
   breakers = new Map();
 
   setPricing(endpointId, inputPer1kUsd, outputPer1kUsd) {
-    this.pricePer1kInputUsd.set(endpointId, inputPer1kUsd);
-    this.pricePer1kOutputUsd.set(endpointId, outputPer1kUsd);
+    const safeIn = Number.isFinite(inputPer1kUsd) && inputPer1kUsd >= 0 ? inputPer1kUsd : 0.003;
+    const safeOut = Number.isFinite(outputPer1kUsd) && outputPer1kUsd >= 0 ? outputPer1kUsd : 0.015;
+    this.pricePer1kInputUsd.set(endpointId, safeIn);
+    this.pricePer1kOutputUsd.set(endpointId, safeOut);
   }
 
   getOrCreateBreaker(endpointId) {
@@ -75,15 +78,25 @@ class ModelPoolClientAdapter {
 
     const slot = breaker.tryAcquireRequestSlot(nowMs);
     if (!slot.admitted) {
-      // [M57-1] Do NOT call breaker.recordFailure() when rejected by an already-OPEN circuit or in-flight HALF_OPEN probe;
-      // otherwise every rejected request resets openedAtMs and prevents the circuit from ever transitioning to HALF_OPEN.
       throw new Error(
       `Endpoint ${endpoint.endpoint_id} circuit breaker rejected request (state=${slot.state})`);
 
     }
 
+    const safePromptTokens =
+    Number.isFinite(req.estimatedPromptTokens) && req.estimatedPromptTokens >= 0 ?
+    Math.floor(req.estimatedPromptTokens) :
+    0;
+    const safeMaxOutTokens =
+    Number.isFinite(req.maxOutputTokens) && req.maxOutputTokens >= 0 ?
+    Math.floor(req.maxOutputTokens) :
+    0;
+    const clampedCacheRatio = Number.isFinite(prefixCacheMatchedRatio) ?
+    Math.max(0, Math.min(1, prefixCacheMatchedRatio)) :
+    0;
+
     const bucket = this.getOrCreateBucket(endpoint.endpoint_id);
-    const totalRequestedTokens = req.estimatedPromptTokens + req.maxOutputTokens;
+    const totalRequestedTokens = safePromptTokens + safeMaxOutTokens;
     const consumeRes = bucket.tryConsume(totalRequestedTokens, nowMs);
     if (!consumeRes.allowed) {
       if (slot.isHalfOpenProbe) {
@@ -97,9 +110,9 @@ class ModelPoolClientAdapter {
       throw new Error(`RateLimitExceeded on ${endpoint.endpoint_id}: wait ${consumeRes.waitMs}ms`);
     }
 
-    const cachedTokens = Math.floor(req.estimatedPromptTokens * prefixCacheMatchedRatio);
-    const uncachedTokens = req.estimatedPromptTokens - cachedTokens;
-    const baseTtftMs = Math.max(15, endpoint.ttft_ewma_ms * (1 - 0.35 * prefixCacheMatchedRatio));
+    const cachedTokens = Math.min(safePromptTokens, Math.floor(safePromptTokens * clampedCacheRatio));
+    const uncachedTokens = Math.max(0, safePromptTokens - cachedTokens);
+    const baseTtftMs = Math.max(15, endpoint.ttft_ewma_ms * (1 - 0.35 * clampedCacheRatio));
 
     const outputText = req.requireJsonSchema ?
     JSON.stringify({ action: "act", tool: "shell_exec", turn: req.turnIndex }) :
@@ -109,18 +122,20 @@ class ModelPoolClientAdapter {
     const sseSummary = this.sseAdapter.streamAndParseCompletion({
       modelName: endpoint.model_name,
       tokens: tokenChunks,
-      promptTokens: req.estimatedPromptTokens,
+      promptTokens: safePromptTokens,
       cachedPromptTokens: cachedTokens,
       baseTtftMs,
       perTokenStepMs: 4.5
     });
 
-    const totalLatencyMs = baseTtftMs + req.maxOutputTokens * 4.5;
+    const totalLatencyMs = baseTtftMs + safeMaxOutTokens * 4.5;
 
     const inRate = this.pricePer1kInputUsd.get(endpoint.endpoint_id) ?? 0.003;
     const outRate = this.pricePer1kOutputUsd.get(endpoint.endpoint_id) ?? 0.015;
-    const costUsd =
-    (uncachedTokens + cachedTokens * 0.1) / 1000 * inRate + req.maxOutputTokens / 1000 * outRate;
+    const costUsd = Math.max(
+    0,
+    (uncachedTokens + cachedTokens * 0.1) / 1000 * inRate + safeMaxOutTokens / 1000 * outRate);
+
 
     breaker.recordSuccess();
     endpoint.ttft_ewma_ms = Math.round(endpoint.ttft_ewma_ms * 0.7 + sseSummary.ttftMs * 0.3);
@@ -132,8 +147,8 @@ class ModelPoolClientAdapter {
       ttftMs: baseTtftMs,
       tpotMs: sseSummary.tpotMs,
       totalLatencyMs,
-      promptTokens: req.estimatedPromptTokens,
-      completionTokens: req.maxOutputTokens,
+      promptTokens: safePromptTokens,
+      completionTokens: safeMaxOutTokens,
       cachedTokens: sseSummary.cachedPromptTokens,
       costUsd: Number(costUsd.toFixed(6)),
       outputText: sseSummary.assembledContent,

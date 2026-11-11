@@ -2356,6 +2356,18 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M63] Deep DFX Hardening Phase II Audit (`POST /v1beta1/management/system/dfx-deep-audit`)
+    if (method === "POST" && pathname === "/v1beta1/management/system/dfx-deep-audit") {
+      const body = await this.readJsonBody(req);
+      const result = await this.managementPlane.executeDfxDeepModuleHardeningAudit({
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(result.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // [M62] DFX Full-Spectrum Resiliency, Diagnosability, Testability & Operability Hardening Audit (`POST /v1beta1/management/system/dfx-hardening-audit`)
     if (method === "POST" && pathname === "/v1beta1/management/system/dfx-hardening-audit") {
       const body = await this.readJsonBody(req);
