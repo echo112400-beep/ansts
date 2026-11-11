@@ -2,6 +2,7 @@
  * @fileoverview M43 End-to-End Verification: denoland/celld v0.6.3 Native Runtime Engine Endpoints,
  * LayerFS 2.0 Rule D9 Store Synchronizer, Closed-Loop Quota Admission Gate & Management Audit SSE Stream.
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";

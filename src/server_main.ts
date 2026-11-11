@@ -14,6 +14,7 @@ import { TaskSpecValidator, TaskSpecValidationError } from "./gateway/validator.
 import { IngressBackpressureController } from "./gateway/backpressure.js";
 import { SseEventStreamGateway } from "./gateway/sse_stream.js";
 import { DashboardBridgeService, DashboardBackendServer, PlatformManagementPlaneEngine, ManagementScenarioId } from "./dashboard/server.js";
+import { ConsoleRbacAuthGuard, ConsoleRbacForbiddenError, type ConsolePermission, type OperatorJwtClaims } from "./dashboard/console_rbac_guard.js";
 import { OtelAndPrometheusExporter } from "./telemetry/otel_prometheus.js";
 import { LayerFsWorkspaceDriver } from "./runtime/layerfs_workspace_driver.js";
 import { ManualFleetScaleController } from "./cluster/manual_scale_controller.js";
@@ -142,6 +143,8 @@ export class AnstsLocalAndComposeServer {
   public readonly walEngine: TurnWalEngine;
   public readonly timeTravelReplayer: DeterministicTimeTravelReplayer;
   public readonly heavyMigrator: EphemeralHeavyExecutorMigrator;
+  /** Present only when ANSTS_CONSOLE_RBAC_SECRET is set. Never falls back to a built-in secret. */
+  private readonly consoleRbac: ConsoleRbacAuthGuard | null;
   public readonly harnessRunner: AgentHarnessRunner;
   public readonly velocityBreaker: SyntacticAndVelocityBreaker;
   public readonly dagEscrow: DagEscrowCoordinator;
@@ -198,6 +201,11 @@ export class AnstsLocalAndComposeServer {
     }
     const sqlFilePath = path.join(this.storageDir, "v25_scheduler.sql.json");
     this.v25Store = new SchedulerV25SingleWritePathStore(new DurableDiskCellSqlStorage(sqlFilePath));
+    const rbacSecret = process.env.ANSTS_CONSOLE_RBAC_SECRET;
+    this.consoleRbac =
+      typeof rbacSecret === "string" && rbacSecret.length > 0
+        ? new ConsoleRbacAuthGuard(rbacSecret, path.join(this.storageDir, "console-rbac-audit.jsonl"))
+        : null;
     this.tunnelRouter = new EdgeTunnelHaRouter();
     this.blackboard = new SharedBlackboardAndGitArbiter();
     this.deadlockDetector = new A2aWaitForGraphDeadlockDetector();
@@ -505,10 +513,84 @@ export class AnstsLocalAndComposeServer {
     });
   }
 
+  private writeJson(res: http.ServerResponse, status: number, body: Record<string, unknown>): void {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  }
+
+  /**
+   * Reads stay unauthenticated so an operator can see why writes are refused.
+   * Management and console mutations require Authorization: Bearer and ignore body role/actor.
+   */
+  private requiresConsoleWriteAuth(method: string, pathname: string): boolean {
+    if (method !== "POST" && method !== "PUT" && method !== "PATCH" && method !== "DELETE") return false;
+    return pathname.startsWith("/v1beta1/management/") || pathname.startsWith("/v1beta1/console/");
+  }
+
+  private permissionForConsoleWrite(pathname: string): ConsolePermission {
+    if (pathname.includes("/approvals/")) return "hitl:approve";
+    if (pathname.includes("/tasks/")) return "tasks:dispatch";
+    return "slots:migrate";
+  }
+
+  private authorizeConsoleWrite(
+    req: http.IncomingMessage,
+    permission: ConsolePermission,
+  ): { ok: true; claims: OperatorJwtClaims } | { ok: false; status: number; error: string; message: string } {
+    if (!this.consoleRbac) {
+      return {
+        ok: false,
+        status: 401,
+        error: "RBAC_SECRET_UNSET",
+        message: "ANSTS_CONSOLE_RBAC_SECRET is unset; console writes are refused",
+      };
+    }
+    const header = String(req.headers.authorization ?? "");
+    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
+    if (!token) {
+      return { ok: false, status: 401, error: "UNAUTHORIZED", message: "Authorization: Bearer is required" };
+    }
+    try {
+      const { claims } = this.consoleRbac.verifyAndAuthorizeAction(token, permission);
+      (req as http.IncomingMessage & { consoleOperator?: OperatorJwtClaims }).consoleOperator = claims;
+      return { ok: true, claims };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "forbidden";
+      const status = err instanceof ConsoleRbacForbiddenError && message.startsWith("403") ? 403 : 401;
+      return {
+        ok: false,
+        status,
+        error: status === 403 ? "RBAC_FORBIDDEN" : "UNAUTHORIZED",
+        message,
+      };
+    }
+  }
+
+  private consoleActor(req: http.IncomingMessage): { actor: string; role: string } {
+    const claims = (req as http.IncomingMessage & { consoleOperator?: OperatorJwtClaims }).consoleOperator;
+    return { actor: claims?.sub ?? "", role: claims?.role ?? "" };
+  }
+
+  private boundedText(value: unknown, max: number): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > max) return null;
+    if (/[\u0000-\u001f]/.test(trimmed)) return null;
+    return trimmed;
+  }
+
   private async handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const method = req.method ?? "GET";
     const urlObj = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = urlObj.pathname;
+
+    if (this.requiresConsoleWriteAuth(method, pathname)) {
+      const decision = this.authorizeConsoleWrite(req, this.permissionForConsoleWrite(pathname));
+      if (!decision.ok) {
+        this.writeJson(res, decision.status, { error: decision.error, message: decision.message });
+        return;
+      }
+    }
 
     if (
       method === "GET" &&
@@ -1200,8 +1282,12 @@ export class AnstsLocalAndComposeServer {
     // [M40] TanStack Console BFF: Interactive Brain Shard Eviction & Rebalance (`POST /v1beta1/console/shards/rebalance`)
     if (method === "POST" && pathname === "/v1beta1/console/shards/rebalance") {
       const body = await this.readJsonBody(req);
-      const action = String(body.action ?? "evict");
-      const brainNodeId = String(body.brainNodeId ?? "brain-node-02");
+      const action = this.boundedText(body.action, 32);
+      const brainNodeId = this.boundedText(body.brainNodeId, 128);
+      if (!action || (action !== "evict" && action !== "register") || !brainNodeId) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: !action ? "action" : "brainNodeId" });
+        return;
+      }
       let event: Record<string, unknown> = {};
       if (action === "evict") {
         event = this.shardCoordinator.evictUnhealthyBrainShardNode(brainNodeId);
@@ -2146,7 +2232,7 @@ export class AnstsLocalAndComposeServer {
         return;
       }
       const nextScenario = (body.scenario ?? "normal") as ManagementScenarioId;
-      const actor = String(body.actor ?? "chen");
+      const actor = this.consoleActor(req).actor;
       this.managementPlane.setScenario(nextScenario, actor);
       await this.managementPlane.pushManagementStateToS3();
       const statePayload = await this.managementPlane.buildFullManagementState();
@@ -2162,8 +2248,8 @@ export class AnstsLocalAndComposeServer {
         maxSlots: Number(body.maxSlots ?? 160),
         dailyBudgetUsd: Number(body.dailyBudgetUsd ?? 1200),
         expectedVersion: Number(body.expectedVersion ?? 14),
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status === 200) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2175,12 +2261,22 @@ export class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/nodes/batch") {
       const body = await this.readJsonBody(req);
+      const operation = this.boundedText(body.operation, 32);
+      const nodeIds = Array.isArray(body.nodeIds) ? body.nodeIds : null;
+      if (!operation || !["drain", "cordon", "uncordon", "prewarm"].includes(operation)) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "operation" });
+        return;
+      }
+      if (!nodeIds || nodeIds.length === 0 || nodeIds.some((id) => this.boundedText(id, 128) === null)) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "nodeIds" });
+        return;
+      }
       const result = this.managementPlane.executeBatchNodeOperation({
-        operation: (body.operation ?? "drain") as "drain" | "cordon" | "uncordon" | "prewarm",
-        nodeIds: (body.nodeIds as string[]) ?? ["celld-brain-01", "body-host-01", "body-host-02"],
+        operation: operation as "drain" | "cordon" | "uncordon" | "prewarm",
+        nodeIds: nodeIds.map((id) => String(id)),
         forceMigrateLeases: Boolean(body.forceMigrateLeases ?? false),
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
@@ -2190,11 +2286,21 @@ export class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/tasks/cancel") {
       const body = await this.readJsonBody(req);
+      const taskId = this.boundedText(body.taskId, 128);
+      const mode = this.boundedText(body.mode, 32);
+      if (!taskId) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "taskId" });
+        return;
+      }
+      if (mode !== "graceful" && mode !== "force_fence") {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "mode" });
+        return;
+      }
       const result = this.managementPlane.cancelOrFenceTask({
-        taskId: String(body.taskId ?? "task-ns-8841"),
-        mode: (body.mode ?? "graceful") as "graceful" | "force_fence",
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        taskId,
+        mode,
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });
@@ -2204,11 +2310,16 @@ export class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/tasks/time-travel") {
       const body = await this.readJsonBody(req);
+      const taskId = this.boundedText(body.taskId, 128);
+      if (!taskId) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "taskId" });
+        return;
+      }
       const result = this.managementPlane.inspectAndForkTaskTurn({
-        taskId: String(body.taskId ?? "task-ns-8841"),
+        taskId,
         targetTurnIndex: Number(body.targetTurnIndex ?? 3),
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status === 200) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2220,14 +2331,26 @@ export class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/approvals/create") {
       const body = await this.readJsonBody(req);
+      const type = this.boundedText(body.type, 64);
+      const target = this.boundedText(body.target, 200);
+      const region = this.boundedText(body.region, 64);
+      const tenant = this.boundedText(body.tenant, 64);
+      const risk = body.risk === undefined ? undefined : this.boundedText(body.risk, 16);
+      if (!type || !target || !region || !tenant || (body.risk !== undefined && !risk)) {
+        this.writeJson(res, 400, {
+          error: "MISSING_OR_INVALID_FIELD",
+          field: !type ? "type" : !target ? "target" : !region ? "region" : !tenant ? "tenant" : "risk",
+        });
+        return;
+      }
       const result = this.managementPlane.createApprovalTicket({
-        type: String(body.type ?? "QUOTA_EMERGENCY_BOOST"),
-        target: String(body.target ?? "Northstar (120 → 180 并发槽)"),
-        region: String(body.region ?? "us-west-2"),
-        tenant: String(body.tenant ?? "Northstar"),
-        initiator: String(body.initiator ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
-        risk: body.risk ? String(body.risk) : undefined,
+        type,
+        target,
+        region,
+        tenant,
+        initiator: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
+        risk,
       });
       if (result.status === 201) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2239,12 +2362,21 @@ export class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/approvals/decide") {
       const body = await this.readJsonBody(req);
+      const approvalId = this.boundedText(body.approvalId, 64);
+      const decision = this.boundedText(body.decision, 16);
+      if (!approvalId) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "approvalId" });
+        return;
+      }
+      if (decision !== "approve" && decision !== "reject") {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "decision" });
+        return;
+      }
       const result = this.managementPlane.decideApprovalTicket({
-        approvalId: String(body.approvalId ?? "APR-2026-091"),
-        initiator: body.initiator ? String(body.initiator) : undefined,
-        approver: String(body.approver ?? "zhou"),
-        role: String(body.role ?? "SRE_ADMIN"),
-        decision: (body.decision ?? "approve") as "approve" | "reject",
+        approvalId,
+        approver: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
+        decision,
       });
       if (result.status === 200) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2256,14 +2388,24 @@ export class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/nodes/scale") {
       const body = await this.readJsonBody(req);
+      const action = this.boundedText(body.action, 32);
+      const nodeId = this.boundedText(body.nodeId, 128);
+      if (action !== "scale_out" && action !== "decommission") {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "action" });
+        return;
+      }
+      if (!nodeId) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "nodeId" });
+        return;
+      }
       const result = this.managementPlane.scaleOutOrDecommissionNode({
-        action: (body.action ?? "scale_out") as "scale_out" | "decommission",
-        nodeId: String(body.nodeId ?? "body-host-04"),
+        action,
+        nodeId,
         region: String(body.region ?? "us-west-2"),
         role: (body.role === "brain" ? "brain" : "body") as "brain" | "body",
         ipAddress: body.ipAddress ? String(body.ipAddress) : undefined,
-        actor: String(body.actor ?? "chen"),
-        actorRole: String(body.actorRole ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        actorRole: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2280,8 +2422,8 @@ export class AnstsLocalAndComposeServer {
         tenantId: String(body.tenantId ?? "Northstar"),
         spendDeltaUsd: body.spendDeltaUsd !== undefined ? Number(body.spendDeltaUsd) : undefined,
         escrowDeltaSlots: body.escrowDeltaSlots !== undefined ? Number(body.escrowDeltaSlots) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2293,13 +2435,18 @@ export class AnstsLocalAndComposeServer {
 
     if (method === "POST" && pathname === "/v1beta1/management/tasks/step") {
       const body = await this.readJsonBody(req);
+      const taskId = this.boundedText(body.taskId, 128);
+      if (!taskId) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: "taskId" });
+        return;
+      }
       const result = this.managementPlane.executeTaskTurnStep({
-        taskId: String(body.taskId ?? "task-ns-8841"),
+        taskId,
         toolName: body.toolName ? String(body.toolName) : undefined,
         shellCommand: body.shellCommand ? String(body.shellCommand) : undefined,
         executeRealBash: Boolean(body.executeRealBash ?? false),
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2315,8 +2462,8 @@ export class AnstsLocalAndComposeServer {
         action: (body.action ?? "promote_step") as "promote_step" | "inject_anomaly" | "reset_canary" | "toggle_region",
         regionId: body.regionId ? String(body.regionId) : undefined,
         capacityAvailable: body.capacityAvailable !== undefined ? Boolean(body.capacityAvailable) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2341,8 +2488,8 @@ export class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/v1beta1/management/system/kernel-storage-audit") {
       const body = await this.readJsonBody(req);
       const result = await this.managementPlane.executeKernelStorageMergeAndBackpressureAudit({
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2353,8 +2500,8 @@ export class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/v1beta1/management/system/storage-ha-audit") {
       const body = await this.readJsonBody(req);
       const result = await this.managementPlane.executeStorageShardSyncAndTransactionAudit({
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2365,8 +2512,8 @@ export class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/v1beta1/management/system/deep-runtime-audit") {
       const body = await this.readJsonBody(req);
       const result = await this.managementPlane.executeDeepRuntimeResilienceAndAntiStarvationAudit({
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2377,8 +2524,8 @@ export class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/v1beta1/management/system/risk-elimination-audit") {
       const body = await this.readJsonBody(req);
       const result = this.managementPlane.executeDeepCrossLayerRiskEliminationAudit({
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2389,8 +2536,8 @@ export class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/v1beta1/management/system/deep-rectification-audit") {
       const body = await this.readJsonBody(req);
       const result = await this.managementPlane.executeSystemWideRectificationAudit({
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2401,8 +2548,8 @@ export class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/v1beta1/management/scheduler/kernel-audit") {
       const body = await this.readJsonBody(req);
       const result = this.managementPlane.executeSchedulerKernelAntiStaleDeadlockStarvationAudit({
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2440,8 +2587,8 @@ export class AnstsLocalAndComposeServer {
         runtimeOverrides: body.runtimeOverrides ? (body.runtimeOverrides as Record<string, unknown>) : undefined,
         sampleTaskSpec: body.sampleTaskSpec ? (body.sampleTaskSpec as Record<string, unknown>) : undefined,
         note: body.note ? String(body.note) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2463,8 +2610,8 @@ export class AnstsLocalAndComposeServer {
         concurrentRequests: body.concurrentRequests !== undefined ? Number(body.concurrentRequests) : undefined,
         peerFsyncLatencyMs: body.peerFsyncLatencyMs !== undefined ? Number(body.peerFsyncLatencyMs) : undefined,
         basedOnGeneration: body.basedOnGeneration !== undefined ? Number(body.basedOnGeneration) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2481,8 +2628,8 @@ export class AnstsLocalAndComposeServer {
         simulatedErrorRequests: body.simulatedErrorRequests !== undefined ? Number(body.simulatedErrorRequests) : undefined,
         simulatedP99LatencyMs: body.simulatedP99LatencyMs !== undefined ? Number(body.simulatedP99LatencyMs) : undefined,
         runbookId: body.runbookId ? String(body.runbookId) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2502,8 +2649,8 @@ export class AnstsLocalAndComposeServer {
         endpointId: body.endpointId ? String(body.endpointId) : undefined,
         promptTokens: body.promptTokens !== undefined ? Number(body.promptTokens) : undefined,
         maxOutputTokens: body.maxOutputTokens !== undefined ? Number(body.maxOutputTokens) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2525,8 +2672,8 @@ export class AnstsLocalAndComposeServer {
         branchName: body.branchName ? String(body.branchName) : undefined,
         allowedHostname: body.allowedHostname ? String(body.allowedHostname) : undefined,
         blockedHostname: body.blockedHostname ? String(body.blockedHostname) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2543,8 +2690,8 @@ export class AnstsLocalAndComposeServer {
         targetHost: body.targetHost ? String(body.targetHost) : undefined,
         expectedGeneration: body.expectedGeneration !== undefined ? Number(body.expectedGeneration) : undefined,
         nextMembers: Array.isArray(body.nextMembers) ? (body.nextMembers as string[]) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2562,8 +2709,8 @@ export class AnstsLocalAndComposeServer {
         hostId: body.hostId ? String(body.hostId) : undefined,
         sovereigntyZone: body.sovereigntyZone ? (String(body.sovereigntyZone) as "US" | "EU" | "APAC") : undefined,
         taskId: body.taskId ? String(body.taskId) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2575,8 +2722,8 @@ export class AnstsLocalAndComposeServer {
       const body = await this.readJsonBody(req);
       const result = this.managementPlane.executeUnifiedPersistenceSnapshot({
         action: (body.action ?? "snapshot_all") as "snapshot_all" | "verify_cold_start_rehydration",
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2592,8 +2739,8 @@ export class AnstsLocalAndComposeServer {
         runtime: body.runtime ? (String(body.runtime) as "runc" | "runsc" | "kata") : undefined,
         workflowId: body.workflowId ? String(body.workflowId) : undefined,
         stepName: body.stepName ? String(body.stepName) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2607,8 +2754,8 @@ export class AnstsLocalAndComposeServer {
         taskId: body.taskId ? String(body.taskId) : undefined,
         sourceBranch: body.sourceBranch ? String(body.sourceBranch) : undefined,
         mergeWinningBranch: body.mergeWinningBranch !== undefined ? Boolean(body.mergeWinningBranch) : true,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2622,8 +2769,8 @@ export class AnstsLocalAndComposeServer {
         action: (body.action ?? "probe_and_autoscale") as "probe_and_autoscale" | "simulate_psi_spike",
         simulatedPsiFullPct: body.simulatedPsiFullPct !== undefined ? Number(body.simulatedPsiFullPct) : undefined,
         incomingWriteRps: body.incomingWriteRps !== undefined ? Number(body.incomingWriteRps) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2644,8 +2791,8 @@ export class AnstsLocalAndComposeServer {
         filePath: body.filePath ? String(body.filePath) : undefined,
         fileContent: body.fileContent ? String(body.fileContent) : undefined,
         targetNodeId: body.targetNodeId ? String(body.targetNodeId) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2666,8 +2813,8 @@ export class AnstsLocalAndComposeServer {
         taskId: body.taskId ? String(body.taskId) : undefined,
         turnIndex: body.turnIndex !== undefined ? Number(body.turnIndex) : undefined,
         toolArgs: body.toolArgs ? (body.toolArgs as Record<string, unknown>) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2693,8 +2840,8 @@ export class AnstsLocalAndComposeServer {
         authorAgentId: body.authorAgentId ? String(body.authorAgentId) : undefined,
         patches: Array.isArray(body.patches) ? (body.patches as Array<{ agentId: string; touchedFiles: string[]; priorityScore: number }>) : undefined,
         victimAgentId: body.victimAgentId ? String(body.victimAgentId) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2707,11 +2854,17 @@ export class AnstsLocalAndComposeServer {
     // [M45-2] Live Heavy Task Cross-Node CRIU/Upperdir Migration (`POST /v1beta1/management/tasks/migrate`)
     if (method === "POST" && pathname === "/v1beta1/management/tasks/migrate") {
       const body = await this.readJsonBody(req);
+      const taskId = this.boundedText(body.taskId, 128);
+      const targetNodeId = this.boundedText(body.targetNodeId, 128);
+      if (!taskId || !targetNodeId) {
+        this.writeJson(res, 400, { error: "MISSING_OR_INVALID_FIELD", field: !taskId ? "taskId" : "targetNodeId" });
+        return;
+      }
       const result = await this.managementPlane.migrateTaskAcrossBodyNodes({
-        taskId: String(body.taskId ?? "task-ns-8841"),
-        targetNodeId: body.targetNodeId ? String(body.targetNodeId) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        taskId,
+        targetNodeId,
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2739,8 +2892,8 @@ export class AnstsLocalAndComposeServer {
       const result = this.managementPlane.executeStorageGcAndEpochAudit({
         action: (body.action ?? "sweep_cas") as "seed_orphans" | "sweep_cas" | "epoch_gc_audit",
         graceSecs: body.graceSecs !== undefined ? Number(body.graceSecs) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();
@@ -2756,8 +2909,8 @@ export class AnstsLocalAndComposeServer {
       const result = this.managementPlane.runFleetRollingUpgradeDiagnostics({
         expectedProtocol: body.expectedProtocol ? String(body.expectedProtocol) : undefined,
         enqueueWebhookTest: Boolean(body.enqueueWebhookTest ?? true),
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
@@ -2768,8 +2921,8 @@ export class AnstsLocalAndComposeServer {
       const body = await this.readJsonBody(req);
       const result = this.managementPlane.executeCapacityOrRebalanceAction({
         action: (body.action ?? "mitigate_capacity") as "mitigate_capacity" | "rebalance_verification" | "apply_budget_fallback",
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN"),
+        actor: this.consoleActor(req).actor,
+        role: this.consoleActor(req).role,
       });
       await this.managementPlane.pushManagementStateToS3();
       res.writeHead(result.status, { "content-type": "application/json" });

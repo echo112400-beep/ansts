@@ -7,6 +7,7 @@
  * 4. Global stateless Task Table fan-out across Brain shards (`GET /v1beta1/console/tasks`)
  * 5. LayerFS Branch & Line-Level Blame explorer BFF (`GET /v1beta1/console/layerfs`)
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";

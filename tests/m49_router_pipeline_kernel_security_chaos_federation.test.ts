@@ -6,6 +6,7 @@
  * 3. [M49-3] Automated Split-Brain / Network Partition Chaos Drill, Host Preflight Readiness Gate & SQLite-Backed Topology CAS Coordinator (`POST /v1beta1/management/chaos/drill`).
  * 4. [M49-4] Dual-Homed Reverse Tunnel Failover (`TunnelGatewayCell`), Multi-Region Federation (`MultiRegionFederationRouter`), `AgentTaskHarnessCell` Auto-Heal & Velocity/Staging Gate (`POST /v1beta1/management/federation/tunnel-harness`).
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";

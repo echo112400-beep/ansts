@@ -171,6 +171,15 @@
   }
 
   let state = createBaselineState();
+  state.scenario = 'unknown';
+  state.hasVerifiedSnapshot = false;
+  state.liveBackendConnected = false;
+  state.tenants = [];
+  state.tasks = [];
+  state.nodes = [];
+  state.approvals = [];
+  state.auditLogs = [];
+  state.sla = null;
   let currentDialogHandler = null;
   let toastTimer = null;
 
@@ -181,6 +190,33 @@
     return 'http://127.0.0.1:8088';
   }
 
+  function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    }[ch]));
+  }
+
+  function consoleToken() {
+    try { return sessionStorage.getItem('anstsConsoleToken') || ''; } catch (_err) { return ''; }
+  }
+
+  function offlineApiResult(method) {
+    const write = method !== 'GET' && method !== 'HEAD';
+    return {
+      ok: false,
+      status: 503,
+      data: {
+        error: write ? 'WRITE_REJECTED_OFFLINE' : 'MANAGEMENT_API_UNAVAILABLE',
+        message: write ? '后端不可达，写操作已拒绝' : '后端不可达'
+      },
+      fromLiveBackend: false
+    };
+  }
+
   // Real Backend API Client: calls actual /v1beta1/management/* & /v1/* endpoints on the ANSTS server
   async function callBackendApi(method, endpointPath, payload) {
     const origin = getBackendOrigin();
@@ -188,9 +224,12 @@
     try {
       const ctrl = new AbortController();
       const tid = setTimeout(() => ctrl.abort(), 1800);
+      const headers = { 'content-type': 'application/json', 'accept': 'application/json' };
+      const token = consoleToken();
+      if (token) headers.authorization = 'Bearer ' + token;
       const resp = await fetch(fullUrl, {
         method,
-        headers: { 'content-type': 'application/json', 'accept': 'application/json' },
+        headers,
         body: payload ? JSON.stringify(payload) : undefined,
         signal: ctrl.signal
       });
@@ -202,7 +241,7 @@
     } catch (_err) {
       state.liveBackendConnected = false;
       updateConnectionIndicators(false);
-      return executeLocalEngineMirror(method, endpointPath, payload || {});
+      return offlineApiResult(method);
     }
   }
 
@@ -230,10 +269,10 @@
   async function fetchBackendState(recoverOffline) {
     const qs = `?region=${encodeURIComponent(state.region)}&tenant=${encodeURIComponent(state.tenant)}&timeRange=${encodeURIComponent(state.timeRange)}${recoverOffline ? '&recover=1' : ''}`;
     const res = await callBackendApi('GET', `/v1beta1/management/state${qs}`);
-    if (res.status === 503) {
-      state.scenario = 'offline';
+    if (res.status === 503 || (res.ok === false && !res.fromLiveBackend)) {
+      state.scenario = state.hasVerifiedSnapshot ? 'offline' : 'unknown';
       const scSel = document.getElementById('scenario');
-      if (scSel) scSel.value = 'offline';
+      if (scSel) scSel.value = state.scenario === 'offline' ? 'offline' : 'normal';
       updateConnectionIndicators(state.liveBackendConnected);
       updateHeaderAndRail();
       renderMainContent();
@@ -241,6 +280,7 @@
     }
     if (res.data && Array.isArray(res.data.tenants)) {
       const d = res.data;
+      state.hasVerifiedSnapshot = true;
       state.scenario = d.scenario || state.scenario;
       state.lastSyncUtc = d.lastSyncUtc || state.lastSyncUtc;
       state.loadSheddingActive = Boolean(d.loadSheddingActive);
@@ -268,562 +308,6 @@
   }
 
   // Deterministic Local Engine Mirror (used only when Canvas iframe cannot reach 127.0.0.1:8088)
-  function executeLocalEngineMirror(method, endpointPath, body) {
-    if (method === 'GET' && endpointPath.startsWith('/v1beta1/management/state')) {
-      if ( endpointPath.includes('recover=1') ) {
-        state.scenario = 'normal';
-      }
-      if (state.scenario === 'offline') {
-        return { ok: false, status: 503, data: { error: 'MANAGEMENT_API_UNAVAILABLE' }, fromLiveBackend: false };
-      }
-      return { ok: true, status: 200, data: state, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/scenario') {
-      if (body.action === 'reset') {
-        const curId = state.identity;
-        const curNav = state.activeNav;
-        state = createBaselineState();
-        state.identity = curId;
-        state.activeNav = curNav;
-        return { ok: true, status: 200, data: { reset: true, state }, fromLiveBackend: false };
-      }
-      state.scenario = body.scenario || 'normal';
-      if (state.scenario === 'stale') state.lastSyncUtc = '2026-11-10 09:12:00 UTC';
-      else state.lastSyncUtc = '2026-11-10 09:30:00 UTC';
-      if (state.scenario === 'conflict') {
-        const ns = state.tenants.find((t) => t.id === 'Northstar');
-        if (ns && ns.configVersion < 15) {
-          ns.configVersion = 15;
-          ns.maxSlots = 150;
-          ns.updatedBy = 'zhou';
-        }
-      }
-      if (state.scenario === 'cancel-unknown') {
-        const tk = state.tasks.find((t) => t.id === 'task-ns-8841');
-        if (tk) tk.state = 'CANCEL_UNCONFIRMED';
-      }
-      if (state.scenario === 'partial') {
-        state.batchReport = {
-          operation: 'drain',
-          partialFailure: true,
-          results: [
-            { nodeId: 'celld-brain-01', status: 'SUCCEEDED' },
-            { nodeId: 'body-host-01', status: 'SUCCEEDED' },
-            { nodeId: 'body-host-02', status: 'FAILED', errorCode: 'ERR_ACTIVE_LEASE_PINNED', message: '节点 body-host-02 持有未释放的 P0 任务租约 (task-ns-8841@epoch:12)' }
-          ]
-        };
-      }
-      return { ok: true, status: 200, data: { scenario: state.scenario, state }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/tenants/config') {
-      const t = state.tenants.find((x) => x.id === body.tenantId) || state.tenants[0];
-      if (Number(body.expectedVersion) !== t.configVersion) {
-        return {
-          ok: false,
-          status: 409,
-          data: {
-            error: 'CAS_VERSION_CONFLICT',
-            actualVersion: t.configVersion,
-            updatedBy: t.updatedBy || 'zhou',
-            currentMaxSlots: t.maxSlots,
-            message: `CAS 版本冲突：基线版本 v${body.expectedVersion} 已过期，远端当前版本为 v${t.configVersion}（由 ${t.updatedBy || 'zhou'} 更新）`
-          },
-          fromLiveBackend: false
-        };
-      }
-      t.maxSlots = Number(body.maxSlots);
-      t.dailyBudgetUsd = Number(body.dailyBudgetUsd);
-      t.configVersion += 1;
-      t.updatedBy = body.actor || 'chen';
-      if (state.scenario === 'quota' || state.scenario === 'conflict') state.scenario = 'normal';
-      state.auditLogs.unshift({
-        ts: '09:31:05 UTC',
-        actor: body.actor || 'chen',
-        role: body.role || 'SRE_ADMIN',
-        action: `更新租户 ${t.id} 配额上限至 ${t.maxSlots} 槽 / 日预算 $${t.dailyBudgetUsd}`,
-        scope: `${t.region} / ${t.id}`,
-        outcome: `已生效 (v${t.configVersion})`
-      });
-      return { ok: true, status: 200, data: { tenantId: t.id, configVersion: t.configVersion }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/nodes/batch') {
-      const nodeIds = body.nodeIds || [];
-      const results = [];
-      for (const nId of nodeIds) {
-        const node = state.nodes.find((n) => n.id === nId);
-        const hasPinned = node && node.pinnedP0Tasks && node.pinnedP0Tasks.length > 0;
-        if (body.operation === 'drain' && hasPinned && !body.forceMigrateLeases) {
-          if (node) node.status = 'DRAIN_FAILED';
-          results.push({ nodeId: nId, status: 'FAILED', errorCode: 'ERR_ACTIVE_LEASE_PINNED', message: `节点 ${nId} 持有未释放的 P0 任务租约 (task-ns-8841@epoch:12)` });
-        } else {
-          if (node) {
-            if (body.forceMigrateLeases) node.pinnedP0Tasks = [];
-            node.status = body.operation === 'drain' || body.operation === 'cordon' ? 'CORDONED' : 'READY';
-          }
-          results.push({ nodeId: nId, status: 'SUCCEEDED' });
-        }
-      }
-      const partialFailure = results.some((r) => r.status === 'FAILED');
-      state.batchReport = { operation: body.operation, partialFailure, results };
-      if (!partialFailure && state.scenario === 'partial') state.scenario = 'normal';
-      return { ok: !partialFailure, status: partialFailure ? 207 : 200, data: state.batchReport, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/tasks/cancel') {
-      const tk = state.tasks.find((t) => t.id === body.taskId) || state.tasks[0];
-      if (body.mode === 'force_fence') {
-        tk.fence += 1;
-        tk.state = 'FENCED_TERMINATED';
-        if (state.scenario === 'cancel-unknown') state.scenario = 'normal';
-        return { ok: true, status: 200, data: { taskId: tk.id, state: 'FENCED_TERMINATED', newFencingToken: tk.fence }, fromLiveBackend: false };
-      }
-      tk.state = 'CANCEL_UNCONFIRMED';
-      return { ok: true, status: 202, data: { taskId: tk.id, state: 'CANCEL_UNCONFIRMED', confirmed: false }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/tasks/time-travel') {
-      if (state.scenario === 'history-missing' && Number(body.targetTurnIndex) >= 4) {
-        return {
-          ok: false,
-          status: 422,
-          data: {
-            error: 'LTX_SEGMENT_MISSING',
-            message: `拒绝执行：任务 ${body.taskId} 的 Turn #${body.targetTurnIndex} S3 LTX 增量段未归档就绪，请选择最近完整校验点 Turn #3 (Commit C2)。`
-          },
-          fromLiveBackend: false
-        };
-      }
-      const newTaskId = `${body.taskId}-fork-t${body.targetTurnIndex}`;
-      state.tasks.unshift({
-        id: newTaskId,
-        tenant: 'Northstar',
-        region: 'us-west-2',
-        priority: 'P0',
-        shardSlot: 42,
-        brain: 'celld-brain-01',
-        body: 'body-host-01',
-        fence: 1,
-        turn: Number(body.targetTurnIndex),
-        branch: `branch-${newTaskId}`,
-        state: 'RUNNING_ACT'
-      });
-      if (state.scenario === 'history-missing') state.scenario = 'normal';
-      return { ok: true, status: 200, data: { forkedTaskId: newTaskId, layerfsBranch: `branch-${newTaskId}` }, fromLiveBackend: false };
-    }
-    if (method === 'GET' && endpointPath.startsWith('/v1beta1/management/tasks/') && endpointPath.endsWith('/turns')) {
-      const taskId = decodeURIComponent(endpointPath.slice('/v1beta1/management/tasks/'.length, endpointPath.length - '/turns'.length));
-      const isMissing = state.scenario === 'history-missing';
-      const turns = [1, 2, 3, 4, 5].map((idx) => ({
-        turnIndex: idx,
-        walSeq: idx,
-        fencingToken: 12,
-        crc32Hex: 'a8f40' + idx + 'c9',
-        integrityVerified: !(isMissing && idx >= 4),
-        changedFiles: ['src/' + taskId + '-turn' + idx + '.ts'],
-        sqliteWalPages: 4 + idx,
-        commitId: 'C' + (idx - 1),
-        ltxStatus: isMissing && idx >= 4 ? 'LTX_SEGMENT_MISSING' : 'VERIFIED'
-      }));
-      return { ok: true, status: 200, data: { taskId, branchName: 'branch-' + taskId, turns }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/approvals/create') {
-      if (body.role === 'VIEWER') {
-        return { ok: false, status: 403, data: { error: 'RBAC_FORBIDDEN', message: 'VIEWER 角色无权发起高危变更申请单' }, fromLiveBackend: false };
-      }
-      const approvalId = 'APR-2026-' + Math.floor(100 + Math.random() * 899);
-      const created = {
-        id: approvalId,
-        approvalId,
-        type: body.type || 'QUOTA_EMERGENCY_BOOST',
-        target: body.target || 'Northstar (120 → 180 并发槽)',
-        region: body.region || 'us-west-2',
-        tenant: body.tenant || 'Northstar',
-        initiator: body.initiator || 'chen',
-        status: 'PENDING_SECOND_ADMIN',
-        risk: body.risk || 'HIGH',
-        createdAt: '09:34 UTC'
-      };
-      state.approvals.unshift(created);
-      return { ok: true, status: 201, data: created, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/approvals/decide') {
-      const item = state.approvals.find((a) => a.id === body.approvalId);
-      const initiator = body.initiator || (item ? item.initiator : 'chen');
-      if (initiator === body.approver) {
-        return { ok: false, status: 409, data: { error: 'SELF_APPROVAL_FORBIDDEN', message: '双人异体复核拦截：发起人不能审批自己提交的高危申请单' }, fromLiveBackend: false };
-      }
-      const nextStatus = body.decision === 'approve' ? `APPROVED (${body.approver})` : `REJECTED (${body.approver})`;
-      if (item) item.status = nextStatus;
-      return { ok: true, status: 200, data: { approvalId: body.approvalId, status: nextStatus }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/celld/isolate') {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          nodeId: 'celld-gw-01',
-          isolateId: 'dyn-worker-task-isolate-01-t1-8f2a19c3',
-          globalOutboundBlocked: true,
-          coldStartLatencyMs: 0.42,
-          output: { computed: 42, isolateEnv: 'task-isolate-01' },
-          heapStatus: { status: 'HEALTHY', heapUtilizationPct: 31.4, measuredHeapMb: 40.2 }
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/celld/facets') {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          facetRecord: { facetName: 'facet-task-facet-01-t1-sql_sandbox', status: 'SPAWNED', isolatedSqliteDbName: 'sqlite://facet/facet-task-facet-01-t1-sql_sandbox.db' },
-          sqlBudgetElapsedMs: 0.08,
-          kvShard: { shardId: 14, physicalKey: 'kv-cell-14:idem-ns:task-facet-01:t1', byteLength: 62 },
-          activeFacetsCount: 1
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/celld/ltx-compaction') {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          taskId: 'task-ns-8841',
-          compactedSnapshot: { snapshotId: 'compact-task-ns-8841-t5', upToTurnIndex: 5, totalSqlitePages: 30, compactionRatio: 1 },
-          l1Compaction: { compactionTriggered: true, batchesMerged: 2, resultingL1Objects: 2 },
-          walTruncation: { shouldTruncateWalAtCheckpoint: true, usePagedRestore: true, estimatedFullHydrationSeconds: 18.75 },
-          uffdRestore: { eagerPagesLoaded: 6, lazyDeferredPages: 24, resumeLatencyMs: 4.4 }
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/layerfs/store-sync') {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          remoteGeneration: 1,
-          r2Key: 'layerfs-stores/ansts-fleet/store.db',
-          etag: '"etag-gen-1"'
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/nodes/scale') {
-      if (body.action === 'decommission') {
-        state.nodes = state.nodes.filter((n) => n.id !== body.nodeId);
-        return { ok: true, status: 200, data: { decommissioned: true, nodeId: body.nodeId }, fromLiveBackend: false };
-      }
-      const newNode = {
-        id: body.nodeId || 'body-host-04',
-        role: body.role === 'brain' ? 'Brain Shard (' + body.nodeId + ')' : 'Body LayerFS (' + body.nodeId + ')',
-        region: body.region || 'us-west-2',
-        slots: body.role === 'brain' ? 64 : 0,
-        cpuPct: 38.5,
-        psiPct: 1.8,
-        status: 'READY',
-        activeLeases: 12,
-        pinnedP0Tasks: [],
-        tunnelGw: 'celld-gw-01 (PRIMARY)'
-      };
-      state.nodes.push(newNode);
-      if (body.role === 'brain') {
-        state.slotDistribution = { 'brain-node-01': 64, 'brain-node-02': 64, 'brain-node-03': 64, [body.nodeId.replace('celld-brain-', 'brain-node-')]: 64 };
-      }
-      return { ok: true, status: 201, data: newNode, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/tenants/finops-escrow') {
-      const t = state.tenants.find((x) => x.id === body.tenantId) || state.tenants[0];
-      if (body.action === 'reserve_escrow') {
-        t.escrowReserved += Number(body.escrowDeltaSlots || 4);
-        return { ok: true, status: 200, data: { tenantId: t.id, escrowReserved: t.escrowReserved }, fromLiveBackend: false };
-      }
-      const delta = Number(body.spendDeltaUsd || 220);
-      t.spentUsd = (t.spentUsd || 0) + delta;
-      const ratio = t.spentUsd / Math.max(1, t.dailyBudgetUsd);
-      t.modelPolicy = ratio >= 1.0 ? '402 HARD_BLOCK (日预算已耗尽)' : ratio >= 0.8 ? '已触发 80% 软降级 → Qwen-3.8 Economy' : 'DeepSeek-R1 → Qwen-3.8 (80%)';
-      return { ok: true, status: 200, data: { tenantId: t.id, spentUsd: t.spentUsd, modelPolicy: t.modelPolicy }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/tasks/step') {
-      const tk = state.tasks.find((x) => x.id === body.taskId) || state.tasks[0];
-      tk.turn += 1;
-      return { ok: true, status: 200, data: { taskId: tk.id, turnIndex: tk.turn, crc32Hex: 'c91f00' + tk.turn, commitId: 'C' + (tk.turn - 1) }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/canary') {
-      if (body.action === 'toggle_region') {
-        return { ok: true, status: 200, data: { updated: true, regionId: body.regionId }, fromLiveBackend: false };
-      }
-      if (!state.canary) state.canary = { state: 'CANARY_ACTIVE', trafficWeightPct: 5 };
-      if (body.action === 'reset_canary') {
-        state.canary = { state: 'CANARY_ACTIVE', trafficWeightPct: 5 };
-      } else if (body.action === 'inject_anomaly') {
-        state.canary = { state: 'ROLLED_BACK', trafficWeightPct: 0 };
-      } else {
-        const nextW = Math.min(100, state.canary.trafficWeightPct * 2 + 15);
-        state.canary = { state: nextW >= 100 ? 'PROMOTED' : 'CANARY_ACTIVE', trafficWeightPct: nextW };
-      }
-      return { ok: true, status: 200, data: state.canary, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/persistence/snapshot') {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          action: body.action || 'verify_cold_start_rehydration',
-          restoredTasksCount: state.tasks.length,
-          restoredFinopsCount: state.tenants.length,
-          restoredApprovalsCount: state.approvals.length,
-          restoredMcpCount: (state.mcpState?.tools || []).length,
-          rpoZeroVerified: true,
-          tableCounts: { persisted_tasks: state.tasks.length, persisted_leases: state.tasks.length, persisted_finops_ledgers: state.tenants.length, persisted_mcp_tools: 1 }
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/celld/container-workflow') {
-      if (body.action === 'run_durable_workflow') {
-        return {
-          ok: true,
-          status: 200,
-          data: {
-            workflowId: 'wf-release-ns-8841',
-            stepName: 'step-ltx-checkpoint',
-            firstExecution: { replayedFromJournal: false, result: { ltxKey: 'ltx/cell-wf-release-ns-8841/tx-00000001-f14.ltx', sizeBytes: 64 } },
-            crashReplayExecution: { replayedFromJournal: true, result: { ltxKey: 'ltx/cell-wf-release-ns-8841/tx-00000001-f14.ltx', sizeBytes: 64 } }
-          },
-          fromLiveBackend: false
-        };
-      }
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          cellId: 'cell-sandbox-ns-8841',
-          started: { running: true, ociRuntime: 'kata', resolvConf: ['1.1.1.1', '1.0.0.1'], committedMemoryMb: 6144 },
-          execResult: { exitCode: 0, rawStdout: 'nameserver 1.1.1.1' },
-          webSocketProbe: { status: 101, webSocketUpgraded: true, port: 8080 },
-          celldFenceImdsBlocked: true
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/layerfs/speculative') {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          taskId: 'task-ns-8841',
-          sourceBranch: 'feat-ns-auth',
-          deterministicReproducible: true,
-          branches: [
-            { branchName: 'spec-task-ns-8841-a', commitId: 'C4', seed: 20261110 },
-            { branchName: 'spec-task-ns-8841-b', commitId: 'C5', seed: 20261110 }
-          ],
-          mergeResult: { mergedCommitId: 'C6' }
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/system/deep-rectification-audit')) {
-      return { status: 200, ok: true, data: { allM52RectificationsVerified: true } };
-    }
-    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/scheduler/kernel-audit')) {
-      return { status: 200, ok: true, data: { stale1HeartbeatTtlEvicted: true, stale2LeaseCapacityReclaimed: true, deadlock1HolBypassPlacedSmallTask: true, deadlock2DagCascadedDeadLetter: true, starvation1FairPreemptionRotation: true, allInvariantsVerified: true } };
-    }
-    if (method === 'GET' && endpointPath.startsWith('/v1beta1/management/design/blueprint')) {
-      return { status: 200, ok: true, data: { designVersion: 'v2.5-M50', pillars: ['DESIGN', 'CONFIGURATION', 'RUNTIME', 'OBSERVABILITY_OPS'], sourceModulesCount: 86, sqliteTablesCount: 16, invariantsVerified: true } };
-    }
-    if (endpointPath.startsWith('/v1beta1/management/config/center')) {
-      return { status: 200, ok: true, data: { activeRevision: 2, hotReloaded: true, changedKeys: ['maxCellConcurrentRequests'] } };
-    }
-    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/runtime/celld-engine')) {
-      return { status: 200, ok: true, data: { submittedTaskId: 'cell-rpc-101', rehydratedTasksCount: 4 } };
-    }
-    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/ops/observability')) {
-      return { status: 200, ok: true, data: { sloEvaluation: { alertSeverity: 'TICKET_P1', burnRate1h: 1.8, errorBudgetRemainingPct: 82.0 }, runbookId: 'RB-SLO-BURN-AND-DLQ-HEAL' } };
-    }
-    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/router/inference-pipeline')) {
-      return { status: 200, ok: true, data: { tenantId: payload.tenantId || 'Northstar', inference: { modelName: 'DeepSeek-R1', ttftMs: 108.2, tpotMs: 4.5, cachedTokens: 780, costUsd: 0.003552, circuitState: 'CLOSED', sseChunksReceived: 5 } } };
-    }
-    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/security/kernel-attestation')) {
-      return { status: 200, ok: true, data: { allowedProbe: { allowed: true, status: 200 }, blockedProbe: { allowed: false, status: 403 }, slsaVerified: true } };
-    }
-    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/chaos/drill')) {
-      return { status: 200, ok: true, data: { drill: { partitionBlockedTraffic: true, partitionHealed: true, zombieBlocked: true, rpoZeroVerified: true }, staleFenceRejected409: true } };
-    }
-    if (method === 'POST' && endpointPath.startsWith('/v1beta1/management/federation/tunnel-harness')) {
-      return { status: 200, ok: true, data: { failoverTunnel: { gatewayId: 'celld-gw-02', role: 'SECONDARY' }, autoHealResult: { recoveredFromMigrationInterrupt: true } } };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/cluster/autoscale-psi') {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          psiDefense: { level: 'FREEZE_AND_CHECKPOINT', evictedTaskIds: ['task-ns-8842'] },
-          backpressure: { mode: 'RED_SHEDDING', recommendedDispatchRateScale: 0.2 },
-          queueSharding: { previousShards: 16, newShards: 32, rebalanced: true },
-          poolScaling: { totalContainerPoolSize: 8 }
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/runtime/sandbox') {
-      if (body.action === 'allocate_and_mount') {
-        return {
-          ok: true,
-          status: 200,
-          data: {
-            taskId: body.taskId || 'task-ns-8841',
-            microVm: { vmId: 'fc-vm-celld-gw-01-1', state: 'ALLOCATED', bootLatencyMs: 65 },
-            multiplexer: { sandboxNumber: 1, activeWorkspacesOnSandbox: 1 },
-            cgroupLimits: { cpuMaxContent: '400000 100000', memoryHighBytes: '3649044480', memoryMaxBytes: '4294967296' },
-            overlayUpperSnapshot: { changedFiles: ['sandbox_mount.meta'], sha256: '8f9a1c4b2e77d0194481a92c1108e73a90c11b2a33d4e5f60123456789abcdef', byteLength: 148 },
-            rightSizedProfile: { think_cpu_cores: 0.25, act_cpu_cores: 3.52, act_memory_mb: 3125, disk_mb: 10240 }
-          },
-          fromLiveBackend: false
-        };
-      }
-      if (body.action === 'vsock_exec_and_io') {
-        return {
-          ok: true,
-          status: 200,
-          data: {
-            vmId: 'fc-vm-task-ns-8841',
-            writeResult: { status: 'OK', filePath: 'agent_artifact.txt', bytesWritten: 34, sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' },
-            execResult: { exitCode: 0, rawStdout: 'verified-by-vsock-task-ns-8841' }
-          },
-          fromLiveBackend: false
-        };
-      }
-      if (body.action === 'issue_and_verify_mtls_tee') {
-        return {
-          ok: true,
-          status: 200,
-          data: {
-            spiffeVerification: { authenticated: true, cryptographicallyVerified: true, nodeRole: 'body-worker' },
-            teeAttestation: { verified: true, asymmetricVerified: true, teePlatform: 'AMD_SEV_SNP' }
-          },
-          fromLiveBackend: false
-        };
-      }
-      return {
-        ok: true,
-        status: 200,
-        data: { cellId: 'AnstsHarnessCell:task-ns-8841', previousNodeId: 'celld-brain-01', newNodeId: 'celld-brain-03', newEpochFencingToken: 2 },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/mcp') {
-      if (!state.mcpState) state.mcpState = createBaselineState().mcpState;
-      if (body.action === 'register_mcp_tool') {
-        const tName = body.toolName || ('mcp_tool_' + Math.floor(100 + Math.random() * 899));
-        const item = { toolName: tName, serverName: body.serverName || 'mcp-k8s-fleet', description: body.description || 'Dynamic MCP JSON-RPC 2.0 compensatable tool', effectClass: 'COMPENSATABLE_WRITE', registeredBy: body.actor || 'chen' };
-        state.mcpState.tools.push(item);
-        return { ok: true, status: 201, data: { ...item, mcpState: state.mcpState }, fromLiveBackend: false };
-      }
-      if (body.action === 'invoke_mcp_tool') {
-        return { ok: true, status: 200, data: { taskId: body.taskId || 'task-ns-8841', toolName: body.toolName || 'mcp_pg_migration_apply', output: { status: 'COMMITTED' }, deduplicated: false, mcpState: state.mcpState }, fromLiveBackend: false };
-      }
-      state.mcpState.lastSagaRollbackReport = { taskId: body.taskId || 'task-ns-8841', compensatedTools: [{ status: 'ROLLED_BACK_LIFO' }] };
-      return { ok: true, status: 200, data: { taskId: body.taskId || 'task-ns-8841', compensatedCount: 1, mcpState: state.mcpState }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/a2a') {
-      if (!state.a2aState) state.a2aState = createBaselineState().a2aState;
-      if (body.action === 'put_blackboard_cas') {
-        const k = body.key || 'arch/zero-trust-policy';
-        const existing = state.a2aState.blackboardEntries.find((e) => e.key === k);
-        const curV = existing ? existing.version : 0;
-        const expV = body.expectedVersion !== undefined ? Number(body.expectedVersion) : curV;
-        if (expV !== curV) {
-          return { ok: false, status: 409, data: { error: 'A2A_BLACKBOARD_CAS_CONFLICT', key: k, expectedVersion: expV, actualVersion: curV, message: 'A2A 黑板 CAS 冲突' }, fromLiveBackend: false };
-        }
-        const nextEntry = { key: k, value: body.value || { mTLS: 'STRICT', updatedBy: body.actor || 'chen', rev: curV + 1 }, version: curV + 1, authorAgentId: 'agent-' + (body.actor || 'chen') };
-        if (existing) Object.assign(existing, nextEntry);
-        else state.a2aState.blackboardEntries.push(nextEntry);
-        return { ok: true, status: 200, data: { committed: true, entry: nextEntry, a2aState: state.a2aState }, fromLiveBackend: false };
-      }
-      if (body.action === 'arbitrate_git_patches') {
-        const arb = { acceptedAgentIds: ['agent-ns-auth-p0', 'agent-hl-ledger-p1'], conflictedAgentIds: ['agent-ns-refactor-p2'] };
-        state.a2aState.lastGitArbitration = arb;
-        return { ok: true, status: 200, data: { ...arb, a2aState: state.a2aState }, fromLiveBackend: false };
-      }
-      if (body.action === 'inject_deadlock_cycle') {
-        state.a2aState.deadlock = { hasDeadlock: true, cyclePath: ['agent-ns-worker-1', 'agent-ns-worker-2', 'agent-ns-worker-3', 'agent-ns-worker-1'] };
-        return { ok: true, status: 200, data: { ...state.a2aState.deadlock, a2aState: state.a2aState }, fromLiveBackend: false };
-      }
-      if (body.action === 'break_deadlock') {
-        state.a2aState.deadlock = { hasDeadlock: false, cyclePath: [] };
-        return { ok: true, status: 200, data: { victimAgentId: 'agent-ns-worker-3', ...state.a2aState.deadlock, a2aState: state.a2aState }, fromLiveBackend: false };
-      }
-      const bisect = { firstBadCommit: 'C2', probesExecuted: 2, probedCommits: [{ commitId: 'C1', passed: true, branchName: 'bisect-probe-C1-0' }, { commitId: 'C2', passed: false, branchName: 'bisect-probe-C2-1' }] };
-      state.a2aState.lastBisectResult = bisect;
-      return { ok: true, status: 200, data: { ...bisect, a2aState: state.a2aState }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/tasks/migrate') {
-      const tk = state.tasks.find((x) => x.id === body.taskId) || state.tasks[0];
-      const srcNode = tk.body;
-      const dstNode = body.targetNodeId || (srcNode === 'body-host-02' ? 'body-host-03' : 'body-host-02');
-      tk.body = dstNode;
-      tk.fence += 1;
-      const snapKey = 'migrations/' + tk.id + '/turn-' + tk.turn + '-f' + tk.fence + '.tar.zst';
-      return { ok: true, status: 200, data: { taskId: tk.id, sourceNodeId: srcNode, targetNodeId: dstNode, newFencingToken: tk.fence, snapshotKey: snapKey, sourceFrozen: true, targetRestored: true, migrationDurationMs: 118 }, fromLiveBackend: false };
-    }
-    if (method === 'GET' && endpointPath.startsWith('/v1beta1/management/layerfs/blame')) {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          taskId: 'task-ns-8841',
-          branchName: 'feat-ns-auth',
-          headCommitId: 'C2',
-          filePath: 'src/task-ns-8841.ts',
-          lines: [
-            { lineNumber: 1, commitId: 'C1', agentId: 'agent-northstar', stepId: 'step-task-ns-8841-t1', content: 'export const taskId = "task-ns-8841";' },
-            { lineNumber: 2, commitId: 'C2', agentId: 'chen', stepId: 'step-task-ns-8841-t2', content: 'export const zeroTrustVerified = true;' }
-          ]
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/storage/gc-sweep') {
-      if (body.action === 'seed_orphans') {
-        state.layerfsStats.totalObjects += 3;
-        state.layerfsStats.fullObjects += 3;
-        return { ok: true, status: 200, data: { seededOrphanBlobIds: ['obj-orphan-1', 'obj-orphan-2', 'obj-orphan-3'], storageStats: state.layerfsStats }, fromLiveBackend: false };
-      }
-      if (body.action === 'sweep_cas') {
-        state.gcSweepReport = { retainedCount: state.layerfsStats.totalObjects - 3, sweptCount: 3, reclaimedBytes: 912, sweptBlobIds: ['obj-orphan-1', 'obj-orphan-2', 'obj-orphan-3'] };
-        state.layerfsStats.totalObjects = Math.max(6, state.layerfsStats.totalObjects - 3);
-        return { ok: true, status: 200, data: { ...state.gcSweepReport, storageStats: state.layerfsStats }, fromLiveBackend: false };
-      }
-      return { ok: true, status: 200, data: { dryRun: true, graceSecs: 3600, deletableEpochCount: 2, reclaimableBytes: 40960, deletableScopes: ['AnstsSchedulerCell:shard-01@epoch-10', 'AnstsSchedulerCell:shard-02@epoch-11'] }, fromLiveBackend: false };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/diagnostics/probe') {
-      return {
-        ok: true,
-        status: 200,
-        data: {
-          expectedProtocol: 'v0.6.3',
-          rollingUpgradeSafe: state.scenario !== 'offline' && state.scenario !== 'partial',
-          expiredLeases: [],
-          unreachablePeers: [],
-          protocolMismatches: [],
-          totalRestoring: 0,
-          traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
-          prometheusMetrics: '# TYPE ansts_cluster_nodes_total gauge\nansts_cluster_nodes_total ' + state.nodes.length + '\n# TYPE ansts_active_tasks_total gauge\nansts_active_tasks_total ' + state.tasks.length + '\n# TYPE ansts_rolling_upgrade_safe gauge\nansts_rolling_upgrade_safe 1\n',
-          webhookOutbox: { deliveredCount: 1, deadLetterCount: 0, hmacHeaderSample: 't=1794303000,v1=9f86d081884c7d659a2feaa0c55ad015' }
-        },
-        fromLiveBackend: false
-      };
-    }
-    if (method === 'POST' && endpointPath === '/v1beta1/management/capacity/action') {
-      state.loadSheddingActive = true;
-      state.verificationRetried = true;
-      state.scenario = 'normal';
-      return { ok: true, status: 200, data: { ok: true }, fromLiveBackend: false };
-    }
-    return { ok: true, status: 200, data: { executed: true, endpointPath, body }, fromLiveBackend: false };
-  }
-
   function showToast(msg) {
     const toast = document.getElementById('toast');
     const announcer = document.getElementById('announcer');
@@ -1254,10 +738,10 @@
               <tbody>
                 ${state.auditLogs.slice(0, 7).map((log) => `
                   <tr>
-                    <td class="mono">${log.ts}</td>
-                    <td><strong>${log.actor}</strong> <span class="muted">(${log.role || 'SRE_ADMIN'})</span></td>
-                    <td>${log.action}</td>
-                    <td><span class="status-pill ${String(log.outcome).includes('失败') || String(log.outcome).includes('超标') ? 'danger' : String(log.outcome).includes('待') || String(log.outcome).includes('UNCONFIRMED') ? 'warn' : 'ok'}">${log.outcome}</span></td>
+                    <td class="mono">${escapeHtml(log.ts)}</td>
+                    <td><strong>${escapeHtml(log.actor)}</strong> <span class="muted">(${escapeHtml(log.role || '')})</span></td>
+                    <td>${escapeHtml(log.action)}</td>
+                    <td><span class="status-pill ${String(log.outcome).includes('失败') || String(log.outcome).includes('超标') ? 'danger' : String(log.outcome).includes('待') || String(log.outcome).includes('UNCONFIRMED') ? 'warn' : 'ok'}">${escapeHtml(log.outcome)}</span></td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -1318,23 +802,23 @@
             <tbody>
               ${state.nodes.map((n) => {
                 const nodePerm = canMutateTarget(n.region, 'all', false);
-                const pinnedList = n.pinnedP0Tasks && n.pinnedP0Tasks.length > 0 ? `P0: ${n.pinnedP0Tasks.join(',')}` : '无 P0 锁';
+                const pinnedList = n.pinnedP0Tasks && n.pinnedP0Tasks.length > 0 ? `P0: ${n.pinnedP0Tasks.map((id) => escapeHtml(id)).join(',')}` : '无 P0 锁';
                 return `
                   <tr>
-                    <td class="mono"><strong>${n.id}</strong></td>
-                    <td>${n.role} ${n.slots > 0 ? `<span class="mono">(${n.slots} 槽)</span>` : ''}</td>
-                    <td class="mono">${n.region}</td>
+                    <td class="mono"><strong>${escapeHtml(n.id)}</strong></td>
+                    <td>${escapeHtml(n.role)} ${n.slots > 0 ? `<span class="mono">(${n.slots} 槽)</span>` : ''}</td>
+                    <td class="mono">${escapeHtml(n.region)}</td>
                     <td class="mono">${n.cpuPct}% / PSI ${n.psiPct}%</td>
                     <td class="mono">${n.activeLeases} <span class="muted">(${pinnedList})</span></td>
-                    <td class="mono">${n.tunnelGw}</td>
+                    <td class="mono">${escapeHtml(n.tunnelGw)}</td>
                     <td>
                       <span class="status-pill ${n.status === 'DRAIN_FAILED' ? 'danger' : n.status === 'CORDONED' ? 'warn' : 'ok'}">
-                        ${n.status}
+                        ${escapeHtml(n.status)}
                       </span>
                     </td>
                     <td>
                       <div class="btn-row">
-                        <button type="button" class="small" data-action="toggle-node-cordon" data-node="${n.id}" data-status="${n.status}" ${!nodePerm.ok ? 'disabled' : ''}>
+                        <button type="button" class="small" data-action="toggle-node-cordon" data-node="${escapeHtml(n.id)}" data-status="${escapeHtml(n.status)}" ${!nodePerm.ok ? 'disabled' : ''}>
                           ${n.status === 'CORDONED' ? '恢复调度 (Uncordon)' : '隔离节点 (Cordon)'}
                         </button>
                       </div>
@@ -1378,8 +862,8 @@
                 const perm = canMutateTarget(t.region, t.id, false);
                 return `
                   <tr>
-                    <td><strong>${t.id}</strong></td>
-                    <td class="mono">${t.region} · ${t.tier}</td>
+                    <td><strong>${escapeHtml(t.id)}</strong></td>
+                    <td class="mono">${escapeHtml(t.region)} · ${escapeHtml(t.tier)}</td>
                     <td class="mono">
                       <span class="status-pill ${ratio >= 100 ? 'danger' : ratio >= 80 ? 'warn' : 'ok'}">${t.usedSlots} / ${t.maxSlots} (${ratio}%)</span>
                     </td>
@@ -1389,13 +873,13 @@
                         ? '<span class="status-pill unknown">UNKNOWN (计费流延迟)</span>'
                         : `$${t.spentUsd} / $${t.dailyBudgetUsd}`}
                     </td>
-                    <td>${t.modelPolicy}</td>
-                    <td class="mono">v${t.configVersion} <span class="muted">(${t.updatedBy || 'chen'})</span></td>
+                    <td>${escapeHtml(t.modelPolicy)}</td>
+                    <td class="mono">v${t.configVersion} <span class="muted">(${escapeHtml(t.updatedBy || '')})</span></td>
                     <td>
                       <div class="btn-row">
-                        <button type="button" class="small primary" data-action="open-quota-dialog" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''}>编辑配额</button>
-                        <button type="button" class="small" data-action="tenant-finops-step" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''} title="累加计费流水测试 80% 软降级与 100% 熔断">+计费步进</button>
-                        <button type="button" class="small" data-action="tenant-escrow-step" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''} title="增加 DAG 子任务并发担保槽位">+DAG预留</button>
+                        <button type="button" class="small primary" data-action="open-quota-dialog" data-tenant="${escapeHtml(t.id)}" ${!perm.ok ? 'disabled' : ''}>编辑配额</button>
+                        <button type="button" class="small" data-action="tenant-finops-step" data-tenant="${escapeHtml(t.id)}" ${!perm.ok ? 'disabled' : ''} title="累加计费流水测试 80% 软降级与 100% 熔断">+计费步进</button>
+                        <button type="button" class="small" data-action="tenant-escrow-step" data-tenant="${escapeHtml(t.id)}" ${!perm.ok ? 'disabled' : ''} title="增加 DAG 子任务并发担保槽位">+DAG预留</button>
                       </div>
                     </td>
                   </tr>
@@ -1456,22 +940,22 @@
                 const pillCls = isUnconfirmed ? 'warn' : isFenced ? 'danger' : 'ok';
                 return `
                   <tr>
-                    <td class="mono"><strong>${t.id}</strong></td>
-                    <td>${t.tenant} · <span class="mono">${t.region}</span></td>
-                    <td class="mono">${t.priority} · Slot #${t.shardSlot ?? 0}</td>
-                    <td class="mono">${t.brain} → ${t.body}</td>
-                    <td class="mono">epoch:${t.fence}</td>
-                    <td class="mono">Turn #${t.turn} · ⎇ ${t.branch}</td>
-                    <td><span class="status-pill ${pillCls}">${t.state}</span></td>
+                    <td class="mono"><strong>${escapeHtml(t.id)}</strong></td>
+                    <td>${escapeHtml(t.tenant)} · <span class="mono">${escapeHtml(t.region)}</span></td>
+                    <td class="mono">${escapeHtml(t.priority)} · Slot #${t.shardSlot ?? 0}</td>
+                    <td class="mono">${escapeHtml(t.brain)} → ${escapeHtml(t.body)}</td>
+                    <td class="mono">epoch:${escapeHtml(t.fence)}</td>
+                    <td class="mono">Turn #${escapeHtml(t.turn)} · ⎇ ${escapeHtml(t.branch)}</td>
+                    <td><span class="status-pill ${pillCls}">${escapeHtml(t.state)}</span></td>
                     <td>
                       <div class="btn-row">
-                        <button type="button" class="small primary" data-action="step-task-turn" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>+推进回合</button>
-                        <button type="button" class="small" data-action="migrate-task-node" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''} title="调用 EphemeralHeavyExecutorMigrator 跨节点热迁移并推进 Fencing Token">热迁移节点</button>
-                        <button type="button" class="small" data-action="open-turn-history-dialog" data-task="${t.id}">回合历史 / 分叉 / Blame</button>
-                        <button type="button" class="small" data-action="graceful-stop-task" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>
+                        <button type="button" class="small primary" data-action="step-task-turn" data-task="${escapeHtml(t.id)}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>+推进回合</button>
+                        <button type="button" class="small" data-action="migrate-task-node" data-task="${escapeHtml(t.id)}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''} title="调用 EphemeralHeavyExecutorMigrator 跨节点热迁移并推进 Fencing Token">热迁移节点</button>
+                        <button type="button" class="small" data-action="open-turn-history-dialog" data-task="${escapeHtml(t.id)}">回合历史 / 分叉 / Blame</button>
+                        <button type="button" class="small" data-action="graceful-stop-task" data-task="${escapeHtml(t.id)}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>
                           请求停止
                         </button>
-                        <button type="button" class="small danger" data-action="open-force-fence-dialog" data-task="${t.id}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>
+                        <button type="button" class="small danger" data-action="open-force-fence-dialog" data-task="${escapeHtml(t.id)}" ${!perm.ok || t.state === 'COMPLETED' || isFenced ? 'disabled' : ''}>
                           强制吊销租约
                         </button>
                       </div>
@@ -1520,19 +1004,19 @@
                 const canClick = isPending && state.scenario !== 'offline';
                 return `
                   <tr>
-                    <td class="mono"><strong>${a.id}</strong></td>
-                    <td class="mono">${a.type}</td>
-                    <td>${a.target}</td>
-                    <td class="mono">${a.region} / ${a.tenant}</td>
-                    <td>${IDENTITIES[a.initiator]?.name || a.initiator}</td>
-                    <td><span class="status-pill ${a.risk === 'CRITICAL' ? 'danger' : 'warn'}">${a.risk}</span></td>
-                    <td><span class="status-pill ${isPending ? 'warn' : 'ok'}">${a.status}</span></td>
+                    <td class="mono"><strong>${escapeHtml(a.id)}</strong></td>
+                    <td class="mono">${escapeHtml(a.type)}</td>
+                    <td>${escapeHtml(a.target)}</td>
+                    <td class="mono">${escapeHtml(a.region)} / ${escapeHtml(a.tenant)}</td>
+                    <td>${escapeHtml(IDENTITIES[a.initiator]?.name || a.initiator)}</td>
+                    <td><span class="status-pill ${a.risk === 'CRITICAL' ? 'danger' : 'warn'}">${escapeHtml(a.risk)}</span></td>
+                    <td><span class="status-pill ${isPending ? 'warn' : 'ok'}">${escapeHtml(a.status)}</span></td>
                     <td>
                       <div class="btn-row">
-                        <button type="button" class="small primary" data-action="decide-approval" data-id="${a.id}" data-initiator="${a.initiator}" data-decision="approve" ${!canClick ? 'disabled' : ''}>
+                        <button type="button" class="small primary" data-action="decide-approval" data-id="${escapeHtml(a.id)}" data-initiator="${escapeHtml(a.initiator)}" data-decision="approve" ${!canClick ? 'disabled' : ''}>
                           批准执行
                         </button>
-                        <button type="button" class="small danger" data-action="decide-approval" data-id="${a.id}" data-initiator="${a.initiator}" data-decision="reject" ${!canClick ? 'disabled' : ''}>
+                        <button type="button" class="small danger" data-action="decide-approval" data-id="${escapeHtml(a.id)}" data-initiator="${escapeHtml(a.initiator)}" data-decision="reject" ${!canClick ? 'disabled' : ''}>
                           驳回
                         </button>
                       </div>
@@ -1574,12 +1058,12 @@
                 return String(l.action).toLowerCase().includes(q) || String(l.scope).toLowerCase().includes(q) || String(l.actor).toLowerCase().includes(q) || String(l.outcome).toLowerCase().includes(q);
               }).map((log) => `
                 <tr>
-                  <td class="mono">${log.ts}</td>
-                  <td><strong>${log.actor}</strong></td>
-                  <td class="mono">${log.role || 'SRE_ADMIN'}</td>
-                  <td class="mono">${log.scope}</td>
-                  <td>${log.action}</td>
-                  <td><span class="status-pill ok">${log.outcome}</span></td>
+                  <td class="mono">${escapeHtml(log.ts)}</td>
+                  <td><strong>${escapeHtml(log.actor)}</strong></td>
+                  <td class="mono">${escapeHtml(log.role || '')}</td>
+                  <td class="mono">${escapeHtml(log.scope)}</td>
+                  <td>${escapeHtml(log.action)}</td>
+                  <td><span class="status-pill ok">${escapeHtml(log.outcome)}</span></td>
                 </tr>
               `).join('')}
             </tbody>
@@ -1656,7 +1140,7 @@
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/storage-ha-audit" data-op="storage_ha_m55_audit">存储/分片存活/LayerFS同步/事务回滚自检 (Persistence/Shard/D9/TimeTravel/RPO0 · M55)</button>
           <button class="btn" data-action="m50-op" data-method="POST" data-endpoint="/v1beta1/management/system/kernel-storage-audit" data-op="kernel_storage_m56_audit">全表冷启恢复/三路合并删改冲突/P0突发准入/内存防泄漏自检 (M56)</button>
           </div>
-          <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${state.lastApiOutput}</pre>
+          <pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;overflow-x:auto;margin:0;max-height:180px;">${escapeHtml(state.lastApiOutput)}</pre>
         </div>
       </div>
 
@@ -2422,9 +1906,9 @@
       const box = document.getElementById('dlg-blame-output');
       if (box && res.data && Array.isArray(res.data.lines)) {
         box.innerHTML =
-          '<div class="table-wrap"><table class="data-table"><thead><tr><th>行号</th><th>Commit</th><th>作者 Agent</th><th>Step ID</th><th>代码内容 (' + (res.data.filePath || '') + ')</th></tr></thead><tbody>' +
+          '<div class="table-wrap"><table class="data-table"><thead><tr><th>行号</th><th>Commit</th><th>作者 Agent</th><th>Step ID</th><th>代码内容 (' + escapeHtml(res.data.filePath || '') + ')</th></tr></thead><tbody>' +
           res.data.lines.map((ln) =>
-            '<tr><td class="mono">L' + ln.lineNumber + '</td><td class="mono">' + ln.commitId + '</td><td class="mono">' + ln.agentId + '</td><td class="mono">' + ln.stepId + '</td><td class="mono"><code>' + ln.content + '</code></td></tr>'
+            '<tr><td class="mono">L' + escapeHtml(ln.lineNumber) + '</td><td class="mono">' + escapeHtml(ln.commitId) + '</td><td class="mono">' + escapeHtml(ln.agentId) + '</td><td class="mono">' + escapeHtml(ln.stepId) + '</td><td class="mono"><code>' + escapeHtml(ln.content) + '</code></td></tr>'
           ).join('') +
           '</tbody></table></div>';
       }
@@ -2855,12 +2339,34 @@
     });
   }
 
+  function mountTokenField() {
+    const tools = document.querySelector('.demo-controls');
+    if (!tools || document.getElementById('console-token')) return;
+    const label = document.createElement('label');
+    label.textContent = 'Bearer ';
+    const input = document.createElement('input');
+    input.id = 'console-token';
+    input.type = 'password';
+    input.autocomplete = 'off';
+    input.placeholder = '控制台令牌';
+    input.value = consoleToken();
+    input.addEventListener('change', () => {
+      try { sessionStorage.setItem('anstsConsoleToken', input.value.trim()); } catch (_err) {}
+    });
+    label.appendChild(input);
+    tools.appendChild(label);
+  }
+
   async function init() {
+    mountTokenField();
     populateTenantFilter();
     updateHeaderAndRail();
     renderMainContent();
     bindGlobalEvents();
     await fetchBackendState();
+    setInterval(() => {
+      fetchBackendState().catch(() => {});
+    }, 15000);
   }
 
   if (document.readyState === 'loading') {

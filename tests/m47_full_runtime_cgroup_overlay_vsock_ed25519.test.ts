@@ -4,6 +4,7 @@
  * Real 4KiB SHA-256 Page-Fault Hydration in `WalCompactorAndPagedRestorer` (`UffdLazyPageFaultRestorer`),
  * Real SQLite/R2-Backed `CelldAdminClient`, and Physical Linux Cgroup v2 / OverlayFS Upperdir / MicroVM Warm Pool Lifecycle.
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";

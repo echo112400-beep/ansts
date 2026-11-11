@@ -7,6 +7,7 @@
  * 4. [Deadlock-2] Cascading DAG `DEAD_LETTER` Propagation (`cascadeDeadLetterToDependents` preventing downstream `SUBMITTED` child tasks from hanging forever).
  * 5. [Starvation-1] Fair Least-Preempted Victim Rotation, Preemption Cooldown Immunity & Preemption Priority Boost (`preempted_count` * 120 boost in `HierarchicalQueueManager`).
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";

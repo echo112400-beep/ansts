@@ -134,6 +134,12 @@ export async function runAnstsCtlRemote(
 ): Promise<CliCommandOutput> {
   const baseUrl = gatewayUrl.replace(/\/$/, "");
   const [cmd, ...rest] = argv;
+  const consoleWriteHeaders = (): Record<string, string> => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const token = process.env.ANSTS_CONSOLE_TOKEN;
+    if (token) headers.authorization = `Bearer ${token}`;
+    return headers;
+  };
 
   if (cmd === "cluster-overview") {
     const [ovResp, shResp] = await Promise.all([
@@ -154,7 +160,7 @@ export async function runAnstsCtlRemote(
     const promptText = rest[2] ?? "cli dispatched task";
     const resp = await fetch(`${baseUrl}/v1beta1/tasks/dispatch`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ tenantId, taskId, promptText }),
     });
     const data = await resp.json();
@@ -165,7 +171,7 @@ export async function runAnstsCtlRemote(
     const branchOrCommit = rest[0] ?? "main";
     const resp = await fetch(`${baseUrl}/v1beta1/security/attest`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({
         branchOrCommit,
         spiffeId: "spiffe://ansts.io/ns/fleet/sa/cli",
@@ -190,33 +196,38 @@ export async function runAnstsCtlRemote(
     const actor = rest[4] ?? "chen";
     const resp = await fetch(`${baseUrl}/v1beta1/management/tenants/config`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tenantId, maxSlots, dailyBudgetUsd, expectedVersion, actor, role: "SRE_ADMIN" }),
+      headers: consoleWriteHeaders(),
+      body: JSON.stringify({ tenantId, maxSlots, dailyBudgetUsd, expectedVersion, actor }),
     });
     const data = await resp.json();
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
   if (cmd === "mgmt-drain") {
-    const nodeId = rest[0] ?? "body-host-02";
+    const nodeId = rest[0];
+    if (!nodeId) {
+      return { exitCode: 1, stdout: JSON.stringify({ error: "MISSING_OR_INVALID_FIELD", field: "nodeId" }) };
+    }
     const forceMigrateLeases = rest.includes("--force-migrate");
     const resp = await fetch(`${baseUrl}/v1beta1/management/nodes/batch`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ operation: "drain", nodeIds: [nodeId], forceMigrateLeases, actor: "chen", role: "SRE_ADMIN" }),
+      headers: consoleWriteHeaders(),
+      body: JSON.stringify({ operation: "drain", nodeIds: [nodeId], forceMigrateLeases }),
     });
     const data = await resp.json();
     return { exitCode: resp.status === 200 ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
   if (cmd === "mgmt-approve") {
-    const approvalId = rest[0] ?? "APR-2026-091";
-    const approver = rest[1] ?? "zhou";
-    const decision = rest[2] ?? "approve";
+    const approvalId = rest[0];
+    const decision = rest[2];
+    if (!approvalId || (decision !== "approve" && decision !== "reject")) {
+      return { exitCode: 1, stdout: JSON.stringify({ error: "MISSING_OR_INVALID_FIELD", field: !approvalId ? "approvalId" : "decision" }) };
+    }
     const resp = await fetch(`${baseUrl}/v1beta1/management/approvals/decide`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ approvalId, approver, decision, role: "SRE_ADMIN" }),
+      headers: consoleWriteHeaders(),
+      body: JSON.stringify({ approvalId, decision }),
     });
     const data = await resp.json();
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
@@ -234,7 +245,7 @@ export async function runAnstsCtlRemote(
     const jsSourceCode = rest[1] ?? "globalThis.__result = { isolateOk: true, val: (inputPayload.x || 7) * 6 };";
     const resp = await fetch(`${baseUrl}/v1beta1/celld/isolate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ taskId, turnIndex: 1, jsSourceCode, allowInternetEgress: false, inputPayload: { x: 7 } }),
     });
     const data = await resp.json();
@@ -245,7 +256,7 @@ export async function runAnstsCtlRemote(
     const taskId = rest[0] ?? "task-ns-8841";
     const resp = await fetch(`${baseUrl}/v1beta1/celld/ltx-compaction`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ taskId, l0ObjectCount: 320, txidDistance: 512, totalL0Megabytes: 48 }),
     });
     const data = await resp.json();
@@ -257,7 +268,7 @@ export async function runAnstsCtlRemote(
     const basedOnGeneration = Number(rest[1] ?? 0);
     const resp = await fetch(`${baseUrl}/v1beta1/layerfs/store-sync`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, basedOnGeneration }),
     });
     const data = await resp.json();
@@ -268,7 +279,7 @@ export async function runAnstsCtlRemote(
     const action = rest[0] ?? "verify_cold_start_rehydration";
     const resp = await fetch(`${baseUrl}/v1beta1/management/persistence/snapshot`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -279,7 +290,7 @@ export async function runAnstsCtlRemote(
     const action = rest[0] ?? "start_and_probe_container";
     const resp = await fetch(`${baseUrl}/v1beta1/management/celld/container-workflow`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -290,7 +301,7 @@ export async function runAnstsCtlRemote(
     const sourceBranch = rest[0] ?? "feat-ns-auth";
     const resp = await fetch(`${baseUrl}/v1beta1/management/layerfs/speculative`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ sourceBranch, mergeWinningBranch: true, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -301,7 +312,7 @@ export async function runAnstsCtlRemote(
     const action = rest[0] ?? "probe_and_autoscale";
     const resp = await fetch(`${baseUrl}/v1beta1/management/cluster/autoscale-psi`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -313,7 +324,7 @@ export async function runAnstsCtlRemote(
     const taskId = rest[1] ?? "task-ns-8841";
     const resp = await fetch(`${baseUrl}/v1beta1/management/runtime/sandbox`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, taskId, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -326,7 +337,7 @@ export async function runAnstsCtlRemote(
     const taskId = rest[2] ?? "task-ns-8841";
     const resp = await fetch(`${baseUrl}/v1beta1/management/mcp`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, toolName, taskId, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -338,7 +349,7 @@ export async function runAnstsCtlRemote(
     const key = rest[1] ?? "arch/zero-trust-policy";
     const resp = await fetch(`${baseUrl}/v1beta1/management/a2a`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, key, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -346,11 +357,14 @@ export async function runAnstsCtlRemote(
   }
 
   if (cmd === "mgmt-migrate") {
-    const taskId = rest[0] ?? "task-ns-8841";
-    const targetNodeId = rest[1] ?? "body-host-03";
+    const taskId = rest[0];
+    const targetNodeId = rest[1];
+    if (!taskId || !targetNodeId) {
+      return { exitCode: 1, stdout: JSON.stringify({ error: "MISSING_OR_INVALID_FIELD", field: !taskId ? "taskId" : "targetNodeId" }) };
+    }
     const resp = await fetch(`${baseUrl}/v1beta1/management/tasks/migrate`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ taskId, targetNodeId, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -361,7 +375,7 @@ export async function runAnstsCtlRemote(
     const action = rest[0] ?? "sweep_cas";
     const resp = await fetch(`${baseUrl}/v1beta1/management/storage/gc-sweep`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -371,7 +385,7 @@ export async function runAnstsCtlRemote(
   if (cmd === "mgmt-kernel-storage-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/system/kernel-storage-audit`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -381,7 +395,7 @@ export async function runAnstsCtlRemote(
   if (cmd === "mgmt-storage-ha-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/system/storage-ha-audit`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -391,7 +405,7 @@ export async function runAnstsCtlRemote(
   if (cmd === "mgmt-runtime-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/system/deep-runtime-audit`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -401,7 +415,7 @@ export async function runAnstsCtlRemote(
   if (cmd === "mgmt-risk-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/system/risk-elimination-audit`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -411,7 +425,7 @@ export async function runAnstsCtlRemote(
   if (cmd === "mgmt-rectify-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/system/deep-rectification-audit`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -421,7 +435,7 @@ export async function runAnstsCtlRemote(
   if (cmd === "mgmt-scheduler-audit") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/scheduler/kernel-audit`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -445,7 +459,7 @@ export async function runAnstsCtlRemote(
     }
     const resp = await fetch(`${baseUrl}/v1beta1/management/config/center`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify(bodyObj),
     });
     const data = await resp.json();
@@ -457,7 +471,7 @@ export async function runAnstsCtlRemote(
     const taskId = rest[1] ?? "task-ns-8841";
     const resp = await fetch(`${baseUrl}/v1beta1/management/runtime/celld-engine`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, taskId, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -469,7 +483,7 @@ export async function runAnstsCtlRemote(
     const runbookId = rest[1] ?? "RB-SLO-BURN-AND-DLQ-HEAL";
     const resp = await fetch(`${baseUrl}/v1beta1/management/ops/observability`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, runbookId, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -481,7 +495,7 @@ export async function runAnstsCtlRemote(
     const tenantId = rest[1] ?? "Northstar";
     const resp = await fetch(`${baseUrl}/v1beta1/management/router/inference-pipeline`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, tenantId, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -493,7 +507,7 @@ export async function runAnstsCtlRemote(
     const taskId = rest[1] ?? "task-ns-8841";
     const resp = await fetch(`${baseUrl}/v1beta1/management/security/kernel-attestation`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, taskId, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -505,7 +519,7 @@ export async function runAnstsCtlRemote(
     const targetHost = rest[1] ?? "body-us-west-02";
     const resp = await fetch(`${baseUrl}/v1beta1/management/chaos/drill`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, targetHost, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -517,7 +531,7 @@ export async function runAnstsCtlRemote(
     const sovereigntyZone = rest[1] ?? "EU";
     const resp = await fetch(`${baseUrl}/v1beta1/management/federation/tunnel-harness`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ action, sovereigntyZone, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();
@@ -528,7 +542,7 @@ export async function runAnstsCtlRemote(
     const expectedProtocol = rest[0] ?? "v0.6.3";
     const resp = await fetch(`${baseUrl}/v1beta1/management/diagnostics/probe`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: consoleWriteHeaders(),
       body: JSON.stringify({ expectedProtocol, enqueueWebhookTest: true, actor: "chen", role: "SRE_ADMIN" }),
     });
     const data = await resp.json();

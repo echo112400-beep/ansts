@@ -6,6 +6,7 @@
  * 3. [Escrow-Deadlock-3] `DagEscrowCoordinator` child sub-agent failure parent unblocking & escrow slot reclamation + `A2aWaitForGraphDeadlockDetector` priority-aware victim selection.
  * 4. [Tunnel-Deadlock-4] `TunnelGatewayCell` stale-heartbeat tunnel auto-demotion and unacknowledged in-flight command re-queueing onto secondary failover gateway.
  */
+import "./console_write_auth.js";
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
