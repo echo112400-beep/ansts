@@ -9085,4 +9085,384 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       },
     };
   }
+
+  /**
+   * [M71] Phase 1 Cognitive & Speculative Execution Acceleration Suite:
+   * - F1 (`adaptive_dag_replan`): Dynamic DAG Subgraph Re-planning (Subgraph Pruning, Dynamic Fan-out,
+   *   Fallback Replacement for Failed Child, Downstream Dependency Rewiring & SQLite `replanRevision` Persistence).
+   * - F2 (`best_of_n_speculative`): Best-of-N Parallel LayerFS CoW Sandbox Branching & Automated Test/Lint Scoring Verifier.
+   * - F3 (`cascade_jury_routing`): Cascade Confidence Router (Logprobs Thresholding, Semantic Intent Cache & Heterogeneous Multi-Model Jury Quorum).
+   * - `run_all_phase1_suite`: Executes all 3 Phase 1 engines end-to-end and returns a unified operational & audit report.
+   */
+  public executePhase1CognitiveAccelerationSuite(params: {
+    action?:
+      | "adaptive_dag_replan"
+      | "best_of_n_speculative"
+      | "cascade_jury_routing"
+      | "run_all_phase1_suite";
+    parentTaskId?: string;
+    sourceBranch?: string;
+    promptText?: string;
+    confidenceThreshold?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const action = params.action ?? "run_all_phase1_suite";
+
+    const runF1AdaptiveDagReplan = () => {
+      const sql = new InMemoryCellSqlStorage();
+      const escrow = new DagEscrowCoordinator(sql);
+      const sched = new CoreScheduler5D(this.deps.leaseCoordinator);
+
+      const parent = new TaskSpec({
+        task_id: params.parentTaskId ?? "task-m71-parent",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        expected_SubAgent_count: 2,
+      });
+      sched.submitTask(parent);
+      escrow.reserveParentEscrow(parent, 10, 0);
+
+      const childObsolete = new TaskSpec({
+        task_id: "task-m71-child-obsolete",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P2_STANDARD,
+        dependencies: [parent.task_id],
+      });
+      const childFailed = new TaskSpec({
+        task_id: "task-m71-child-failed",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P2_STANDARD,
+        dependencies: [parent.task_id],
+      });
+      const downstreamAggregator = new TaskSpec({
+        task_id: "task-m71-downstream-agg",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        dependencies: [childFailed.task_id],
+      });
+
+      sched.submitTask(childObsolete);
+      sched.submitTask(childFailed);
+      sched.submitTask(downstreamAggregator);
+
+      escrow.registerChildSubAgent(parent, childObsolete);
+      escrow.registerChildSubAgent(parent, childFailed);
+
+      // Simulate childFailed failing and cascading dead-letter before adaptive replanning rescues the DAG
+      escrow.failOrCancelChildSubAgent(parent, childFailed.task_id, true);
+      sched.cascadeDeadLetterToDependents(childFailed.task_id);
+
+      const fallbackChildA = new TaskSpec({
+        task_id: "task-m71-fallback-a",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        dependencies: [parent.task_id],
+      });
+      const fallbackChildB = new TaskSpec({
+        task_id: "task-m71-fallback-b",
+        tenant_id: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        dependencies: [parent.task_id],
+      });
+
+      const replanRes = sched.replanDagSubgraph({
+        parentTaskId: parent.task_id,
+        pruneChildIds: [childObsolete.task_id],
+        fallbackForFailedChildId: childFailed.task_id,
+        injectChildren: [fallbackChildA, fallbackChildB],
+        escrowCoordinator: escrow,
+        maxTenantQuota: 10,
+        currentTenantUsed: 1,
+      });
+
+      const escrowColdStart = new DagEscrowCoordinator(sql);
+      const rehydratedEscrow = escrowColdStart.getEscrowRecord(parent.task_id);
+
+      const f1Verified =
+        replanRes.replanRevision === 1 &&
+        replanRes.prunedChildIds.includes(childObsolete.task_id) &&
+        replanRes.injectedChildIds.length === 2 &&
+        replanRes.rewiredDownstreamTaskIds.includes(downstreamAggregator.task_id) &&
+        replanRes.revivedDownstreamTaskIds.includes(downstreamAggregator.task_id) &&
+        downstreamAggregator.state === TaskState.SUBMITTED &&
+        downstreamAggregator.dependencies.includes(fallbackChildA.task_id) &&
+        downstreamAggregator.dependencies.includes(fallbackChildB.task_id) &&
+        parent.state === TaskState.WAITING_SUB_AGENT &&
+        rehydratedEscrow?.replanRevision === 1 &&
+        rehydratedEscrow?.childTaskIds.size === 2;
+
+      return {
+        ...replanRes,
+        downstreamDepsAfterRewire: downstreamAggregator.dependencies,
+        downstreamStateAfterReplan: downstreamAggregator.state,
+        rehydratedReplanRevision: rehydratedEscrow?.replanRevision ?? 0,
+        f1Verified,
+      };
+    };
+
+    const runF2BestOfNSpeculative = () => {
+      const forker = new CoWSandboxBranchForker(this.deps.layerFsDriver);
+      const baseBranch = params.sourceBranch ?? "main";
+      const specRes = forker.executeBestOfNSpeculativeVerifier({
+        sourceBranch: baseBranch,
+        targetPromoteBranch: "m71-promoted-release",
+        candidates: [
+          {
+            branchName: "m71-cand-draft-broken",
+            modelTier: "gpt-4o-mini (T=0.7)",
+            temperature: 0.7,
+            seed: 101,
+            patchCommand: "echo 'export const sum = (a, b) => a - b;' > fix.js",
+            verifyCommand: "echo 'TESTS_PASSED=2 LINT_WARNINGS=4' && exit 1",
+          },
+          {
+            branchName: "m71-cand-sonnet-warn",
+            modelTier: "claude-3-7-sonnet (T=0.3)",
+            temperature: 0.3,
+            seed: 102,
+            patchCommand: "echo 'export const sum = (a, b) => a + b; // todo' > fix.js",
+            verifyCommand: "echo 'TESTS_PASSED=10 LINT_WARNINGS=2'",
+          },
+          {
+            branchName: "m71-cand-flagship-clean",
+            modelTier: "claude-3-7-sonnet-thinking (T=0.1)",
+            temperature: 0.1,
+            seed: 103,
+            patchCommand: "echo 'export const sum = (a: number, b: number): number => a + b;' > fix.js",
+            verifyCommand: "echo 'TESTS_PASSED=12 LINT_WARNINGS=0'",
+          },
+        ],
+      });
+
+      const f2Verified =
+        specRes.winnerBranchName === "m71-cand-flagship-clean" &&
+        specRes.winnerScore >= 90 &&
+        specRes.prunedLoserBranches.includes("m71-cand-draft-broken") &&
+        specRes.prunedLoserBranches.includes("m71-cand-sonnet-warn") &&
+        specRes.candidates.length === 3;
+
+      return {
+        ...specRes,
+        f2Verified,
+      };
+    };
+
+    const runF3CascadeAndJury = () => {
+      const routerSql = new InMemoryCellSqlStorage();
+      const router = new CognitiveRouter(0.3, routerSql, 128);
+      router.registerEndpoint(
+        new LlmEndpointMetrics({
+          endpoint_id: "ep-fast-mini",
+          provider: "openai",
+          model_name: "gpt-4o-mini-fast",
+          ttft_ewma_ms: 85,
+          tpm_limit: 2_000_000,
+          rpm_limit: 5000,
+        })
+      );
+      router.registerEndpoint(
+        new LlmEndpointMetrics({
+          endpoint_id: "ep-flagship-opus",
+          provider: "anthropic",
+          model_name: "claude-3-7-sonnet-reasoner",
+          ttft_ewma_ms: 340,
+          tpm_limit: 2_000_000,
+          rpm_limit: 2000,
+        })
+      );
+
+      const promptText =
+        params.promptText ?? "Analyze PostgreSQL connection pool exhaustion and generate safe pgbouncer patch";
+      const threshold = params.confidenceThreshold ?? 0.82;
+
+      // 1. High-confidence Tier-1 fast draft acceptance
+      const tier1Res = router.routeWithCascadeAndSemanticCache({
+        promptText,
+        systemPrompt: "You are an SRE assistant.",
+        toolDefinitions: "[]",
+        draftLogprobs: [-0.05, -0.08, -0.04, -0.06],
+        confidenceThreshold: threshold,
+        riskLevel: "LOW",
+        estimatedTokens: 1500,
+      });
+
+      // 2. Semantic cache hit on paraphrased/whitespace-normalized repeat query
+      const cacheHitRes = router.routeWithCascadeAndSemanticCache({
+        promptText: `  ${promptText.toUpperCase()}!!! `,
+        systemPrompt: "You are an SRE assistant.",
+        toolDefinitions: "[]",
+        draftLogprobs: [-0.4, -0.5],
+        confidenceThreshold: threshold,
+        riskLevel: "LOW",
+        estimatedTokens: 1500,
+      });
+
+      // 3. Low-confidence automatic escalation to Tier-2 Flagship Reasoner
+      const escalatedRes = router.routeWithCascadeAndSemanticCache({
+        promptText: "Design zero-downtime multi-region Raft consensus migration with custom fencing",
+        systemPrompt: "You are a distributed systems architect.",
+        toolDefinitions: "[]",
+        draftLogprobs: [-0.85, -1.1, -0.92, -0.78],
+        confidenceThreshold: threshold,
+        riskLevel: "MEDIUM",
+        estimatedTokens: 2400,
+      });
+
+      // 4. Heterogeneous Multi-Model Jury Quorum (Approved vs Vetoed)
+      const juryApproved = router.evaluateMultiModelJuryQuorum({
+        actionId: "act-m71-safe-migration",
+        riskLevel: "HIGH",
+        votes: [
+          {
+            endpointId: "ep-flagship-opus",
+            modelName: "claude-3-7-sonnet-reasoner",
+            approve: true,
+            safetyScore: 94,
+            rationale: "Migration script is idempotent and guarded by IF NOT EXISTS.",
+          },
+          {
+            endpointId: "ep-gpt4o",
+            modelName: "gpt-4o",
+            approve: true,
+            safetyScore: 91,
+            rationale: "No destructive DDL or lock escalation detected.",
+          },
+          {
+            endpointId: "ep-deepseek-r1",
+            modelName: "deepseek-r1",
+            approve: true,
+            safetyScore: 89,
+            rationale: "Rollback compensating transaction is verified.",
+          },
+        ],
+      });
+
+      const juryVetoed = router.evaluateMultiModelJuryQuorum({
+        actionId: "act-m71-unsafe-drop",
+        riskLevel: "HIGH",
+        votes: [
+          {
+            endpointId: "ep-flagship-opus",
+            modelName: "claude-3-7-sonnet-reasoner",
+            approve: false,
+            safetyScore: 15,
+            rationale: "Unscoped DROP TABLE without backup snapshot.",
+          },
+          {
+            endpointId: "ep-gpt4o",
+            modelName: "gpt-4o",
+            approve: true,
+            safetyScore: 72,
+            rationale: "Syntax valid.",
+          },
+          {
+            endpointId: "ep-deepseek-r1",
+            modelName: "deepseek-r1",
+            approve: false,
+            safetyScore: 25,
+            rationale: "Violates production data retention policy.",
+          },
+        ],
+      });
+
+      // Verify SQLite cold-start persistence of semanticIntentCache
+      const routerRehydrated = new CognitiveRouter(0.3, routerSql, 128);
+      const rehydratedCacheHit = routerRehydrated.routeWithCascadeAndSemanticCache({
+        promptText,
+        systemPrompt: "You are an SRE assistant.",
+        toolDefinitions: "[]",
+        draftLogprobs: [-0.9],
+        confidenceThreshold: threshold,
+        riskLevel: "LOW",
+        estimatedTokens: 1500,
+      });
+
+      const f3Verified =
+        tier1Res.cascadeTier === "TIER1_FAST_DRAFT" &&
+        !tier1Res.escalatedToFlagship &&
+        cacheHitRes.semanticCacheHit === true &&
+        cacheHitRes.cascadeTier === "TIER0_SEMANTIC_CACHE" &&
+        escalatedRes.escalatedToFlagship === true &&
+        escalatedRes.cascadeTier === "TIER2_FLAGSHIP_REASONER" &&
+        juryApproved.consensusDecision === "APPROVED" &&
+        juryApproved.quorumReached === true &&
+        juryVetoed.consensusDecision === "REJECTED_BY_JURY" &&
+        juryVetoed.hasCriticalVeto === true &&
+        rehydratedCacheHit.semanticCacheHit === true;
+
+      return {
+        tier1Res,
+        cacheHitRes,
+        escalatedRes,
+        juryApproved,
+        juryVetoed,
+        rehydratedSemanticCacheHit: rehydratedCacheHit.semanticCacheHit,
+        f3Verified,
+      };
+    };
+
+    if (action === "adaptive_dag_replan") {
+      const res = runF1AdaptiveDagReplan();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F1] 动态 DAG 自适应重规划 (Rev #${res.replanRevision}, 剪枝 ${res.prunedChildIds.length} 节点, 注入 ${res.injectedChildIds.length} 替补节点, 重连下游 ${res.rewiredDownstreamTaskIds.length} 节点)`,
+        "Phase1 / AdaptiveDagReplanner",
+        res.f1Verified ? "DAG_REPLAN_OK" : "DAG_REPLAN_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "best_of_n_speculative") {
+      const res = runF2BestOfNSpeculative();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F2] Best-of-N 投机并行沙箱择优 (胜出分支 ${res.winnerBranchName} · 得分 ${res.winnerScore}, 自动清理 ${res.prunedLoserBranches.length} 败北分支)`,
+        "Phase1 / BestOfNSpeculativeVerifier",
+        res.f2Verified ? "BEST_OF_N_PROMOTED" : "BEST_OF_N_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    if (action === "cascade_jury_routing") {
+      const res = runF3CascadeAndJury();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行 [F3] 级联置信度路由与异构模型陪审团共识 (Tier-0 语义缓存命中=${res.cacheHitRes.semanticCacheHit}, 陪审团放行=${res.juryApproved.consensusDecision} / 拦截=${res.juryVetoed.consensusDecision})`,
+        "Phase1 / CascadeJuryRouter",
+        res.f3Verified ? "CASCADE_JURY_OK" : "CASCADE_JURY_WARN"
+      );
+      return { status: 200, body: res };
+    }
+
+    const f1AdaptiveDagReplan = runF1AdaptiveDagReplan();
+    const f2BestOfNSpeculative = runF2BestOfNSpeculative();
+    const f3CascadeAndJury = runF3CascadeAndJury();
+    const allM71Phase1ChecksPassed =
+      f1AdaptiveDagReplan.f1Verified &&
+      f2BestOfNSpeculative.f2Verified &&
+      f3CascadeAndJury.f3Verified;
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 [M71] 第一阶段认知与投机加速包全量验证 (F1 动态 DAG 重规划 + F2 Best-of-N 投机择优 + F3 级联置信度路由与陪审团, 通过=${allM71Phase1ChecksPassed})`,
+      "Phase1 / CognitiveAccelerationSuite",
+      allM71Phase1ChecksPassed ? "PHASE1_ACCEL_ALL_PASS" : "PHASE1_ACCEL_FAILED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        f1AdaptiveDagReplan,
+        f2BestOfNSpeculative,
+        f3CascadeAndJury,
+        allM71Phase1ChecksPassed,
+      },
+    };
+  }
 }

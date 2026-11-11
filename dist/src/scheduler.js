@@ -544,4 +544,178 @@ class CoreScheduler5D {
     }
     return recoveredIds;
   }
+
+  /**
+   * [M71-1 / F1] Adaptive DAG Subgraph Re-planning in CoreScheduler5D:
+   * - Prunes obsolete/cancelled/failed child tasks (`pruneChildIds` & `fallbackForFailedChildId`),
+   *   reclaiming active leases, node CPU/memory/`running_tasks`, and queue entries.
+   * - Injects new dynamic fan-out or fallback tasks (`injectChildren`) and coordinates with `DagEscrowCoordinator.replanSubgraph`.
+   * - Automatically rewires downstream tasks whose `dependencies` referenced `fallbackForFailedChildId` or `pruneChildIds`
+   *   to depend on the newly injected replacement tasks, and revives downstream tasks that were previously dead-lettered
+   *   due to `UPSTREAM_DEPENDENCY_DEAD_LETTER:<fallbackForFailedChildId>`.
+   */
+  replanDagSubgraph(params)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    const parent = this.allTasks.get(params.parentTaskId);
+    if (!parent) {
+      throw new Error(`Parent task '${params.parentTaskId}' not found in CoreScheduler5D`);
+    }
+
+    const pruneSet = new Set([
+    ...(params.pruneChildIds ?? []),
+    ...(params.fallbackForFailedChildId ? [params.fallbackForFailedChildId] : [])]);
+
+
+    const prunedChildIds = [];
+    for (const pruneId of pruneSet) {
+      this.deadLetterIds.delete(pruneId);
+      const t = this.allTasks.get(pruneId);
+      if (!t || t.state === _models.TaskState.COMPLETED) continue;
+
+      const activeLease = this.leaseCoordinator.getLease(t.task_id);
+      if (activeLease || LEASED_OR_RUNNING_STATES.has(t.state)) {
+        const nodeIdToRelease = activeLease?.node_id ?? t.assigned_node_id;
+        if (nodeIdToRelease) {
+          const node = this.nodes.get(nodeIdToRelease);
+          if (node) {
+            node.free_cpu_cores = Math.min(
+            node.total_cpu_cores,
+            node.free_cpu_cores + t.resource_profile.think_cpu_cores);
+
+            node.free_memory_mb = Math.min(
+            node.total_memory_mb,
+            node.free_memory_mb + Math.floor(t.resource_profile.act_memory_mb * 0.25));
+
+            node.running_tasks = Math.max(0, node.running_tasks - 1);
+          }
+        }
+        this.leaseCoordinator.revokeLease(t.task_id);
+        this.queueManager.completeTask(t);
+        t.assigned_node_id = undefined;
+      } else if (t.state === _models.TaskState.QUEUED) {
+        this.queueManager.removeQueuedTask(t.task_id);
+      }
+
+      t.state = _models.TaskState.CANCELLED;
+      t.dead_letter_reason = "PRUNED_BY_ADAPTIVE_DAG_REPLAN";
+      this.releaseContentFingerprintIfOwned(t);
+      prunedChildIds.push(t.task_id);
+    }
+
+    let replanRevision = 1;
+    if (params.escrowCoordinator) {
+      const escrowRes = params.escrowCoordinator.replanSubgraph({
+        parent,
+        pruneChildIds: params.pruneChildIds,
+        injectChildren: params.injectChildren,
+        fallbackForFailedChildId: params.fallbackForFailedChildId,
+        maxTenantQuota: params.maxTenantQuota,
+        currentTenantUsed: params.currentTenantUsed
+      });
+      replanRevision = escrowRes.replanRevision;
+    }
+
+    this.deadLetterIds.delete(parent.task_id);
+
+    const injectedChildIds = [];
+    for (const child of params.injectChildren ?? []) {
+      child.dependencies = Array.from(
+      new Set([
+      ...child.dependencies.filter((d) => !pruneSet.has(d)),
+      ...(child.dependencies.length === 0 ? [] : [])]));
+
+
+      this.submitTask(child);
+      injectedChildIds.push(child.task_id);
+    }
+
+    const rewiredDownstreamTaskIds = [];
+    const revivedDownstreamTaskIds = [];
+    for (const candidate of this.allTasks.values()) {
+      if (
+      candidate.task_id === parent.task_id ||
+      pruneSet.has(candidate.task_id) ||
+      injectedChildIds.includes(candidate.task_id))
+      {
+        continue;
+      }
+      const hadPrunedDep = candidate.dependencies.some((d) => pruneSet.has(d));
+      if (!hadPrunedDep) continue;
+
+      const updatedDeps = new Set();
+      for (const dep of candidate.dependencies) {
+        if (pruneSet.has(dep)) {
+          for (const replId of injectedChildIds) {
+            updatedDeps.add(replId);
+          }
+        } else {
+          updatedDeps.add(dep);
+        }
+      }
+      candidate.dependencies = Array.from(updatedDeps);
+      rewiredDownstreamTaskIds.push(candidate.task_id);
+
+      if (
+      candidate.state === _models.TaskState.DEAD_LETTER &&
+      Array.from(pruneSet).some(
+      (pId) => candidate.dead_letter_reason === `UPSTREAM_DEPENDENCY_DEAD_LETTER:${pId}`))
+
+      {
+        this.deadLetterIds.delete(candidate.task_id);
+        candidate.dead_letter_reason = "";
+        if (this.dependenciesSatisfied(candidate)) {
+          candidate.state = _models.TaskState.QUEUED;
+          this.queueManager.enqueue(candidate);
+        } else {
+          candidate.state = _models.TaskState.SUBMITTED;
+        }
+        revivedDownstreamTaskIds.push(candidate.task_id);
+      } else if (candidate.state === _models.TaskState.SUBMITTED && this.dependenciesSatisfied(candidate)) {
+        candidate.state = _models.TaskState.QUEUED;
+        this.queueManager.enqueue(candidate);
+      }
+    }
+
+    return {
+      parentTaskId: parent.task_id,
+      prunedChildIds,
+      injectedChildIds,
+      rewiredDownstreamTaskIds,
+      revivedDownstreamTaskIds,
+      replanRevision,
+      parentState: parent.state
+    };
+  }
 }exports.CoreScheduler5D = CoreScheduler5D;

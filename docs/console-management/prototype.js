@@ -1431,6 +1431,9 @@
             </select>
             <button type="button" class="small" data-action="coalesce-duplicate-task" ${!permGlobal.ok ? 'disabled' : ''} title="模拟相同指纹/幂等键并发请求合并与提权">+ 合并并发重复请求演练</button>
             <button type="button" class="small warn" data-action="open-dlq-workbench">DLQ 死信与 Outbox 重放工作台</button>
+            <button type="button" class="small" data-action="open-adaptive-dag-replan">[F1] 动态 DAG 重规划</button>
+            <button type="button" class="small" data-action="open-best-of-n-verifier">[F2] Best-of-N 投机择优</button>
+            <button type="button" class="small" data-action="open-cascade-jury-router">[F3] 级联置信度路由 &amp; 陪审团</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -2481,6 +2484,67 @@
       state.lastApiOutput = JSON.stringify(d, null, 2);
       await fetchBackendState();
       showToast("已将并发重复请求 " + (d.incomingDuplicateId || "dup") + " 合并至 " + (d.canonicalTaskId || "task-ns-8841") + " (累计合并 ×" + (d.mergedDuplicateCount || 1) + "，节省 " + (d.estimatedSavedTokens || 4200) + " Tokens)");
+      return;
+    }
+    if (action === "open-adaptive-dag-replan") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-cognitive-acceleration", {
+        action: "adaptive_dag_replan",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      openDialog(
+        "[F1] 动态 DAG 自适应重规划工作台 (POST /v1beta1/management/ops/phase1-cognitive-acceleration)",
+        "<div><strong>父任务：</strong> <code class=\"mono\">" + (d.parentTaskId || "task-m71-parent") + "</code> · <strong>重规划版本：</strong> <span class=\"status-pill ok\">Rev #" + (d.replanRevision || 1) + "</span></div>" +
+        "<div class=\"muted\" style=\"margin-top:6px;\">已剪枝冗余/失败子节点：<code class=\"mono\">" + ((d.prunedChildIds || []).join(", ")) + "</code></div>" +
+        "<div class=\"muted\" style=\"margin-top:4px;\">动态注入替补子节点：<code class=\"mono\">" + ((d.injectedChildIds || []).join(", ")) + "</code></div>" +
+        "<div class=\"muted\" style=\"margin-top:4px;\">自动重连并从死信恢复的下游汇聚节点：<code class=\"mono\">" + ((d.revivedDownstreamTaskIds || []).join(", ")) + "</code> (状态=<span class=\"status-pill ok\">" + (d.downstreamStateAfterReplan || "SUBMITTED") + "</span>)</div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-best-of-n-verifier") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-cognitive-acceleration", {
+        action: "best_of_n_speculative",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      const candRows = (d.candidates || []).map(c =>
+        "<tr><td class=\"mono\">" + c.branchName + "</td><td>" + c.modelTier + "</td><td><span class=\"status-pill " + (c.passed ? "ok" : "danger") + "\">" + (c.passed ? "PASS" : "FAIL") + "</span></td><td class=\"mono\">" + c.testsPassed + " / warn=" + c.lintWarnings + "</td><td class=\"mono\"><strong>" + c.score + "</strong></td></tr>"
+      ).join("");
+      openDialog(
+        "[F2] Best-of-N 投机并行沙箱与评分择优器 (POST /v1beta1/management/ops/phase1-cognitive-acceleration)",
+        "<div><strong>胜出晋级分支：</strong> <code class=\"mono\">" + (d.winnerBranchName || "") + "</code> → <code class=\"mono\">" + (d.promotedBranchName || "") + "</code> (<span class=\"status-pill ok\">Score " + (d.winnerScore || 98.5) + "</span>)</div>" +
+        "<div class=\"muted\" style=\"margin:6px 0;\">已自动清理败北 CoW 分支：<code class=\"mono\">" + ((d.prunedLoserBranches || []).join(", ")) + "</code></div>" +
+        "<table class=\"data-table\"><thead><tr><th>候选分支</th><th>模型/温度</th><th>验证结果</th><th>单测/Lint</th><th>综合评分</th></tr></thead><tbody>" + candRows + "</tbody></table>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
+      return;
+    }
+    if (action === "open-cascade-jury-router") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/phase1-cognitive-acceleration", {
+        action: "cascade_jury_routing",
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      openDialog(
+        "[F3] 级联置信度路由、语义缓存与异构模型陪审团共识 (POST /v1beta1/management/ops/phase1-cognitive-acceleration)",
+        "<div><strong>Tier-0 语义缓存：</strong> <span class=\"status-pill ok\">HIT (节省 " + (d.cacheHitRes?.savedTokens || 1500) + " Tokens)</span> · <strong>Tier-1 草案直出置信度：</strong> <code class=\"mono\">" + (d.tier1Res?.meanConfidence || 0.94) + "</code></div>" +
+        "<div style=\"margin-top:6px;\"><strong>Tier-2 低置信度自动升级：</strong> <code class=\"mono\">" + (d.escalatedRes?.selectedModel || "claude-3-7-sonnet-reasoner") + "</code> (<span class=\"status-pill warn\">ESCALATED</span>)</div>" +
+        "<div style=\"margin-top:6px;\"><strong>异构三模型陪审团共识：</strong> 安全迁移单=<span class=\"status-pill ok\">" + (d.juryApproved?.consensusDecision || "APPROVED") + " (均分 " + (d.juryApproved?.averageSafetyScore || 91.3) + ")</span> · 高危删表=<span class=\"status-pill danger\">" + (d.juryVetoed?.consensusDecision || "REJECTED_BY_JURY") + "</span></div>",
+        "完成复核",
+        () => closeDialog()
+      );
+      await fetchBackendState();
       return;
     }
     if (action === "open-dlq-workbench") {

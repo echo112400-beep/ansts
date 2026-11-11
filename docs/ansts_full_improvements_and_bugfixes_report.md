@@ -514,4 +514,16 @@
 | **7. [M70-4] 配置中心版本化字段级 Diff 预览** | 在热更新或回滚前对比基线配置与候选配置的逐字段差异（`MODIFIED` / `ADDED` / `UNCHANGED`），避免盲目变更。 | `POST /v1beta1/management/ops/day2-governance` (`config_diff_preview`) · `anstsctl mgmt-day2-ops config_diff_preview` | 审计与混沌视图 **「配置版本字段级 Diff 预览」** |
 | **8. [M70-1 & M70-4] Outbox Webhook 密钥零停机双密钥轮换** | 在 `TransactionalOutboxDispatcher` 中新增 `rotateSigningSecret(newPrimarySecret, graceWindowSec, nowSec)`，在宽限期内同时支持新主密钥与旧次级密钥的 `crypto.timingSafeEqual` 恒定时间验签，实现零停机平滑轮换。 | `POST /v1beta1/management/ops/day2-governance` (`rotate_webhook_secret`) · `anstsctl mgmt-day2-ops rotate_webhook_secret` | 审计与混沌视图 **「Outbox 双密钥平滑轮换」** |
 
-- **全量回归验证**：新增 `tests/m70_console_day2_ops_governance_workbench.test.ts`，全仓 **63 个测试套件（176 项子测试）100% 通过**。
+- **全量回归验证**：新增 `tests/m70_console_day2_ops_governance_workbench.test.ts`，全仓 **64 个测试套件（180 项子测试）100% 通过**。
+
+
+## 二十一、M71 第一阶段认知与投机执行加速套件（Phase 1 Cognitive & Speculative Execution Acceleration Suite）
+
+围绕下一代系统演进路线图的第一阶段（**F1 动态 DAG 自适应重规划 + F2 Best-of-N 投机并行沙箱与评分择优器 + F3 级联置信度路由与异构模型陪审团**），完成了核心算法落地、SQLite 持久化、Console BFF 接口、前端工作台与 `anstsctl` CLI 的端到端集成：
+
+| 特性编号与名称 | 涉及模块 | 核心算法与工程实现细节 | 验证结果 |
+| :--- | :--- | :--- | :--- |
+| **[M71-1 / F1] 动态 DAG 自适应重规划引擎 (`Adaptive DAG Re-planner`)** | `src/dag/escrow.ts`、`src/scheduler.ts` | 新增 `DagEscrowCoordinator.replanSubgraph()` 与 `CoreScheduler5D.replanDagSubgraph()`：支持运行期剪枝冗余/失败子节点（原子回收租约、节点 CPU/内存与托管槽位）、动态分裂/注入替补子节点（带全图环路检测 `assertNoCycle`）、自动重写下游汇聚节点依赖边并从级联 `DEAD_LETTER` 状态原地复活，同时将 `replanRevision` 持久化至 SQLite `persisted_escrows`。 | 已验证 (`tests/m71_phase1_cognitive_speculative_acceleration.test.ts` Subtest 1) |
+| **[M71-2 / F2] Best-of-N 投机并行沙箱与评分择优器 (`Speculative Parallel Verifier`)** | `src/runtime/sandbox_branch_forker.ts` | 新增 `CoWSandboxBranchForker.executeBestOfNSpeculativeVerifier()`：基于 LayerFS 零拷贝同时派生 $N$ 个候选分支并在 `DeterministicExecutionEnvelope` 下执行真实命令与验证脚本，采集单测通过数 (`TESTS_PASSED`)、Lint 告警数 (`LINT_WARNINGS`) 与挂载耗时计算综合质量分 (`0..100`)，自动将最高分分支晋级合并至目标分支并调用 `gcUnreachableCommits()` 清理全部败北分支与孤立块。 | 已验证 (`tests/m71_phase1_cognitive_speculative_acceleration.test.ts` Subtest 2) |
+| **[M71-3 / F3] 级联置信度路由、语义缓存与异构模型陪审团 (`Cascade Router & Multi-Model Jury`)** | `src/cognitive_router.ts` | 新增 `computeSemanticIntentHash()`、`routeWithCascadeAndSemanticCache()` 与 `evaluateMultiModelJuryQuorum()`：支持归一化语义意图缓存命中 (`TIER0_SEMANTIC_CACHE` 节省 100% 推理 Token 且持久化至 SQLite `persisted_router_state`)、基于 Token 对数概率均值 $\bar{p} = \frac{1}{K}\sum \exp(\text{logprob}_i)$ 的轻量草案直出 (`TIER1_FAST_DRAFT`) 与低置信度自动升级旗舰推理模型 (`TIER2_FLAGSHIP_REASONER`)，以及高危操作下跨异构模型的 $\ge 2/3$ 法定人数与安全均分一票否决陪审团机制。 | 已验证 (`tests/m71_phase1_cognitive_speculative_acceleration.test.ts` Subtest 3) |
+| **[M71-4] 管理面 BFF、Console 交互台与 CLI 闭环** | `src/dashboard/server.ts`、`src/server_main.ts`、`src/cli/anstsctl.ts`、`docs/console-management/prototype.js` | 新增 `POST /v1beta1/management/ops/phase1-cognitive-acceleration`、`anstsctl mgmt-phase1-accel` 及控制台任务治理视图顶部 **`[F1] 动态 DAG 重规划`**、**`[F2] Best-of-N 投机择优`**、**`[F3] 级联置信度路由 & 陪审团`** 三大交互式工作台。 | 已验证 (`tests/m71_phase1_cognitive_speculative_acceleration.test.ts` Subtest 4，全仓 **64 个测试套件 / 180 项子测试 100% 通过**) |

@@ -14,6 +14,7 @@ var _models = require("../models.js"); /**
 
 
 
+
 const TERMINAL_PARENT_STATES = new Set([
 _models.TaskState.COMPLETED,
 _models.TaskState.SUCCEEDED,
@@ -56,7 +57,8 @@ class DagEscrowCoordinator {
         tenantId: String(parsed.tenantId ?? "default"),
         escrowedSlots: Number(parsed.escrowedSlots ?? parsed.escrowReserved ?? 0),
         usedSlots: Number(parsed.usedSlots ?? 0),
-        childTaskIds: new Set(childIds)
+        childTaskIds: new Set(childIds),
+        replanRevision: Number(parsed.replanRevision ?? 0)
       };
       this.escrows.set(parentTaskId, rec);
       const childDepsMap =
@@ -90,6 +92,7 @@ class DagEscrowCoordinator {
       escrowedSlots: rec.escrowedSlots,
       usedSlots: rec.usedSlots,
       childTaskIds: Array.from(rec.childTaskIds),
+      replanRevision: rec.replanRevision ?? 0,
       childDependencies
     }));
 
@@ -244,6 +247,131 @@ class DagEscrowCoordinator {
       this.sql.exec("DELETE FROM persisted_escrows WHERE parent_task_id = ?", parentTaskId);
     }
     return freed;
+  }
+
+
+  /**
+   * [M71-1 / F1] Adaptive DAG Subgraph Re-planner:
+   * Atomically prunes obsolete/failed child sub-agents, reclaims their escrowed quota slots,
+   * validates cycle-freedom for newly injected dynamic fan-out or fallback children, expands escrow
+   * within tenant quota if needed, and persists the incremented `replanRevision` to SQLite.
+   */
+  replanSubgraph(params)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    const { parent } = params;
+    const canReviveDeadLetterParent =
+    parent.state === _models.TaskState.DEAD_LETTER &&
+    params.fallbackForFailedChildId !== undefined &&
+    parent.dead_letter_reason === `CHILD_SUB_AGENT_FAILED:${params.fallbackForFailedChildId}`;
+
+    if (TERMINAL_PARENT_STATES.has(parent.state) && !canReviveDeadLetterParent) {
+      throw new Error(
+      `Cannot replan subgraph for parent '${parent.task_id}' in terminal state '${parent.state}'`);
+
+    }
+
+    let escrow = this.escrows.get(parent.task_id);
+    if (!escrow) {
+      escrow = {
+        parentTaskId: parent.task_id,
+        tenantId: parent.tenant_id,
+        escrowedSlots: Math.max(0, parent.expected_SubAgent_count),
+        usedSlots: 0,
+        childTaskIds: new Set(),
+        replanRevision: 0
+      };
+      this.escrows.set(parent.task_id, escrow);
+    }
+
+    const pruneSet = new Set([
+    ...(params.pruneChildIds ?? []),
+    ...(params.fallbackForFailedChildId ? [params.fallbackForFailedChildId] : [])]);
+
+    const prunedChildIds = [];
+    let reclaimedSlots = 0;
+
+    for (const cId of pruneSet) {
+      if (escrow.childTaskIds.delete(cId)) {
+        prunedChildIds.push(cId);
+        if (escrow.usedSlots > 0) {
+          escrow.usedSlots -= 1;
+          reclaimedSlots += 1;
+        }
+      }
+      this.dependencyGraph.delete(cId);
+    }
+
+    const injectList = params.injectChildren ?? [];
+    const newUniqueChildren = injectList.filter((c) => !escrow.childTaskIds.has(c.task_id));
+
+    for (const child of injectList) {
+      const cleanedDeps = child.dependencies.filter((d) => !pruneSet.has(d));
+      this.assertNoCycle(child.task_id, new Set([parent.task_id, ...cleanedDeps]));
+    }
+
+    let expandedEscrowSlots = 0;
+    const neededSlots = escrow.usedSlots + newUniqueChildren.length;
+    if (neededSlots > escrow.escrowedSlots) {
+      const delta = neededSlots - escrow.escrowedSlots;
+      if (
+      params.maxTenantQuota !== undefined &&
+      params.currentTenantUsed !== undefined &&
+      params.currentTenantUsed + delta > params.maxTenantQuota)
+      {
+        throw new Error(
+        `Insufficient tenant quota to expand SubAgent escrow by ${delta} slots during adaptive replanning for ${parent.task_id}`);
+
+      }
+      escrow.escrowedSlots += delta;
+      expandedEscrowSlots = delta;
+    }
+
+    const injectedChildIds = [];
+    for (const child of injectList) {
+      const cleanedDeps = child.dependencies.filter((d) => !pruneSet.has(d));
+      this.dependencyGraph.set(child.task_id, new Set([parent.task_id, ...cleanedDeps]));
+      if (!escrow.childTaskIds.has(child.task_id)) {
+        escrow.childTaskIds.add(child.task_id);
+        escrow.usedSlots += 1;
+      }
+      injectedChildIds.push(child.task_id);
+    }
+
+    escrow.replanRevision = (escrow.replanRevision ?? 0) + 1;
+    if (canReviveDeadLetterParent) {
+      parent.dead_letter_reason = "";
+    }
+    parent.state =
+    escrow.childTaskIds.size > 0 ? _models.TaskState.WAITING_SUB_AGENT : _models.TaskState.RUNNING_THINK;
+    this.persistEscrow(escrow);
+
+    return {
+      replanRevision: escrow.replanRevision,
+      prunedChildIds,
+      injectedChildIds,
+      reclaimedSlots,
+      expandedEscrowSlots,
+      activeChildCount: escrow.childTaskIds.size,
+      parentState: parent.state
+    };
+  }
+
+  getEscrowRecord(parentTaskId) {
+    return this.escrows.get(parentTaskId);
   }
 
   getTenantEscrowedSlots(tenantId) {

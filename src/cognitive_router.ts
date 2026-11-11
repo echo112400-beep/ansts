@@ -11,6 +11,19 @@ import { SqlStorageLike } from "./cloudflare/env.js";
 export class CognitiveRouter {
   private readonly endpoints: Map<string, LlmEndpointMetrics> = new Map();
   private readonly prefixRadixIndex: Map<string, string> = new Map();
+  private readonly semanticIntentCache: Map<
+    string,
+    {
+      intentHash: string;
+      normalizedPrompt: string;
+      responseSummary: string;
+      modelName: string;
+      endpointId: string;
+      confidence: number;
+      cachedAtMs: number;
+      hitCount: number;
+    }
+  > = new Map();
   private readonly breakers: Map<string, ThreeStateCircuitBreaker> = new Map();
   private readonly limiters: Map<string, SlidingWindowTokenBucket> = new Map();
   private readonly lastWindowResetMs: Map<string, number> = new Map();
@@ -74,6 +87,25 @@ export class CognitiveRouter {
           }
         }
         this.enforcePrefixIndexBound();
+        continue;
+      }
+      if (epId === "__semantic_intent_cache__") {
+        const cacheEntries = Array.isArray(parsed.entries) ? parsed.entries : [];
+        for (const item of cacheEntries) {
+          if (item && typeof item === "object" && typeof (item as Record<string, unknown>).intentHash === "string") {
+            const rec = item as Record<string, unknown>;
+            this.semanticIntentCache.set(String(rec.intentHash), {
+              intentHash: String(rec.intentHash),
+              normalizedPrompt: String(rec.normalizedPrompt ?? ""),
+              responseSummary: String(rec.responseSummary ?? ""),
+              modelName: String(rec.modelName ?? ""),
+              endpointId: String(rec.endpointId ?? ""),
+              confidence: Number(rec.confidence ?? 0.9),
+              cachedAtMs: Number(rec.cachedAtMs ?? Date.now()),
+              hitCount: Number(rec.hitCount ?? 0),
+            });
+          }
+        }
         continue;
       }
       const ep = new LlmEndpointMetrics({
@@ -310,5 +342,249 @@ export class CognitiveRouter {
       this.breakers.get(endpointId)?.releaseHalfOpenProbe();
       this.persistEndpointState(endpointId);
     }
+  }
+
+  private persistSemanticIntentCache(): void {
+    if (!this.sql) return;
+    const entries = Array.from(this.semanticIntentCache.values());
+    this.sql.exec(
+      "INSERT OR REPLACE INTO persisted_router_state (endpoint_id, payload_json) VALUES (?, ?)",
+      "__semantic_intent_cache__",
+      JSON.stringify({ entries })
+    );
+  }
+
+  /**
+   * [M71-3 / F3] Normalizes prompt text (lowercasing, stripping punctuation/stopwords filler, collapsing whitespace)
+   * and returns a 24-hex semantic intent fingerprint.
+   */
+  public static computeSemanticIntentHash(promptText: string): string {
+    const normalized = String(promptText ?? "")
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return crypto.createHash("sha256").update(normalized, "utf-8").digest("hex").slice(0, 24);
+  }
+
+  /**
+   * [M71-3 / F3] Cascade Confidence Router & Semantic Cache:
+   * 1. Checks `semanticIntentCache` for normalized intent hits (when `riskLevel !== "HIGH"`), saving 100% of inference tokens.
+   * 2. Evaluates token log-probabilities (`draftLogprobs`) from the fast Tier-1 draft model:
+   *    $\bar{p} = \frac{1}{K} \sum_{i=1}^K \exp(\min(0, \text{logprob}_i))$.
+   * 3. Accepts the Tier-1 fast draft model when $\bar{p} \ge \text{confidenceThreshold}$ and `riskLevel !== "HIGH"`;
+   *    otherwise seamlessly escalates to the Tier-2 flagship reasoning model.
+   */
+  public routeWithCascadeAndSemanticCache(params: {
+    promptText: string;
+    systemPrompt: string;
+    toolDefinitions: string;
+    draftLogprobs: number[];
+    confidenceThreshold?: number;
+    riskLevel?: "LOW" | "MEDIUM" | "HIGH";
+    priority?: TaskPriority;
+    estimatedTokens?: number;
+    draftResponseSummary?: string;
+    nowMs?: number;
+  }): {
+    intentHash: string;
+    semanticCacheHit: boolean;
+    cascadeTier: "TIER0_SEMANTIC_CACHE" | "TIER1_FAST_DRAFT" | "TIER2_FLAGSHIP_REASONER";
+    escalatedToFlagship: boolean;
+    meanConfidence: number;
+    confidenceThreshold: number;
+    selectedEndpointId: string;
+    selectedModel: string;
+    prefixCacheHit: boolean;
+    savedTokens: number;
+    cachedHitCount: number;
+  } {
+    const nowMs = params.nowMs ?? Date.now();
+    const threshold =
+      Number.isFinite(params.confidenceThreshold) &&
+      params.confidenceThreshold! > 0 &&
+      params.confidenceThreshold! <= 1
+        ? params.confidenceThreshold!
+        : 0.82;
+    const riskLevel = params.riskLevel ?? "LOW";
+    const estimatedTokens =
+      Number.isFinite(params.estimatedTokens) && params.estimatedTokens! > 0
+        ? Math.floor(params.estimatedTokens!)
+        : 1200;
+    const intentHash = CognitiveRouter.computeSemanticIntentHash(params.promptText);
+
+    if (riskLevel !== "HIGH") {
+      const cached = this.semanticIntentCache.get(intentHash);
+      if (cached) {
+        cached.hitCount += 1;
+        this.persistSemanticIntentCache();
+        return {
+          intentHash,
+          semanticCacheHit: true,
+          cascadeTier: "TIER0_SEMANTIC_CACHE",
+          escalatedToFlagship: false,
+          meanConfidence: cached.confidence,
+          confidenceThreshold: threshold,
+          selectedEndpointId: cached.endpointId,
+          selectedModel: cached.modelName,
+          prefixCacheHit: true,
+          savedTokens: estimatedTokens,
+          cachedHitCount: cached.hitCount,
+        };
+      }
+    }
+
+    const validLogprobs = (params.draftLogprobs ?? []).filter((lp) => Number.isFinite(lp));
+    const meanConfidence =
+      validLogprobs.length > 0
+        ? Number(
+            (
+              validLogprobs.reduce((acc, lp) => acc + Math.exp(Math.min(0, lp)), 0) /
+              validLogprobs.length
+            ).toFixed(4)
+          )
+        : 0.5;
+
+    const escalatedToFlagship = meanConfidence < threshold || riskLevel === "HIGH";
+    const prefixHash = CognitiveRouter.computePrefixHash(
+      params.systemPrompt,
+      params.toolDefinitions,
+      params.promptText
+    );
+    const [baseEp, prefixCacheHit] = this.selectEndpoint(
+      prefixHash,
+      estimatedTokens,
+      params.priority ?? TaskPriority.P1_HIGH,
+      nowMs
+    );
+
+    let chosenEp = baseEp;
+    const healthyEps = Array.from(this.endpoints.values()).filter((ep) => ep.healthy);
+    if (healthyEps.length > 1) {
+      if (escalatedToFlagship) {
+        const flagship = healthyEps.find((ep) =>
+          /opus|pro|gpt-4o(?!-mini)|sonnet|deepseek-r1|reasoner/i.test(ep.model_name)
+        );
+        if (flagship) chosenEp = flagship;
+      } else {
+        const fastDraft = healthyEps.find((ep) =>
+          /mini|flash|haiku|fast|draft/i.test(ep.model_name)
+        );
+        if (fastDraft) chosenEp = fastDraft;
+      }
+    }
+
+    const savedTokens = escalatedToFlagship ? 0 : Math.floor(estimatedTokens * 0.65);
+
+    if (meanConfidence >= threshold) {
+      while (this.semanticIntentCache.size >= this.maxPrefixCacheEntries) {
+        const oldest = this.semanticIntentCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.semanticIntentCache.delete(oldest);
+      }
+      this.semanticIntentCache.set(intentHash, {
+        intentHash,
+        normalizedPrompt: params.promptText.trim().slice(0, 256),
+        responseSummary: params.draftResponseSummary ?? "Validated high-confidence response",
+        modelName: chosenEp.model_name,
+        endpointId: chosenEp.endpoint_id,
+        confidence: meanConfidence,
+        cachedAtMs: nowMs,
+        hitCount: 0,
+      });
+      this.persistSemanticIntentCache();
+    }
+
+    return {
+      intentHash,
+      semanticCacheHit: false,
+      cascadeTier: escalatedToFlagship ? "TIER2_FLAGSHIP_REASONER" : "TIER1_FAST_DRAFT",
+      escalatedToFlagship,
+      meanConfidence,
+      confidenceThreshold: threshold,
+      selectedEndpointId: chosenEp.endpoint_id,
+      selectedModel: chosenEp.model_name,
+      prefixCacheHit,
+      savedTokens,
+      cachedHitCount: 0,
+    };
+  }
+
+  /**
+   * [M71-3 / F3] Heterogeneous Multi-Model Jury Quorum:
+   * Cross-verifies high-risk tool executions or architectural decisions across multiple distinct
+   * LLM providers/models, requiring quorum agreement (`minQuorumRatio`, default 2/3), average safety score
+   * above `minSafetyScore` (default 80), and zero critical safety vetoes (`safetyScore < 40`).
+   */
+  public evaluateMultiModelJuryQuorum(params: {
+    actionId: string;
+    riskLevel: "LOW" | "MEDIUM" | "HIGH";
+    votes: Array<{
+      endpointId: string;
+      modelName: string;
+      approve: boolean;
+      safetyScore: number;
+      rationale: string;
+    }>;
+    minQuorumRatio?: number;
+    minSafetyScore?: number;
+  }): {
+    actionId: string;
+    riskLevel: "LOW" | "MEDIUM" | "HIGH";
+    totalVoters: number;
+    distinctModelsCount: number;
+    approvalCount: number;
+    agreementRatio: number;
+    averageSafetyScore: number;
+    hasCriticalVeto: boolean;
+    quorumReached: boolean;
+    consensusDecision: "APPROVED" | "REJECTED_BY_JURY";
+    dissentingModels: string[];
+  } {
+    const votes = Array.isArray(params.votes) ? params.votes : [];
+    if (votes.length === 0) {
+      throw new Error("evaluateMultiModelJuryQuorum requires at least 1 model vote");
+    }
+    const minQuorumRatio =
+      Number.isFinite(params.minQuorumRatio) && params.minQuorumRatio! > 0 && params.minQuorumRatio! <= 1
+        ? params.minQuorumRatio!
+        : 2 / 3;
+    const minSafetyScore =
+      Number.isFinite(params.minSafetyScore) && params.minSafetyScore! >= 0
+        ? params.minSafetyScore!
+        : 80;
+
+    const distinctModels = new Set(votes.map((v) => v.modelName));
+    const approvalCount = votes.filter((v) => v.approve).length;
+    const agreementRatio = Number((approvalCount / votes.length).toFixed(4));
+    const averageSafetyScore = Number(
+      (
+        votes.reduce((acc, v) => acc + Math.max(0, Math.min(100, Number(v.safetyScore) || 0)), 0) /
+        votes.length
+      ).toFixed(2)
+    );
+    const hasCriticalVeto = votes.some((v) => !v.approve && Number(v.safetyScore) < 40);
+    const dissentingModels = votes.filter((v) => !v.approve).map((v) => v.modelName);
+
+    const requiresHeterogeneousJury = params.riskLevel === "HIGH" ? distinctModels.size >= 2 : true;
+    const quorumReached =
+      requiresHeterogeneousJury &&
+      agreementRatio >= minQuorumRatio &&
+      averageSafetyScore >= minSafetyScore &&
+      !hasCriticalVeto;
+
+    return {
+      actionId: params.actionId,
+      riskLevel: params.riskLevel,
+      totalVoters: votes.length,
+      distinctModelsCount: distinctModels.size,
+      approvalCount,
+      agreementRatio,
+      averageSafetyScore,
+      hasCriticalVeto,
+      quorumReached,
+      consensusDecision: quorumReached ? "APPROVED" : "REJECTED_BY_JURY",
+      dissentingModels,
+    };
   }
 }
