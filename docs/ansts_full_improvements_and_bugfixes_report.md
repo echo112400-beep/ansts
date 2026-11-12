@@ -699,3 +699,19 @@
    - 新增 `LayerFsContentStoreEngine.listEpisodicTrajectories()`，实时展示已固化的 `golden/<episodeId>` 黄金镜像分支、HEAD Commit、仓库签名与预计节省冷启动时间 (`savedColdStartMs`)，并支持通过控制台或 CLI `anstsctl mgmt-swarm hatch_golden_episode` 从活跃分支孵化新黄金镜像。
 4. **端到端回归验证 (`tests/m82_console_swarm_guardrail_spot_market_and_episodic_store.test.ts`)**：
    - 全量 **89 个 `src/` 源码模块**、**75 个测试套件（共 209 项测试）100% 通过**。
+
+
+---
+
+## 33. M83: TanStack Console 多地域主权联邦、双归属反向隧道网关、跨地域 RS(4,2) 纠删码灾备与网络混沌代理工作台套件 (`GET /v1beta1/console/federation`, `POST /v1beta1/management/federation/action`, `anstsctl mgmt-federation-console`)
+
+1. **双归属 (PRIMARY / SECONDARY) Outbound mTLS 反向隧道矩阵与主备切换 (`TunnelGatewayCell` & `reverseTunnels`)**：
+   - 将 `TunnelGatewayCell` 绑定至持久化 SQLite `tunnel_gateway_bindings` 与 `tunnel_gateway_commands`，支持实时展示所有 NAT 隔离 Body 宿主 (`body-host-01..03`) 到 `celld-gw-01` (`PRIMARY`) 与 `celld-gw-02` (`SECONDARY`) 的连接代次 (`connGeneration`)、Epoch 与健康状态。
+   - 支持在线模拟网关失联 (`toggle_tunnel_gateway_health`) 验证亚秒级 `PRIMARY → SECONDARY` 自动选路切换，并支持向任意宿主下发反向隧道心跳指令 (`dispatch_tunnel_probe`)。
+2. **跨地域 Reed-Solomon `RS(K=4, M=2)` 纠删码 WAL 6-Region 分片与双地域陨落无损重构 (`CrossRegionErasureCodedWalManager` & `erasureCoding`)**：
+   - 将 `CrossRegionErasureCodedWalManager` 绑定至 SQLite `persisted_erasure_coded_wals`，在控制台实时展示全球 6 个地域 (`us-east-va`, `us-west-or`, `eu-west-ie`, `ap-east-hk`, `sa-east-sp`, `af-south-cpt`) 的 4 数据块 (`D0..D3`) + 2 校验块 (`P0..P1`) 拓扑与 CRC32 校验和。
+   - 支持在线编码新跨地域 WAL 清单 (`encode_erasure_wal`) 及模拟任意 2 个地域同时损毁并基于伽罗瓦域 `GF(2^8)` 无损重构原始 WAL 数据 (`simulate_dual_region_outage_rebuild`，验证 `crc32Match === true`)。
+3. **多地域主权联邦路由表与网络混沌故障注入代理 (`MultiRegionFederationRouter` & `NetworkChaosFaultInjectionProxy`)**：
+   - 实时展示 `US / EU / APAC` 三大主权域联邦接入点的 EWMA RTT 延迟，并支持在控制台一键注入带 60s TTL 自动过期的节点网络分区与延迟抖动 (`inject_chaos_partition`) 或一键清除全部混沌故障 (`heal_all_chaos_faults`)。
+4. **端到端回归验证 (`tests/m83_console_federation_reverse_tunnel_erasure_and_chaos.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**76 个测试套件（共 210 项测试）100% 通过**。

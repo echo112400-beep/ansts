@@ -375,4 +375,8 @@ export class CrossRegionErasureCodedWalManager {
   public getManifest(walId: string): ErasureEncodedWalManifest | undefined {
     return this.manifests.get(walId);
   }
+
+  public listManifests(): ErasureEncodedWalManifest[] {
+    return Array.from(this.manifests.values());
+  }
 }

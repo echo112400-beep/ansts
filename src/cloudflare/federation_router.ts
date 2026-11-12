@@ -18,6 +18,10 @@ export class MultiRegionFederationRouter {
     this.regions.set(ep.regionCode, { ...ep, rttEwmaMs: safeRtt });
   }
 
+  public listRegions(): FederatedRegionEndpoint[] {
+    return Array.from(this.regions.values()).map((r) => ({ ...r }));
+  }
+
   public selectOptimalRegion(params: {
     requiredSovereigntyZone?: "US" | "EU" | "APAC";
     preferredRegionCode?: string;

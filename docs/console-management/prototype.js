@@ -102,7 +102,8 @@
     { id: 'configs', label: '配置中心与版本治理', badgeKey: 'configs' },
     { id: 'runtime', label: '分布式运行面与 LayerFS 可视', badgeKey: 'runtime' },
     { id: 'observability', label: '可观测性、SLO 与自愈运维', badgeKey: 'observability' },
-    { id: 'swarm', label: '智能体协同、策略与算力市场', badgeKey: 'swarm' }
+    { id: 'swarm', label: '智能体协同、策略与算力市场', badgeKey: 'swarm' },
+    { id: 'federation', label: '多地域联邦、隧道与灾备纠删码', badgeKey: 'federation' }
   ];
 
   function createBaselineState() {
@@ -148,6 +149,7 @@
       runtimeVisualization: null,
       observabilityVisualization: null,
       swarmVisualization: null,
+      federationVisualization: null,
       allTenantIds: [],
       regions: [],
       nodes: [],
@@ -266,6 +268,7 @@
       if (d.runtimeVisualization) state.runtimeVisualization = d.runtimeVisualization;
       if (d.observabilityVisualization) state.observabilityVisualization = d.observabilityVisualization;
       if (d.swarmVisualization) state.swarmVisualization = d.swarmVisualization;
+      if (d.federationVisualization) state.federationVisualization = d.federationVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -406,6 +409,12 @@
       const rulesCnt = state.swarmVisualization?.formalGuardrail?.totalRulesCount ?? 5;
       const spotSlots = state.swarmVisualization?.spotQuotaMarket?.totalAvailableSpotSlots ?? 20;
       return { text: `${rulesCnt} 策略 · ${spotSlots} Spot`, cls: 'ok' };
+    }
+    if (key === 'federation') {
+      const pCnt = state.federationVisualization?.chaosEngineering?.activePartitionCount ?? 0;
+      if (pCnt > 0) return { text: `${pCnt} 分区故障`, cls: 'danger' };
+      const tCnt = state.federationVisualization?.reverseTunnels?.healthyBindingsCount ?? 6;
+      return { text: `${tCnt} 隧道 · RS(4,2)`, cls: 'ok' };
     }
     const brCount = state.runtimeVisualization?.layerfsBranches?.length ?? 4;
     return { text: `${brCount} 分支`, cls: '' };
@@ -2174,6 +2183,190 @@
     `;
   }
 
+  function renderFederationSection() {
+    const fv = state.federationVisualization || {
+      federatedRegions: [],
+      reverseTunnels: { totalBindingsCount: 6, healthyBindingsCount: 6, hosts: [], allBindings: [] },
+      erasureCoding: { scheme: 'Cauchy Reed-Solomon GF(2^8) RS(K=4, M=2)', manifestsCount: 1, manifests: [], lastRebuildReport: null },
+      chaosEngineering: { partitionedHosts: [], jitterByHost: {}, activePartitionCount: 0 }
+    };
+    const rt = fv.reverseTunnels || {};
+    const ec = fv.erasureCoding || {};
+    const ch = fv.chaosEngineering || {};
+    const perm = canMutateTarget('all', 'all', false);
+    const rbReport = ec.lastRebuildReport;
+
+    return `
+      <section class="kpi-grid" aria-label="多地域联邦与灾备纠删码核心指标">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>多地域主权联邦路由器 (FederationRouter)</span><span class="status-pill ok">US / EU / APAC</span></div>
+          <div class="kpi-value">${(fv.federatedRegions || []).length} 联邦地域</div>
+          <div class="kpi-sub">最低 RTT EWMA: <span class="mono">${fv.federatedRegions?.[0]?.rttEwmaMs ?? 18} ms (${esc(fv.federatedRegions?.[0]?.regionCode || 'us-west-2')})</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>双归属 mTLS 反向隧道网关 (TunnelGatewayCell)</span><span class="status-pill ${rt.healthyBindingsCount === rt.totalBindingsCount ? 'ok' : 'warn'}">零入站端口穿透</span></div>
+          <div class="kpi-value">${rt.healthyBindingsCount ?? 6} / ${rt.totalBindingsCount ?? 6} 在线</div>
+          <div class="kpi-sub">宿主双归属: <span class="mono">PRIMARY (celld-gw-01) + SECONDARY (celld-gw-02)</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>跨地域 RS(K=4, M=2) 纠删码 WAL 归档</span><span class="status-pill ok">容忍 2 地域陨落</span></div>
+          <div class="kpi-value">${ec.manifestsCount ?? 1} 份 6-Shard 清单</div>
+          <div class="kpi-sub">编码方案: <span class="mono">${esc(ec.scheme || 'GF(2^8) RS(4,2)')}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>网络混沌故障注入代理 (ChaosProxy)</span><span class="status-pill ${ch.activePartitionCount > 0 ? 'danger' : 'ok'}">${ch.activePartitionCount > 0 ? '故障演练中' : '网络无故障'}</span></div>
+          <div class="kpi-value">${ch.activePartitionCount ?? 0} 隔离节点</div>
+          <div class="kpi-sub">隔离列表: <span class="mono">${(ch.partitionedHosts || []).join(', ') || 'NONE'}</span></div>
+        </div>
+      </section>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">双归属 (PRIMARY / SECONDARY) Outbound mTLS 反向隧道矩阵与亚秒级主备故障切换台 (GET /v1beta1/console/federation · POST /v1beta1/management/federation/action)</h2>
+            <p class="panel-subtitle">NAT 隔离的 Body 沙箱宿主通过出站长连接双归属注册至 <code>celld-gw-01</code> 与 <code>celld-gw-02</code>，当 PRIMARY 网关失联时自动零丢包切换至 SECONDARY。</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Body 宿主节点</th>
+                <th>绑定网关 (Gateway ID)</th>
+                <th>隧道角色</th>
+                <th>Epoch / Generation</th>
+                <th>健康状态</th>
+                <th>当前宿主主选路</th>
+                <th>反向隧道运维操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(rt.hosts || []).map((h) =>
+                (h.bindings || []).map((b, idx) => `
+                  <tr>
+                    <td class="mono">${idx === 0 ? `<strong>${esc(h.hostId)}</strong> <span class="muted">(待取指令:${h.pendingCommandsCount})</span>` : `<span class="muted">↳ ${esc(h.hostId)}</span>`}</td>
+                    <td class="mono"><strong>${esc(b.gatewayId)}</strong></td>
+                    <td><span class="status-pill ${b.role === 'PRIMARY' ? 'ok' : ''}">${esc(b.role)}</span></td>
+                    <td class="mono">epoch:${b.epoch} · gen:${b.connGeneration}</td>
+                    <td><span class="status-pill ${b.healthy ? 'ok' : 'danger'}">${b.healthy ? 'HEALTHY' : 'DOWN'}</span></td>
+                    <td class="mono">${h.activeGatewayId === b.gatewayId ? `<span class="status-pill ok">★ ACTIVE (${esc(h.activeRole)})</span>` : `<span class="muted">STANDBY</span>`}</td>
+                    <td>
+                      <div class="btn-row">
+                        <button type="button" class="small ${b.healthy ? 'warn' : 'primary'}" data-action="fed-toggle-tunnel-gw" data-host="${esc(b.hostId)}" data-gw="${esc(b.gatewayId)}" data-next="${b.healthy ? '0' : '1'}" ${!perm.ok ? 'disabled' : ''}>
+                          ${b.healthy ? '模拟网关失联 (Down)' : '恢复网关连接 (Up)'}
+                        </button>
+                        ${idx === 0 ? `<button type="button" class="small primary" data-action="fed-dispatch-tunnel-cmd" data-host="${esc(h.hostId)}" ${!perm.ok ? 'disabled' : ''}>下发隧道心跳指令</button>` : ''}
+                      </div>
+                    </td>
+                  </tr>
+                `).join('')
+              ).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">跨地域 Reed-Solomon RS(K=4, M=2) 纠删码 WAL 6-Region 分片清单与双地域陨落无损重构台 (CrossRegionErasureCodedWalManager)</h2>
+            <p class="panel-subtitle">使用伽罗瓦域 <code>GF(2^8)</code> 算术将 WAL 快照切分为 4 个数据块 (<code>D0..D3</code>) 与 2 个校验块 (<code>P0..P1</code>) 分发至全球 6 个地域，任意 2 个地域同时损毁仍可 100% 数学无损还原。</p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="fed-encode-erasure-wal" ${!perm.ok ? 'disabled' : ''}>+ 编码新跨地域 RS(4,2) WAL 快照</button>
+            <button type="button" class="small danger" data-action="fed-rebuild-erasure-wal" ${!perm.ok ? 'disabled' : ''}>⚡ 模拟 2 地域同时损毁并执行 GF(2^8) 无损重构</button>
+          </div>
+        </div>
+        ${rbReport ? `
+          <div class="state-banner info" style="margin-bottom:10px;">
+            <div>
+              <strong>最近跨地域 RS(4,2) 灾备无损重构报告 (${esc(rbReport.walId)})：</strong>
+              模拟损毁地域: <code class="mono">${(rbReport.droppedRegions || []).join(', ')}</code>
+              · 存活分片: <code class="mono">${rbReport.survivingShardsCount}/6</code>
+              · 重构字节数: <code class="mono">${rbReport.reconstructedByteLength} Bytes</code>
+              · CRC32 校验: <span class="status-pill ${rbReport.crc32Match ? 'ok' : 'danger'}">${rbReport.crc32Match ? 'MATCH (' + esc(rbReport.reconstructedCrc32Hex) + ')' : 'MISMATCH'}</span>
+              <div class="muted">还原载荷预览: <code class="mono">${esc(String(rbReport.reconstructedDataText || '').slice(0, 140))}</code></div>
+            </div>
+          </div>
+        ` : ''}
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>WAL 清单 ID</th>
+                <th>原始字节 / 分片大小</th>
+                <th>原始 CRC32</th>
+                <th>6 地域分片拓扑分布 (4 Data + 2 Parity)</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(ec.manifests || []).map((m) => `
+                <tr>
+                  <td class="mono"><strong>${esc(m.walId)}</strong></td>
+                  <td class="mono">${m.originalByteLength} B (每片 ${m.shardLength} B)</td>
+                  <td class="mono"><span class="status-pill ok">0x${esc(m.originalCrc32Hex)}</span></td>
+                  <td class="mono">
+                    <div class="btn-row">
+                      ${(m.shards || []).map((s) => `
+                        <span class="status-pill ${s.isParity ? 'warn' : 'ok'}" title="CRC32: 0x${esc(s.crc32Hex)}">
+                          <strong>${esc(s.label)}</strong> @ ${esc(s.targetRegion)} (0x${esc(s.crc32Hex.slice(0, 6))})
+                        </span>
+                      `).join('')}
+                    </div>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">多地域数据主权与低延迟联邦路由表 (MultiRegionFederationRouter)</h2>
+              <p class="panel-subtitle">根据租户 <code>US / EU / APAC</code> 数据主权合规锁与实时 EWMA RTT 自动优选联邦 Cell 接入点。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>地域代码</th><th>主权合规域</th><th>联邦 Cell 端点</th><th>EWMA RTT</th><th>状态</th></tr></thead>
+              <tbody>
+                ${(fv.federatedRegions || []).map((r) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(r.regionCode)}</strong></td>
+                    <td><span class="status-pill ok">${esc(r.sovereigntyZone)}</span></td>
+                    <td class="mono">${esc(r.baseUrl)}</td>
+                    <td class="mono">${r.rttEwmaMs} ms</td>
+                    <td><span class="status-pill ${r.healthy ? 'ok' : 'danger'}">${r.healthy ? 'HEALTHY' : 'OFFLINE'}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">网络混沌故障注入与自动过期保护代理 (NetworkChaosFaultInjectionProxy)</h2>
+              <p class="panel-subtitle">支持向指定宿主注入带 TTL 自动过期的网络分区与延迟抖动，验证脑裂 Fencing Token 隔离与恢复。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small danger" data-action="fed-inject-partition" ${!perm.ok ? 'disabled' : ''}>+ 注入 body-host-02 网络分区 (60s TTL)</button>
+              <button type="button" class="small primary" data-action="fed-heal-partitions" ${!perm.ok ? 'disabled' : ''}>✓ 一键清除全部混沌故障</button>
+            </div>
+          </div>
+          <div class="muted" style="padding:8px 0;">
+            当前被隔离宿主节点: <strong class="mono">${(ch.partitionedHosts || []).join(', ') || '无 (0 个节点处于网络分区状态)'}</strong><br/>
+            当前节点延迟抖动注入: <code class="mono">${esc(JSON.stringify(ch.jitterByHost || {}))}</code>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   function renderMainContent() {
     const main = document.getElementById('content');
     if (!main) return;
@@ -2206,6 +2399,9 @@
         break;
       case 'swarm':
         sectionHtml = renderSwarmSection();
+        break;
+      case 'federation':
+        sectionHtml = renderFederationSection();
         break;
       case 'overview':
       default:
@@ -3694,6 +3890,101 @@
         "关闭成本归因报告",
         () => closeDialog()
       );
+      return;
+    }
+    if (action === "fed-toggle-tunnel-gw") {
+      const hostId = target.getAttribute("data-host") || "body-host-01";
+      const gatewayId = target.getAttribute("data-gw") || "celld-gw-01";
+      const healthy = target.getAttribute("data-next") === "1";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/federation/action", {
+        action: "toggle_tunnel_gateway_health",
+        hostId,
+        gatewayId,
+        healthy,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "切换隧道网关状态失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`宿主 ${hostId} 网关 ${gatewayId} 已切换为 ${healthy ? "HEALTHY" : "DOWN"}，当前主选路: ${res.data?.activeTunnel?.gatewayId || "NONE"}`);
+      return;
+    }
+    if (action === "fed-dispatch-tunnel-cmd") {
+      const hostId = target.getAttribute("data-host") || "body-host-01";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/federation/action", {
+        action: "dispatch_tunnel_probe",
+        hostId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "下发反向隧道指令失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已通过反向隧道 ${res.data?.ack?.viaGateway || "gw"} 完成 ${hostId} 指令下发与 ACK 确认`);
+      return;
+    }
+    if (action === "fed-encode-erasure-wal") {
+      const p = getPrincipal();
+      const walId = `wal-rs-turn-${Date.now() % 10000}`;
+      const res = await callBackendApi("POST", "/v1beta1/management/federation/action", {
+        action: "encode_erasure_wal",
+        walId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "编码纠删码 WAL 失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已编码跨地域 RS(4,2) 6-Shard 清单 ${walId} (CRC32=0x${res.data?.manifest?.originalCrc32Hex || "OK"})`);
+      return;
+    }
+    if (action === "fed-rebuild-erasure-wal") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/federation/action", {
+        action: "simulate_dual_region_outage_rebuild",
+        droppedShardIndices: [0, 2],
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "执行纠删码重构失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已完成双地域损毁 GF(2^8) 无损重构：CRC32 匹配=${res.data?.rebuildReport?.crc32Match}`);
+      return;
+    }
+    if (action === "fed-inject-partition") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/federation/action", {
+        action: "inject_chaos_partition",
+        targetHost: "body-host-02",
+        ttlMs: 60000,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast("已向 body-host-02 注入 60s TTL 网络分区与 180ms 抖动");
+      return;
+    }
+    if (action === "fed-heal-partitions") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/federation/action", {
+        action: "heal_all_chaos_faults",
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast(`已清除全部网络混沌故障 (恢复 ${res.data?.healedCount ?? 0} 个节点)`);
       return;
     }
     if (action === "open-add-policy-rule-dialog") {

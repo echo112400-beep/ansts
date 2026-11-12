@@ -694,6 +694,27 @@ gatewayUrl = process.env.ANSTS_GATEWAY_URL ?? "http://127.0.0.1:18080")
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-federation-console") {
+    const action = (rest[0] ?? "inspect").trim();
+    if (action === "inspect") {
+      const resp = await fetch(`${baseUrl}/v1beta1/console/federation`);
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    const resp = await fetch(`${baseUrl}/v1beta1/management/federation/action`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action,
+        walId: rest[1] ? rest[1].trim() : undefined,
+        actor: "chen",
+        role: "SRE_ADMIN"
+      })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-swarm") {
     const action = (rest[0] ?? "inspect").trim();
     if (action === "inspect") {

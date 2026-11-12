@@ -375,4 +375,8 @@ class CrossRegionErasureCodedWalManager {
   getManifest(walId) {
     return this.manifests.get(walId);
   }
+
+  listManifests() {
+    return Array.from(this.manifests.values());
+  }
 }exports.CrossRegionErasureCodedWalManager = CrossRegionErasureCodedWalManager;

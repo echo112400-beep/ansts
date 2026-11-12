@@ -2444,6 +2444,49 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M83] TanStack Console BFF: Multi-Region Federation, Dual-Homed Reverse Tunnels, RS(4,2) Erasure Coding & Chaos (`GET /v1beta1/console/federation`)
+    if (method === "GET" && pathname === "/v1beta1/console/federation") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildFederationAndDrVisualization()));
+      return;
+    }
+
+    // [M83] Interactive Federation, Reverse Tunnel, RS(4,2) Erasure Rebuild & Chaos Action (`POST /v1beta1/management/federation/action`)
+    if (method === "POST" && pathname === "/v1beta1/management/federation/action") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = await this.managementPlane.executeFederationAndDrManagementAction({
+        action: body.action ?? "simulate_dual_region_outage_rebuild",
+
+
+
+
+
+
+        hostId: body.hostId ? String(body.hostId) : undefined,
+        gatewayId: body.gatewayId ? String(body.gatewayId) : undefined,
+        healthy: body.healthy !== undefined ? Boolean(body.healthy) : undefined,
+        walId: body.walId ? String(body.walId) : undefined,
+        payloadText: body.payloadText ? String(body.payloadText) : undefined,
+        droppedShardIndices: Array.isArray(body.droppedShardIndices) ? body.droppedShardIndices : undefined,
+        targetHost: body.targetHost ? String(body.targetHost) : undefined,
+        ttlMs: body.ttlMs !== undefined ? Number(body.ttlMs) : undefined,
+        actor: auth.actor,
+        role: auth.role
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M82] Interactive Swarm, Formal Guardrail, Spot Market & Episodic Hatchery Action (`POST /v1beta1/management/swarm/action`)
     if (method === "POST" && pathname === "/v1beta1/management/swarm/action") {
       const body = await this.readJsonBody(req);

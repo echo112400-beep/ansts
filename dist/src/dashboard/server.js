@@ -332,6 +332,8 @@ class PlatformManagementPlaneEngine {
   runbookStats = new Map();
   lastSimulatedErrorRequests = 4;
   lastGuardrailEvaluation = null;
+  erasureWalManager;
+  lastErasureRebuildReport = null;
 
   constructor(deps) {
     this.deps = deps;
@@ -387,7 +389,8 @@ class PlatformManagementPlaneEngine {
     if (this.topologyCas.getMembers().length === 0) {
       this.topologyCas.forceSyncMembers(["celld-brain-01", "celld-brain-02", "celld-brain-03"]);
     }
-    this.tunnelCell = new _tunnel_gateway_cell.TunnelGatewayCell();
+    this.tunnelCell = new _tunnel_gateway_cell.TunnelGatewayCell(deps.v25Store.sql);
+    this.erasureWalManager = new _erasure_coder.CrossRegionErasureCodedWalManager(deps.v25Store.sql);
     this.federationRouter = new _federation_router.MultiRegionFederationRouter();
     this.federationRouter.registerRegion({
       regionCode: "us-west-2",
@@ -925,6 +928,39 @@ class PlatformManagementPlaneEngine {
         tags: ["auth", "spiffe", "jwt"],
         savedColdStartMs: 4600
       });
+    }
+
+    // [M83] Seed initial Dual-Homed Reverse Tunnels and RS(4,2) Cross-Region Erasure-Coded WAL Manifest
+    if (this.tunnelCell.listAllTunnels().length === 0) {
+      for (const hId of ["body-host-01", "body-host-02", "body-host-03"]) {
+        this.tunnelCell.registerTunnel({
+          hostId: hId,
+          gatewayId: "celld-gw-01",
+          role: "PRIMARY",
+          connGeneration: 10,
+          epoch: 14
+        });
+        this.tunnelCell.registerTunnel({
+          hostId: hId,
+          gatewayId: "celld-gw-02",
+          role: "SECONDARY",
+          connGeneration: 10,
+          epoch: 14
+        });
+      }
+    }
+    if (this.erasureWalManager.listManifests().length === 0) {
+      this.erasureWalManager.encodeWal(
+      "wal-prod-ns-8841-turn5",
+      JSON.stringify({
+        taskId: "task-ns-8841",
+        tenantId: "Northstar",
+        turnIndex: 5,
+        fencingToken: 12,
+        commitId: "C1",
+        rpoZeroVerified: true
+      }));
+
     }
 
     this.appendAudit("chen", "SRE_ADMIN", "初始化平台管理面控制基线与 256-Slot 分片映射", "Global", "已生效 (RPO=0)");
@@ -1467,7 +1503,271 @@ class PlatformManagementPlaneEngine {
       runtimeVisualization: this.buildRuntimeVisualization(),
       observabilityVisualization: this.buildObservabilityVisualization(),
       swarmVisualization: this.buildSwarmAndCognitiveVisualization(),
+      federationVisualization: this.buildFederationAndDrVisualization(),
       status: "HEALTHY"
+    };
+  }
+
+  buildFederationAndDrVisualization() {
+    this.ensureInitialized();
+    const federatedRegions = this.federationRouter.listRegions();
+    const allTunnels = this.tunnelCell.listAllTunnels();
+    const hostIds = Array.from(new Set(allTunnels.map((t) => t.hostId)));
+    const hostTunnelSummaries = hostIds.map((hId) => {
+      let activeGatewayId = "NONE";
+      let activeRole = "NONE";
+      try {
+        const active = this.tunnelCell.selectActiveTunnel(hId);
+        activeGatewayId = active.gatewayId;
+        activeRole = active.role;
+      } catch {
+
+        // all down
+      }return {
+        hostId: hId,
+        activeGatewayId,
+        activeRole,
+        pendingCommandsCount: this.tunnelCell.getPendingCommandCount(hId),
+        bindings: allTunnels.filter((t) => t.hostId === hId)
+      };
+    });
+
+    const erasureManifests = this.erasureWalManager.listManifests().map((m) => ({
+      walId: m.walId,
+      originalByteLength: m.originalByteLength,
+      shardLength: m.shardLength,
+      dataShardsCount: m.dataShardsCount,
+      parityShardsCount: m.parityShardsCount,
+      totalShardsCount: m.totalShardsCount,
+      originalCrc32Hex: m.originalCrc32Hex,
+      timestampMs: m.timestampMs,
+      shards: m.shards.map((s) => ({
+        shardIndex: s.shardIndex,
+        label: s.isParity ? `P${s.shardIndex - m.dataShardsCount}` : `D${s.shardIndex}`,
+        isParity: s.isParity,
+        targetRegion: s.targetRegion,
+        crc32Hex: s.crc32Hex,
+        shardLength: s.shardLength
+      }))
+    }));
+
+    const activeChaosFaults = this.chaosProxy.inspectActiveFaults();
+
+    return {
+      federatedRegions,
+      reverseTunnels: {
+        totalBindingsCount: allTunnels.length,
+        healthyBindingsCount: allTunnels.filter((t) => t.healthy).length,
+        hosts: hostTunnelSummaries,
+        allBindings: allTunnels
+      },
+      erasureCoding: {
+        scheme: "Cauchy Reed-Solomon GF(2^8) RS(K=4, M=2)",
+        manifestsCount: erasureManifests.length,
+        manifests: erasureManifests,
+        lastRebuildReport: this.lastErasureRebuildReport
+      },
+      chaosEngineering: {
+        ...activeChaosFaults,
+        activePartitionCount: activeChaosFaults.partitionedHosts.length
+      }
+    };
+  }
+
+  async executeFederationAndDrManagementAction(params)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权操控双归属反向隧道、跨地域纠删码或网络混沌代理" }
+      };
+    }
+
+    if (params.action === "toggle_tunnel_gateway_health") {
+      const hostId = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.hostId ?? "body-host-01").trim());
+      const gatewayId = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.gatewayId ?? "celld-gw-01").trim());
+      const healthy = Boolean(params.healthy ?? false);
+      this.tunnelCell.markGatewayHealth(hostId, gatewayId, healthy);
+      let activeAfter = { gatewayId: "NONE", role: "NONE" };
+      try {
+        activeAfter = this.tunnelCell.selectActiveTunnel(hostId);
+      } catch {
+
+        // all down
+      }this.appendAudit(
+      params.actor,
+      params.role,
+      `变更反向隧道网关健康状态 [${hostId} ↔ ${gatewayId} → ${healthy ? "HEALTHY" : "DOWN"}]，当前活跃选路：${activeAfter.gatewayId} (${activeAfter.role})`,
+      `ReverseTunnel / ${hostId}`,
+      `ACTIVE_${activeAfter.gatewayId}`);
+
+      return {
+        status: 200,
+        body: {
+          hostId,
+          gatewayId,
+          healthy,
+          activeTunnel: activeAfter,
+          federationVisualization: this.buildFederationAndDrVisualization()
+        }
+      };
+    }
+
+    if (params.action === "dispatch_tunnel_probe") {
+      const hostId = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.hostId ?? "body-host-01").trim());
+      const { command, completionPromise } = this.tunnelCell.enqueueCommandForHost(hostId, {
+        op: "EXEC_SANDBOX_HEARTBEAT_PROBE",
+        dispatchedBy: params.actor,
+        ts: Date.now()
+      });
+      const active = this.tunnelCell.selectActiveTunnel(hostId);
+      const polled = this.tunnelCell.pollPendingCommands(hostId, active.gatewayId);
+      this.tunnelCell.acknowledgeCommand(command.commandId, {
+        acknowledgedBy: hostId,
+        viaGateway: active.gatewayId,
+        status: "TUNNEL_RTT_OK"
+      });
+      const ack = await completionPromise;
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `通过双归属反向隧道 [${active.gatewayId}/${active.role}] 向宿主 ${hostId} 下发并确认指令 ${command.commandId}`,
+      `ReverseTunnel / ${hostId}`,
+      `ACK_OK (${active.gatewayId})`);
+
+      return {
+        status: 200,
+        body: {
+          command,
+          polledCount: polled.length,
+          ack,
+          federationVisualization: this.buildFederationAndDrVisualization()
+        }
+      };
+    }
+
+    if (params.action === "encode_erasure_wal") {
+      const walId = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.walId ?? `wal-rs-${Date.now() % 10000}`).trim());
+      const payloadText = String(
+      params.payloadText ??
+      JSON.stringify({
+        walId,
+        tenantId: "Northstar",
+        turnIndex: 6,
+        fencingToken: 14,
+        committedAtUtc: new Date().toISOString()
+      }));
+
+      const manifest = this.erasureWalManager.encodeWal(walId, payloadText);
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `执行跨地域 Reed-Solomon RS(4,2) 纠删码编码 [${walId}] (原始字节=${manifest.originalByteLength}B, 6 地域分片 CRC32=${manifest.originalCrc32Hex})`,
+      `ErasureWAL / ${walId}`,
+      `ENCODED_6_SHARDS`);
+
+      return {
+        status: 201,
+        body: {
+          manifest,
+          federationVisualization: this.buildFederationAndDrVisualization()
+        }
+      };
+    }
+
+    if (params.action === "simulate_dual_region_outage_rebuild") {
+      const manifests = this.erasureWalManager.listManifests();
+      const targetWalId = String(params.walId ?? manifests[0]?.walId ?? "wal-prod-ns-8841-turn5").trim();
+      const manifest = this.erasureWalManager.getManifest(targetWalId);
+      if (!manifest) {
+        return { status: 404, body: { error: "WAL_MANIFEST_NOT_FOUND", walId: targetWalId } };
+      }
+      const dropped = Array.isArray(params.droppedShardIndices) && params.droppedShardIndices.length > 0 ?
+      params.droppedShardIndices.map((n) => Number(n)) :
+      [0, 2];
+      const surviving = manifest.shards.filter((s) => !dropped.includes(s.shardIndex));
+      const rebuildRes = this.erasureWalManager.reconstructWal(targetWalId, surviving);
+      const droppedRegions = manifest.shards.
+      filter((s) => dropped.includes(s.shardIndex)).
+      map((s) => `${s.targetRegion}(#${s.shardIndex})`);
+      this.lastErasureRebuildReport = {
+        ...rebuildRes,
+        droppedRegions,
+        rebuiltAtUtc: `${new Date().toISOString().slice(11, 19)} UTC`
+      };
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `模拟双地域陨落 [${droppedRegions.join(", ")}] 并基于 GF(2^8) 纠删码无损重构 [${targetWalId}] → CRC32 匹配=${rebuildRes.crc32Match} (${rebuildRes.reconstructedByteLength}B)`,
+      `ErasureWAL / ${targetWalId}`,
+      rebuildRes.crc32Match ? "REBUILT_LOSSLESS_CRC_OK" : "REBUILD_FAILED");
+
+      return {
+        status: 200,
+        body: {
+          rebuildReport: this.lastErasureRebuildReport,
+          federationVisualization: this.buildFederationAndDrVisualization()
+        }
+      };
+    }
+
+    if (params.action === "inject_chaos_partition") {
+      const targetHost = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.targetHost ?? "body-host-02").trim());
+      const ttlMs = Number(params.ttlMs ?? 60_000);
+      this.chaosProxy.injectPartition(targetHost, ttlMs);
+      this.chaosProxy.injectLatencyJitter(targetHost, 180);
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `向宿主节点 [${targetHost}] 注入 TTL=${Math.round(ttlMs / 1000)}s 网络分区与 180ms 延迟抖动故障`,
+      `ChaosProxy / ${targetHost}`,
+      "PARTITION_INJECTED");
+
+      return {
+        status: 200,
+        body: {
+          targetHost,
+          ttlMs,
+          activeFaults: this.chaosProxy.inspectActiveFaults(),
+          federationVisualization: this.buildFederationAndDrVisualization()
+        }
+      };
+    }
+
+    // action === "heal_all_chaos_faults"
+    const healedCount = this.chaosProxy.healAllPartitions();
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `一键清除全部网络混沌分区与延迟抖动故障 (共恢复 ${healedCount} 个受影响节点)`,
+    "ChaosProxy / Global",
+    `HEALED (${healedCount} hosts)`);
+
+    return {
+      status: 200,
+      body: {
+        healedCount,
+        activeFaults: this.chaosProxy.inspectActiveFaults(),
+        federationVisualization: this.buildFederationAndDrVisualization()
+      }
     };
   }
 

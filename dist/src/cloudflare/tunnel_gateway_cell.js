@@ -256,6 +256,20 @@ class TunnelGatewayCell {
     return { demotedGateways, requeuedCommandIds };
   }
 
+  listAllTunnels() {
+    const out = [];
+    for (const list of this.tunnelsByHost.values()) {
+      for (const b of list) {
+        out.push({ ...b });
+      }
+    }
+    return out;
+  }
+
+  getPendingCommandCount(hostId) {
+    return (this.pendingCommandsByHost.get(hostId) ?? []).length;
+  }
+
   selectActiveTunnel(hostId) {
     const list = (this.tunnelsByHost.get(hostId) ?? []).filter((b) => b.healthy);
     if (list.length === 0) {

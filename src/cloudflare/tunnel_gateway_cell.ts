@@ -256,6 +256,20 @@ export class TunnelGatewayCell {
     return { demotedGateways, requeuedCommandIds };
   }
 
+  public listAllTunnels(): ReverseTunnelBinding[] {
+    const out: ReverseTunnelBinding[] = [];
+    for (const list of this.tunnelsByHost.values()) {
+      for (const b of list) {
+        out.push({ ...b });
+      }
+    }
+    return out;
+  }
+
+  public getPendingCommandCount(hostId: string): number {
+    return (this.pendingCommandsByHost.get(hostId) ?? []).length;
+  }
+
   public selectActiveTunnel(hostId: string): ReverseTunnelBinding {
     const list = (this.tunnelsByHost.get(hostId) ?? []).filter((b) => b.healthy);
     if (list.length === 0) {

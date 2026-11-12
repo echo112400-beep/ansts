@@ -18,6 +18,10 @@ class MultiRegionFederationRouter {
     this.regions.set(ep.regionCode, { ...ep, rttEwmaMs: safeRtt });
   }
 
+  listRegions() {
+    return Array.from(this.regions.values()).map((r) => ({ ...r }));
+  }
+
   selectOptimalRegion(params)
 
 
