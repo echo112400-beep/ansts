@@ -16,7 +16,8 @@
     "prestart": "node scripts/ci_check.mjs --stage build-if-missing",
     "dev:cluster:up": "cat deploy/dev-cluster/dev-cluster-up.sh | bash",
     "dev:cluster:down": "cat deploy/dev-cluster/dev-cluster-down.sh | bash",
-    "start:local": "cat scripts/run-local.sh | bash"
+    "start:local": "cat scripts/run-local.sh | bash",
+    "start:celld-worker": "bash scripts/celld_worker_up.sh"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -27,6 +28,7 @@
     "@babel/plugin-transform-modules-commonjs": "^7.20.0",
     "@babel/plugin-transform-typescript": "^7.20.0",
     "@types/node": "^20.11.0",
+    "esbuild": "^0.25.11",
     "js-yaml": "^4.1.0",
     "typescript": "^5.3.0"
   }

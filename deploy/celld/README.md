@@ -4,6 +4,31 @@ The dev cluster runs a real [denoland/celld](https://github.com/denoland/celld) 
 three celld nodes (`celld-brain-01..03`) own `AnstsSchedulerCell` shards, and the gateways submit work to
 them instead of scheduling in-process.
 
+## Start the worker service (one celld process)
+
+This starts the scheduler service as a worker that **celld loads**. It does not start the Node gateway
+(`node dist/src/server_main.js`). celld bundles `src/cloudflare/worker.ts`, binds the SQLite Durable
+Objects from `deploy/celld/wrangler.celld.json`, and serves the worker. Task rows live in
+`AnstsSchedulerCell`, under `.celld/worker-service/.celld/dev`.
+
+```bash
+npm install
+npm run build
+export CELLD_BIN=/path/to/celld    # denoland/celld 0.6.3; or put `celld` on PATH
+bash scripts/celld_worker_up.sh
+```
+
+| Boundary | What it is |
+| --- | --- |
+| celld process | `celld dev`. Public worker listener `127.0.0.1:9876` (`CELLD_PORT`). Internal operator listener is an ephemeral loopback port printed as `internal listening`. |
+| Worker | `src/cloudflare/worker.ts` `fetch`. `GET /healthz`, `GET /.well-known/celld/health`, `POST /v1/scheduler/*`, `POST /internal/v1beta1/brain/schedule`. |
+| Durable Object | `AnstsSchedulerCell` (also harness and tunnel cells). celld passes `ctx.storage.sql`. `GET /v1/scheduler/tasks` returns that cell's `cellId`. |
+| Node gateway | Separate process. Not started by this command. |
+
+`CELLD_CLEAN=1` deletes `.celld/dev` before start. Without it, a second run of the same project directory reads the same Durable Object back, including tasks submitted before the process exited.
+
+Verified against celld `0.6.3` (`celld dev`). esbuild comes from `node_modules` after `npm install`, or `CELLD_ESBUILD`.
+
 ## What runs where
 
 | Piece | Container | Port | Role |

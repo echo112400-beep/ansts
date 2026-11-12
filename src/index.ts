@@ -49,6 +49,7 @@ export * from "./cloudflare/celld_admin_client.js";
 export * from "./cloudflare/federation_router.js";
 export * from "./cloudflare/celld_native_optimizations.js";
 export { default as cloudflareCelldWorker } from "./cloudflare/worker.js";
+export * from "./cloudflare/celld_worker_service.js";
 export * from "./finops/budget_controller.js";
 export * from "./cli/anstsctl.js";
 export * from "./dashboard/server.js";

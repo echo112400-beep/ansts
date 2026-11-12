@@ -8,7 +8,7 @@ import * as path from "node:path";
 import * as Ansts from "../src/index.js";
 
 describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit", () => {
-  it("1. Verifies all 58 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
+  it("1. Verifies all 91 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
     const walk = (dir: string): string[] => {
       let out: string[] = [];
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -19,7 +19,7 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
       return out;
     };
     const srcFiles = walk(path.join(process.cwd(), "src"));
-    assert.equal(srcFiles.length, 89);
+    assert.equal(srcFiles.length, 91);
     for (const f of srcFiles) {
       const content = fs.readFileSync(f, "utf-8");
       assert.ok(content.includes("@fileoverview"), `Missing @fileoverview in ${f}`);
