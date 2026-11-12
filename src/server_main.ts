@@ -2472,6 +2472,41 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M91] TanStack Console BFF: Batch Task Planning & DAG Blueprint Designer
+    if (method === "GET" && pathname === "/v1beta1/console/tasks/blueprints") {
+      const out = this.managementPlane.listTaskBlueprints();
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/tasks/batch-plan") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.planAndDispatchTaskBatch({
+        mode: body.mode === "commit_and_dispatch" ? "commit_and_dispatch" : "dry_run",
+        blueprintId: body.blueprintId ? String(body.blueprintId) : undefined,
+        planName: body.planName ? String(body.planName) : undefined,
+        tenantId: body.tenantId ? String(body.tenantId) : undefined,
+        region: body.region ? String(body.region) : undefined,
+        stages: Array.isArray(body.stages) ? (body.stages as Array<{
+          taskId: string;
+          role?: string;
+          prompt: string;
+          priority?: number;
+          dependsOn?: string[];
+          thinkCpuCores?: number;
+          actCpuCores?: number;
+          actMemoryMb?: number;
+          estimatedTokens?: number;
+        }>) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN"),
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M90] TanStack Console BFF: Queue Backpressure, Load-Shedding Simulator & DLQ Replay
     if (method === "GET" && pathname === "/v1beta1/console/queues/backpressure") {
       const utilParam = urlObj.searchParams.get("utilizationRatio") ?? "0.88";

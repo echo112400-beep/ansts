@@ -1614,6 +1614,505 @@ export class PlatformManagementPlaneEngine {
     }
   }
 
+  private ensureTaskBlueprintsTable(): void {
+    const sql = this.deps.v25Store.sql;
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS v25_mgmt_task_blueprints (
+        blueprint_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        region TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        stages_json TEXT NOT NULL
+      )
+    `);
+  }
+
+  public getPresetTaskBlueprints(): Array<Record<string, unknown>> {
+    return [
+      {
+        blueprintId: "fullstack-feature-pipeline",
+        name: "全栈特性研发与灰度验证流水线 (4 阶段 DAG)",
+        tenantId: "Northstar",
+        region: "us-west-2",
+        description: "需求分析与架构设计 → 并行 Schema/API 编码与前端组件实现 → LayerFS 集成测试与金丝雀门控",
+        stages: [
+          {
+            taskId: "plan-arch-spec",
+            role: "Architect-Agent",
+            prompt: "Analyze requirements and produce API & schema specification",
+            priority: 1,
+            dependsOn: [],
+            thinkCpuCores: 0.5,
+            actCpuCores: 2.0,
+            actMemoryMb: 4096,
+            estimatedTokens: 12000,
+          },
+          {
+            taskId: "impl-backend-bff",
+            role: "Backend-Agent",
+            prompt: "Implement SQLite persistence and BFF HTTP endpoints in LayerFS branch",
+            priority: 1,
+            dependsOn: ["plan-arch-spec"],
+            thinkCpuCores: 0.5,
+            actCpuCores: 4.0,
+            actMemoryMb: 8192,
+            estimatedTokens: 28000,
+          },
+          {
+            taskId: "impl-console-ui",
+            role: "Frontend-Agent",
+            prompt: "Build TanStack Console interactive workbench and state bindings",
+            priority: 2,
+            dependsOn: ["plan-arch-spec"],
+            thinkCpuCores: 0.5,
+            actCpuCores: 4.0,
+            actMemoryMb: 8192,
+            estimatedTokens: 24000,
+          },
+          {
+            taskId: "verify-ci-canary",
+            role: "SRE-Verifier-Agent",
+            prompt: "Merge LayerFS branches, run full CI test suite and verify release readiness gates",
+            priority: 0,
+            dependsOn: ["impl-backend-bff", "impl-console-ui"],
+            thinkCpuCores: 0.5,
+            actCpuCores: 4.0,
+            actMemoryMb: 8192,
+            estimatedTokens: 16000,
+          },
+        ],
+      },
+      {
+        blueprintId: "distributed-chaos-verif",
+        name: "跨地域联邦灾备与混沌工程演练蓝图 (3 阶段 DAG)",
+        tenantId: "Helios",
+        region: "eu-central-1",
+        description: "热沙箱池预热与快照固定 → 双归属隧道故障注入 → RS(4,2) 纠删码重构与恢复审计",
+        stages: [
+          {
+            taskId: "chaos-prep-snapshot",
+            role: "Prep-Agent",
+            prompt: "Pin LayerFS golden commit and prewarm 8 kata sandboxes",
+            priority: 1,
+            dependsOn: [],
+            thinkCpuCores: 0.25,
+            actCpuCores: 2.0,
+            actMemoryMb: 4096,
+            estimatedTokens: 8000,
+          },
+          {
+            taskId: "chaos-inject-partition",
+            role: "Chaos-Agent",
+            prompt: "Inject split-brain partition and trigger secondary tunnel gateway failover",
+            priority: 0,
+            dependsOn: ["chaos-prep-snapshot"],
+            thinkCpuCores: 0.25,
+            actCpuCores: 2.0,
+            actMemoryMb: 4096,
+            estimatedTokens: 10000,
+          },
+          {
+            taskId: "chaos-verify-rpo",
+            role: "Auditor-Agent",
+            prompt: "Verify RPO=0 LTX WAL integrity and RS(4,2) shard reconstruction",
+            priority: 0,
+            dependsOn: ["chaos-inject-partition"],
+            thinkCpuCores: 0.5,
+            actCpuCores: 4.0,
+            actMemoryMb: 8192,
+            estimatedTokens: 14000,
+          },
+        ],
+      },
+      {
+        blueprintId: "multi-tenant-finops-sweep",
+        name: "多租户配额巡检与工作记忆压缩批处理 (3 并行+汇总 DAG)",
+        tenantId: "Vanguard",
+        region: "ap-northeast-1",
+        description: "并行扫描租户 Token 消耗与前缀缓存命中率 → 汇总生成 FinOps 降级建议与 L0→L1 压缩",
+        stages: [
+          {
+            taskId: "scan-prefix-cache",
+            role: "Cache-Scanner",
+            prompt: "Audit CognitiveRouter prefix radix index and KV-warm hit ratio",
+            priority: 2,
+            dependsOn: [],
+            thinkCpuCores: 0.25,
+            actCpuCores: 2.0,
+            actMemoryMb: 4096,
+            estimatedTokens: 9000,
+          },
+          {
+            taskId: "scan-wal-segments",
+            role: "Storage-Scanner",
+            prompt: "Scan L0 WAL frames and identify candidates for LayerFS URI compaction",
+            priority: 3,
+            dependsOn: [],
+            thinkCpuCores: 0.25,
+            actCpuCores: 2.0,
+            actMemoryMb: 4096,
+            estimatedTokens: 9500,
+          },
+          {
+            taskId: "compile-finops-report",
+            role: "FinOps-Synthesizer",
+            prompt: "Synthesize cost attribution report and compact cold working memory",
+            priority: 2,
+            dependsOn: ["scan-prefix-cache", "scan-wal-segments"],
+            thinkCpuCores: 0.5,
+            actCpuCores: 4.0,
+            actMemoryMb: 8192,
+            estimatedTokens: 15000,
+          },
+        ],
+      },
+    ];
+  }
+
+  public listTaskBlueprints(): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    this.ensureTaskBlueprintsTable();
+    const sql = this.deps.v25Store.sql;
+    const savedRows = sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_task_blueprints ORDER BY created_at DESC")
+      .toArray();
+    const customBlueprints = savedRows.map((r) => ({
+      blueprintId: String(r.blueprint_id),
+      name: String(r.name),
+      tenantId: String(r.tenant_id),
+      region: String(r.region),
+      createdBy: String(r.created_by),
+      createdAt: String(r.created_at),
+      stages: JSON.parse(String(r.stages_json ?? "[]")) as Array<Record<string, unknown>>,
+    }));
+    return {
+      status: 200,
+      body: {
+        presets: this.getPresetTaskBlueprints(),
+        customBlueprints,
+      },
+    };
+  }
+
+  public planAndDispatchTaskBatch(params: {
+    mode: "dry_run" | "commit_and_dispatch";
+    blueprintId?: string;
+    planName?: string;
+    tenantId?: string;
+    region?: string;
+    stages?: Array<{
+      taskId: string;
+      role?: string;
+      prompt: string;
+      priority?: number;
+      dependsOn?: string[];
+      thinkCpuCores?: number;
+      actCpuCores?: number;
+      actMemoryMb?: number;
+      estimatedTokens?: number;
+    }>;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    this.ensureTaskBlueprintsTable();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行批量任务规划或下发" },
+      };
+    }
+
+    const presets = this.getPresetTaskBlueprints();
+    const matchedPreset = params.blueprintId
+      ? presets.find((p) => p.blueprintId === params.blueprintId)
+      : undefined;
+
+    const tenantId = sanitizeHtmlString(
+      String(params.tenantId ?? matchedPreset?.tenantId ?? "Northstar").trim()
+    );
+    const region = sanitizeHtmlString(
+      String(params.region ?? matchedPreset?.region ?? "us-west-2").trim()
+    );
+    const planName = sanitizeHtmlString(
+      String(params.planName ?? matchedPreset?.name ?? "Custom Batch Task Plan").trim()
+    );
+
+    const rawStages =
+      Array.isArray(params.stages) && params.stages.length > 0
+        ? params.stages
+        : ((matchedPreset?.stages as Array<{
+            taskId: string;
+            role?: string;
+            prompt: string;
+            priority?: number;
+            dependsOn?: string[];
+            thinkCpuCores?: number;
+            actCpuCores?: number;
+            actMemoryMb?: number;
+            estimatedTokens?: number;
+          }>) ?? []);
+
+    if (rawStages.length === 0) {
+      return {
+        status: 400,
+        body: { error: "EMPTY_BATCH_STAGES", message: "批量任务规划至少需要包含 1 个阶段任务 (stages)" },
+      };
+    }
+
+    const validationErrors: string[] = [];
+    const stageMap = new Map<
+      string,
+      {
+        taskId: string;
+        role: string;
+        prompt: string;
+        priority: number;
+        dependsOn: string[];
+        thinkCpuCores: number;
+        actCpuCores: number;
+        actMemoryMb: number;
+        estimatedTokens: number;
+      }
+    >();
+
+    for (const st of rawStages) {
+      const tId = sanitizeHtmlString(String(st.taskId ?? "").trim());
+      if (!tId || !/^[a-zA-Z0-9_\-:.]{3,128}$/.test(tId)) {
+        validationErrors.push(`任务 ID '${tId}' 不合法（需为 3–128 位字母数字或短横线）`);
+        continue;
+      }
+      if (stageMap.has(tId)) {
+        validationErrors.push(`存在重复的阶段任务 ID: '${tId}'`);
+        continue;
+      }
+      const prio = Math.max(0, Math.min(3, Number(st.priority ?? 1)));
+      const deps = Array.isArray(st.dependsOn)
+        ? st.dependsOn.map((d) => String(d).trim()).filter(Boolean)
+        : [];
+      if (deps.includes(tId)) {
+        validationErrors.push(`任务 '${tId}' 存在自依赖 (self-dependency)`);
+      }
+      stageMap.set(tId, {
+        taskId: tId,
+        role: sanitizeHtmlString(String(st.role ?? "Worker-Agent")),
+        prompt: sanitizeHtmlString(String(st.prompt ?? `Execute stage ${tId}`)),
+        priority: prio,
+        dependsOn: deps,
+        thinkCpuCores: Number(st.thinkCpuCores ?? 0.25),
+        actCpuCores: Number(st.actCpuCores ?? 4.0),
+        actMemoryMb: Number(st.actMemoryMb ?? 8192),
+        estimatedTokens: Number(st.estimatedTokens ?? 10000),
+      });
+    }
+
+    // Verify all dependsOn exist in stageMap
+    for (const st of stageMap.values()) {
+      for (const dep of st.dependsOn) {
+        if (!stageMap.has(dep)) {
+          validationErrors.push(`任务 '${st.taskId}' 依赖的タスク '${dep}' 不在当前批次蓝图中`);
+        }
+      }
+    }
+
+    // Kahn's algorithm for cycle detection & topological execution waves
+    const inDegree = new Map<string, number>();
+    const adj = new Map<string, string[]>();
+    for (const st of stageMap.values()) {
+      inDegree.set(st.taskId, 0);
+      adj.set(st.taskId, []);
+    }
+    for (const st of stageMap.values()) {
+      for (const dep of st.dependsOn) {
+        if (stageMap.has(dep)) {
+          inDegree.set(st.taskId, (inDegree.get(st.taskId) ?? 0) + 1);
+          adj.get(dep)!.push(st.taskId);
+        }
+      }
+    }
+
+    const waves: string[][] = [];
+    let currentWave = Array.from(inDegree.entries())
+      .filter(([, deg]) => deg === 0)
+      .map(([id]) => id);
+    let visitedCount = 0;
+
+    while (currentWave.length > 0) {
+      waves.push(currentWave);
+      visitedCount += currentWave.length;
+      const nextWave: string[] = [];
+      for (const u of currentWave) {
+        for (const v of adj.get(u) ?? []) {
+          const nextDeg = (inDegree.get(v) ?? 1) - 1;
+          inDegree.set(v, nextDeg);
+          if (nextDeg === 0) {
+            nextWave.push(v);
+          }
+        }
+      }
+      currentWave = nextWave;
+    }
+
+    if (visitedCount < stageMap.size) {
+      validationErrors.push("DAG 依赖图存在环路 (DAG_CYCLE_DETECTED)，无法生成拓扑执行波次");
+    }
+
+    const totalActCpuCores = Array.from(stageMap.values()).reduce((acc, s) => acc + s.actCpuCores, 0);
+    const peakWaveMemoryMb = waves.reduce((maxMem, waveIds) => {
+      const waveMem = waveIds.reduce((sum, id) => sum + (stageMap.get(id)?.actMemoryMb ?? 0), 0);
+      return Math.max(maxMem, waveMem);
+    }, 0);
+    const totalEstimatedTokens = Array.from(stageMap.values()).reduce(
+      (acc, s) => acc + s.estimatedTokens,
+      0
+    );
+    const estimatedCostUsd = Number(((totalEstimatedTokens / 1000) * 0.015).toFixed(2));
+
+    const enrichedStages = Array.from(stageMap.values()).map((st) => {
+      const waveIdx = waves.findIndex((w) => w.includes(st.taskId));
+      return {
+        ...st,
+        waveNumber: waveIdx >= 0 ? waveIdx + 1 : null,
+        initialDispatchState: waveIdx === 0 ? "QUEUED_WAVE_1" : "WAITING_UPSTREAM_DAG",
+      };
+    });
+
+    if (validationErrors.length > 0) {
+      return {
+        status: 400,
+        body: {
+          valid: false,
+          mode: params.mode,
+          validationErrors,
+          planName,
+          tenantId,
+          region,
+          waves,
+          stages: enrichedStages,
+        },
+      };
+    }
+
+    if (params.mode === "dry_run") {
+      return {
+        status: 200,
+        body: {
+          valid: true,
+          mode: "dry_run",
+          validationErrors: [],
+          planName,
+          tenantId,
+          region,
+          stageCount: stageMap.size,
+          waveCount: waves.length,
+          maxParallelism: waves.reduce((m, w) => Math.max(m, w.length), 0),
+          waves,
+          resourceSummary: {
+            totalActCpuCores,
+            peakWaveMemoryMb,
+            totalEstimatedTokens,
+            estimatedCostUsd,
+            requiredEscrowSlots: stageMap.size,
+          },
+          stages: enrichedStages,
+        },
+      };
+    }
+
+    // commit_and_dispatch mode
+    const batchId = `batch-${Date.now() % 100000}`;
+    const coordinatorTaskId = `${batchId}-coord`;
+    const sql = this.deps.v25Store.sql;
+    sql.exec(
+      "INSERT OR REPLACE INTO v25_mgmt_task_blueprints (blueprint_id, name, tenant_id, region, created_by, created_at, stages_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      batchId,
+      planName,
+      tenantId,
+      region,
+      params.actor,
+      new Date().toISOString(),
+      JSON.stringify(enrichedStages)
+    );
+
+    const parentTask = new TaskSpec({
+      task_id: coordinatorTaskId,
+      tenant_id: tenantId,
+      priority: 1 as TaskPriority,
+      prompt: `[Batch Coordinator] ${planName} (${stageMap.size} stages across ${waves.length} waves)`,
+    });
+    parentTask.state = TaskState.RUNNING_ACT;
+    parentTask.expected_SubAgent_count = stageMap.size;
+    this.deps.scheduler.allTasks.set(coordinatorTaskId, parentTask);
+    this.deps.v25Store.commitTaskSingleWritePath(parentTask, "body-host-01");
+    this.deps.dagEscrow.reserveParentEscrow(parentTask, 2000, stageMap.size + 2);
+
+    const dispatchedTaskIds: string[] = [];
+    for (const st of enrichedStages) {
+      const fullTaskId = `${batchId}-${st.taskId}`;
+      const mappedDeps = st.dependsOn.map((d) => `${batchId}-${d}`);
+      const childSpec = new TaskSpec({
+        task_id: fullTaskId,
+        tenant_id: tenantId,
+        parent_task_id: coordinatorTaskId,
+        depends_on: mappedDeps,
+        priority: st.priority as TaskPriority,
+        prompt: `[${st.role}] ${st.prompt}`,
+        resource_profile: {
+          think_cpu_cores: st.thinkCpuCores,
+          act_cpu_cores: st.actCpuCores,
+          act_memory_mb: st.actMemoryMb,
+          disk_mb: 10240,
+        },
+      });
+      if (st.waveNumber === 1) {
+        childSpec.state = TaskState.QUEUED;
+        this.mgmtQueueManager.enqueue(childSpec);
+      } else {
+        childSpec.state = TaskState.RUNNING_ACT;
+      }
+      this.deps.dagEscrow.registerChildSubAgent(parentTask, childSpec, mappedDeps);
+      this.deps.scheduler.allTasks.set(fullTaskId, childSpec);
+      this.deps.v25Store.commitTaskSingleWritePath(childSpec, "body-host-01");
+      dispatchedTaskIds.push(fullTaskId);
+    }
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `批量规划并下发 DAG 蓝图任务 [${planName}] (Batch=${batchId}, Stages=${stageMap.size}, Waves=${waves.length})`,
+      `Tasks / BatchPlanner / ${tenantId}`,
+      `DISPATCHED (${stageMap.size} tasks)`
+    );
+
+    return {
+      status: 201,
+      body: {
+        valid: true,
+        mode: "commit_and_dispatch",
+        batchId,
+        coordinatorTaskId,
+        dispatchedCount: dispatchedTaskIds.length,
+        dispatchedTaskIds,
+        planName,
+        tenantId,
+        region,
+        waveCount: waves.length,
+        waves,
+        resourceSummary: {
+          totalActCpuCores,
+          peakWaveMemoryMb,
+          totalEstimatedTokens,
+          estimatedCostUsd,
+          requiredEscrowSlots: stageMap.size,
+        },
+        stages: enrichedStages,
+        dagVisualization: this.buildDagAndCognitiveSnapshot(),
+      },
+    };
+  }
+
   public simulateQueueLoadSheddingAndBackpressure(params: {
     utilizationRatio: number;
   }): { status: number; body: Record<string, unknown> } {

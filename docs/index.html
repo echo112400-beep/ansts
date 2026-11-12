@@ -1037,6 +1037,8 @@ html.dark-theme .data-table tbody tr:hover {
       configDiffResult: null,
       configDryRunResult: null,
       queueBackpressureResult: null,
+      selectedBlueprintId: 'fullstack-feature-pipeline',
+      batchTaskPlanResult: null,
       lastSyncUtc: null,
       loadSheddingActive: false,
       verificationRetried: false,
@@ -2040,6 +2042,7 @@ html.dark-theme .data-table tbody tr:hover {
             <button type="button" class="small" data-action="open-erasure-coding">[N6] 跨地域日志纠删码重构</button>
             <button type="button" class="small primary" data-action="open-release-readiness-gate">[Prod] 生产发布准入核查 (Release Gate)</button>
             <button type="button" class="small danger" data-action="dag-batch-cancel-tasks" ${!permGlobal.ok ? 'disabled' : ''}>批量安全停止选中任务</button>
+            <button type="button" class="small primary" data-action="open-batch-task-planner-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 批量规划设计任务 (Batch Planner)</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -2145,6 +2148,69 @@ html.dark-theme .data-table tbody tr:hover {
             </tbody>
           </table>
         </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">批量任务规划设计与 DAG 蓝图编排工作台 (Batch Task Planner &amp; DAG Blueprint Designer)</h2>
+            <p class="panel-subtitle">对接 <code>GET /v1beta1/console/tasks/blueprints</code> 与 <code>POST /v1beta1/management/tasks/batch-plan</code>，支持多阶段任务拓扑波次推导 (Kahn 环路检测)、算力/Escrow 容量预演与一键原子批量下发。</p>
+          </div>
+          <div class="btn-row">
+            <select id="batch-plan-blueprint-select" style="height:30px;">
+              <option value="fullstack-feature-pipeline" ${state.selectedBlueprintId === 'fullstack-feature-pipeline' ? 'selected' : ''}>[4 阶段] 全栈特性研发与灰度验证流水线</option>
+              <option value="distributed-chaos-verif" ${state.selectedBlueprintId === 'distributed-chaos-verif' ? 'selected' : ''}>[3 阶段] 跨地域联邦灾备与混沌工程演练蓝图</option>
+              <option value="multi-tenant-finops-sweep" ${state.selectedBlueprintId === 'multi-tenant-finops-sweep' ? 'selected' : ''}>[3 阶段] 多租户配额巡检与工作记忆压缩批处理</option>
+            </select>
+            <button type="button" class="small" data-action="batch-plan-dry-run" ${!permGlobal.ok ? 'disabled' : ''}>拓扑校验与容量预演 (Dry-Run)</button>
+            <button type="button" class="small primary" data-action="batch-plan-commit-dispatch" ${!permGlobal.ok ? 'disabled' : ''}>一键批量下发蓝图任务 (Commit &amp; Dispatch)</button>
+          </div>
+        </div>
+        ${state.batchTaskPlanResult ? `
+          <div class="subcard" style="margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+              <div>
+                <strong>蓝图名称:</strong> ${esc(state.batchTaskPlanResult.planName)}
+                · 租户: <span class="mono">${esc(state.batchTaskPlanResult.tenantId)} (${esc(state.batchTaskPlanResult.region)})</span>
+                · 状态: <span class="status-pill ${state.batchTaskPlanResult.valid ? 'ok' : 'danger'}">${state.batchTaskPlanResult.mode === 'commit_and_dispatch' ? '已原子下发 (' + (state.batchTaskPlanResult.batchId || 'OK') + ')' : 'Dry-Run 拓扑通过'}</span>
+              </div>
+              <div class="mono">
+                执行波次: <strong>${state.batchTaskPlanResult.waveCount ?? 0} Waves</strong>
+                · 总算力: <strong>${state.batchTaskPlanResult.resourceSummary?.totalActCpuCores ?? 0} ACT Cores</strong>
+                · 峰值波次内存: <strong>${state.batchTaskPlanResult.resourceSummary?.peakWaveMemoryMb ?? 0} MB</strong>
+                · 预估成本: <strong>$${state.batchTaskPlanResult.resourceSummary?.estimatedCostUsd ?? 0}</strong>
+              </div>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>拓扑波次 (Wave)</th>
+                  <th>阶段任务 ID</th>
+                  <th>智能体角色 (Role)</th>
+                  <th>上游依赖 (dependsOn)</th>
+                  <th>优先级 / 资源配额</th>
+                  <th>初始调度状态</th>
+                  <th>任务指令摘要</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${(state.batchTaskPlanResult.stages || []).map((st) => `
+                  <tr>
+                    <td class="mono"><span class="status-pill ${st.waveNumber === 1 ? 'ok' : 'warn'}">Wave #${st.waveNumber ?? '?'}</span></td>
+                    <td class="mono"><strong>${esc(st.taskId)}</strong></td>
+                    <td>${esc(st.role)}</td>
+                    <td class="mono">${(st.dependsOn || []).length === 0 ? '<span class="muted">ROOT (无上游依赖)</span>' : (st.dependsOn || []).map((d) => `<span class="status-pill">${esc(d)}</span>`).join(' → ')}</td>
+                    <td class="mono">P${st.priority} · ${st.thinkCpuCores}c/${st.actCpuCores}c · ${st.actMemoryMb}MB</td>
+                    <td><span class="status-pill ${st.waveNumber === 1 ? 'ok' : 'warn'}">${esc(st.initialDispatchState)}</span></td>
+                    <td>${esc(st.prompt)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        ` : `<p class="muted">选择上方预设 DAG 蓝图（或点击顶部「+ 批量规划设计任务」自定义多阶段 JSON 蓝图），点击「拓扑校验与容量预演」查看 Kahn 拓扑波次与资源评估，或点击「一键批量下发蓝图任务」原子注册至调度器与 DAG Escrow。</p>`}
       </div>
     `;
   }
@@ -6089,6 +6155,88 @@ html.dark-theme .data-table tbody tr:hover {
       });
       await fetchBackendState();
       showToast(`已在分支 ${branchName} 提交快照 Commit ${res.data?.commitId || "OK"}`);
+      return;
+    }
+    if (action === "batch-plan-dry-run" || action === "batch-plan-commit-dispatch") {
+      const p = getPrincipal();
+      const bpId = document.getElementById("batch-plan-blueprint-select")?.value || state.selectedBlueprintId || "fullstack-feature-pipeline";
+      state.selectedBlueprintId = bpId;
+      const mode = action === "batch-plan-commit-dispatch" ? "commit_and_dispatch" : "dry_run";
+      const res = await callBackendApi("POST", "/v1beta1/management/tasks/batch-plan", {
+        mode,
+        blueprintId: bpId,
+        actor: p.id,
+        role: p.role,
+      });
+      if (res.ok && res.data) {
+        state.batchTaskPlanResult = res.data;
+        if (mode === "commit_and_dispatch") {
+          await fetchBackendState();
+        } else {
+          render();
+        }
+        showToast(
+          mode === "commit_and_dispatch"
+            ? `批量任务蓝图已原子下发：Batch ${res.data.batchId} (${res.data.dispatchedCount} 个阶段任务)`
+            : `批量任务 Dry-Run 校验通过：${res.data.stageCount} 个阶段 / ${res.data.waveCount} 个拓扑波次`
+        );
+      }
+      return;
+    }
+    if (action === "open-batch-task-planner-dialog") {
+      const defaultStages = [
+        { taskId: "design-schema", role: "Architect-Agent", prompt: "Design distributed schema & API contract", priority: 1, dependsOn: [], actCpuCores: 2, actMemoryMb: 4096 },
+        { taskId: "code-service", role: "Backend-Agent", prompt: "Implement core service and unit tests", priority: 1, dependsOn: ["design-schema"], actCpuCores: 4, actMemoryMb: 8192 },
+        { taskId: "audit-security", role: "SecOps-Agent", prompt: "Run zero-trust & RBAC verification suite", priority: 0, dependsOn: ["code-service"], actCpuCores: 4, actMemoryMb: 8192 }
+      ];
+      openDialog(
+        "批量规划设计任务与自定义 DAG 蓝图 (POST /v1beta1/management/tasks/batch-plan)",
+        `
+          <div class="form-field">
+            <label for="dlg-batch-name">批次规划名称 (Plan Name)</label>
+            <input id="dlg-batch-name" type="text" value="自定义多智能体协同研发批次" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-batch-tenant">目标租户 (Tenant)</label>
+            <select id="dlg-batch-tenant">
+              <option value="Northstar" selected>Northstar (us-west-2)</option>
+              <option value="Helios">Helios (eu-central-1)</option>
+              <option value="Vanguard">Vanguard (ap-northeast-1)</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="dlg-batch-stages">阶段任务 DAG 定义 (JSON Stages)</label>
+            <textarea id="dlg-batch-stages" rows="7" class="mono" style="width:100%;font-size:12px;">${esc(JSON.stringify(defaultStages, null, 2))}</textarea>
+          </div>
+        `,
+        "校验并批量下发",
+        async () => {
+          const p = getPrincipal();
+          const planName = document.getElementById("dlg-batch-name")?.value || "Custom Batch Plan";
+          const tenantId = document.getElementById("dlg-batch-tenant")?.value || "Northstar";
+          let stages = defaultStages;
+          try {
+            stages = JSON.parse(document.getElementById("dlg-batch-stages")?.value || "[]");
+          } catch (_e) {
+            showToast("阶段任务 JSON 格式解析失败");
+            return;
+          }
+          closeDialog();
+          const res = await callBackendApi("POST", "/v1beta1/management/tasks/batch-plan", {
+            mode: "commit_and_dispatch",
+            planName,
+            tenantId,
+            stages,
+            actor: p.id,
+            role: p.role,
+          });
+          if (res.ok && res.data) {
+            state.batchTaskPlanResult = res.data;
+            await fetchBackendState();
+            showToast(`已批量规划并下发 ${res.data.dispatchedCount} 个阶段任务 (${res.data.batchId})`);
+          }
+        }
+      );
       return;
     }
     if (action === "simulate-queue-backpressure") {

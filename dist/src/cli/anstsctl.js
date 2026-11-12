@@ -694,6 +694,39 @@ gatewayUrl = process.env.ANSTS_GATEWAY_URL ?? "http://127.0.0.1:18080")
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-task-blueprints") {
+    const resp = await fetch(`${baseUrl}/v1beta1/console/tasks/blueprints`);
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-task-batch-plan") {
+    const mode = (rest[0] ?? "dry_run").trim();
+    const arg1 = (rest[1] ?? "fullstack-feature-pipeline").trim();
+    const payload = {
+      mode: mode === "commit_and_dispatch" ? "commit_and_dispatch" : "dry_run",
+      actor: "cli-admin",
+      role: "SRE_ADMIN"
+    };
+    if (arg1.startsWith("[") || arg1.startsWith("{")) {
+      const parsed = JSON.parse(arg1);
+      if (Array.isArray(parsed)) {
+        payload.stages = parsed;
+      } else {
+        Object.assign(payload, parsed);
+      }
+    } else {
+      payload.blueprintId = arg1;
+    }
+    const resp = await fetch(`${baseUrl}/v1beta1/management/tasks/batch-plan`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-queue-backpressure") {
     const util = (rest[0] ?? "0.88").trim();
     const resp = await fetch(
