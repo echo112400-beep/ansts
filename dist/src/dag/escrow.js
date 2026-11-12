@@ -370,6 +370,39 @@ class DagEscrowCoordinator {
     };
   }
 
+  inspectDagEscrowSnapshot()
+
+
+
+
+
+
+
+
+
+
+
+  {
+    const escrows = Array.from(this.escrows.values()).map((r) => ({
+      parentTaskId: r.parentTaskId,
+      tenantId: r.tenantId,
+      escrowedSlots: r.escrowedSlots,
+      usedSlots: r.usedSlots,
+      replanRevision: r.replanRevision ?? 0,
+      childTaskIds: Array.from(r.childTaskIds)
+    }));
+    const edges = Array.from(this.dependencyGraph.entries()).map(([childTaskId, deps]) => ({
+      childTaskId,
+      dependsOn: Array.from(deps)
+    }));
+    return {
+      totalEscrowsCount: escrows.length,
+      totalEdgesCount: edges.length,
+      escrows,
+      edges
+    };
+  }
+
   getEscrowRecord(parentTaskId) {
     return this.escrows.get(parentTaskId);
   }

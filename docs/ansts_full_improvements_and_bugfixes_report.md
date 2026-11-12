@@ -745,3 +745,16 @@
    - 在顶部栏新增 `☾ 暗色模式 / ☀ 亮色模式` (`toggle-theme`) 与 `⟳ 自动轮询: 5s / ⏸ 轮询已暂停` (`toggle-auto-refresh`) 按钮，并在每次调用后端 BFF 时实时刷新 `REAL BFF · 真实后端已连接 (Xms)` RTT 延迟指标。
 4. **端到端回归验证 (`tests/m85_console_security_release_gate_and_theme_controls.test.ts`)**：
    - 全量 **89 个 `src/` 源码模块**、**78 个测试套件（共 212 项测试）100% 通过**。
+
+
+---
+
+## 36. M86: 实时 DAG 父子任务依赖拓扑与 Escrow 并发担保可视工作台及批量任务治理套件 (`GET /v1beta1/console/dag`, `POST /v1beta1/management/tasks/dag-action`, `anstsctl mgmt-dag`)
+
+1. **DAG 父子任务依赖拓扑与 Escrow 并发担保可视 (`DagEscrowCoordinator.inspectDagEscrowSnapshot` & `GET /v1beta1/console/dag`)**：
+   - 在 `DagEscrowCoordinator` 新增 `inspectDagEscrowSnapshot()`，实时聚合所有父任务的并发担保槽位 (`usedSlots` / `escrowedSlots`)、重规划版本号 (`replanRevision`) 及子智能体依赖边 (`dependsOn`)。
+   - 在 `tasks` 视图 (`renderTasksSection()`) 内嵌 DAG 拓扑工作台，支持在线为父任务派生子智能体 (`spawn_sub_agent`，带终态父任务 `409 TERMINAL_PARENT_GUARD` 保护)、完成子任务释放槽位 (`complete_sub_agent`) 及模拟子任务失败联动父任务 (`fail_sub_agent`)。
+2. **多任务批量选择与安全停止 (`batch_cancel_tasks`)**：
+   - 在任务运行队列新增多选复选框 (`task-batch-check`) 与一键“批量安全停止选中任务” (`dag-batch-cancel-tasks`) 交互，支持批量下发优雅停止指令并持久化审计记录。
+3. **端到端回归验证 (`tests/m86_console_dag_topology_and_batch_task_governance.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**79 个测试套件（共 213 项测试）100% 通过**。

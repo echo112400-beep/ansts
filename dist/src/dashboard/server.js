@@ -994,6 +994,37 @@ data:{status:"RPO_ZERO_READY",activeShards:256}
 });
 }
 
+// [M86] Seed initial Parent-Child DAG Escrow topology on task-ns-8842
+this.deps.dagEscrow.bindSqlStorage(this.deps.v25Store.sql);
+const parent8842=this.deps.scheduler.allTasks.get("task-ns-8842");
+if(parent8842&&this.deps.dagEscrow.inspectDagEscrowSnapshot().totalEscrowsCount===0){
+parent8842.expected_SubAgent_count=3;
+this.deps.dagEscrow.reserveParentEscrow(parent8842,120,86);
+const sub1=new _models.TaskSpec({
+task_id:"task-ns-8842-sub1",
+tenant_id:"Northstar",
+parent_task_id:"task-ns-8842",
+priority:_models.TaskPriority.P1_HIGH,
+prompt:"Audit RustFS S3 LTX segment CRC32 integrity"
+});
+sub1.state=_models.TaskState.RUNNING_ACT;
+const sub2=new _models.TaskSpec({
+task_id:"task-ns-8842-sub2",
+tenant_id:"Northstar",
+parent_task_id:"task-ns-8842",
+priority:_models.TaskPriority.P1_HIGH,
+dependencies:["task-ns-8842-sub1"],
+prompt:"Synthesize cross-shard FinOps reconciliation summary"
+});
+sub2.state=_models.TaskState.QUEUED;
+this.deps.dagEscrow.registerChildSubAgent(parent8842,sub1);
+this.deps.dagEscrow.registerChildSubAgent(parent8842,sub2);
+this.deps.scheduler.allTasks.set(sub1.task_id,sub1);
+this.deps.scheduler.allTasks.set(sub2.task_id,sub2);
+this.deps.v25Store.commitTaskSingleWritePath(sub1,"body-host-01");
+this.deps.v25Store.commitTaskSingleWritePath(sub2,"body-host-01");
+}
+
 this.appendAudit("chen","SRE_ADMIN","初始化平台管理面控制基线与 256-Slot 分片映射","Global","已生效 (RPO=0)");
 this.appendAudit("lin","OPERATOR","触发 LayerFS 分支 feat-ns-auth 快照同步至 s3://ansts-fleet","us-west-2 / Northstar","成功 (Commit C1)");
 this.appendAudit("chen","SRE_ADMIN","复核通过周发起的分片维护单 APR-2026-088","us-west-2 / Global","APPROVED (chen)");
@@ -1537,7 +1568,190 @@ swarmVisualization:this.buildSwarmAndCognitiveVisualization(),
 federationVisualization:this.buildFederationAndDrVisualization(),
 profilerVisualization:this.buildProfilerAndStreamVisualization(),
 securityVisualization:this.buildSecurityAndReleaseVisualization(),
+dagVisualization:this.buildDagAndCognitiveSnapshot(),
 status:"HEALTHY"
+};
+}
+
+buildDagAndCognitiveSnapshot(){
+this.ensureInitialized();
+const dagSnap=this.deps.dagEscrow.inspectDagEscrowSnapshot();
+const enrichedEscrows=dagSnap.escrows.map((e)=>{
+const parentTask=this.deps.scheduler.allTasks.get(e.parentTaskId);
+const children=e.childTaskIds.map((cId)=>{
+const ct=this.deps.scheduler.allTasks.get(cId);
+return{
+taskId:cId,
+state:ct?String(ct.state):"COMPLETED",
+priority:ct?`P${ct.priority}`:"P1",
+prompt:ct?.prompt??"Sub-agent execution unit",
+dependsOn:dagSnap.edges.find((ed)=>ed.childTaskId===cId)?.dependsOn??[e.parentTaskId]
+};
+});
+return{
+...e,
+parentState:parentTask?String(parentTask.state):"WAITING_SUB_AGENT",
+children
+};
+});
+
+return{
+totalEscrowsCount:dagSnap.totalEscrowsCount,
+totalEdgesCount:dagSnap.totalEdgesCount,
+escrows:enrichedEscrows,
+cognitivePrefixIndexSize:this.harnessRunner.router.getPrefixIndexSize()
+};
+}
+
+executeDagTopologyAction(params)
+
+
+
+
+
+
+
+{
+this.ensureInitialized();
+if(params.role==="VIEWER"){
+return{
+status:403,
+body:{error:"RBAC_FORBIDDEN",message:"VIEWER 角色无权变更 DAG 子任务拓扑或批量取消任务"}
+};
+}
+
+if(params.action==="batch_cancel_tasks"){
+const ids=Array.isArray(params.taskIds)?params.taskIds.map((x)=>String(x).trim()).filter(Boolean):[];
+if(ids.length===0){
+return{status:400,body:{error:"MISSING_REQUIRED_PARAMETERS",message:"Required: non-empty taskIds array"}};
+}
+const results=ids.map((tId)=>{
+const r=this.cancelOrFenceTask({
+taskId:tId,
+mode:"graceful",
+actor:params.actor,
+role:params.role
+});
+return{taskId:tId,status:r.status,body:r.body};
+});
+this.appendAudit(
+params.actor,
+params.role,
+`批量执行 ${ids.length} 个任务的安全停止请求 (${ids.join(", ")})`,
+"Tasks / BatchCancel",
+`BATCH_DONE (${results.filter((r)=>r.status<400).length}/${ids.length})`);
+
+return{
+status:200,
+body:{
+batchCount:ids.length,
+results,
+dagVisualization:this.buildDagAndCognitiveSnapshot()
+}
+};
+}
+
+const parentId=String(params.parentTaskId??"task-ns-8842").trim();
+const parentTask=
+this.deps.scheduler.allTasks.get(parentId)??
+this.deps.v25Store.getPersistedTask(parentId);
+if(!parentTask){
+return{status:404,body:{error:"PARENT_TASK_NOT_FOUND",parentTaskId:parentId}};
+}
+
+if(params.action==="spawn_sub_agent"){
+const childId=(0,_console_rbac_guard.sanitizeHtmlString)(String(params.childTaskId??`${parentId}-sub${Date.now()%1000}`).trim());
+parentTask.expected_SubAgent_count=Math.max(parentTask.expected_SubAgent_count+1,3);
+if(parentTask.state===_models.TaskState.COMPLETED||parentTask.state===_models.TaskState.CANCELLED||parentTask.state===_models.TaskState.DEAD_LETTER){
+return{
+status:409,
+body:{error:"TERMINAL_PARENT_GUARD",message:`父任务 ${parentId} 已处于终态 (${parentTask.state})，禁止派生子任务`}
+};
+}
+this.deps.dagEscrow.reserveParentEscrow(parentTask,500,10);
+const childTask=new _models.TaskSpec({
+task_id:childId,
+tenant_id:parentTask.tenant_id,
+parent_task_id:parentId,
+priority:parentTask.priority,
+prompt:(0,_console_rbac_guard.sanitizeHtmlString)(String(params.prompt??"Execute dynamic DAG sub-agent verification"))
+});
+childTask.state=_models.TaskState.RUNNING_ACT;
+const regRes=this.deps.dagEscrow.registerChildSubAgent(parentTask,childTask);
+this.deps.scheduler.allTasks.set(childId,childTask);
+this.deps.v25Store.commitTaskSingleWritePath(parentTask,parentTask.assigned_node_id??"body-host-01");
+this.deps.v25Store.commitTaskSingleWritePath(childTask,"body-host-01");
+this.appendAudit(
+params.actor,
+params.role,
+`为父任务 [${parentId}] 派生 DAG 子智能体 [${childId}] (EscrowSlot=${regRes.usedEscrowSlot})`,
+`DAG / ${parentId}`,
+`SPAWNED (${childId})`);
+
+return{
+status:201,
+body:{
+parentTaskId:parentId,
+childTaskId:childId,
+...regRes,
+dagVisualization:this.buildDagAndCognitiveSnapshot()
+}
+};
+}
+
+const childId=String(params.childTaskId??"").trim();
+if(!childId){
+return{status:400,body:{error:"MISSING_REQUIRED_PARAMETERS",message:"Required: childTaskId"}};
+}
+const childTask=this.deps.scheduler.allTasks.get(childId);
+
+if(params.action==="complete_sub_agent"){
+const parentResumed=this.deps.dagEscrow.completeChildSubAgent(parentTask,childId);
+if(childTask){
+childTask.state=_models.TaskState.COMPLETED;
+this.deps.v25Store.commitTaskSingleWritePath(childTask,childTask.assigned_node_id??"body-host-01");
+}
+this.deps.v25Store.commitTaskSingleWritePath(parentTask,parentTask.assigned_node_id??"body-host-01");
+this.appendAudit(
+params.actor,
+params.role,
+`完成 DAG 子任务 [${childId}] 并释放担保槽位 (父任务 ${parentId} 恢复=${parentResumed})`,
+`DAG / ${parentId}`,
+parentResumed?"PARENT_RESUMED":"CHILD_COMPLETED");
+
+return{
+status:200,
+body:{
+parentTaskId:parentId,
+childTaskId:childId,
+parentResumed,
+dagVisualization:this.buildDagAndCognitiveSnapshot()
+}
+};
+}
+
+// action === "fail_sub_agent"
+const failRes=this.deps.dagEscrow.failOrCancelChildSubAgent(parentTask,childId,true);
+if(childTask){
+childTask.state=_models.TaskState.DEAD_LETTER;
+this.deps.v25Store.commitTaskSingleWritePath(childTask,childTask.assigned_node_id??"body-host-01");
+}
+this.deps.v25Store.commitTaskSingleWritePath(parentTask,parentTask.assigned_node_id??"body-host-01");
+this.appendAudit(
+params.actor,
+params.role,
+`标记 DAG 子任务 [${childId}] 失败并触发父任务 [${parentId}] 状态联动 (${failRes.parentState})`,
+`DAG / ${parentId}`,
+`CHILD_FAILED (${failRes.parentState})`);
+
+return{
+status:200,
+body:{
+parentTaskId:parentId,
+childTaskId:childId,
+...failRes,
+dagVisualization:this.buildDagAndCognitiveSnapshot()
+}
 };
 }
 

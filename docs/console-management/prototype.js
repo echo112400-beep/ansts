@@ -153,6 +153,7 @@
       federationVisualization: null,
       profilerVisualization: null,
       securityVisualization: null,
+      dagVisualization: null,
       autoRefreshPaused: false,
       darkTheme: false,
       lastBffRttMs: 0,
@@ -280,6 +281,7 @@
       if (d.federationVisualization) state.federationVisualization = d.federationVisualization;
       if (d.profilerVisualization) state.profilerVisualization = d.profilerVisualization;
       if (d.securityVisualization) state.securityVisualization = d.securityVisualization;
+      if (d.dagVisualization) state.dagVisualization = d.dagVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -1071,6 +1073,7 @@
             <button type="button" class="small" data-action="open-byzantine-slashing">[N5] 拜占庭信用惩戒与隔离</button>
             <button type="button" class="small" data-action="open-erasure-coding">[N6] 跨地域日志纠删码重构</button>
             <button type="button" class="small primary" data-action="open-release-readiness-gate">[Prod] 生产发布准入核查 (Release Gate)</button>
+            <button type="button" class="small danger" data-action="dag-batch-cancel-tasks" ${!permGlobal.ok ? 'disabled' : ''}>批量安全停止选中任务</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -1101,7 +1104,7 @@
                 const pillCls = isUnconfirmed ? 'warn' : isFenced ? 'danger' : 'ok';
                 return `
                   <tr>
-                    <td class="mono"><strong>${esc(t.id)}</strong>${t.mergedDuplicateCount > 0 ? ` <span class="status-pill ok" title="已合并重复请求: ${(t.mergedRequestIds || []).join(", ")}">合并×${t.mergedDuplicateCount}</span>` : ""}</td>
+                    <td class="mono"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" class="task-batch-check" value="${esc(t.id)}" /><strong>${esc(t.id)}</strong></label>${t.mergedDuplicateCount > 0 ? ` <span class="status-pill ok" title="已合并重复请求: ${(t.mergedRequestIds || []).join(", ")}">合并×${t.mergedDuplicateCount}</span>` : ""}</td>
                     <td>${esc(t.tenant)} · <span class="mono">${esc(t.region)}</span></td>
                     <td class="mono">${t.priority} · Slot #${t.shardSlot ?? 0}</td>
                     <td class="mono">${t.brain} → ${t.body}</td>
@@ -1125,6 +1128,54 @@
                   </tr>
                 `;
               }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">DAG 父子任务依赖拓扑与 Escrow 并发担保可视工作台 (GET /v1beta1/console/dag · POST /v1beta1/management/tasks/dag-action)</h2>
+            <p class="panel-subtitle">实时展示 <code>DagEscrowCoordinator</code> 维护的父任务担保槽位 (Escrow Slots)、子智能体拓扑边 (<code>dependsOn</code>) 及防死锁终端保护。</p>
+          </div>
+          <div class="btn-row">
+            <span class="status-pill ok">活跃 Escrow: ${state.dagVisualization?.totalEscrowsCount ?? 0} · 依赖边: ${state.dagVisualization?.totalEdgesCount ?? 0} · Prefix Index: ${state.dagVisualization?.cognitivePrefixIndexSize ?? 0}</span>
+            <button type="button" class="small primary" data-action="dag-spawn-subagent" data-parent="task-ns-8842" ${!permGlobal.ok ? 'disabled' : ''}>+ 为 task-ns-8842 派生子智能体</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>父任务 / 子任务 ID</th>
+                <th>租户 / 担保槽位 (Used / Escrowed)</th>
+                <th>上游依赖边 (dependsOn)</th>
+                <th>生命周期状态</th>
+                <th>子任务指令摘要</th>
+                <th>DAG 拓扑操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(state.dagVisualization?.escrows || []).map((escrow) =>
+                (escrow.children || []).map((ch, idx) => `
+                  <tr>
+                    <td class="mono">
+                      ${idx === 0 ? `<strong>${esc(escrow.parentTaskId)}</strong> <span class="status-pill">${esc(escrow.parentState)}</span><div class="muted">↳ ${esc(ch.taskId)}</div>` : `<span class="muted">↳</span> <strong>${esc(ch.taskId)}</strong>`}
+                    </td>
+                    <td class="mono">${esc(escrow.tenantId)} · ${escrow.usedSlots} / ${escrow.escrowedSlots} 槽 (Rev #${escrow.replanRevision})</td>
+                    <td class="mono">${(ch.dependsOn || []).map((d) => `<span class="status-pill">${esc(d)}</span>`).join(' → ')}</td>
+                    <td><span class="status-pill ${ch.state === 'COMPLETED' ? 'ok' : ch.state === 'DEAD_LETTER' ? 'danger' : 'warn'}">${esc(ch.state)}</span></td>
+                    <td>${esc(ch.prompt)}</td>
+                    <td>
+                      <div class="btn-row">
+                        <button type="button" class="small primary" data-action="dag-complete-subagent" data-parent="${esc(escrow.parentTaskId)}" data-child="${esc(ch.taskId)}" ${!permGlobal.ok || ch.state === 'COMPLETED' || ch.state === 'DEAD_LETTER' ? 'disabled' : ''}>完成子任务</button>
+                        <button type="button" class="small danger" data-action="dag-fail-subagent" data-parent="${esc(escrow.parentTaskId)}" data-child="${esc(ch.taskId)}" ${!permGlobal.ok || ch.state === 'COMPLETED' || ch.state === 'DEAD_LETTER' ? 'disabled' : ''}>模拟失败</button>
+                      </div>
+                    </td>
+                  </tr>
+                `).join('')
+              ).join('')}
             </tbody>
           </table>
         </div>
@@ -4127,6 +4178,61 @@
       const btn = document.getElementById("auto-refresh-btn");
       if (btn) btn.textContent = state.autoRefreshPaused ? "⏸ 轮询已暂停" : "⟳ 自动轮询: 5s";
       showToast(state.autoRefreshPaused ? "已暂停 5s 自动轮询（SSE 实时推送仍保持连接）" : "已恢复 5s 后台状态同步");
+      return;
+    }
+    if (action === "dag-batch-cancel-tasks") {
+      const checked = Array.from(document.querySelectorAll('.task-batch-check:checked')).map((el) => el.value);
+      if (checked.length === 0) {
+        showToast("请先勾选至少一个要停止的任务复选框");
+        return;
+      }
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/tasks/dag-action", {
+        action: "batch_cancel_tasks",
+        taskIds: checked,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast(`已对 ${checked.length} 个选中任务下发批量安全停止指令`);
+      return;
+    }
+    if (action === "dag-spawn-subagent") {
+      const parentTaskId = target.getAttribute("data-parent") || "task-ns-8842";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/tasks/dag-action", {
+        action: "spawn_sub_agent",
+        parentTaskId,
+        prompt: `Dynamic sub-agent spawned by ${p.id}`,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "派生子任务失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已为 ${parentTaskId} 派生子任务 ${res.data?.childTaskId}`);
+      return;
+    }
+    if (action === "dag-complete-subagent" || action === "dag-fail-subagent") {
+      const parentTaskId = target.getAttribute("data-parent") || "task-ns-8842";
+      const childTaskId = target.getAttribute("data-child") || "";
+      const p = getPrincipal();
+      const op = action === "dag-complete-subagent" ? "complete_sub_agent" : "fail_sub_agent";
+      const res = await callBackendApi("POST", "/v1beta1/management/tasks/dag-action", {
+        action: op,
+        parentTaskId,
+        childTaskId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "更新子任务状态失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`子任务 ${childTaskId} 已更新 (${op})`);
       return;
     }
     if (action === "sec-run-probe") {

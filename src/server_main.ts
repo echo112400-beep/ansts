@@ -2465,6 +2465,43 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M86] TanStack Console BFF: Live DAG Dependency & Escrow Topology (`GET /v1beta1/console/dag`)
+    if (method === "GET" && pathname === "/v1beta1/console/dag") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildDagAndCognitiveSnapshot()));
+      return;
+    }
+
+    // [M86] Interactive DAG Sub-Agent Lifecycle & Batch Task Action (`POST /v1beta1/management/tasks/dag-action`)
+    if (method === "POST" && pathname === "/v1beta1/management/tasks/dag-action") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeDagTopologyAction({
+        action: (body.action ?? "spawn_sub_agent") as
+          | "spawn_sub_agent"
+          | "complete_sub_agent"
+          | "fail_sub_agent"
+          | "batch_cancel_tasks",
+        parentTaskId: body.parentTaskId ? String(body.parentTaskId) : undefined,
+        childTaskId: body.childTaskId ? String(body.childTaskId) : undefined,
+        prompt: body.prompt ? String(body.prompt) : undefined,
+        taskIds: Array.isArray(body.taskIds) ? (body.taskIds as string[]) : undefined,
+        actor: auth.actor,
+        role: auth.role,
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M85] Interactive Zero-Trust Intrusion Probe (`POST /v1beta1/management/security/probe`)
     if (method === "POST" && pathname === "/v1beta1/management/security/probe") {
       const body = await this.readJsonBody(req);

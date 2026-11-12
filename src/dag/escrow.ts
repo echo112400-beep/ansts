@@ -370,6 +370,39 @@ export class DagEscrowCoordinator {
     };
   }
 
+  public inspectDagEscrowSnapshot(): {
+    totalEscrowsCount: number;
+    totalEdgesCount: number;
+    escrows: Array<{
+      parentTaskId: string;
+      tenantId: string;
+      escrowedSlots: number;
+      usedSlots: number;
+      replanRevision: number;
+      childTaskIds: string[];
+    }>;
+    edges: Array<{ childTaskId: string; dependsOn: string[] }>;
+  } {
+    const escrows = Array.from(this.escrows.values()).map((r) => ({
+      parentTaskId: r.parentTaskId,
+      tenantId: r.tenantId,
+      escrowedSlots: r.escrowedSlots,
+      usedSlots: r.usedSlots,
+      replanRevision: r.replanRevision ?? 0,
+      childTaskIds: Array.from(r.childTaskIds),
+    }));
+    const edges = Array.from(this.dependencyGraph.entries()).map(([childTaskId, deps]) => ({
+      childTaskId,
+      dependsOn: Array.from(deps),
+    }));
+    return {
+      totalEscrowsCount: escrows.length,
+      totalEdgesCount: edges.length,
+      escrows,
+      edges,
+    };
+  }
+
   public getEscrowRecord(parentTaskId: string): QuotaEscrowRecord | undefined {
     return this.escrows.get(parentTaskId);
   }
