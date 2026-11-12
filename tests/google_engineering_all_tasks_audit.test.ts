@@ -8,7 +8,10 @@ import * as path from "node:path";
 import * as Ansts from "../src/index.js";
 
 describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit", () => {
-  it("1. Verifies all 58 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
+  // Census was frozen at 89 in 10022739. 8e841b3 added src/cluster/celld_fleet_client.ts
+  // (exported from src/index.ts, covered by tests/celld_fleet_client.test.ts). It carries
+  // @fileoverview, so the header check stays; only the module count moves to 90.
+  it("1. Verifies all 90 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
     const walk = (dir: string): string[] => {
       let out: string[] = [];
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -19,7 +22,7 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
       return out;
     };
     const srcFiles = walk(path.join(process.cwd(), "src"));
-    assert.equal(srcFiles.length, 89);
+    assert.equal(srcFiles.length, 90);
     for (const f of srcFiles) {
       const content = fs.readFileSync(f, "utf-8");
       assert.ok(content.includes("@fileoverview"), `Missing @fileoverview in ${f}`);
