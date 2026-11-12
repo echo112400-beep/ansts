@@ -11,10 +11,9 @@ COPY migrations ./migrations
 COPY scripts ./scripts
 COPY src ./src
 COPY tests ./tests
-COPY dist ./dist
 
-# If online or compiler is present, rebuild dist/ from src/; otherwise pre-built dist/ is ready to run immediately
-RUN npm install --no-audit --no-fund 2>/dev/null && npm run build || true
+# dist/ is not tracked in git any more; it is always rebuilt from src/ + tests/ here
+RUN npm install --no-audit --no-fund 2>/dev/null && npm run build
 
 ENV NODE_ENV=production \
     ANSTS_HOST=0.0.0.0 \

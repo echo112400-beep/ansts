@@ -14,9 +14,8 @@ COPY tests ./tests
 COPY scripts ./scripts
 COPY docs ./docs
 COPY specs ./specs
-COPY dist ./dist
 
-RUN npm install --no-audit --no-fund 2>/dev/null && node scripts/ci_check.mjs --stage build || true
+RUN npm install --no-audit --no-fund 2>/dev/null && node scripts/ci_check.mjs --stage build
 
 EXPOSE 8080 8081 8082 8083 9443 9501 9502
 
