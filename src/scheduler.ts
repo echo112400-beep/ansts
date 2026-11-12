@@ -34,6 +34,16 @@ const LEASED_OR_RUNNING_STATES = new Set<TaskState>([
   TaskState.SUSPENDED_APPROVAL,
 ]);
 
+/**
+ * States a purge may remove: the task is over, nothing will execute it again. `QUEUED` and every leased or
+ * running state are deliberately absent.
+ */
+const PURGEABLE_STATES = new Set<TaskState>([
+  TaskState.COMPLETED,
+  TaskState.FAILED,
+  TaskState.DEAD_LETTER,
+]);
+
 export class CoreScheduler5D {
   public readonly queueManager: HierarchicalQueueManager;
   public readonly leaseCoordinator: LeaseCoordinator;
@@ -88,6 +98,48 @@ export class CoreScheduler5D {
     ) {
       this.contentFingerprintIndex.delete(task.content_fingerprint);
     }
+  }
+
+  /**
+   * Drops finished tasks from every index the scheduler keeps for them.
+   *
+   * Only terminal states are purgeable; an in-flight task (`QUEUED`, `LEASED`, `RUNNING_*`, ...) can never be
+   * removed by a purge request, because deleting the record of a task a body is about to execute would let the
+   * cell place it again. Age is measured from `created_at`, the only timestamp a `TaskSpec` carries.
+   */
+  public purgeTerminalTasks(options: {
+    states?: TaskState[];
+    olderThanMs?: number;
+    dryRun?: boolean;
+    nowMs?: number;
+  } = {}): { purged: string[]; remaining: number } {
+    const requested = options.states && options.states.length > 0 ? options.states : [...PURGEABLE_STATES];
+    for (const state of requested) {
+      if (!PURGEABLE_STATES.has(state)) {
+        throw new Error(`PURGE_REJECTED_STATE: ${state} is not terminal and cannot be purged`);
+      }
+    }
+    const targets = new Set(requested);
+    const nowMs = options.nowMs ?? Date.now();
+    const candidates: TaskSpec[] = [];
+    for (const task of this.allTasks.values()) {
+      if (!targets.has(task.state)) continue;
+      if (options.olderThanMs !== undefined) {
+        const ageMs = nowMs - task.created_at * 1000;
+        if (ageMs < options.olderThanMs) continue;
+      }
+      candidates.push(task);
+    }
+    if (!options.dryRun) {
+      for (const task of candidates) {
+        this.allTasks.delete(task.task_id);
+        this.releaseContentFingerprintIfOwned(task);
+        for (const [key, taskId] of this.idempotencyIndex) {
+          if (taskId === task.task_id) this.idempotencyIndex.delete(key);
+        }
+      }
+    }
+    return { purged: candidates.map((task) => task.task_id), remaining: this.allTasks.size };
   }
 
   public resolveTaskByIdempotencyKey(tenantId: string, idempotencyKey: string): TaskSpec | undefined {

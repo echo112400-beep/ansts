@@ -427,6 +427,40 @@ export class AnstsSchedulerCell {
       });
     }
 
+    if (request.method === "POST" && normalizedPath === "/purge") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const states = Array.isArray(body.states)
+        ? body.states.map((state) => String(state) as TaskState)
+        : undefined;
+      const olderThanMs =
+        body.older_than_ms === undefined ? undefined : Number(body.older_than_ms);
+      const dryRun = body.dry_run === true;
+      let result: { purged: string[]; remaining: number };
+      try {
+        result = this.scheduler.purgeTerminalTasks({ states, olderThanMs, dryRun });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: "PURGE_REJECTED", message: (err as Error).message }),
+          { status: 400, headers: { "content-type": "application/json" } }
+        );
+      }
+      if (!dryRun) {
+        for (const taskId of result.purged) {
+          this.ctx.storage.sql.exec("DELETE FROM ansts_tasks WHERE task_id = ?", taskId);
+          this.ctx.storage.sql.exec("DELETE FROM ansts_claims WHERE task_id = ?", taskId);
+        }
+      }
+      return new Response(
+        JSON.stringify({
+          purged: result.purged.length,
+          task_ids: result.purged,
+          remaining: result.remaining,
+          dry_run: dryRun,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+
     if (request.method === "GET" && normalizedPath === "/tasks") {
       const tasks = Array.from(this.scheduler.allTasks.values());
       return new Response(JSON.stringify({ cellId: this.ctx.id.toString(), totalTasks: tasks.length, tasks }), {

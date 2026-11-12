@@ -83,6 +83,17 @@ export class CelldFleetUnavailableError extends Error {
   }
 }
 
+/**
+ * Thrown when the cell refuses a purge request (for example an in-flight task state). Distinct from
+ * `CelldFleetUnavailableError` because the fleet answered fine — the request itself was wrong.
+ */
+export class CelldPurgeRejectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CelldPurgeRejectedError";
+  }
+}
+
 export class CelldOwnershipCasError extends Error {
   public readonly cellId: string;
   public readonly expectedEpoch: number;
@@ -379,6 +390,48 @@ export class CelldFleetClient {
       }
     }
     return "UNREACHABLE";
+  }
+
+  /**
+   * Purges finished tasks from the cell. Only terminal tasks can be purged; the cell rejects any in-flight
+   * state, so a cleanup request can never drop a task a body is about to execute. `dryRun` reports what would
+   * go without deleting it.
+   */
+  public async purgeTerminalTasks(
+    options: { states?: string[]; olderThanMs?: number; dryRun?: boolean } = {}
+  ): Promise<{ purged: number; taskIds: string[]; remaining: number }> {
+    let lastError: unknown = null;
+    for (const node of this.nodes) {
+      try {
+        const resp = await this.fetchImpl(`${node.publicUrl}/v1/scheduler/purge`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            states: options.states,
+            older_than_ms: options.olderThanMs,
+            dry_run: options.dryRun === true,
+          }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const body = (await resp.json()) as Record<string, unknown>;
+        if (!resp.ok) {
+          // A rejected purge is a caller error, not an unreachable fleet: surface it as-is and stop probing,
+          // otherwise ops reads "node unavailable" for what is really "you asked to purge a running task".
+          throw new CelldPurgeRejectedError(String(body.message ?? `purge failed with HTTP ${resp.status}`));
+        }
+        return {
+          purged: Number(body.purged ?? 0),
+          taskIds: Array.isArray(body.task_ids) ? body.task_ids.map((id) => String(id)) : [],
+          remaining: Number(body.remaining ?? 0),
+        };
+      } catch (err) {
+        if (err instanceof CelldPurgeRejectedError) throw err;
+        lastError = err;
+      }
+    }
+    throw new CelldFleetUnavailableError(
+      `celld purge unreachable: ${lastError instanceof Error ? lastError.message : "no node answered"}`
+    );
   }
 
   /**

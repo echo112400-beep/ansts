@@ -24,7 +24,7 @@ import { SagaCompensatorEngine } from "./saga/compensator.js";
 import { StagingCommitAndApprovalGate } from "./saga/staging.js";
 import { SagaToolGateway } from "./saga_gateway.js";
 import { HaSchedulerShardCoordinator } from "./cloudflare/ha_scheduler_shard_coordinator.js";
-import { CelldFleetClient } from "./cluster/celld_fleet_client.js";
+import { CelldFleetClient, CelldPurgeRejectedError } from "./cluster/celld_fleet_client.js";
 import { SchedulerV25SingleWritePathStore } from "./cloudflare/scheduler_v25_persistence.js";
 import { EdgeTunnelHaRouter } from "./runtime/edge_tunnel_ha_router.js";
 import { DurableDiskCellSqlStorage } from "./cloudflare/env.js";
@@ -1082,6 +1082,33 @@ export class AnstsLocalAndComposeServer {
           return;
         }
         throw err;
+      }
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1/tasks/purge") {
+      if (!this.celldFleet) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "CELLD_FLEET_NOT_CONFIGURED" }));
+        return;
+      }
+      try {
+        const body = await this.readJsonBody(req);
+        const states = Array.isArray(body.states) ? body.states.map((s) => String(s)) : undefined;
+        const olderThanMs = body.older_than_ms === undefined ? undefined : Number(body.older_than_ms);
+        const result = await this.celldFleet.purgeTerminalTasks({
+          states,
+          olderThanMs,
+          dryRun: body.dry_run === true,
+        });
+        this.invalidatePeerTasksCache();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const status = err instanceof CelldPurgeRejectedError ? 400 : 503;
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "PURGE_FAILED", message }));
       }
       return;
     }

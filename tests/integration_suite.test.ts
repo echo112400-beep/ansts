@@ -154,4 +154,41 @@ describe("M1-M6 Core Integration Suite", () => {
     assert.equal(invocations, 1);
     assert.deepEqual(res1, res2);
   });
+
+  it("7. CoreScheduler5D purges finished tasks only, and dry runs touch nothing", () => {
+    const scheduler = new CoreScheduler5D(15.0);
+    const completed = new TaskSpec({ task_id: "purge-done-1", tenant_id: "t1", content_fingerprint: "fp-done-1" });
+    completed.state = TaskState.COMPLETED;
+    const deadLetter = new TaskSpec({ task_id: "purge-dead-1", tenant_id: "t1" });
+    deadLetter.state = TaskState.DEAD_LETTER;
+    const running = new TaskSpec({ task_id: "purge-running-1", tenant_id: "t1" });
+    running.state = TaskState.RUNNING_ACT;
+    const queued = new TaskSpec({ task_id: "purge-queued-1", tenant_id: "t1" });
+    for (const task of [completed, deadLetter, running, queued]) scheduler.allTasks.set(task.task_id, task);
+    scheduler.contentFingerprintIndex.set("fp-done-1", "purge-done-1");
+
+    // Dry run reports the candidates without removing anything.
+    const preview = scheduler.purgeTerminalTasks({ dryRun: true });
+    assert.deepEqual(preview.purged.sort(), ["purge-dead-1", "purge-done-1"]);
+    assert.equal(scheduler.allTasks.size, 4);
+
+    // An in-flight state is refused outright rather than silently ignored.
+    assert.throws(() => scheduler.purgeTerminalTasks({ states: [TaskState.RUNNING_ACT] }), /PURGE_REJECTED_STATE/);
+
+    // Only the finished tasks go; the running and queued ones survive and their indices stay consistent.
+    const purged = scheduler.purgeTerminalTasks();
+    assert.deepEqual(purged.purged.sort(), ["purge-dead-1", "purge-done-1"]);
+    assert.equal(purged.remaining, 2);
+    assert.equal(scheduler.allTasks.has("purge-running-1"), true);
+    assert.equal(scheduler.allTasks.has("purge-queued-1"), true);
+    assert.equal(scheduler.contentFingerprintIndex.has("fp-done-1"), false);
+
+    // Age filtering uses created_at, so a task younger than the threshold stays.
+    const freshDeadLetter = new TaskSpec({ task_id: "purge-dead-2", tenant_id: "t1" });
+    freshDeadLetter.state = TaskState.DEAD_LETTER;
+    scheduler.allTasks.set(freshDeadLetter.task_id, freshDeadLetter);
+    const aged = scheduler.purgeTerminalTasks({ olderThanMs: 60_000 });
+    assert.deepEqual(aged.purged, []);
+    assert.equal(scheduler.allTasks.has("purge-dead-2"), true);
+  });
 });

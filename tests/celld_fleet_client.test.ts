@@ -4,7 +4,13 @@
  */
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
-import { InMemoryR2Bucket, CelldFleetClient, CelldOwnershipCasError, CelldFleetUnavailableError } from "../src/index.js";
+import {
+  InMemoryR2Bucket,
+  CelldFleetClient,
+  CelldOwnershipCasError,
+  CelldFleetUnavailableError,
+  CelldPurgeRejectedError,
+} from "../src/index.js";
 
 interface CapturedCall {
   url: string;
@@ -225,6 +231,34 @@ describe("M-FLEET-1 CelldFleetClient", () => {
     status = 404;
     captured.length = 0;
     assert.equal(await client.claimTask("task-gone", "gw-02"), "TAKEN");
+  });
+
+  it("12. purgeTerminalTasks posts the purge and maps the cell's counts", async () => {
+    const captured: CapturedCall[] = [];
+    const client = new CelldFleetClient({
+      nodes: NODES,
+      fetchImpl: jsonFetch(
+        () => ({ body: { purged: 2, task_ids: ["task-a", "task-b"], remaining: 5, dry_run: true } }),
+        captured
+      ),
+    });
+
+    const result = await client.purgeTerminalTasks({ states: ["DEAD_LETTER"], olderThanMs: 60_000, dryRun: true });
+    assert.equal(captured[0].url, "http://celld-01:8081/v1/scheduler/purge");
+    assert.deepEqual(captured[0].body, { states: ["DEAD_LETTER"], older_than_ms: 60_000, dry_run: true });
+    assert.deepEqual(result, { purged: 2, taskIds: ["task-a", "task-b"], remaining: 5 });
+  });
+
+  it("13. purgeTerminalTasks rejects a refused purge as a caller error, not an unreachable fleet", async () => {
+    const client = new CelldFleetClient({
+      nodes: NODES,
+      fetchImpl: jsonFetch(() => ({ status: 400, body: { message: "RUNNING_ACT is not terminal" } })),
+    });
+    // A refused purge must not read as "0 tasks purged", nor as "fleet down" — ops has to see the reason.
+    await assert.rejects(
+      async () => client.purgeTerminalTasks({ states: ["RUNNING_ACT"] }),
+      (err: unknown) => err instanceof CelldPurgeRejectedError && /not terminal/.test(err.message)
+    );
   });
 
   it("11. claimTask reports UNREACHABLE — not TAKEN — when the fleet cannot answer", async () => {
