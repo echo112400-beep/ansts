@@ -194,6 +194,17 @@ class SseEventStreamGateway {
     return [...(this.historyByTask.get(taskId) ?? [])];
   }
 
+  listRecentEvents(limit = 15) {
+    const all = [];
+    for (const list of this.historyByTask.values()) {
+      for (const evt of list) {
+        all.push(evt);
+      }
+    }
+    all.sort((a, b) => b.timestampMs - a.timestampMs);
+    return all.slice(0, Math.max(1, limit));
+  }
+
   getActiveSubscriptionCount(taskId) {
     if (taskId !== undefined) {
       return this.subscriptionsByTask.get(taskId)?.size ?? 0;

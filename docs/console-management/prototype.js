@@ -150,6 +150,7 @@
       observabilityVisualization: null,
       swarmVisualization: null,
       federationVisualization: null,
+      profilerVisualization: null,
       allTenantIds: [],
       regions: [],
       nodes: [],
@@ -269,6 +270,7 @@
       if (d.observabilityVisualization) state.observabilityVisualization = d.observabilityVisualization;
       if (d.swarmVisualization) state.swarmVisualization = d.swarmVisualization;
       if (d.federationVisualization) state.federationVisualization = d.federationVisualization;
+      if (d.profilerVisualization) state.profilerVisualization = d.profilerVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -879,6 +881,77 @@
               }).join('')}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Bayesian EWMA 租户算力画像与 Right-Sizing 自动调优台 (GET /v1beta1/console/profiler · POST /v1beta1/management/profiler/action)</h2>
+              <p class="panel-subtitle">对接 <code>TaskResourceProfiler</code> (SQLite <code>persisted_profiler_history</code>)，根据实测峰值 CPU/内存动态计算最佳 ACT 相位资源配额并一键下发。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small" data-action="open-command-palette">⌘K 全局命令面板</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>租户名称</th>
+                  <th>实测峰值 EWMA (CPU / 内存)</th>
+                  <th>样本数</th>
+                  <th>Right-Sizing 推荐配额 (ACT)</th>
+                  <th>画像调优操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${(state.profilerVisualization?.tenantProfiles || []).map((tp) => `
+                  <tr>
+                    <td><strong>${esc(tp.tenantId)}</strong></td>
+                    <td class="mono">${tp.peakCpuEwma} Cores / ${tp.peakMemMbEwma} MB</td>
+                    <td class="mono"><span class="status-pill ok">${tp.samples} samples</span></td>
+                    <td class="mono"><strong>${tp.recommendedActCores}c / ${tp.recommendedActMemoryMb} MB</strong></td>
+                    <td>
+                      <div class="btn-row">
+                        <button type="button" class="small" data-action="prof-record-sample" data-tenant="${esc(tp.tenantId)}" ${!perm.ok ? 'disabled' : ''}>+采样峰值负载</button>
+                        <button type="button" class="small primary" data-action="prof-apply-rightsize" data-tenant="${esc(tp.tenantId)}" ${!perm.ok ? 'disabled' : ''}>✓ 应用推荐配额</button>
+                      </div>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">预测性 EWMA 热沙箱池预热器 (PredictiveSandboxPrewarmer) 与实时 SSE 事件总线缓冲区</h2>
+              <p class="panel-subtitle">实时展示到达率 EWMA (<code class="mono">${state.profilerVisualization?.predictivePrewarmer?.ewmaArrivalRatePerSec ?? 5}/s</code> · 推荐热池 <code class="mono">${state.profilerVisualization?.predictivePrewarmer?.recommendedWarmPoolSize ?? 25}</code>) 及最近广播的 SSE 帧。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small primary" data-action="prof-predict-burst" ${!perm.ok ? 'disabled' : ''}>+ 模拟突发到达率并预热沙箱池</button>
+              <button type="button" class="small" data-action="prof-publish-sse" ${!perm.ok ? 'disabled' : ''}>+ 广播实时 SSE 诊断事件</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>SSE 事件 ID</th><th>事件类型 (Event)</th><th>目标流 (Stream)</th><th>事件载荷摘要</th></tr></thead>
+              <tbody>
+                ${(state.profilerVisualization?.sseStreamBus?.recentEvents || []).slice(0, 6).map((ev) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(ev.id)}</strong></td>
+                    <td><span class="status-pill ok">${esc(ev.event)}</span></td>
+                    <td class="mono">${esc(ev.taskId)}</td>
+                    <td class="mono">${esc(JSON.stringify(ev.data || {})).slice(0, 90)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     `;
@@ -3892,6 +3965,134 @@
       );
       return;
     }
+    if (action === "open-command-palette") {
+      openDialog(
+        "⌘K 全局快速导航与 SRE 运维命令面板 (Command Palette)",
+        `
+          <div class="form-field">
+            <label for="dlg-cmd-nav">1. 快速跳转至管理控制台工作台视图 (11 大核心模块)</label>
+            <select id="dlg-cmd-nav">
+              ${NAV_ITEMS.map((item) => `<option value="${esc(item.id)}" ${state.activeNav === item.id ? 'selected' : ''}>[${esc(item.id)}] ${esc(item.label)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="dlg-cmd-op">2. 或直接执行快捷全局运维指令 (可选)</label>
+            <select id="dlg-cmd-op">
+              <option value="jump_only">仅跳转至所选工作台视图</option>
+              <option value="run_release_gate">执行生产发布准入核查 (8/8 Release Readiness Gate)</option>
+              <option value="run_health_scorecard">执行 M60–M69 全链路健康评分卡巡检</option>
+              <option value="predict_prewarm">触发预测性 EWMA 热沙箱池突发预热</option>
+              <option value="broadcast_sse">向全集群广播实时 SSE 运维诊断心跳</option>
+            </select>
+          </div>
+        `,
+        "执行命令 / 跳转视角",
+        async () => {
+          const targetNav = document.getElementById("dlg-cmd-nav")?.value || state.activeNav;
+          const quickOp = document.getElementById("dlg-cmd-op")?.value || "jump_only";
+          state.activeNav = targetNav;
+          closeDialog();
+          const p = getPrincipal();
+          if (quickOp === "run_release_gate") {
+            const res = await callBackendApi("POST", "/v1beta1/management/release/readiness", { actor: p.id, role: p.role });
+            showToast(`生产发布准入核查：${res.data?.passedCount || 8}/${res.data?.totalGates || 8} 项全部通过`);
+          } else if (quickOp === "run_health_scorecard") {
+            const res = await callBackendApi("POST", "/v1beta1/management/ops/health-scorecard", { actor: p.id, role: p.role });
+            showToast(`全链路健康评分卡得分：${res.data?.overallScorePct || 100}%`);
+          } else if (quickOp === "predict_prewarm") {
+            const res = await callBackendApi("POST", "/v1beta1/management/profiler/action", {
+              action: "predict_and_prewarm_burst",
+              observedArrivalsPerSec: 16.0,
+              actor: p.id,
+              role: p.role
+            });
+            showToast(`已完成 EWMA 预测预热：推荐热池=${res.data?.recommendedWarmPoolSize || 25}`);
+          } else if (quickOp === "broadcast_sse") {
+            await callBackendApi("POST", "/v1beta1/management/profiler/action", {
+              action: "publish_sse_diagnostic_event",
+              eventType: "console.cmd_palette.ping",
+              actor: p.id,
+              role: p.role
+            });
+            showToast("已通过全局命令面板广播实时 SSE 诊断事件");
+          } else {
+            showToast(`已切换至工作台：${targetNav}`);
+          }
+          await fetchBackendState();
+        }
+      );
+      return;
+    }
+    if (action === "prof-record-sample") {
+      const tenantId = target.getAttribute("data-tenant") || "Northstar";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/profiler/action", {
+        action: "record_tenant_sample",
+        tenantId,
+        observedPeakCpu: 3.5,
+        observedPeakMemoryMb: 3072,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "采样租户负载失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已更新 ${tenantId} 算力画像 → 推荐 ACT=${res.data?.recommendedProfile?.act_cpu_cores}c / ${res.data?.recommendedProfile?.act_memory_mb}MB`);
+      return;
+    }
+    if (action === "prof-apply-rightsize") {
+      const tenantId = target.getAttribute("data-tenant") || "Northstar";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/profiler/action", {
+        action: "apply_right_sized_profile",
+        tenantId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "应用 Right-Sizing 配额失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已将 Right-Sizing 推荐配额应用至 ${tenantId} 的 ${(res.data?.updatedTaskIds || []).length} 个任务`);
+      return;
+    }
+    if (action === "prof-predict-burst") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/profiler/action", {
+        action: "predict_and_prewarm_burst",
+        observedArrivalsPerSec: 15.0,
+        avgSandboxHoldSec: 4.0,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "触发预测预热失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`预测性预热完成：EWMA=${res.data?.ewmaArrivalRatePerSec}/s → 推荐热池=${res.data?.recommendedWarmPoolSize} 个`);
+      return;
+    }
+    if (action === "prof-publish-sse") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/profiler/action", {
+        action: "publish_sse_diagnostic_event",
+        eventType: "console.sre.heartbeat",
+        message: `Diagnostic ping by ${p.id} (${p.role})`,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "广播 SSE 事件失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已广播实时 SSE 帧 ${res.data?.envelope?.id || "OK"}`);
+      return;
+    }
     if (action === "fed-toggle-tunnel-gw") {
       const hostId = target.getAttribute("data-host") || "body-host-01";
       const gatewayId = target.getAttribute("data-gw") || "celld-gw-01";
@@ -4971,6 +5172,12 @@
       if (e.target && e.target.id === 'mgmt-audit-role') {
         state.auditFilterRole = e.target.value;
         renderMainContent();
+      }
+    });
+    document.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault();
+        handleActionClick({ getAttribute: (k) => (k === 'data-action' ? 'open-command-palette' : null) });
       }
     });
     document.addEventListener('click', (e) => {

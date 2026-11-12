@@ -101,4 +101,22 @@ export class TaskResourceProfiler {
       );
     }
   }
+
+  public listTenantProfiles(): Array<{
+    tenantId: string;
+    peakCpuEwma: number;
+    peakMemMbEwma: number;
+    samples: number;
+    recommendedActCores: number;
+    recommendedActMemoryMb: number;
+  }> {
+    return Array.from(this.historyByTenant.entries()).map(([tenantId, hist]) => ({
+      tenantId,
+      peakCpuEwma: Number(hist.peakCpuEwma.toFixed(2)),
+      peakMemMbEwma: Math.round(hist.peakMemMbEwma),
+      samples: hist.samples,
+      recommendedActCores: Math.max(0.25, Number((hist.peakCpuEwma * 1.2).toFixed(2))),
+      recommendedActMemoryMb: Math.max(512, Math.ceil(hist.peakMemMbEwma * 1.25)),
+    }));
+  }
 }

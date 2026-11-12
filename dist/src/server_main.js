@@ -2451,6 +2451,46 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M84] TanStack Console BFF: Bayesian EWMA Resource Profiler, Predictive Prewarmer & SSE Stream Bus (`GET /v1beta1/console/profiler`)
+    if (method === "GET" && pathname === "/v1beta1/console/profiler") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildProfilerAndStreamVisualization()));
+      return;
+    }
+
+    // [M84] Interactive Resource Profiler, Predictive Prewarmer & SSE Broadcast Action (`POST /v1beta1/management/profiler/action`)
+    if (method === "POST" && pathname === "/v1beta1/management/profiler/action") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeProfilerAndStreamAction({
+        action: body.action ?? "record_tenant_sample",
+
+
+
+
+        tenantId: body.tenantId ? String(body.tenantId) : undefined,
+        observedPeakCpu: body.observedPeakCpu !== undefined ? Number(body.observedPeakCpu) : undefined,
+        observedPeakMemoryMb: body.observedPeakMemoryMb !== undefined ? Number(body.observedPeakMemoryMb) : undefined,
+        observedArrivalsPerSec: body.observedArrivalsPerSec !== undefined ? Number(body.observedArrivalsPerSec) : undefined,
+        avgSandboxHoldSec: body.avgSandboxHoldSec !== undefined ? Number(body.avgSandboxHoldSec) : undefined,
+        eventType: body.eventType ? String(body.eventType) : undefined,
+        message: body.message ? String(body.message) : undefined,
+        actor: auth.actor,
+        role: auth.role
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M83] Interactive Federation, Reverse Tunnel, RS(4,2) Erasure Rebuild & Chaos Action (`POST /v1beta1/management/federation/action`)
     if (method === "POST" && pathname === "/v1beta1/management/federation/action") {
       const body = await this.readJsonBody(req);

@@ -715,3 +715,19 @@
    - 实时展示 `US / EU / APAC` 三大主权域联邦接入点的 EWMA RTT 延迟，并支持在控制台一键注入带 60s TTL 自动过期的节点网络分区与延迟抖动 (`inject_chaos_partition`) 或一键清除全部混沌故障 (`heal_all_chaos_faults`)。
 4. **端到端回归验证 (`tests/m83_console_federation_reverse_tunnel_erasure_and_chaos.test.ts`)**：
    - 全量 **89 个 `src/` 源码模块**、**76 个测试套件（共 210 项测试）100% 通过**。
+
+
+---
+
+## 34. M84: TanStack Console 全局快捷命令面板 (`⌘K`)、Bayesian EWMA 租户算力画像、预测性热沙箱池预热与实时 SSE 事件总线工作台套件 (`GET /v1beta1/console/profiler`, `POST /v1beta1/management/profiler/action`, `anstsctl mgmt-profiler`)
+
+1. **Bayesian EWMA 租户算力画像与 Right-Sizing 自动调优 (`TaskResourceProfiler` & `tenantProfiles`)**：
+   - 将 `TaskResourceProfiler` 绑定至 SQLite `persisted_profiler_history`，在控制台实时展示各租户 (`Northstar`, `Helios`, `Vanguard`) 的实测峰值 CPU/内存 EWMA、采样次数及 Right-Sizing 推荐配额 (`ACT CPU Cores` 与 `ACT Memory MB`)。
+   - 支持在线采样实测峰值负载 (`record_tenant_sample`) 并一键将推荐配额下发应用至租户所有活跃任务 (`apply_right_sized_profile`)。
+2. **预测性时间序列 EWMA 热沙箱池预热器与实时 SSE 事件总线缓冲区 (`PredictiveSandboxPrewarmer` & `SseEventStreamGateway`)**：
+   - 将 `PredictiveSandboxPrewarmer` 绑定至 SQLite `persisted_prewarmer_state`，支持在线模拟突发到达率并自动预测并发度与补充 `WarmSandboxPoolManager` 热池 (`predict_and_prewarm_burst`)。
+   - 在 `SseEventStreamGateway` 新增 `listRecentEvents()`，实时展示 SSE 事件总线环形缓冲区最近广播的事件帧，并支持从控制台一键广播自定义诊断事件 (`publish_sse_diagnostic_event`)。
+3. **全局快捷导航与 SRE 命令面板 (`⌘K` / `Ctrl+K` · `open-command-palette`)**：
+   - 在控制台顶部栏新增 `⌘K 命令面板` 按钮并监听全局 `Ctrl+K` / `Meta+K` 快捷键，支持跨 11 大核心模块快速跳转、一键执行生产发布准入核查 (8/8 Release Gate)、运行 M60–M69 健康评分卡、触发预测预热与广播 SSE 诊断心跳。
+4. **端到端回归验证 (`tests/m84_console_command_palette_profiler_prewarmer_and_sse_bus.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**77 个测试套件（共 211 项测试）100% 通过**。

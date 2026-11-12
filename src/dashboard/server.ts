@@ -334,6 +334,10 @@ export class PlatformManagementPlaneEngine {
   private lastGuardrailEvaluation: Record<string, unknown> | null = null;
   private readonly erasureWalManager: CrossRegionErasureCodedWalManager;
   private lastErasureRebuildReport: Record<string, unknown> | null = null;
+  private lastPrewarmerPrediction: { predictedConcurrency: number; recommendedWarmPoolSize: number } = {
+    predictedConcurrency: 20,
+    recommendedWarmPoolSize: 25,
+  };
 
   constructor(deps: ManagementPlaneDeps) {
     this.deps = deps;
@@ -357,7 +361,7 @@ export class PlatformManagementPlaneEngine {
     );
     this.teeBridge = new ConfidentialTeeAttestationBridge();
     this.mtlsBridge = new MtlsReverseTunnelBridge();
-    this.resourceProfiler = new TaskResourceProfiler();
+    this.resourceProfiler = new TaskResourceProfiler(0.35, deps.v25Store.sql);
     this.celldAdmin = new CelldAdminClient(deps.v25Store.sql);
     this.unifiedStore = new UnifiedComponentPersistenceStore(deps.v25Store.sql);
     this.containerManager = new CelldNativeContainerSandboxManager();
@@ -963,6 +967,32 @@ export class PlatformManagementPlaneEngine {
       );
     }
 
+    // [M84] Seed initial Bayesian EWMA tenant resource profiles & initial SSE diagnostic event
+    if (this.resourceProfiler.listTenantProfiles().length === 0) {
+      const seedProfiles: Array<{ tenant: string; samples: Array<[number, number]> }> = [
+        { tenant: "Northstar", samples: [[2.8, 2400], [3.1, 2650], [2.9, 2520], [3.0, 2580]] },
+        { tenant: "Helios", samples: [[1.7, 1750], [1.9, 1890], [1.8, 1820]] },
+        { tenant: "Vanguard", samples: [[1.1, 1200], [1.3, 1340], [1.2, 1280]] },
+      ];
+      for (const sp of seedProfiles) {
+        const dummyTask = new TaskSpec({ task_id: `prof-${sp.tenant}`, tenant_id: sp.tenant });
+        for (const [cpu, mem] of sp.samples) {
+          this.resourceProfiler.recordExecutionMetrics(dummyTask, cpu, mem);
+        }
+      }
+    }
+    this.deps.prewarmer.bindSqlStorage(this.deps.v25Store.sql);
+    if (this.deps.sseGateway && this.deps.sseGateway.listRecentEvents(5).length === 0) {
+      this.deps.sseGateway.publish({
+        id: "sse-bootstrap-01",
+        event: "cluster.ready",
+        taskId: "mgmt-audit-stream",
+        turnIndex: 1,
+        timestampMs: Date.now(),
+        data: { status: "RPO_ZERO_READY", activeShards: 256 },
+      });
+    }
+
     this.appendAudit("chen", "SRE_ADMIN", "初始化平台管理面控制基线与 256-Slot 分片映射", "Global", "已生效 (RPO=0)");
     this.appendAudit("lin", "OPERATOR", "触发 LayerFS 分支 feat-ns-auth 快照同步至 s3://ansts-fleet", "us-west-2 / Northstar", "成功 (Commit C1)");
     this.appendAudit("chen", "SRE_ADMIN", "复核通过周发起的分片维护单 APR-2026-088", "us-west-2 / Global", "APPROVED (chen)");
@@ -1504,7 +1534,170 @@ export class PlatformManagementPlaneEngine {
       observabilityVisualization: this.buildObservabilityVisualization(),
       swarmVisualization: this.buildSwarmAndCognitiveVisualization(),
       federationVisualization: this.buildFederationAndDrVisualization(),
+      profilerVisualization: this.buildProfilerAndStreamVisualization(),
       status: "HEALTHY",
+    };
+  }
+
+  public buildProfilerAndStreamVisualization(): Record<string, unknown> {
+    this.ensureInitialized();
+    const tenantProfiles = this.resourceProfiler.listTenantProfiles();
+    const ewmaArrivalRatePerSec = Number(this.deps.prewarmer.getEwmaArrivalRatePerSec().toFixed(2));
+    const sseGateway = this.deps.sseGateway;
+    const recentSseEvents = sseGateway ? sseGateway.listRecentEvents(10) : [];
+    const activeSubscriptions = sseGateway ? sseGateway.getActiveSubscriptionCount() : 0;
+
+    return {
+      tenantProfiles,
+      predictivePrewarmer: {
+        ewmaArrivalRatePerSec,
+        predictedConcurrency: this.lastPrewarmerPrediction.predictedConcurrency,
+        recommendedWarmPoolSize: this.lastPrewarmerPrediction.recommendedWarmPoolSize,
+        warmPoolCurrent: this.warmPool.stats(),
+      },
+      sseStreamBus: {
+        activeSubscriptions,
+        recentEventsCount: recentSseEvents.length,
+        recentEvents: recentSseEvents,
+      },
+    };
+  }
+
+  public executeProfilerAndStreamAction(params: {
+    action:
+      | "record_tenant_sample"
+      | "apply_right_sized_profile"
+      | "predict_and_prewarm_burst"
+      | "publish_sse_diagnostic_event";
+    tenantId?: string;
+    observedPeakCpu?: number;
+    observedPeakMemoryMb?: number;
+    observedArrivalsPerSec?: number;
+    avgSandboxHoldSec?: number;
+    eventType?: string;
+    message?: string;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权变更 Bayesian 算力画像、触发预测预热或广播 SSE 诊断事件" },
+      };
+    }
+
+    if (params.action === "record_tenant_sample") {
+      const tenantId = sanitizeHtmlString(String(params.tenantId ?? "Northstar").trim());
+      const cpu = Number(params.observedPeakCpu ?? 3.4);
+      const mem = Number(params.observedPeakMemoryMb ?? 2950);
+      const sampleTask = new TaskSpec({ task_id: `sample-${tenantId}`, tenant_id: tenantId });
+      this.resourceProfiler.recordExecutionMetrics(sampleTask, cpu, mem);
+      const recommended = this.resourceProfiler.recommendProfile(sampleTask);
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `采样租户 [${tenantId}] 实测峰值负载 (CPU=${cpu}c, Mem=${mem}MB) → Bayesian EWMA 推荐 ACT=${recommended.act_cpu_cores}c / ${recommended.act_memory_mb}MB`,
+        `Profiler / ${tenantId}`,
+        `RECOMMENDED (${recommended.act_cpu_cores}c/${recommended.act_memory_mb}MB)`
+      );
+      return {
+        status: 200,
+        body: {
+          tenantId,
+          observedPeakCpu: cpu,
+          observedPeakMemoryMb: mem,
+          recommendedProfile: recommended,
+          profilerVisualization: this.buildProfilerAndStreamVisualization(),
+        },
+      };
+    }
+
+    if (params.action === "apply_right_sized_profile") {
+      const tenantId = sanitizeHtmlString(String(params.tenantId ?? "Northstar").trim());
+      const dummy = new TaskSpec({ task_id: `apply-${tenantId}`, tenant_id: tenantId });
+      const rec = this.resourceProfiler.recommendProfile(dummy);
+      const updatedTaskIds: string[] = [];
+      for (const [tId, tk] of this.deps.scheduler.allTasks.entries()) {
+        if (tk.tenant_id === tenantId) {
+          tk.resource_profile = { ...rec };
+          this.deps.v25Store.commitTaskSingleWritePath(tk, tk.assigned_node_id ?? "body-host-01");
+          updatedTaskIds.push(tId);
+        }
+      }
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `将 Bayesian EWMA Right-Sizing 推荐配额 (ACT=${rec.act_cpu_cores}c / ${rec.act_memory_mb}MB) 应用至租户 [${tenantId}] 的 ${updatedTaskIds.length} 个任务`,
+        `Profiler / ${tenantId}`,
+        `APPLIED (${updatedTaskIds.length} tasks)`
+      );
+      return {
+        status: 200,
+        body: {
+          tenantId,
+          appliedProfile: rec,
+          updatedTaskIds,
+          profilerVisualization: this.buildProfilerAndStreamVisualization(),
+        },
+      };
+    }
+
+    if (params.action === "predict_and_prewarm_burst") {
+      const arrivals = Number(params.observedArrivalsPerSec ?? 14.5);
+      const holdSec = Number(params.avgSandboxHoldSec ?? 4.0);
+      const pred = this.deps.prewarmer.recordArrivalSampleAndPredict(arrivals, holdSec);
+      this.lastPrewarmerPrediction = pred;
+      const replenished = this.warmPool.replenishPool();
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `执行时间序列 EWMA 预测预热 (实测到达率=${arrivals}/s → EWMA=${this.deps.prewarmer.getEwmaArrivalRatePerSec().toFixed(2)}/s, 预测并发=${pred.predictedConcurrency}, 推荐热池=${pred.recommendedWarmPoolSize})`,
+        "Prewarmer / Global",
+        `PREWARMED (Target=${pred.recommendedWarmPoolSize})`
+      );
+      return {
+        status: 200,
+        body: {
+          ...pred,
+          ewmaArrivalRatePerSec: Number(this.deps.prewarmer.getEwmaArrivalRatePerSec().toFixed(2)),
+          replenishedCount: replenished,
+          profilerVisualization: this.buildProfilerAndStreamVisualization(),
+        },
+      };
+    }
+
+    // action === "publish_sse_diagnostic_event"
+    const evtId = `sse-diag-${Date.now()}`;
+    const eventType = sanitizeHtmlString(String(params.eventType ?? "console.diagnostic.ping").trim());
+    const message = sanitizeHtmlString(String(params.message ?? "Live SSE diagnostic broadcast from Console SRE operator"));
+    const envelope = {
+      id: evtId,
+      event: eventType,
+      taskId: "mgmt-audit-stream",
+      turnIndex: 1,
+      timestampMs: Date.now(),
+      data: {
+        actor: params.actor,
+        role: params.role,
+        message,
+      },
+    };
+    const delivered = this.deps.sseGateway ? this.deps.sseGateway.publish(envelope) : 0;
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `向 SSE 实时事件总线广播诊断事件 [${eventType}] (id=${evtId}, 投递活跃订阅=${delivered})`,
+      "SSE-Bus / Global",
+      `PUBLISHED (${evtId})`
+    );
+    return {
+      status: 200,
+      body: {
+        envelope,
+        deliveredSubscribers: delivered,
+        profilerVisualization: this.buildProfilerAndStreamVisualization(),
+      },
     };
   }
 
