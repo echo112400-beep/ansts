@@ -1,3 +1,4 @@
+import { HierarchicalQueueManager } from "../queue_manager.js";
 import { ConsoleRbacAuthGuard, sanitizeHtmlString } from "./console_rbac_guard.js";
 import assert from "node:assert/strict";
 import { CrossRegionErasureCodedWalManager } from "../checkpoint/erasure_coder.js";
@@ -327,6 +328,7 @@ export class PlatformManagementPlaneEngine {
   } | null = null;
   private initialized = false;
   public readonly rbacGuard: ConsoleRbacAuthGuard = new ConsoleRbacAuthGuard();
+  public readonly mgmtQueueManager: HierarchicalQueueManager = new HierarchicalQueueManager();
 
   constructor(deps: ManagementPlaneDeps) {
     this.deps = deps;
@@ -816,6 +818,63 @@ export class PlatformManagementPlaneEngine {
       "09:20:00 UTC"
     );
 
+    // [M79] Seed initial queued tasks into mgmtQueueManager for live DRF Binary Max-Heap visualization
+    for (const qId of ["task-ns-8845", "task-hl-3022", "task-vg-1049"]) {
+      this.mgmtQueueManager.removeQueuedTask(qId);
+    }
+    this.mgmtQueueManager.tenantActiveCount.clear();
+    this.mgmtQueueManager.tenantActiveCount.set("Northstar", 2);
+    this.mgmtQueueManager.tenantActiveCount.set("Helios", 1);
+    this.mgmtQueueManager.tenantActiveCount.set("Vanguard", 0);
+    this.mgmtQueueManager.tenantActiveCount.set("Aegis", 0);
+
+    const nowSec = Date.now() / 1000;
+    const initialQueuedSpecs: Array<{
+      id: string;
+      tenant: string;
+      priority: TaskPriority;
+      waitSec: number;
+      preempted: number;
+      prompt: string;
+    }> = [
+      {
+        id: "task-ns-8845",
+        tenant: "Northstar",
+        priority: TaskPriority.P1_HIGH,
+        waitSec: 42,
+        preempted: 0,
+        prompt: "Verify cross-shard SQLite WAL compaction & LTX checksums",
+      },
+      {
+        id: "task-hl-3022",
+        tenant: "Helios",
+        priority: TaskPriority.P2_STANDARD,
+        waitSec: 85,
+        preempted: 1,
+        prompt: "Execute EU sovereign data residency audit in kata container",
+      },
+      {
+        id: "task-vg-1049",
+        tenant: "Vanguard",
+        priority: TaskPriority.P3_BATCH,
+        waitSec: 180,
+        preempted: 0,
+        prompt: "Run nightly APAC billing ledger reconciliation batch",
+      },
+    ];
+    for (const qt of initialQueuedSpecs) {
+      const qSpec = new TaskSpec({
+        task_id: qt.id,
+        tenant_id: qt.tenant,
+        priority: qt.priority,
+        prompt: qt.prompt,
+        created_at: nowSec - qt.waitSec,
+        preempted_count: qt.preempted,
+      });
+      qSpec.state = TaskState.QUEUED;
+      this.mgmtQueueManager.enqueue(qSpec);
+    }
+
     this.appendAudit("chen", "SRE_ADMIN", "初始化平台管理面控制基线与 256-Slot 分片映射", "Global", "已生效 (RPO=0)");
     this.appendAudit("lin", "OPERATOR", "触发 LayerFS 分支 feat-ns-auth 快照同步至 s3://ansts-fleet", "us-west-2 / Northstar", "成功 (Commit C1)");
     this.appendAudit("chen", "SRE_ADMIN", "复核通过周发起的分片维护单 APR-2026-088", "us-west-2 / Global", "APPROVED (chen)");
@@ -1232,6 +1291,126 @@ export class PlatformManagementPlaneEngine {
       runtimeSandboxState: this.getRuntimeSandboxSnapshot(),
       gcSweepReport: this.lastGcSweepReport,
       auditChainIntegrity: this.rbacGuard.verifyAuditChainIntegrity(),
+      queueVisualization: (() => {
+        const snap = this.mgmtQueueManager.inspectQueueSnapshot();
+        const allPrio = { P0: 0, P1: 0, P2: 0, P3: 0 };
+        for (const t of tasks) {
+          if (t.priority === "P0") allPrio.P0 += 1;
+          else if (t.priority === "P1") allPrio.P1 += 1;
+          else if (t.priority === "P2") allPrio.P2 += 1;
+          else allPrio.P3 += 1;
+        }
+        for (const th of snap.tenantHeaps) {
+          for (const qi of th.queuedItems) {
+            if (qi.priorityLabel === "P0") allPrio.P0 += 1;
+            else if (qi.priorityLabel === "P1") allPrio.P1 += 1;
+            else if (qi.priorityLabel === "P2") allPrio.P2 += 1;
+            else allPrio.P3 += 1;
+          }
+        }
+        return {
+          ...snap,
+          allTasksPriorityCounts: allPrio,
+          hotCellGuard: {
+            maxConcurrentFetchesPerCell: 64,
+            maxProducersPerQueueBatch: 256,
+          },
+        };
+      })(),
+      healthMatrix: (() => {
+        const auditCheck = this.rbacGuard.verifyAuditChainIntegrity();
+        const mem = process.memoryUsage();
+        const activeBrainCount = Object.values(slotDistribution).filter((v) => Number(v) > 0).length;
+        const probes = [
+          {
+            id: "PROBE-GATEWAY",
+            name: "Gateway & BFF (/healthz & /readyz)",
+            status: this.scenario === "offline" ? "UNAVAILABLE" : "HEALTHY",
+            latencyMs: 1.1,
+            detail: `Node ${this.deps.nodeId} · Bearer JWT & CSP Active`,
+          },
+          {
+            id: "PROBE-CELLD",
+            name: "celld Isolate Runtime (/.well-known/celld/health)",
+            status: "HEALTHY",
+            latencyMs: 0.8,
+            detail: `V8 Isolate Pool & DO Storage Ready`,
+          },
+          {
+            id: "PROBE-SHARD-RING",
+            name: "256-Slot Consistent Hash Ring",
+            status: activeBrainCount >= 2 ? "HEALTHY" : "DEGRADED",
+            latencyMs: 0.4,
+            detail: `${activeBrainCount} Active Brain Shards · 256/256 Slots Assigned`,
+          },
+          {
+            id: "PROBE-SQLITE-RPO0",
+            name: "SQLite RPO=0 Persistence & S3 LTX",
+            status: "HEALTHY",
+            latencyMs: 1.4,
+            detail: `${tenants.length} Tenants · ${tasks.length} Tasks · ${approvals.length} Approvals`,
+          },
+          {
+            id: "PROBE-TUNNEL-HA",
+            name: "Dual-Homed Reverse Tunnel (mTLS)",
+            status: "HEALTHY",
+            latencyMs: 1.9,
+            detail: `${nodes.filter((n) => n.id.startsWith("body-")).length} Body Hosts (PRIMARY + SECONDARY)`,
+          },
+          {
+            id: "PROBE-AUDIT-CHAIN",
+            name: "Cryptographic SHA-256 Audit Chain",
+            status: auditCheck.valid ? "HEALTHY" : "TAMPERED",
+            latencyMs: 0.5,
+            detail: `Verified ${auditCheck.totalEntries} Entries · Head ${auditCheck.headHashHex.slice(0, 12)}...`,
+          },
+        ];
+        const overallHealthy = probes.every((p) => p.status === "HEALTHY") && slaEvaluation.compliant;
+        return {
+          overallHealthy,
+          overallStatus: overallHealthy ? "HEALTHY" : this.scenario === "offline" ? "OFFLINE" : "DEGRADED",
+          probes,
+          processMemory: {
+            rssMb: Number((mem.rss / (1024 * 1024)).toFixed(1)),
+            heapUsedMb: Number((mem.heapUsed / (1024 * 1024)).toFixed(1)),
+            heapTotalMb: Number((mem.heapTotal / (1024 * 1024)).toFixed(1)),
+          },
+        };
+      })(),
+      stateVisualization: (() => {
+        const qSnap = this.mgmtQueueManager.inspectQueueSnapshot();
+        const dist: Record<string, number> = {
+          QUEUED: qSnap.totalQueuedCount,
+          LEASED: 0,
+          RUNNING_ACT: 0,
+          CANCEL_UNCONFIRMED: 0,
+          FENCED_TERMINATED: 0,
+          COMPLETED: 0,
+          DEAD_LETTER: 0,
+        };
+        for (const t of tasks) {
+          const st = String(t.state);
+          dist[st] = (dist[st] ?? 0) + 1;
+        }
+        return {
+          taskStateDistribution: dist,
+          celldNodeLoad: {
+            owned_cells: tasks.length + tenants.length + qSnap.totalQueuedCount,
+            resident_cells: (dist.RUNNING_ACT ?? 0) + (dist.LEASED ?? 0) + 1,
+            capacity_waiting: qSnap.totalQueuedCount,
+            activation_waiting: 0,
+            restoring: this.scenario === "verification" && !this.verificationRetried ? 1 : 0,
+            pressured: this.scenario === "capacity" && !this.loadSheddingActive,
+            memory_headroom: !(this.scenario === "capacity" && !this.loadSheddingActive),
+            shed_cells: this.loadSheddingActive ? 2 : 0,
+            isolates: {
+              live: nodes.filter((n) => n.status === "READY").length,
+              live_empty: 1,
+              retiring: nodes.filter((n) => n.status === "CORDONED").length,
+            },
+          },
+        };
+      })(),
       status: "HEALTHY",
     };
   }
@@ -11099,6 +11278,277 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         },
         gates,
         auditChainIntegrity,
+      },
+    };
+  }
+
+  /**
+   * [M79] Executes real interactive Queue Management operations on `mgmtQueueManager` & `CoreScheduler5D`
+   * (`POST /v1beta1/management/queues/action`).
+   */
+  public executeQueueManagementAction(params: {
+    action:
+      | "enqueue_task"
+      | "enqueue_multi_tenant_burst"
+      | "reprioritize_queued_task"
+      | "pop_and_schedule_next"
+      | "remove_queued_task";
+    taskId?: string;
+    tenantId?: string;
+    priority?: number;
+    prompt?: string;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权修改调度队列" },
+      };
+    }
+
+    const nowSec = Date.now() / 1000;
+
+    if (params.action === "enqueue_task") {
+      const taskId = sanitizeHtmlString(params.taskId ?? `task-q-${Math.floor(100 + Math.random() * 899)}`);
+      const tenantId = sanitizeHtmlString(params.tenantId ?? "Northstar");
+      const prioNum = Math.max(0, Math.min(3, Number(params.priority ?? 1)));
+      const prompt = sanitizeHtmlString(params.prompt ?? "Interactive queued task from Console");
+      const spec = new TaskSpec({
+        task_id: taskId,
+        tenant_id: tenantId,
+        priority: prioNum as TaskPriority,
+        prompt,
+        created_at: nowSec - 10,
+      });
+      spec.state = TaskState.QUEUED;
+      this.mgmtQueueManager.enqueue(spec);
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `向租户 ${tenantId} 二项最大堆入队任务 ${taskId} (Priority=P${prioNum})`,
+        `Queue / ${tenantId}`,
+        "ENQUEUED"
+      );
+      return {
+        status: 201,
+        body: {
+          enqueued: true,
+          taskId,
+          tenantId,
+          priority: prioNum,
+          queueVisualization: this.mgmtQueueManager.inspectQueueSnapshot(),
+        },
+      };
+    }
+
+    if (params.action === "enqueue_multi_tenant_burst") {
+      const suffix = Math.floor(100 + Math.random() * 899);
+      const burstSpecs: Array<{ id: string; tenant: string; prio: TaskPriority; wait: number; prompt: string }> = [
+        {
+          id: `task-ns-burst-${suffix}`,
+          tenant: "Northstar",
+          prio: TaskPriority.P0_EMERGENCY,
+          wait: 15,
+          prompt: "Urgent P0 hotfix verification in isolated sandbox",
+        },
+        {
+          id: `task-hl-burst-${suffix}`,
+          tenant: "Helios",
+          prio: TaskPriority.P1_HIGH,
+          wait: 35,
+          prompt: "High-priority GDPR cross-region LTX sync check",
+        },
+        {
+          id: `task-vg-burst-${suffix}`,
+          tenant: "Vanguard",
+          prio: TaskPriority.P2_STANDARD,
+          wait: 65,
+          prompt: "Standard APAC settlement shard validation",
+        },
+        {
+          id: `task-ag-burst-${suffix}`,
+          tenant: "Aegis",
+          prio: TaskPriority.P1_HIGH,
+          wait: 50,
+          prompt: "Zero-active-task tenant DRF fairness boost verification",
+        },
+      ];
+      for (const b of burstSpecs) {
+        const sp = new TaskSpec({
+          task_id: b.id,
+          tenant_id: b.tenant,
+          priority: b.prio,
+          prompt: b.prompt,
+          created_at: nowSec - b.wait,
+        });
+        sp.state = TaskState.QUEUED;
+        this.mgmtQueueManager.enqueue(sp);
+      }
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `注入多租户并发突发队列 (4 个 P0–P2 跨租户排队任务) 用于 DRF 二项堆调度演练`,
+        "Global / QueueManager",
+        `BURST_ENQUEUED (total=${this.mgmtQueueManager.totalQueued()})`
+      );
+      return {
+        status: 201,
+        body: {
+          enqueuedBurstCount: burstSpecs.length,
+          enqueuedTaskIds: burstSpecs.map((b) => b.id),
+          queueVisualization: this.mgmtQueueManager.inspectQueueSnapshot(),
+        },
+      };
+    }
+
+    if (params.action === "reprioritize_queued_task") {
+      const taskId = String(params.taskId ?? "").trim();
+      const newPrio = Math.max(0, Math.min(3, Number(params.priority ?? 0))) as TaskPriority;
+      const snapBefore = this.mgmtQueueManager.inspectQueueSnapshot();
+      let foundSpec: TaskSpec | null = null;
+      for (const th of snapBefore.tenantHeaps) {
+        const hit = th.queuedItems.find((i) => i.taskId === taskId);
+        if (hit) {
+          foundSpec = new TaskSpec({
+            task_id: hit.taskId,
+            tenant_id: hit.tenantId,
+            priority: newPrio,
+            prompt: hit.prompt,
+            created_at: nowSec - hit.waitSeconds,
+          });
+          foundSpec.state = TaskState.QUEUED;
+          break;
+        }
+      }
+      if (!foundSpec) {
+        return {
+          status: 404,
+          body: { error: "QUEUED_TASK_NOT_FOUND", taskId },
+        };
+      }
+      this.mgmtQueueManager.reprioritizeQueuedTask(foundSpec, newPrio);
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `在租户 ${foundSpec.tenant_id} 二项最大堆内原地提权任务 ${taskId} → P${newPrio}`,
+        `Queue / ${foundSpec.tenant_id}`,
+        `REPRIORITIZED (P${newPrio})`
+      );
+      return {
+        status: 200,
+        body: {
+          reprioritized: true,
+          taskId,
+          newPriority: newPrio,
+          queueVisualization: this.mgmtQueueManager.inspectQueueSnapshot(),
+        },
+      };
+    }
+
+    if (params.action === "remove_queued_task") {
+      const taskId = String(params.taskId ?? "").trim();
+      if (!taskId) {
+        return {
+          status: 400,
+          body: { error: "MISSING_REQUIRED_PARAMETERS", message: "Required parameter: taskId" },
+        };
+      }
+      this.mgmtQueueManager.removeQueuedTask(taskId);
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `从排队二项最大堆移除待调度任务 ${taskId}`,
+        "Global / QueueManager",
+        "REMOVED_FROM_QUEUE"
+      );
+      return {
+        status: 200,
+        body: {
+          removed: true,
+          taskId,
+          queueVisualization: this.mgmtQueueManager.inspectQueueSnapshot(),
+        },
+      };
+    }
+
+    // action === "pop_and_schedule_next"
+    const snapBefore = this.mgmtQueueManager.inspectQueueSnapshot();
+    const winnerPreview = snapBefore.nextTournamentWinner;
+    const popped = this.mgmtQueueManager.popNext();
+    if (!popped) {
+      return {
+        status: 200,
+        body: {
+          popped: false,
+          message: "当前队列为空，无待弹出任务",
+          queueVisualization: this.mgmtQueueManager.inspectQueueSnapshot(),
+        },
+      };
+    }
+
+    const sql = this.deps.v25Store.sql;
+    const readyBodies = sql
+      .exec<Record<string, unknown>>(
+        "SELECT * FROM v25_mgmt_node_overrides WHERE status = ?",
+        "READY"
+      )
+      .toArray()
+      .map((r) => String(r.node_id))
+      .filter((id) => id.startsWith("body-"));
+    const targetBody = readyBodies[0] ?? "body-host-01";
+    const branchName = `task-${popped.task_id}`;
+
+    popped.state = TaskState.RUNNING_ACT;
+    popped.assigned_node_id = targetBody;
+    popped.lease_fencing_token = Math.max(1, popped.lease_fencing_token);
+    this.deps.scheduler.allTasks.set(popped.task_id, popped);
+    this.deps.v25Store.commitTaskSingleWritePath(popped, targetBody);
+    sql.exec(
+      "INSERT OR REPLACE INTO v25_scheduler_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, idem_key, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      popped.task_id,
+      popped.tenant_id,
+      popped.priority,
+      popped.state,
+      popped.lease_fencing_token,
+      targetBody,
+      popped.idempotency_key || `idem:${popped.tenant_id}:${popped.task_id}`,
+      JSON.stringify(popped)
+    );
+    sql.exec(
+      "INSERT OR REPLACE INTO v25_mgmt_task_branches (task_id, branch_name) VALUES (?, ?)",
+      popped.task_id,
+      branchName
+    );
+    this.deps.walEngine.appendTurnDelta({
+      taskId: popped.task_id,
+      turnIndex: 1,
+      fencingToken: popped.lease_fencing_token,
+      changedFiles: [`src/${popped.task_id}-turn1.ts`],
+      sqliteWalPages: 5,
+      highestSubmittedFencingToken: popped.lease_fencing_token,
+    });
+
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `DRF 二项堆锦标赛弹出最高分任务 ${popped.task_id} (Tenant=${popped.tenant_id}, Score=${winnerPreview?.effectiveScore ?? 0}) → 调度至 ${targetBody}`,
+      `Scheduler / ${popped.tenant_id}`,
+      `SCHEDULED_RUNNING (${targetBody})`
+    );
+
+    return {
+      status: 200,
+      body: {
+        popped: true,
+        scheduledTaskId: popped.task_id,
+        tenantId: popped.tenant_id,
+        priority: popped.priority,
+        effectiveScore: winnerPreview?.effectiveScore ?? 0,
+        assignedBodyHostId: targetBody,
+        fencingToken: popped.lease_fencing_token,
+        queueVisualization: this.mgmtQueueManager.inspectQueueSnapshot(),
       },
     };
   }

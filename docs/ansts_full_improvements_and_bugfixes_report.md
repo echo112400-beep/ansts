@@ -633,3 +633,20 @@
    - **动态 MCP 工具自定义注册弹窗 (`open-register-mcp-dialog`) 与行级调用/注销 (`invoke-specific-mcp-tool` / `unregister-mcp-tool`)**：支持自定义录入工具名称、所属 MCP 服务与描述，并在每行直接触发工具调用或注销。
    - 全量通过 **71 个测试套件（203 项端到端测试）** (`tests/m78_console_interactive_crud_and_sqlite_telemetry.test.ts`)。
 
+---
+
+## 29. M79 TanStack Console 集群管理、全栈健康探针矩阵、生命周期状态可视与 DRF 二项最大堆队列可视工作台 (Cluster Health Matrix, State Visualization & DRF Queue Visualizer)
+
+针对集群管理、健康可视、状态可视与队列可视四大核心运维场景，完成了从调度器内核 (`HierarchicalQueueManager`) 到管理面 BFF 与前端可视工作台的全链路增强：
+
+1. **多级优先队列 (P0–P3) 与租户二项最大堆实时可视与调度干预 (`src/queue_manager.ts` & `POST /v1beta1/management/queues/action`)**：
+   - **`HierarchicalQueueManager.inspectQueueSnapshot()`**：无损导出全部活跃租户二项最大堆 (`tenantHeaps`)、P0–P3 优先级分布 (`priorityBreakdown`)、每个排队任务的基础分 (`BaseScore`) + 老化等待补偿 (`AgingBonus`) + 抢占补偿 (`PreemptionBonus`) - DRF 活跃任务惩罚 (`Active × 25.0`) = 动态综合得分 (`EffectiveScore`)，以及下一轮跨租户锦标赛胜出候选 (`nextTournamentWinner`)。
+   - **交互式队列调度工作台 (`GET /v1beta1/console/queues` & `POST /v1beta1/management/queues/action` & `anstsctl mgmt-queues`)**：支持在 Console UI 中自定义录入排队任务 (`enqueue_task`)、一键注入跨租户并发突发队列 (`enqueue_multi_tenant_burst`)、在二项堆内原地将任意任务提权至 `P0_EMERGENCY` (`reprioritize_queued_task`)、单步弹出最高分任务并真实派发至就绪 Body 节点 (`pop_and_schedule_next`，同步写入 SQLite `v25_scheduler_tasks` 与 `TurnWalEngine` CRC32 帧)，以及从队列移除任务 (`remove_queued_task`)。
+
+2. **全栈子系统健康探针矩阵 (`GET /v1beta1/console/health` & `healthMatrix`)**：
+   - 实时探测并聚合 6 大核心健康维度：`PROBE-GATEWAY` (`/healthz` & `/readyz`)、`PROBE-CELLD` (`/.well-known/celld/health` V8 Isolate 运行时)、`PROBE-SHARD-RING` (`256-Slot` 一致性哈希环活跃 Brain 覆盖率)、`PROBE-SQLITE-RPO0` (`RPO=0` 持久化表规模)、`PROBE-TUNNEL-HA` (`Dual-Homed mTLS` 反向隧道绑定) 与 `PROBE-AUDIT-CHAIN` (`SHA-256` 审计哈希链完整性)，并实时展示进程物理内存 (`RSS MB`) 与 V8 堆内存 (`Heap Used / Total MB`)。
+
+3. **任务全生命周期状态机与 `celld /state` 负载计数器可视 (`stateVisualization`)**：
+   - 实时聚合全集群任务在 `QUEUED`、`LEASED`、`RUNNING_ACT`、`CANCEL_UNCONFIRMED`、`FENCED_TERMINATED`、`COMPLETED`、`DEAD_LETTER` 等各状态的分布以及 `celld /state` 的 `owned_cells`、`resident_cells`、`capacity_waiting`、`restoring`、`pressured` 与 `isolates` 实时指标。
+   - 全量通过 **72 个测试套件（205 项端到端测试）** (`tests/m79_console_cluster_health_state_and_queue_visualizer.test.ts`)。
+

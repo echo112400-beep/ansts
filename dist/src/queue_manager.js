@@ -229,4 +229,151 @@ class HierarchicalQueueManager {
     }
     return top;
   }
+
+  /**
+   * [M79] Returns a real-time, non-destructive inspection snapshot of all per-tenant Binary Max-Heaps,
+   * priority bands (P0..P3), DRF active penalties, aging boosts, and the next tournament winner.
+   */
+  inspectQueueSnapshot(nowSec = Date.now() / 1000)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    const priorityBreakdown = { P0: 0, P1: 0, P2: 0, P3: 0 };
+    for (const t of this.queuedTasks.values()) {
+      const p = Number(t.priority ?? 1);
+      if (p === 0) priorityBreakdown.P0 += 1;else
+      if (p === 1) priorityBreakdown.P1 += 1;else
+      if (p === 2) priorityBreakdown.P2 += 1;else
+      priorityBreakdown.P3 += 1;
+    }
+
+    let nextTournamentWinner =
+
+
+
+
+    null;
+
+    const tenantHeaps =
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    [];
+
+    const allTenantKeys = new Set([
+    ...this.tenantHeaps.keys(),
+    ...this.tenantActiveCount.keys()]);
+
+
+    for (const tenantId of Array.from(allTenantKeys).sort()) {
+      const rawHeap = this.tenantHeaps.get(tenantId) ?? [];
+      const validNodes = rawHeap.filter((n) => this.queuedTasks.has(n.task.task_id));
+      const activeRunningCount = this.getTenantActiveCount(tenantId);
+      const drfPenalty = Number((activeRunningCount * 25.0).toFixed(2));
+
+      const queuedItems = validNodes.
+      map((n) => {
+        const task = n.task;
+        const prio = Number(task.priority ?? 1);
+        const prioLabel = prio === 0 ? "P0" : prio === 1 ? "P1" : prio === 2 ? "P2" : "P3";
+        const baseScore = this.getBasePriorityScore(task.priority);
+        const waitSeconds = Math.max(0, Number((nowSec - task.created_at).toFixed(1)));
+        const agingBonus = Number((waitSeconds * this.agingBoostPerSec).toFixed(2));
+        const preemptionBonus = Number(
+        ((task.preempted_count ?? 0) * this.preemptionCompensationBoost).toFixed(2));
+
+        const effectiveScore = Number(this.computeEffectiveScore(task, nowSec).toFixed(2));
+        return {
+          taskId: task.task_id,
+          tenantId: task.tenant_id,
+          priority: prio,
+          priorityLabel: prioLabel,
+          baseScore,
+          agingBonus,
+          preemptionBonus,
+          drfPenalty,
+          effectiveScore,
+          waitSeconds,
+          prompt: task.prompt ?? ""
+        };
+      }).
+      sort((a, b) => b.effectiveScore - a.effectiveScore);
+
+      const topItem = queuedItems[0] ?? null;
+      if (topItem) {
+        if (!nextTournamentWinner || topItem.effectiveScore > nextTournamentWinner.effectiveScore) {
+          nextTournamentWinner = {
+            tenantId,
+            taskId: topItem.taskId,
+            priority: topItem.priority,
+            effectiveScore: topItem.effectiveScore
+          };
+        }
+      }
+
+      if (queuedItems.length > 0 || activeRunningCount > 0) {
+        tenantHeaps.push({
+          tenantId,
+          queuedCount: queuedItems.length,
+          activeRunningCount,
+          drfPenalty,
+          topTaskId: topItem ? topItem.taskId : null,
+          topEffectiveScore: topItem ? topItem.effectiveScore : null,
+          queuedItems
+        });
+      }
+    }
+
+    return {
+      totalQueuedCount: this.queuedTasks.size,
+      activeTenantHeapsCount: this.tenantHeaps.size,
+      priorityBreakdown,
+      nextTournamentWinner,
+      tenantHeaps
+    };
+  }
 }exports.HierarchicalQueueManager = HierarchicalQueueManager;

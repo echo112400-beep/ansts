@@ -996,6 +996,7 @@ dialog#dialog::backdrop {
 
   const NAV_ITEMS = [
     { id: 'overview', label: '平台态势与容量恢复', badgeKey: 'overview' },
+    { id: 'queues', label: '队列与健康状态可视', badgeKey: 'queues' },
     { id: 'nodes', label: '节点与分片单元编排', badgeKey: 'nodes' },
     { id: 'tenants', label: '租户配额与 FinOps 治理', badgeKey: 'tenants' },
     { id: 'tasks', label: '任务运行与回合诊断', badgeKey: 'tasks' },
@@ -1039,6 +1040,9 @@ dialog#dialog::backdrop {
       auditFilterRole: 'ALL',
       slotDistribution: {},
       batchReport: null,
+      queueVisualization: null,
+      healthMatrix: null,
+      stateVisualization: null,
       allTenantIds: [],
       regions: [],
       nodes: [],
@@ -1150,6 +1154,9 @@ dialog#dialog::backdrop {
       if (d.slotDistribution) state.slotDistribution = d.slotDistribution;
       state.batchReport = d.batchReport || null;
       state.auditChainIntegrity = d.auditChainIntegrity || null;
+      if (d.queueVisualization) state.queueVisualization = d.queueVisualization;
+      if (d.healthMatrix) state.healthMatrix = d.healthMatrix;
+      if (d.stateVisualization) state.stateVisualization = d.stateVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -1260,6 +1267,10 @@ dialog#dialog::backdrop {
       if (state.scenario === 'quota') return { text: '额度满', cls: 'danger' };
       if (state.scenario === 'budget' || state.scenario === 'conflict') return { text: '需关注', cls: 'warn' };
       return { text: `${state.tenants.length} 租户`, cls: '' };
+    }
+    if (key === 'queues') {
+      const qCount = state.queueVisualization?.totalQueuedCount ?? 0;
+      return { text: `${qCount} 排队`, cls: qCount >= 6 ? 'warn' : '' };
     }
     if (key === 'tasks') {
       if (state.scenario === 'cancel-unknown' || state.scenario === 'history-missing') {
@@ -1576,6 +1587,42 @@ dialog#dialog::backdrop {
                     </tr>
                   `;
                 }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">全栈健康探针矩阵与状态机/队列概览 (GET /v1beta1/console/health &amp; /queues)</h2>
+              <p class="panel-subtitle">实时聚合 <code>/healthz</code>、<code>/.well-known/celld/health</code>、<code>/state</code> Cell 负载、11 态生命周期分布与 DRF 二项最大堆排队态势。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small primary" data-action="switch-nav" data-nav="queues">打开队列与健康状态可视工作台 →</button>
+            </div>
+          </div>
+          <div class="btn-row" style="margin-bottom:8px;">
+            ${Object.entries(state.stateVisualization?.taskStateDistribution || {}).map(([stName, cnt]) =>
+              `<span class="status-pill ${stName === 'FENCED_TERMINATED' || stName === 'DEAD_LETTER' ? 'danger' : stName === 'QUEUED' || stName === 'CANCEL_UNCONFIRMED' ? 'warn' : 'ok'}">${esc(stName)}: <strong>${cnt}</strong></span>`
+            ).join('')}
+            <span class="status-pill">排队总数: <strong>${state.queueVisualization?.totalQueuedCount ?? 0}</strong></span>
+            <span class="status-pill">下一胜出: <strong>${esc(state.queueVisualization?.nextTournamentWinner?.taskId || 'NONE')}</strong></span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr><th>健康探针项</th><th>状态</th><th>耗时</th><th>实时探测详情</th></tr>
+              </thead>
+              <tbody>
+                ${(state.healthMatrix?.probes || []).map((pr) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(pr.name)}</strong></td>
+                    <td><span class="status-pill ${pr.status === 'HEALTHY' ? 'ok' : 'danger'}">${esc(pr.status)}</span></td>
+                    <td class="mono">${pr.latencyMs}ms</td>
+                    <td class="mono">${esc(pr.detail)}</td>
+                  </tr>
+                `).join('')}
               </tbody>
             </table>
           </div>
@@ -2154,12 +2201,189 @@ dialog#dialog::backdrop {
     `;
   }
 
+
+  function renderQueuesAndHealthSection() {
+    const qv = state.queueVisualization || {
+      totalQueuedCount: 0,
+      activeTenantHeapsCount: 0,
+      priorityBreakdown: { P0: 0, P1: 0, P2: 0, P3: 0 },
+      nextTournamentWinner: null,
+      tenantHeaps: []
+    };
+    const hm = state.healthMatrix || { overallHealthy: true, overallStatus: 'HEALTHY', probes: [], processMemory: { rssMb: 0, heapUsedMb: 0, heapTotalMb: 0 } };
+    const sv = state.stateVisualization || { taskStateDistribution: {}, celldNodeLoad: {} };
+    const pb = qv.priorityBreakdown || { P0: 0, P1: 0, P2: 0, P3: 0 };
+    const win = qv.nextTournamentWinner;
+    const perm = canMutateTarget(state.region, state.tenant, false);
+
+    const allQueuedRows = [];
+    for (const th of (qv.tenantHeaps || [])) {
+      for (const item of (th.queuedItems || [])) {
+        allQueuedRows.push({
+          ...item,
+          activeRunningCount: th.activeRunningCount,
+          isTopOfHeap: th.topTaskId === item.taskId,
+          isTournamentWinner: win && win.taskId === item.taskId
+        });
+      }
+    }
+
+    return `
+      <section class="kpi-grid" aria-label="队列与健康状态核心指标">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>当前排队任务总数 (HierarchicalQueueManager)</span><span class="status-pill ${qv.totalQueuedCount > 0 ? 'warn' : 'ok'}">${qv.activeTenantHeapsCount} 活跃租户堆</span></div>
+          <div class="kpi-value">${qv.totalQueuedCount} 排队</div>
+          <div class="kpi-sub">优先级分布: <span class="mono">P0:${pb.P0} · P1:${pb.P1} · P2:${pb.P2} · P3:${pb.P3}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>下一轮 DRF 锦标赛胜出候选 (popNext)</span><span class="status-pill ok">${win ? esc(win.tenantId) : '队列空闲'}</span></div>
+          <div class="kpi-value">${win ? esc(win.taskId) : 'IDLE'}</div>
+          <div class="kpi-sub">动态综合得分: <span class="mono">${win ? win.effectiveScore + ' pts (P' + win.priority + ')' : 'N/A'}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>全栈子系统健康探针矩阵 (/v1beta1/console/health)</span><span class="status-pill ${hm.overallHealthy ? 'ok' : 'danger'}">${esc(hm.overallStatus || 'HEALTHY')}</span></div>
+          <div class="kpi-value">${(hm.probes || []).filter((p) => p.status === 'HEALTHY').length} / ${(hm.probes || []).length || 6} 通过</div>
+          <div class="kpi-sub">V8 内存: <span class="mono">Heap ${hm.processMemory?.heapUsedMb ?? 0}/${hm.processMemory?.heapTotalMb ?? 0} MB · RSS ${hm.processMemory?.rssMb ?? 0} MB</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>celld /state Cell 负载与 Isolate 状态</span><span class="status-pill ${sv.celldNodeLoad?.pressured ? 'danger' : 'ok'}">${sv.celldNodeLoad?.pressured ? 'PRESSURED' : 'HEADROOM OK'}</span></div>
+          <div class="kpi-value">${sv.celldNodeLoad?.owned_cells ?? 0} Owned Cells</div>
+          <div class="kpi-sub">Resident: <span class="mono">${sv.celldNodeLoad?.resident_cells ?? 0} · Waiting: ${sv.celldNodeLoad?.capacity_waiting ?? 0} · Live Isolates: ${sv.celldNodeLoad?.isolates?.live ?? 0}</span></div>
+        </div>
+      </section>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">多级优先队列 (P0–P3)、DRF 公平惩罚与租户二项最大堆可视工作台 (对接 HierarchicalQueueManager · POST /v1beta1/management/queues/action)</h2>
+            <p class="panel-subtitle">实时展示各租户二项最大堆 (Binary Max-Heap) 内部排序及跨租户 DRF 锦标赛动态得分：<code>EffectiveScore = Base(P0=1000/P1=300/P2=150/P3=50) + AgingBoost(0.05/s) + PreemptionBoost(120) - DRFPenalty(Active×25)</code>。</p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small" data-action="open-enqueue-task-dialog" ${!perm.ok ? 'disabled' : ''}>+ 录入新排队任务 (Enqueue)</button>
+            <button type="button" class="small" data-action="queue-enqueue-burst" ${!perm.ok ? 'disabled' : ''}>+ 注入多租户并发突发队列 (Burst ×4)</button>
+            <button type="button" class="small primary" data-action="queue-pop-schedule" ${!perm.ok || qv.totalQueuedCount === 0 ? 'disabled' : ''}>▶ 弹出并调度下一胜出任务 (Pop &amp; Schedule)</button>
+          </div>
+        </div>
+
+        <div class="btn-row" style="margin-bottom:10px;">
+          ${(qv.tenantHeaps || []).map((th) => `
+            <span class="status-pill ${th.queuedCount > 0 ? 'ok' : ''}">
+              租户堆 <strong>${esc(th.tenantId)}</strong>: 排队 <code class="mono">${th.queuedCount}</code> · 运行中 <code class="mono">${th.activeRunningCount}</code> (DRF 惩罚 <code class="mono">-${th.drfPenalty}</code>) · 堆顶 <code class="mono">${esc(th.topTaskId || 'empty')} (${th.topEffectiveScore ?? '-'})</code>
+            </span>
+          `).join('')}
+        </div>
+
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>排队任务 ID</th>
+                <th>所属租户二项堆</th>
+                <th>优先级</th>
+                <th>得分拆解 (Base + Aging + Preempt - DRF)</th>
+                <th>动态综合得分</th>
+                <th>已等待时长</th>
+                <th>任务指令 (Prompt)</th>
+                <th>队列调度操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${allQueuedRows.length === 0 ? `
+                <tr><td colspan="8" class="muted" style="text-align:center;padding:16px;">当前所有租户二项最大堆均为空（点击上方“+ 注入多租户并发突发队列”或“+ 录入新排队任务”即可实时观察二项堆排序与 DRF 调度）</td></tr>
+              ` : allQueuedRows.map((item) => `
+                <tr>
+                  <td class="mono">
+                    <strong>${esc(item.taskId)}</strong>
+                    ${item.isTournamentWinner ? ' <span class="status-pill ok">★ 下一弹出胜出者</span>' : item.isTopOfHeap ? ' <span class="status-pill">堆顶 (Heap Root)</span>' : ''}
+                  </td>
+                  <td><strong>${esc(item.tenantId)}</strong> <span class="muted">(运行:${item.activeRunningCount})</span></td>
+                  <td><span class="status-pill ${item.priority === 0 ? 'danger' : item.priority === 1 ? 'warn' : 'ok'}">${esc(item.priorityLabel)}</span></td>
+                  <td class="mono">${item.baseScore} + ${item.agingBonus} + ${item.preemptionBonus} - ${item.drfPenalty}</td>
+                  <td class="mono"><strong>${item.effectiveScore} pts</strong></td>
+                  <td class="mono">${item.waitSeconds}s</td>
+                  <td>${esc(item.prompt)}</td>
+                  <td>
+                    <div class="btn-row">
+                      <button type="button" class="small primary" data-action="queue-promote-p0" data-task="${esc(item.taskId)}" ${!perm.ok || item.priority === 0 ? 'disabled' : ''}>提权至 P0</button>
+                      <button type="button" class="small danger" data-action="queue-remove-task" data-task="${esc(item.taskId)}" ${!perm.ok ? 'disabled' : ''}>移出队列</button>
+                    </div>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">集群全栈健康探针矩阵 (GET /v1beta1/console/health)</h2>
+              <p class="panel-subtitle">覆盖网关入口、V8 Isolate 运行时、256 哈希槽、SQLite RPO=0、双归属反向隧道与防篡改审计链。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>探针编号</th><th>探针名称</th><th>健康状态</th><th>响应耗时</th><th>实时指标详情</th></tr></thead>
+              <tbody>
+                ${(hm.probes || []).map((pr) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(pr.id)}</strong></td>
+                    <td>${esc(pr.name)}</td>
+                    <td><span class="status-pill ${pr.status === 'HEALTHY' ? 'ok' : 'danger'}">${esc(pr.status)}</span></td>
+                    <td class="mono">${pr.latencyMs}ms</td>
+                    <td class="mono">${esc(pr.detail)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">任务全生命周期状态机分布与 celld /state 负载可视</h2>
+              <p class="panel-subtitle">实时统计集群内所有任务的生命周期状态分布及 <code>celld</code> 节点状态计数器。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>生命周期状态 (TaskState)</th><th>任务数量</th><th>状态语义说明</th></tr></thead>
+              <tbody>
+                ${Object.entries(sv.taskStateDistribution || {}).map(([stKey, count]) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(stKey)}</strong></td>
+                    <td class="mono"><span class="status-pill ${stKey === 'FENCED_TERMINATED' || stKey === 'DEAD_LETTER' ? 'danger' : stKey === 'QUEUED' || stKey === 'CANCEL_UNCONFIRMED' ? 'warn' : 'ok'}">${count}</span></td>
+                    <td class="muted">${
+                      stKey === 'QUEUED' ? '位于租户二项最大堆等待 DRF 锦标赛弹出调度' :
+                      stKey === 'LEASED' ? '已分配 Epoch Fencing Token 租约并绑定宿主' :
+                      stKey === 'RUNNING_ACT' ? '正在 Body LayerFS 沙箱内执行多回合工具调用' :
+                      stKey === 'CANCEL_UNCONFIRMED' ? '已下发停止指令，等待反向隧道 ACK 确认' :
+                      stKey === 'FENCED_TERMINATED' ? '已强制推进 Epoch Fencing Token 并硬件级隔离旧租约' :
+                      stKey === 'COMPLETED' ? '已完成全部回合且 WAL/LTX 校验归档完毕' :
+                      '死信队列隔离待重放'
+                    }</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   function renderMainContent() {
     const main = document.getElementById('content');
     if (!main) return;
     const bannerHtml = renderScenarioBanner();
     let sectionHtml = '';
     switch (state.activeNav) {
+      case 'queues':
+        sectionHtml = renderQueuesAndHealthSection();
+        break;
       case 'nodes':
         sectionHtml = renderNodesSection();
         break;
@@ -2738,6 +2962,125 @@ dialog#dialog::backdrop {
       });
       await fetchBackendState();
       showToast('后端已热迁移 body-host-02 上的 P0 租约并完成节点隔离排水');
+      return;
+    }
+    if (action === 'open-enqueue-task-dialog') {
+      const nextNum = Math.floor(100 + Math.random() * 899);
+      const dynamicTenants = Array.isArray(state.allTenantIds) && state.allTenantIds.length > 0
+        ? state.allTenantIds
+        : ['Northstar', 'Helios', 'Vanguard', 'Aegis'];
+      openDialog(
+        '录入新排队任务至租户二项最大堆 (POST /v1beta1/management/queues/action)',
+        '<div class="form-field"><label for="dlg-q-id">排队任务 ID (Task ID)</label>' +
+        '<input id="dlg-q-id" type="text" value="task-q-' + nextNum + '" class="mono" /></div>' +
+        '<div class="form-field"><label for="dlg-q-tenant">所属租户二项堆 (Tenant Heap)</label><select id="dlg-q-tenant">' +
+        dynamicTenants.map((tid) => '<option value="' + esc(tid) + '">' + esc(tid) + '</option>').join('') +
+        '</select></div>' +
+        '<div class="form-field"><label for="dlg-q-prio">任务优先级 (Priority Band)</label><select id="dlg-q-prio">' +
+        '<option value="0">P0_EMERGENCY (Base 1000 pts)</option>' +
+        '<option value="1" selected>P1_HIGH (Base 300 pts)</option>' +
+        '<option value="2">P2_STANDARD (Base 150 pts)</option>' +
+        '<option value="3">P3_BATCH (Base 50 pts)</option>' +
+        '</select></div>' +
+        '<div class="form-field"><label for="dlg-q-prompt">任务指令 (Prompt)</label>' +
+        '<input id="dlg-q-prompt" type="text" value="Verify DRF binary max-heap scheduling and TurnWal CRC32" /></div>',
+        '入队至二项最大堆',
+        async () => {
+          const taskId = document.getElementById('dlg-q-id').value.trim();
+          const tenantId = document.getElementById('dlg-q-tenant').value;
+          const priority = Number(document.getElementById('dlg-q-prio').value);
+          const prompt = document.getElementById('dlg-q-prompt').value.trim();
+          const p = getPrincipal();
+          const res = await callBackendApi('POST', '/v1beta1/management/queues/action', {
+            action: 'enqueue_task',
+            taskId,
+            tenantId,
+            priority,
+            prompt,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            const errEl = document.getElementById('dialog-error');
+            if (errEl) errEl.textContent = res.data?.message || '任务入队失败';
+            return;
+          }
+          closeDialog();
+          await fetchBackendState();
+          showToast(`已将任务 ${taskId} (P${priority}) 入队至租户 ${tenantId} 二项最大堆`);
+        }
+      );
+      return;
+    }
+    if (action === 'queue-enqueue-burst') {
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/queues/action', {
+        action: 'enqueue_multi_tenant_burst',
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '突发入队被拒绝');
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已向 4 个租户二项最大堆注入 ${res.data.enqueuedBurstCount || 4} 个并发排队任务`);
+      return;
+    }
+    if (action === 'queue-pop-schedule') {
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/queues/action', {
+        action: 'pop_and_schedule_next',
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '弹出调度被拒绝');
+        return;
+      }
+      await fetchBackendState();
+      if (res.data && res.data.popped) {
+        showToast(`DRF 锦标赛已弹出最高分任务 ${res.data.scheduledTaskId} (${res.data.effectiveScore} pts) → 调度至 ${res.data.assignedBodyHostId}`);
+      } else {
+        showToast('当前队列为空');
+      }
+      return;
+    }
+    if (action === 'queue-promote-p0') {
+      const taskId = target.getAttribute('data-task') || '';
+      if (!taskId) return;
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/queues/action', {
+        action: 'reprioritize_queued_task',
+        taskId,
+        priority: 0,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '队列原地提权失败');
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已在二项最大堆内将任务 ${taskId} 原地提权至 P0_EMERGENCY (1000 pts)`);
+      return;
+    }
+    if (action === 'queue-remove-task') {
+      const taskId = target.getAttribute('data-task') || '';
+      if (!taskId) return;
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/queues/action', {
+        action: 'remove_queued_task',
+        taskId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '移除排队任务失败');
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已从二项最大堆移除排队任务 ${taskId}`);
       return;
     }
     if (action === 'delete-tenant') {

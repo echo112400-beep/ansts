@@ -694,7 +694,23 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
-        if (cmd === "mgmt-release-gate") {
+        if (cmd === "mgmt-queues") {
+    const action = rest[0] ?? "inspect";
+    if (action.trim() === "inspect") {
+      const resp = await fetch(`${baseUrl}/v1beta1/console/queues`);
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    const resp = await fetch(`${baseUrl}/v1beta1/management/queues/action`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: action.trim(), taskId: rest[1], actor: "chen", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-release-gate") {
     const resp = await fetch(`${baseUrl}/v1beta1/management/release/readiness`, {
       method: "POST",
       headers: { "content-type": "application/json" },

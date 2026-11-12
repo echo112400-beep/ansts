@@ -2395,6 +2395,58 @@ class AnstsLocalAndComposeServer {
       await this.managementPlane.pullManagementStateFromS3();
     }
 
+    // [M79] TanStack Console BFF: Live DRF Binary Max-Heap Queue Visualization (`GET /v1beta1/console/queues`)
+    if (method === "GET" && pathname === "/v1beta1/console/queues") {
+      const statePayload = await this.managementPlane.buildFullManagementState();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(statePayload.queueVisualization));
+      return;
+    }
+
+    // [M79] TanStack Console BFF: Live Subsystem Health Matrix & State Machine Visualization (`GET /v1beta1/console/health`)
+    if (method === "GET" && pathname === "/v1beta1/console/health") {
+      const statePayload = await this.managementPlane.buildFullManagementState();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        healthMatrix: statePayload.healthMatrix,
+        stateVisualization: statePayload.stateVisualization
+      }));
+
+      return;
+    }
+
+    // [M79] Management Plane Interactive Queue Workbench (`POST /v1beta1/management/queues/action`)
+    if (method === "POST" && pathname === "/v1beta1/management/queues/action") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeQueueManagementAction({
+        action: body.action ?? "enqueue_multi_tenant_burst",
+
+
+
+
+
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        tenantId: body.tenantId ? String(body.tenantId) : undefined,
+        priority: body.priority !== undefined ? Number(body.priority) : undefined,
+        prompt: body.prompt ? String(body.prompt) : undefined,
+        actor: auth.actor,
+        role: auth.role
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M77] Console Production Release Readiness Gate (`GET/POST /v1beta1/management/release/readiness`)
     if (
     (method === "GET" || method === "POST") &&
