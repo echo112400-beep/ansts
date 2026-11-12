@@ -1,8 +1,8 @@
 /**
- * @fileoverview Start path for the ANSTS scheduler service as a denoland/celld-loaded worker.
- * `celld dev` bundles `src/cloudflare/worker.ts`, injects the SQLite Durable Object bindings, and
- * serves the worker. Cell state stays in that project's `.celld/dev` store. This module does not
- * start the in-process Node gateway.
+ * @fileoverview Start path for the unified ANSTS control plane as a denoland/celld-loaded worker.
+ * `celld dev` bundles `src/cloudflare/worker.ts` and serves both the gateway HTTP API and the
+ * scheduler. Gateway and scheduler state stay in SQLite Durable Objects under `.celld/dev`.
+ * Body execution remains a separate Node or Body process.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";

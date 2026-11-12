@@ -4,12 +4,23 @@ The dev cluster runs a real [denoland/celld](https://github.com/denoland/celld) 
 three celld nodes (`celld-brain-01..03`) own `AnstsSchedulerCell` shards, and the gateways submit work to
 them instead of scheduling in-process.
 
-## Start the worker service (one celld process)
+## Start the unified control plane (one celld process)
 
-This starts the scheduler service as a worker that **celld loads**. It does not start the Node gateway
-(`node dist/src/server_main.js`). celld bundles `src/cloudflare/worker.ts`, binds the SQLite Durable
-Objects from `deploy/celld/wrangler.celld.json`, and serves the worker. Task rows live in
-`AnstsSchedulerCell`, under `.celld/worker-service/.celld/dev`.
+This is the primary way to run the gateway and the scheduler. celld loads `src/cloudflare/worker.ts`
+and serves both. `AnstsGatewayCell` holds dispatch, lease, and operator-session rows.
+`AnstsSchedulerCell` holds tasks. Both are SQLite Durable Objects in the same celld process, under
+`.celld/worker-service/.celld/dev`.
+
+`npm start` / `node dist/src/server_main.js` is the host process: Body execution, LayerFS, cgroups,
+and the dashboard. It is not a second control plane. Set `ANSTS_CELLD_WORKER_URL` (or
+`celldWorkerUrl`) and that process forwards `/v1/tasks`, `/v1beta1/tasks/dispatch`, and gateway lease
+routes to this worker instead of scheduling them in memory. Its `/healthz` reports
+`controlPlane: "legacy-node-host"`.
+
+Operator lease release (`POST /v1beta1/gateway/leases/release`) requires `Authorization: Bearer` signed
+with `ANSTS_CONSOLE_RBAC_SECRET` and a JSON body `"confirm": true`. An empty secret, the wrangler
+default, fail-closes with 503. Put the secret in `.dev.vars` beside the staged wrangler config for
+`celld dev`, or in the process environment for a fleet. Do not commit it.
 
 ```bash
 npm install
@@ -21,9 +32,11 @@ bash scripts/celld_worker_up.sh
 | Boundary | What it is |
 | --- | --- |
 | celld process | `celld dev`. Public worker listener `127.0.0.1:9876` (`CELLD_PORT`). Internal operator listener is an ephemeral loopback port printed as `internal listening`. |
-| Worker | `src/cloudflare/worker.ts` `fetch`. `GET /healthz`, `GET /.well-known/celld/health`, `POST /v1/scheduler/*`, `POST /internal/v1beta1/brain/schedule`. |
-| Durable Object | `AnstsSchedulerCell` (also harness and tunnel cells). celld passes `ctx.storage.sql`. `GET /v1/scheduler/tasks` returns that cell's `cellId`. |
-| Node gateway | Separate process. Not started by this command. |
+| Worker | `src/cloudflare/worker.ts` `fetch`. Gateway routes and scheduler routes. |
+| Gateway Durable Object | `AnstsGatewayCell`. Dispatch, lease, and operator session rows. |
+| Scheduler Durable Object | `AnstsSchedulerCell`. Task rows. Harness and tunnel cells stay available on `/v1/harness` and `/v1/tunnel`. |
+| Gateway HTTP | `GET /health`, `/healthz`, `/readyz`; `POST /v1/tasks`; `GET /v1/tasks/:id`; `POST /v1beta1/tasks/dispatch`; `GET /v1beta1/console/gateway`; `GET /v1beta1/gateway/state`; `POST /v1beta1/gateway/leases/release`. |
+| Body / host process | Sandbox execution, LayerFS, cgroups, and the dashboard. Not inside the worker. Talks to the worker over HTTP when `ANSTS_CELLD_WORKER_URL` is set. |
 
 `CELLD_CLEAN=1` deletes `.celld/dev` before start. Without it, a second run of the same project directory reads the same Durable Object back, including tasks submitted before the process exited.
 

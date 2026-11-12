@@ -4,7 +4,9 @@
  * and dispatches queued task messages in `queue(batch, env)` to `ANSTS_SCHEDULER_CELL` with retry-on-failure semantics.
  */
 import { CloudflareCelldEnv, QueueBatchLike } from "./env.js";
+import { handleUnifiedGatewayRequest } from "./gateway_cell.js";
 export { AnstsSchedulerCell } from "./scheduler_cell.js";
+export { AnstsGatewayCell } from "./gateway_cell.js";
 export { AgentTaskHarnessCell } from "./harness_cell.js";
 export { TunnelGatewayCell } from "./tunnel_gateway_cell.js";
 
@@ -70,16 +72,8 @@ async function dispatchBrainSchedule(request: Request, env: CloudflareCelldEnv):
 export default {
   async fetch(request: Request, env: CloudflareCelldEnv): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/healthz") {
-      return new Response(
-        JSON.stringify({
-          status: "ok",
-          runtime: "denoland/celld-cloudflare-workers",
-          region: env.CELLD_REGION ?? "local",
-        }),
-        { status: 200, headers: { "content-type": "application/json" } }
-      );
-    }
+    const gatewayResponse = await handleUnifiedGatewayRequest(request, env);
+    if (gatewayResponse) return gatewayResponse;
     if (url.pathname === "/internal/v1beta1/brain/schedule" && request.method === "POST") {
       return dispatchBrainSchedule(request, env);
     }

@@ -83,6 +83,8 @@ export interface AnstsServiceRuntimeOptions {
   peerBrainUrls?: Record<string, string>;
   peerBodyUrls?: Record<string, string>;
   celldFleet?: CelldFleetClient | null;
+  /** When set, control-plane HTTP routes are proxied to the celld worker instead of scheduled in this process. */
+  celldWorkerUrl?: string | null;
   storageDir?: string;
   s3Endpoint?: string;
   primaryGatewayUrl?: string;
@@ -116,6 +118,11 @@ export class AnstsLocalAndComposeServer {
   public readonly peerBodyUrls: Record<string, string>;
   /** Real denoland/celld fleet that owns the brain layer; null when the deployment has no celld nodes. */
   public readonly celldFleet: CelldFleetClient | null;
+  /**
+   * Primary control plane. When set, `/v1/tasks`, dispatch, and gateway lease routes are forwarded
+   * to the celld-loaded worker. This process remains the host for Body execution, LayerFS, and the dashboard.
+   */
+  public readonly celldWorkerUrl: string | null;
   public readonly scheduler: CoreScheduler5D;
   public readonly backpressure: IngressBackpressureController;
   public readonly sseGateway: SseEventStreamGateway;
@@ -214,6 +221,8 @@ export class AnstsLocalAndComposeServer {
       (process.env.ANSTS_CELLD_FLEET_URLS || process.env.ANSTS_CELLD_INTERNAL_URLS
         ? CelldFleetClient.fromEnv(process.env)
         : null);
+    const configuredWorkerUrl = options.celldWorkerUrl ?? process.env.ANSTS_CELLD_WORKER_URL ?? "";
+    this.celldWorkerUrl = configuredWorkerUrl.trim().replace(/\/+$/, "") || null;
 
     this.tickIntervalMs = options.tickIntervalMs ?? Number(process.env.ANSTS_TICK_INTERVAL_MS ?? 1000);
     this.scheduler = new CoreScheduler5D(15.0);
@@ -453,7 +462,14 @@ export class AnstsLocalAndComposeServer {
       this.apiServer.on("error", reject);
       this.apiServer.listen(targetApiPort, this.host, () => {
         const addr = this.apiServer!.address();
-        resolve(typeof addr === "object" && addr ? addr.port : targetApiPort);
+        const bound = typeof addr === "object" && addr ? addr.port : targetApiPort;
+        console.log(
+          `[ANSTS] host process role=${this.nodeRole} api=:${bound}. Primary control plane is the celld worker (npm run start:celld-worker). Body execution, LayerFS, and the dashboard stay in this process.`
+        );
+        if (this.celldWorkerUrl) {
+          console.log(`[ANSTS] proxying control-plane routes to ${this.celldWorkerUrl}`);
+        }
+        resolve(bound);
       });
     });
 
@@ -872,10 +888,75 @@ export class AnstsLocalAndComposeServer {
     });
   }
 
+  private isCelldControlPlaneRoute(method: string, pathname: string): boolean {
+    if (method === "POST" && pathname === "/v1/tasks") return true;
+    if (method === "GET" && pathname.startsWith("/v1/tasks/") && pathname.length > "/v1/tasks/".length) return true;
+    if (method === "POST" && pathname === "/v1beta1/tasks/dispatch") return true;
+    if (method === "GET" && pathname === "/v1beta1/gateway/state") return true;
+    if (method === "GET" && pathname === "/v1beta1/console/gateway") return true;
+    if (method === "POST" && pathname === "/v1beta1/gateway/leases/release") return true;
+    return false;
+  }
+
+  /** Forwards a control-plane request to the celld worker. A network failure is 502, not an in-process schedule. */
+  private async proxyControlPlaneToCelldWorker(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    method: string,
+    pathname: string,
+    search: string
+  ): Promise<void> {
+    const rawBody = await new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      req.on("data", (chunk: Buffer) => {
+        totalBytes += chunk.byteLength;
+        if (totalBytes > this.maxBodyBytes) {
+          reject(new Error(`PAYLOAD_TOO_LARGE: request body exceeded ${this.maxBodyBytes} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("error", reject);
+    });
+    const headers: Record<string, string> = {};
+    const contentType = req.headers["content-type"];
+    const authorization = req.headers["authorization"];
+    if (typeof contentType === "string") headers["content-type"] = contentType;
+    if (typeof authorization === "string") headers.authorization = authorization;
+    let upstream: Response;
+    try {
+      upstream = await fetch(`${this.celldWorkerUrl}${pathname}${search}`, {
+        method,
+        headers,
+        body: method === "GET" || method === "HEAD" ? undefined : rawBody,
+      });
+    } catch (err) {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "CELLD_WORKER_UNREACHABLE",
+          controlPlane: "celld-worker",
+          message: (err as Error).message,
+        })
+      );
+      return;
+    }
+    const payload = Buffer.from(await upstream.arrayBuffer());
+    const responseType = upstream.headers.get("content-type") ?? "application/json";
+    res.writeHead(upstream.status, { "content-type": responseType });
+    res.end(payload);
+  }
+
   private async handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const method = req.method ?? "GET";
     const urlObj = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = urlObj.pathname;
+    if (this.celldWorkerUrl && this.isCelldControlPlaneRoute(method, pathname)) {
+      await this.proxyControlPlaneToCelldWorker(req, res, method, pathname, urlObj.search);
+      return;
+    }
 
     if (
       method === "GET" &&
@@ -896,6 +977,8 @@ export class AnstsLocalAndComposeServer {
           healthy: true,
           nodeId: this.nodeId,
           nodeRole: this.nodeRole,
+          controlPlane: "legacy-node-host",
+          celldWorkerUrl: this.celldWorkerUrl,
           queuedTasks: this.scheduler.queueManager.totalQueued(),
           totalTasks: this.scheduler.allTasks.size,
           activeNodes: this.scheduler.nodes.size,

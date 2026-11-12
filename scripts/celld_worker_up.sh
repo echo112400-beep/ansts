@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Start the ANSTS scheduler service as a worker loaded by denoland/celld.
+# Start the unified ANSTS control plane as a worker loaded by denoland/celld.
 #
-# The celld process bundles and runs src/cloudflare/worker.ts. Scheduler rows live in the
-# AnstsSchedulerCell SQLite Durable Object, under the staged project's .celld/dev directory.
-# The Node gateway is a different process and is not started here.
+# The celld process bundles and runs src/cloudflare/worker.ts. Gateway dispatch, lease, and
+# session rows live in AnstsGatewayCell. Scheduler rows live in AnstsSchedulerCell. Both are
+# SQLite Durable Objects under the staged project's .celld/dev directory.
+# Body execution, LayerFS, and the dashboard stay in the Node host process.
 #
 #   bash scripts/celld_worker_up.sh
 #
