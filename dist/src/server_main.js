@@ -364,6 +364,7 @@ class AnstsLocalAndComposeServer {
 
     const bridge = new _server.DashboardBridgeService(this.scheduler, this.fleetController);
     this.dashboardServer = new _server.DashboardBackendServer(bridge, this.host);
+    this.dashboardServer.setDelegateHandler((req, res) => this.handleHttpRequest(req, res));
     this.facetSupervisor = new _celld_native_optimizations.DurableObjectFacetSupervisor();
     this.managementPlane = new _server.PlatformManagementPlaneEngine({
       nodeId: this.nodeId,
@@ -427,11 +428,24 @@ class AnstsLocalAndComposeServer {
           res.end(JSON.stringify({ error: msg }));
         });
       });
-      this.apiServer.on("error", reject);
-      this.apiServer.listen(targetApiPort, this.host, () => {
-        const addr = this.apiServer.address();
-        resolve(typeof addr === "object" && addr ? addr.port : targetApiPort);
-      });
+      const tryListen = (portToTry) => {
+        this.apiServer.once("error", (err) => {
+          if (err.code === "EADDRINUSE" && portToTry === 8080) {
+            tryListen(8089);
+            return;
+          }
+          if (err.code === "EADDRINUSE" && portToTry === 8089) {
+            tryListen(0);
+            return;
+          }
+          reject(err);
+        });
+        this.apiServer.listen(portToTry, this.host, () => {
+          const addr = this.apiServer.address();
+          resolve(typeof addr === "object" && addr ? addr.port : portToTry);
+        });
+      };
+      tryListen(targetApiPort);
     });
 
     const boundDashPort = await this.dashboardServer.listen(targetDashPort);
@@ -672,7 +686,19 @@ class AnstsLocalAndComposeServer {
   }
 
   async handleHttpRequest(req, res) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Last-Event-ID");
+    res.setHeader(
+    "Access-Control-Expose-Headers",
+    "Content-Type, X-Upstream-Gateway-Port, Retry-After, X-Ansts-Deduplicated");
+
     const method = req.method ?? "GET";
+    if (method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     const urlObj = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = urlObj.pathname;
 
@@ -2898,6 +2924,41 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M93] celld Dev Service Status & Console Live Backend Probe
+    if (method === "GET" && pathname === "/v1beta1/console/celld-dev-status") {
+      const statusPayload = this.managementPlane.buildCelldDevServiceStatus({
+        nodeRole: this.nodeRole,
+        peerBrainUrls: this.peerBrainUrls,
+        peerBodyUrls: this.peerBodyUrls,
+        s3Endpoint: this.s3Endpoint
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(statusPayload));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/celld/probe") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeCelldDevServiceProbe({
+        targetOrigin: body.targetOrigin ? String(body.targetOrigin) : undefined,
+        reconcileCells: Boolean(body.reconcileCells ?? true),
+        actor: auth.actor,
+        role: auth.role
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     if (method === "GET" && pathname === "/v1beta1/management/state") {
       if (this.managementPlane.getScenario() === "offline" && urlObj.searchParams.get("recover") !== "1") {
         res.writeHead(503, { "content-type": "application/json" });
@@ -4390,7 +4451,7 @@ class AnstsLocalAndComposeServer {
             "x-frame-options": "DENY",
             "referrer-policy": "strict-origin-when-cross-origin",
             "content-security-policy":
-            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:;"
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self' data:;"
           });
           res.end(fs.readFileSync(candidatePath, "utf-8"));
           return;

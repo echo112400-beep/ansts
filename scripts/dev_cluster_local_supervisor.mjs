@@ -33,9 +33,24 @@ const PEER_BODY_URLS = {
 const anstsNodes = [];
 const auxHttpServers = [];
 
+function applyCorsHeaders(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Last-Event-ID");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Type, X-Upstream-Gateway-Port, Retry-After, X-Ansts-Deduplicated");
+}
+
 function startAuxServer(port, handler, name) {
   return new Promise((resolve, reject) => {
-    const srv = http.createServer(handler);
+    const srv = http.createServer((req, res) => {
+      applyCorsHeaders(res);
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      handler(req, res);
+    });
     srv.on("error", reject);
     srv.listen(port, "127.0.0.1", () => {
       auxHttpServers.push({ name, port, server: srv });
@@ -155,15 +170,77 @@ async function bootAll() {
     8088,
     async (req, res) => {
       const urlPath = req.url ?? "/";
-      if (urlPath.startsWith("/v1/") || urlPath.startsWith("/v1beta1/") || urlPath.startsWith("/internal/v1beta1/")) {
+      const cleanPath = urlPath.split("?")[0];
+      const isApiOrProbeRoute =
+        urlPath.startsWith("/v1/") ||
+        urlPath.startsWith("/v1beta1/") ||
+        urlPath.startsWith("/internal/v1beta1/") ||
+        cleanPath === "/.well-known/celld/health" ||
+        cleanPath === "/healthz" ||
+        cleanPath === "/health" ||
+        cleanPath === "/readyz" ||
+        cleanPath === "/state" ||
+        cleanPath === "/metrics";
+
+      if (isApiOrProbeRoute) {
         const targetPort = gatewayUpstreamPorts[rrCounter++ % gatewayUpstreamPorts.length];
+        const forwardHeaders = {
+          "content-type": req.headers["content-type"] ?? "application/json",
+        };
+        if (req.headers["authorization"]) {
+          forwardHeaders["authorization"] = req.headers["authorization"];
+        }
+        if (req.headers["accept"]) {
+          forwardHeaders["accept"] = req.headers["accept"];
+        }
+        if (req.headers["last-event-id"]) {
+          forwardHeaders["last-event-id"] = req.headers["last-event-id"];
+        }
+
+        // Unbuffered SSE streaming proxy for /v1/events/stream and /v1beta1/management/events/stream
+        if (
+          cleanPath === "/v1/events/stream" ||
+          cleanPath === "/v1beta1/management/events/stream"
+        ) {
+          const proxyReq = http.request(
+            {
+              hostname: "127.0.0.1",
+              port: targetPort,
+              path: urlPath,
+              method: req.method ?? "GET",
+              headers: forwardHeaders,
+            },
+            (upstreamRes) => {
+              res.writeHead(upstreamRes.statusCode ?? 200, {
+                "content-type": upstreamRes.headers["content-type"] ?? "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache, no-transform",
+                "connection": "keep-alive",
+                "x-accel-buffering": "no",
+                "x-upstream-gateway-port": String(targetPort),
+              });
+              upstreamRes.pipe(res);
+            }
+          );
+          proxyReq.on("error", (err) => {
+            if (!res.headersSent) {
+              res.writeHead(502, { "content-type": "application/json" });
+            }
+            res.end(JSON.stringify({ error: "BAD_GATEWAY", message: err.message }));
+          });
+          req.on("close", () => {
+            proxyReq.destroy();
+          });
+          proxyReq.end();
+          return;
+        }
+
         try {
           const chunks = [];
           for await (const chunk of req) chunks.push(chunk);
           const bodyBuf = Buffer.concat(chunks);
           const upstreamResp = await fetch(`http://127.0.0.1:${targetPort}${urlPath}`, {
             method: req.method ?? "GET",
-            headers: { "content-type": req.headers["content-type"] ?? "application/json" },
+            headers: forwardHeaders,
             body: req.method !== "GET" && req.method !== "HEAD" ? bodyBuf : undefined,
           });
           const respText = await upstreamResp.text();
@@ -179,11 +256,10 @@ async function bootAll() {
         return;
       }
 
-      const cleanPath = urlPath.split("?")[0];
       const staticRoutes = {
         "/": { rel: "index.html", type: "text/html; charset=utf-8" },
         "/index.html": { rel: "index.html", type: "text/html; charset=utf-8" },
-        "/ansts_console_live.html": { rel: "ansts_console_live.html", type: "text/html; charset=utf-8" },
+        "/ansts_console_live.html": { rel: "index.html", type: "text/html; charset=utf-8" },
         "/ansts_console_management.html": { rel: "ansts_console_management.html", type: "text/html; charset=utf-8" },
         "/management": { rel: "ansts_console_management.html", type: "text/html; charset=utf-8" },
         "/console-management/prototype.css": { rel: "console-management/prototype.css", type: "text/css; charset=utf-8" },
@@ -193,7 +269,14 @@ async function bootAll() {
       const entry = staticRoutes[cleanPath] || staticRoutes["/"];
       const filePath = path.join(ROOT_DIR, "docs", entry.rel);
       if (fs.existsSync(filePath)) {
-        res.writeHead(200, { "content-type": entry.type });
+        res.writeHead(200, {
+          "content-type": entry.type,
+          "x-content-type-options": "nosniff",
+          "x-frame-options": "DENY",
+          "referrer-policy": "strict-origin-when-cross-origin",
+          "content-security-policy":
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self' data:;",
+        });
         res.end(fs.readFileSync(filePath, "utf-8"));
         return;
       }

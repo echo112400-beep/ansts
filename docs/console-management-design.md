@@ -25,3 +25,11 @@ ANSTS v2.5 采用 **控制面 (`denoland/celld` v0.6.3 Durable Object Actor) + �
 - **Unix Socket Vsock 守护进程、`eBPF` LSM 与 Ed25519 `SLSA` 证明**：`POST /v1beta1/management/security/kernel-attestation`
 - **网络分区脑裂演练、宿主机 Preflight 与 `Topology CAS`**：`POST /v1beta1/management/chaos/drill`
 - **双归属反向隧道切换、多地域联邦路由与 `Harness` 迁移自愈**：`POST /v1beta1/management/federation/tunnel-harness`
+
+## M93: celld 开发服务真实启动与 Console 后端对接工作台 (Live celld Dev Cluster & BFF Wiring)
+- **后端与代理层优化**:
+  - `AnstsLocalAndComposeServer` (`src/server_main.ts`) 与 `DashboardBackendServer` (`src/dashboard/server.ts`) 全量开启 CORS (`Access-Control-Allow-Origin: *`) 与 `OPTIONS` (`204 No Content`) 预检支持，`dashboardPort` (`:8090`) 完整委托代理 Console 静态页面、`/v1beta1/*` BFF 与 `/.well-known/celld/health`、`/state`、`/metrics`，且当默认 `8080` 端口被宿主机占用时自动无感回退至 `:8089`。
+  - `scripts/dev_cluster_local_supervisor.mjs` (`:8088` TanStack Console 反向代理) 与 `deploy/dev-cluster/nginx-tanstack-console.conf` 完整透传 `Authorization: Bearer <jwt>`、`Accept`、`Last-Event-ID` 请求头，支持 `/v1/events/stream` 与 `/v1beta1/management/events/stream?live=1` 无缓冲实时流式转发 (`http.request` pipe)，并代理 `/.well-known/celld/health`、`/state`、`/metrics`。
+  - 新增 `GET /v1beta1/console/celld-dev-status`、`POST /v1beta1/management/celld/probe` 及 CLI `anstsctl mgmt-celld-status`、`anstsctl mgmt-celld-probe`，执行 6 项核心子系统探活核验 (`CELLD_WELL_KNOWN_HEALTH`、`CELLD_NATIVE_LOAD_STATE`、`CELLD_DURABLE_SQLITE_RPO0`、`CELLD_DO_CELL_PLACEMENT`、`CONSOLE_BFF_CORS_AND_JWT_GUARD`、`LIVE_SSE_AND_LAYERFS_ENGINE`)。
+- **Console 前端对接优化**:
+  - `getBackendOrigin()` 与 `callBackendApi()` 支持 `?backend=` 参数、顶栏「🔌 后端对接与 celld 探活」对话框动态切换及本地开发集群候选端点 (`:8088`、`:18080`、`:18081`、`:8089`、`:8090`) 自动探活绑定（严格校验 HTTP 2xx 响应，离线时保持 503 零伪造状态）。

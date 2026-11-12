@@ -694,6 +694,23 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-celld-status") {
+    const resp = await fetch(`${baseUrl}/v1beta1/console/celld-dev-status`);
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-celld-probe") {
+    const targetOrigin = rest[0] ? rest[0].trim() : baseUrl;
+    const resp = await fetch(`${baseUrl}/v1beta1/management/celld/probe`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ targetOrigin, reconcileCells: true, actor: "cli-admin", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-approvals-saga") {
     const resp = await fetch(`${baseUrl}/v1beta1/console/approvals/saga`);
     const data = await resp.json();

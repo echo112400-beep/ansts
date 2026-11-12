@@ -32,32 +32,72 @@ else
 fi
 
 echo "===> [2/4] Waiting for Gateway-01 (:18080) & TanStack Console (:8088) to become healthy..."
-for i in $(seq 1 30); do
-  if curl -fsS http://127.0.0.1:18080/health >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8088/ >/dev/null 2>&1; then
-    echo "   [OK] Gateway-01 (:18080), Gateway-02 (:18081), Brains (:18082..18084), Bodies (:19501..19502) & TanStack Console (:8088) are online!"
-    break
-  fi
-  sleep 1
-done
+env -u NODE_PATH node -e '
+(async () => {
+  for (let i = 0; i < 30; i++) {
+    try {
+      const r1 = await fetch("http://127.0.0.1:18080/.well-known/celld/health");
+      const r2 = await fetch("http://127.0.0.1:8088/.well-known/celld/health");
+      if (r1.ok && r2.ok) {
+        console.log("   [OK] Gateway-01 (:18080), Gateway-02 (:18081), Brains (:18082..18084), Bodies (:19501..19502) & TanStack Console (:8088) are online!");
+        process.exit(0);
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  console.error("Timed out waiting for dev-cluster health");
+  process.exit(1);
+})();
+'
 
 echo "===> [3/4] Registering Dual-Homed Reverse Tunnels & Dispatching Distributed Smoke Task..."
-curl -fsS -X POST http://127.0.0.1:18080/internal/v1beta1/tunnel/register \
-  -H "Content-Type: application/json" \
-  -d '{"hostId":"body-host-01","gatewayId":"celld-gw-01","role":"PRIMARY","connGeneration":1,"epoch":1}' | sed 's/^/   [Tunnel Primary] /'
-echo ""
+env -u NODE_PATH node -e '
+(async () => {
+  const t1 = await (await fetch("http://127.0.0.1:18080/internal/v1beta1/tunnel/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hostId: "body-host-01", gatewayId: "celld-gw-01", role: "PRIMARY", connGeneration: 1, epoch: 1 }),
+  })).json();
+  console.log("   [Tunnel Primary]", JSON.stringify(t1));
 
-curl -fsS -X POST http://127.0.0.1:18081/internal/v1beta1/tunnel/register \
-  -H "Content-Type: application/json" \
-  -d '{"hostId":"body-host-01","gatewayId":"celld-gw-02","role":"SECONDARY","connGeneration":1,"epoch":1}' | sed 's/^/   [Tunnel Secondary] /'
-echo ""
+  const t2 = await (await fetch("http://127.0.0.1:18081/internal/v1beta1/tunnel/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hostId: "body-host-01", gatewayId: "celld-gw-02", role: "SECONDARY", connGeneration: 1, epoch: 1 }),
+  })).json();
+  console.log("   [Tunnel Secondary]", JSON.stringify(t2));
 
-curl -fsS -X POST http://127.0.0.1:18080/v1beta1/tasks/dispatch \
-  -H "Content-Type: application/json" \
-  -d '{"tenantId":"tenant-alpha","taskId":"task-distributed-001","repoId":"ansts-monorepo","promptText":"verify distributed celld dispatch","targetBodyHostId":"body-host-01"}' | sed 's/^/   [Dispatch Result] /'
-echo ""
+  const disp = await (await fetch("http://127.0.0.1:18080/v1beta1/tasks/dispatch", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      tenantId: "tenant-alpha",
+      taskId: "task-distributed-001",
+      repoId: "ansts-monorepo",
+      promptText: "verify distributed celld dispatch",
+      targetBodyHostId: "body-host-01",
+    }),
+  })).json();
+  console.log("   [Dispatch Result]", JSON.stringify(disp));
+})();
+'
 
-echo "===> [4/4] Verifying TanStack Console BFF Endpoints & Prometheus Metrics..."
-curl -fsS "http://127.0.0.1:8088/v1beta1/console/overview?region=us-west-2" | sed 's/^/   [TanStack Console Overview] /'
-echo ""
-curl -fsS "http://127.0.0.1:8088/v1beta1/console/shards" | sed 's/^/   [TanStack Shard Matrix] /'
-echo ""
+echo "===> [4/4] Verifying TanStack Console BFF (:8088), Authenticated celld Probe & Native /state..."
+env -u NODE_PATH node -e '
+const { ConsoleRbacAuthGuard } = require("./dist/src/dashboard/console_rbac_guard.js");
+(async () => {
+  const token = new ConsoleRbacAuthGuard().issuePrincipalToken("chen");
+  const probe = await (await fetch("http://127.0.0.1:8088/v1beta1/management/celld/probe", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ targetOrigin: "http://127.0.0.1:8088", reconcileCells: true }),
+  })).json();
+  console.log("   [TanStack Console :8088 Authenticated celld Probe]", JSON.stringify({
+    probeId: probe.probeId,
+    allHealthy: probe.allHealthy,
+    passedCount: probe.passedCount,
+    totalCount: probe.totalCount,
+    nodeId: probe.nodeId,
+  }));
+})();
+'
