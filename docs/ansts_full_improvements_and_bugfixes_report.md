@@ -325,7 +325,7 @@
   - **问题**: 当等待图中同时存在多个不相交或嵌套死锁环（如 `A <-> B` 与 `C <-> D`）时，`resolveCycleWithLowestPriorityVictim` 仅剔除首个环的受害者即返回，导致其余死锁环仍处于未解开状态（`resolved: false`）。
   - **整改**: 升级为有界迭代式解环循环，逐轮定位当前环中优先级最低的受害者并剥离其等待边，直至全图死锁环 100% 消除，同时返回完整的 `evictedVictims` 列表。
 - **[M63-5] DFX-Security & Cost Accuracy: `ConfidentialTeeAttestationBridge` 外部验签防篡改、`ZeroTrustSandboxSecurityGuard` IPv6-IMDS/块设备防护与 `ModelPoolClientAdapter` 成本钳制** (`src/runtime/confidential_tee_bridge.ts`, `src/runtime/zero_trust_security_guard.ts`, `src/router/pool_client.ts`):
-  - **问题**: TEE 证明生成未严格校验十六进制度量摘要格式且缺少外部 Quote 防篡改校验函数；零信任命令守卫未拦截 IPv4 映射 IPv6 云元数据地址 `::ffff:169.254.169.254`、ECS 元数据 `169.254.170.2`、`mkfs.*`、`dd of=/dev/*` 及空字节 ` ` 注入；`ModelPoolClientAdapter` 在 `prefixCacheMatchedRatio > 1.0` 时算出负数 `uncachedTokens` 导致计费失真。
+  - **问题**: TEE 证明生成未严格校验十六进制度量摘要格式且缺少外部 Quote 防篡改校验函数；零信任命令守卫未拦截 IPv4 映射 IPv6 云元数据地址 `::ffff:169.254.169.254`、ECS 元数据 `169.254.170.2`、`mkfs.*`、`dd of=/dev/*` 及空字节 `` 注入；`ModelPoolClientAdapter` 在 `prefixCacheMatchedRatio > 1.0` 时算出负数 `uncachedTokens` 导致计费失真。
   - **整改**: 增加严格十六进制格式检查与 `verifyExternalAttestationQuote`；在零信任守卫中拦截 IPv6/ECS IMDS、块设备格式化覆盖与空字节注入；在模型池客户端中将 `prefixCacheMatchedRatio` 严格钳制在 `[0, 1]` 并保证 `uncachedTokens >= 0` 与 `costUsd >= 0`。
 
 ---
@@ -650,3 +650,21 @@
    - 实时聚合全集群任务在 `QUEUED`、`LEASED`、`RUNNING_ACT`、`CANCEL_UNCONFIRMED`、`FENCED_TERMINATED`、`COMPLETED`、`DEAD_LETTER` 等各状态的分布以及 `celld /state` 的 `owned_cells`、`resident_cells`、`capacity_waiting`、`restoring`、`pressured` 与 `isolates` 实时指标。
    - 全量通过 **72 个测试套件（205 项端到端测试）** (`tests/m79_console_cluster_health_state_and_queue_visualizer.test.ts`)。
 
+
+
+---
+
+## 30. M80: TanStack Console 配置管理中心与深度运行面可视套件 (`GET /v1beta1/console/configs`, `GET /v1beta1/console/runtime`, `POST /v1beta1/management/runtime/layerfs-branch`, `anstsctl mgmt-runtime`)
+
+1. **版本化动态配置中心可视与在线 CAS 热更新 (`buildConfigVisualization` & `GET /v1beta1/console/configs` & `POST /v1beta1/management/config/center`)**：
+   - 在 `PlatformManagementPlaneEngine.buildConfigVisualization()` 中直接从 SQLite `v25_mgmt_config_revisions` 读取当前生效版本 (`activeRevision`)、SHA-256 校验和、完整修订历史链 (`revisions`，含各版本完整 JSON 快照) 以及 11 项核心配置 Schema 契约 (`schemaRules`)。
+   - 强化 `validate_and_apply_config` 的 Schema 边界校验（非法负数/越界参数返回 `400 CONFIG_SCHEMA_INVALID`）与乐观锁 CAS 校验（过期 `expectedRevision` 返回 `409 CONFIG_CAS_CONFLICT`），支持热重载至 `HotCellOverloadAndQueueGuard` 与 `FleetReplicatedDurabilityEngine`，并支持一键原子回滚 (`rollback_revision`)。
+   - 动态同步 `config_diff_preview` 的基线配置，彻底消除静态配置常量。
+2. **深度运行面可视与 LayerFS CoW 分支交互工作台 (`buildRuntimeVisualization` & `GET /v1beta1/console/runtime` & `POST /v1beta1/management/runtime/layerfs-branch`)**：
+   - 实时聚合 `layerfsBranches`（分支名、HEAD Commit、Agent/Step 溯源、挂载耗时、工作区文件树与字节数）、`layerfsStorage`（CAS 对象数与压缩节省比例）、`sandboxAndCgroup`（`WarmSandboxPoolManager` 热池与 `THINK 0.25c / ACT 4.0c` Cgroup v2 配额）、`celldRuntime`（`DurableObjectFacetSupervisor` 活跃 Facets 与 `TopologyCasCoordinator`）、`cognitiveRouterEndpoints`（端点 TTFT EWMA、三态熔断器与 RPM/TPM 余量）及 `zeroTrustSecurity`（SPIFFE mTLS CA、AMD SEV-SNP TEE 与 eBPF LSM 状态）。
+   - 新增 `POST /v1beta1/management/runtime/layerfs-branch` 与 CLI `anstsctl mgmt-runtime`，支持在线零拷贝派生分支 (`fork_branch`)、写入文件快照 (`commit_file`)、回滚分支 (`rollback_branch`) 及删除非主干分支并触发 B-Tree 不可达节点 GC (`delete_branch`，保护 `main` 分支返回 `400 CANNOT_DELETE_MAIN_BRANCH`）。
+3. **TanStack Console 独立导航与交互面板 (`docs/console-management/prototype.js` & `docs/index.html`)**：
+   - 新增独立 **`configs` (`配置中心与版本治理`)** 导航页签 (`renderConfigsSection()`)，内置 4 张配置核心指标卡、11 项 Schema 契约实时对照表、在线 CAS 配置编辑弹窗 (`open-config-editor-dialog`)、JSON Diff 对比预览、历史版本 JSON 查看器及逐行“一键回滚至此版本”按钮。
+   - 升级 **`runtime` (`分布式运行面与 LayerFS 可视`)** 视图 (`renderRuntimeSection()`)，新增运行面 4 张 KPI 指标卡、LayerFS CoW 分支树交互工作台（支持派生分支、写入文件快照、查看行级 Blame 溯源与删除分支）以及 Cgroup v2 双相配额 / DO Facets / 认知路由端点池可视表。
+4. **端到端回归验证 (`tests/m80_console_config_management_and_runtime_visualization.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**73 个测试套件（共 207 项测试）100% 通过**。

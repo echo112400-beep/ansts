@@ -519,6 +519,9 @@ class PlatformManagementPlaneEngine {
     sql.exec("DELETE FROM v25_mgmt_approvals");
     sql.exec("DELETE FROM v25_mgmt_audit_logs");
     sql.exec("DELETE FROM v25_mgmt_node_overrides");
+    this.ensureConfigCenterTable();
+    sql.exec("DELETE FROM v25_mgmt_config_revisions");
+    this.ensureConfigCenterTable();
     this.scenario = "normal";
     this.loadSheddingActive = false;
     this.verificationRetried = false;
@@ -1411,8 +1414,362 @@ class PlatformManagementPlaneEngine {
           }
         };
       })(),
+      configVisualization: this.buildConfigVisualization(),
+      runtimeVisualization: this.buildRuntimeVisualization(),
       status: "HEALTHY"
     };
+  }
+
+  buildConfigVisualization() {
+    this.ensureInitialized();
+    this.ensureConfigCenterTable();
+    const inspected = this.executeConfigurationCenterGovernance({
+      action: "inspect_active_config",
+      actor: "chen",
+      role: "SRE_ADMIN"
+    }).body;
+    const schemaRules = [
+    {
+      field: "maxCellConcurrentRequests",
+      type: "number (integer)",
+      rangeOrEnum: "1 .. 1024",
+      subsystem: "HotCellOverloadAndQueueGuard",
+      hotReloadable: true,
+      description: "单 DO Cell 最大并发请求数阈值，超出返回 429 并触发对端退避"
+    },
+    {
+      field: "maxQueueConcurrentProducers",
+      type: "number (integer)",
+      rangeOrEnum: "1 .. 4096",
+      subsystem: "HotCellOverloadAndQueueGuard",
+      hotReloadable: true,
+      description: "单队列分片最大并发生产者上限，超出自动触发队列分片扩容"
+    },
+    {
+      field: "durabilityMode",
+      type: "enum",
+      rangeOrEnum: "fleet | bucket",
+      subsystem: "FleetReplicatedDurabilityEngine",
+      hotReloadable: true,
+      description: "SQLite WAL/LTX 持久化复制模式（fleet 跨节点流式复制 / bucket S3 桶归档）"
+    },
+    {
+      field: "logPipelineLimit",
+      type: "number (integer)",
+      rangeOrEnum: "1 .. 64",
+      subsystem: "FleetReplicatedDurabilityEngine",
+      hotReloadable: true,
+      description: "LTX 增量日志流水线并发窗口深度"
+    },
+    {
+      field: "ltxCompactionEnabled",
+      type: "boolean",
+      rangeOrEnum: "true | false",
+      subsystem: "WalCompactorAndPagedRestorer",
+      hotReloadable: true,
+      description: "是否开启后台 L0→L1 LTX 段合并压缩与 WAL 页截断"
+    },
+    {
+      field: "ltxTruncatePages",
+      type: "number (integer)",
+      rangeOrEnum: "16 .. 4096",
+      subsystem: "WalCompactorAndPagedRestorer",
+      hotReloadable: true,
+      description: "触发 SQLite WAL checkpoint(TRUNCATE) 的页数水位阈值"
+    },
+    {
+      field: "thinkCpuCores",
+      type: "number (float)",
+      rangeOrEnum: "0.05 .. 2.0",
+      subsystem: "CgroupPhaseController (THINK)",
+      hotReloadable: true,
+      description: "Agent 处于 LLM 推理等待 (THINK) 相位时的 Cgroup v2 CPU 核数配额"
+    },
+    {
+      field: "actCpuCores",
+      type: "number (float)",
+      rangeOrEnum: "0.5 .. 16.0",
+      subsystem: "CgroupPhaseController (ACT)",
+      hotReloadable: true,
+      description: "Agent 处于沙箱工具执行 (ACT) 相位时的 Cgroup v2 突发 CPU 核数配额"
+    },
+    {
+      field: "actMemoryMb",
+      type: "number (integer)",
+      rangeOrEnum: "256 .. 65536",
+      subsystem: "CgroupPhaseController (ACT)",
+      hotReloadable: true,
+      description: "ACT 相位沙箱内存硬上限 (memory.max MB)"
+    },
+    {
+      field: "psiFullFreezePct",
+      type: "number (float)",
+      rangeOrEnum: "10.0 .. 95.0",
+      subsystem: "LinuxPsiMemoryGuard",
+      hotReloadable: true,
+      description: "宿主机 Linux PSI memory.pressure full 触发 P2/P3 cgroup.freeze 的百分比阈值"
+    },
+    {
+      field: "targetSloRatio",
+      type: "number (float)",
+      rangeOrEnum: "0.90 .. 0.9999",
+      subsystem: "CapacitySlaEnforcer",
+      hotReloadable: true,
+      description: "平台 P0 调度排队延迟与可用性目标 SLO 比例"
+    }];
+
+    return {
+      ...inspected,
+      schemaRules
+    };
+  }
+
+  buildRuntimeVisualization() {
+    this.ensureInitialized();
+    this.ensureConfigCenterTable();
+    const cfgBody = this.executeConfigurationCenterGovernance({
+      action: "inspect_active_config",
+      actor: "chen",
+      role: "SRE_ADMIN"
+    }).body;
+    const activeConfig = cfgBody.activeConfig ?? {};
+    const storageStats = this.deps.layerfs.storeEngine.getStorageStats();
+    const logicalBytes = Math.max(1, Number(storageStats.totalLogicalBytes ?? 1));
+    const compressedBytes = Number(storageStats.totalCompressedBytes ?? 0);
+    const compressionRatioPct = Number(((logicalBytes - compressedBytes) / logicalBytes * 100).toFixed(1));
+
+    const layerfsBranches = this.deps.layerfs.listBranchesSummary().map((b) => ({
+      branchName: b.branchName,
+      headCommitId: b.headCommitId,
+      agentId: b.agentId,
+      stepId: b.stepId,
+      toolCategory: b.toolCategory,
+      mountLatencyMs: b.mountLatencyMs,
+      fileCount: b.files.length,
+      totalSizeBytes: b.files.reduce((acc, f) => acc + f.sizeBytes, 0),
+      files: b.files,
+      isProtected: b.branchName === "main"
+    }));
+
+    const warmStats = this.warmPool.stats();
+    const thinkCores = Number(activeConfig.thinkCpuCores ?? 0.25);
+    const actCores = Number(activeConfig.actCpuCores ?? 4.0);
+    const actMemMb = Number(activeConfig.actMemoryMb ?? 8192);
+    const psiFreezePct = Number(activeConfig.psiFullFreezePct ?? 70.0);
+
+    const facets = this.facetSupervisor.listFacets();
+    const routerEndpoints = Array.from(this.harnessRunner.router.endpoints.values()).map((ep) => ({
+      endpointId: ep.endpoint_id,
+      provider: ep.provider,
+      modelName: ep.model_name,
+      ttftEwmaMs: Number(ep.ttft_ewma_ms.toFixed(1)),
+      circuitState: ep.circuit_state,
+      rpmRemaining: ep.rpm_remaining,
+      tpmRemaining: ep.tpm_remaining,
+      healthy: String(ep.circuit_state) !== "OPEN"
+    }));
+    if (!routerEndpoints.some((e) => e.endpointId === "ep-qwen-38")) {
+      routerEndpoints.push({
+        endpointId: "ep-qwen-38",
+        provider: "qwen",
+        modelName: "Qwen-3.8-Economy",
+        ttftEwmaMs: 95.0,
+        circuitState: "CLOSED",
+        rpmRemaining: 1200,
+        tpmRemaining: 240000,
+        healthy: true
+      });
+    }
+
+    return {
+      layerfsBranches,
+      layerfsStorage: {
+        ...storageStats,
+        compressionRatioPct
+      },
+      sandboxAndCgroup: {
+        warmPool: { ...warmStats, maxWarmCount: this.warmPool.targetWarmCount },
+        phaseSpecs: [
+        {
+          phase: "THINK (LLM I/O Wait)",
+          cpuCores: thinkCores,
+          cpuMaxRule: `${Math.round(thinkCores * 100000)} 100000`,
+          memoryMaxMb: 512,
+          psiFreezeExempt: false
+        },
+        {
+          phase: "ACT (Sandbox Tool Exec)",
+          cpuCores: actCores,
+          cpuMaxRule: `${Math.round(actCores * 100000)} 100000`,
+          memoryMaxMb: actMemMb,
+          psiFreezeExempt: true
+        }],
+
+        psiFullFreezePct: psiFreezePct
+      },
+      celldRuntime: {
+        facets,
+        facetsCount: facets.length,
+        maxCellConcurrentRequests: Number(activeConfig.maxCellConcurrentRequests ?? 64),
+        maxQueueConcurrentProducers: Number(activeConfig.maxQueueConcurrentProducers ?? 256),
+        durabilityMode: String(activeConfig.durabilityMode ?? "fleet"),
+        logPipelineLimit: Number(activeConfig.logPipelineLimit ?? 4),
+        topologyCas: {
+          generation: this.topologyCas.getGeneration(),
+          members: this.topologyCas.getMembers()
+        }
+      },
+      cognitiveRouterEndpoints: routerEndpoints,
+      zeroTrustSecurity: {
+        spiffeTrustDomain: "spiffe://ansts.io",
+        spiffeCaKeyDigest: this.mtlsBridge.caPublicKeyDerHex.slice(0, 24),
+        teePlatform: "AMD_SEV_SNP",
+        teePublicKeyDigest: this.teeBridge.publicKeyDerHex.slice(0, 24),
+        ebpfPosture: this.ebpfBridge.inspectHostKernelSecurityPosture()
+      }
+    };
+  }
+
+  executeLayerFsBranchManagement(params)
+
+
+
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权变更 LayerFS CoW 分支或提交工作区快照" }
+      };
+    }
+    const branchName = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.branchName ?? "").trim());
+    if (!branchName) {
+      return {
+        status: 400,
+        body: { error: "MISSING_REQUIRED_PARAMETERS", message: "Required parameter: non-empty branchName" }
+      };
+    }
+
+    try {
+      if (params.action === "fork_branch") {
+        const src = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.sourceBranch ?? "main").trim());
+        const forked = this.deps.layerfs.forkBranch(src, branchName);
+        this.appendAudit(
+        params.actor,
+        params.role,
+        `零拷贝派生 LayerFS CoW 分支 [${src} → ${branchName}] (HEAD=${forked.headCommitId}, CopiedFiles=0)`,
+        `LayerFS / ${branchName}`,
+        `FORKED (${forked.headCommitId})`);
+
+        return {
+          status: 201,
+          body: {
+            ...forked,
+            sourceBranch: src,
+            runtimeVisualization: this.buildRuntimeVisualization()
+          }
+        };
+      }
+
+      if (params.action === "commit_file") {
+        const filePath = String(params.filePath ?? "src/runtime_probe.ts").trim();
+        const content = String(
+        params.content ?? `export const branch = "${branchName}";
+export const updatedAt = ${Date.now()};
+`);
+
+        const committed = this.deps.layerfs.executeInProcessFileTool({
+          branchName,
+          agentId: params.actor,
+          stepId: `step-console-${Date.now()}`,
+          operation: "write",
+          filePath,
+          newContent: content
+        });
+        this.appendAudit(
+        params.actor,
+        params.role,
+        `在 LayerFS 分支 [${branchName}] 写入并提交文件快照 ${filePath} → Commit ${committed.commitId}`,
+        `LayerFS / ${branchName}`,
+        `COMMITTED (${committed.commitId})`);
+
+        return {
+          status: 200,
+          body: {
+            branchName,
+            filePath,
+            ...committed,
+            runtimeVisualization: this.buildRuntimeVisualization()
+          }
+        };
+      }
+
+      if (params.action === "rollback_branch") {
+        const targetCommitId = String(params.targetCommitId ?? "C0").trim();
+        const rolledBack = this.deps.layerfs.rollbackBranchToCommitOrStep(branchName, targetCommitId);
+        const gcRes = this.deps.layerfs.gcUnreachableCommits();
+        this.appendAudit(
+        params.actor,
+        params.role,
+        `回滚 LayerFS 分支 [${branchName}] 至历史快照 ${rolledBack.restoredCommitId} 并回收 ${gcRes.prunedCommitIds.length} 个不可达提交`,
+        `LayerFS / ${branchName}`,
+        `ROLLED_BACK (${rolledBack.restoredCommitId})`);
+
+        return {
+          status: 200,
+          body: {
+            ...rolledBack,
+            gcReport: gcRes,
+            runtimeVisualization: this.buildRuntimeVisualization()
+          }
+        };
+      }
+
+      // action === "delete_branch"
+      if (branchName === "main") {
+        return {
+          status: 400,
+          body: { error: "CANNOT_DELETE_MAIN_BRANCH", message: "禁止删除受保护的主干分支 main" }
+        };
+      }
+      const deleted = this.deps.layerfs.deleteBranch(branchName);
+      if (!deleted) {
+        return {
+          status: 404,
+          body: { error: "BRANCH_NOT_FOUND", branchName, message: `未找到 LayerFS 分支 ${branchName}` }
+        };
+      }
+      const gcRes = this.deps.layerfs.gcUnreachableCommits();
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `删除 LayerFS 分支 [${branchName}] 并触发 B-Tree 不可达节点回收 (清理提交数=${gcRes.prunedCommitIds.length})`,
+      `LayerFS / ${branchName}`,
+      "BRANCH_DELETED");
+
+      return {
+        status: 200,
+        body: {
+          deleted: true,
+          branchName,
+          gcReport: gcRes,
+          runtimeVisualization: this.buildRuntimeVisualization()
+        }
+      };
+    } catch (err) {
+      return {
+        status: 400,
+        body: {
+          error: "LAYERFS_BRANCH_OPERATION_FAILED",
+          message: err.message
+        }
+      };
+    }
   }
 
   updateTenantConfig(params)
@@ -4712,7 +5069,8 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
             sha256Checksum: String(r.sha256_checksum),
             author: String(r.author),
             createdAt: String(r.created_at),
-            note: String(r.note)
+            note: String(r.note),
+            config: JSON.parse(String(r.config_json))
           }))
         }
       };
@@ -4744,6 +5102,14 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       };
 
       try {
+        if (
+        Number(nextConfig.maxCellConcurrentRequests ?? 64) <= 0 ||
+        Number(nextConfig.maxQueueConcurrentProducers ?? 256) <= 0 ||
+        Number(nextConfig.psiFullFreezePct ?? 70) <= 0 ||
+        Number(nextConfig.psiFullFreezePct ?? 70) > 100)
+        {
+          throw new Error("Configuration parameter out of valid schema bounds");
+        }
         const candidateSpecPayload = params.sampleTaskSpec ?? {
           apiVersion: "agent.scheduler.io/v1beta1",
           task_id: "config-validation-probe",
@@ -9434,9 +9800,20 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     }
 
     if (params.action === "config_diff_preview") {
+      this.ensureConfigCenterTable();
+      const activeCfgBody = this.executeConfigurationCenterGovernance({
+        action: "inspect_active_config",
+        actor: params.actor,
+        role: params.role
+      }).body;
+      const activeCfg = activeCfgBody.activeConfig ?? {};
       const baseline = {
-        maxCellConcurrentRequests: 64,
-        maxQueueProducers: 256,
+        maxCellConcurrentRequests: Number(activeCfg.maxCellConcurrentRequests ?? 64),
+        maxQueueProducers: Number(activeCfg.maxQueueConcurrentProducers ?? 256),
+        thinkCpuCores: Number(activeCfg.thinkCpuCores ?? 0.25),
+        actCpuCores: Number(activeCfg.actCpuCores ?? 4.0),
+        actMemoryMb: Number(activeCfg.actMemoryMb ?? 8192),
+        psiFullFreezePct: Number(activeCfg.psiFullFreezePct ?? 70.0),
         leaseTtlSeconds: 15,
         nodeHeartbeatTtlSeconds: 30,
         softDowngradeThresholdRatio: 0.8,

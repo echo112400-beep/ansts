@@ -694,7 +694,30 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
-        if (cmd === "mgmt-queues") {
+  if (cmd === "mgmt-runtime") {
+    const action = (rest[0] ?? "inspect").trim();
+    if (action === "inspect") {
+      const resp = await fetch(`${baseUrl}/v1beta1/console/runtime`);
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    const branchName = (rest[1] ?? "feat-runtime-branch").trim();
+    const resp = await fetch(`${baseUrl}/v1beta1/management/runtime/layerfs-branch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action,
+        branchName,
+        sourceBranch: rest[2] ? rest[2].trim() : "main",
+        actor: "chen",
+        role: "SRE_ADMIN",
+      }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-queues") {
     const action = rest[0] ?? "inspect";
     if (action.trim() === "inspect") {
       const resp = await fetch(`${baseUrl}/v1beta1/console/queues`);

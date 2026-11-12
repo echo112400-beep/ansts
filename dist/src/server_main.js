@@ -2416,6 +2416,51 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M80] TanStack Console BFF: Configuration Management Center & Revision History (`GET /v1beta1/console/configs`)
+    if (method === "GET" && pathname === "/v1beta1/console/configs") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildConfigVisualization()));
+      return;
+    }
+
+    // [M80] TanStack Console BFF: Deep Runtime Visualization (`GET /v1beta1/console/runtime`)
+    if (method === "GET" && pathname === "/v1beta1/console/runtime") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildRuntimeVisualization()));
+      return;
+    }
+
+    // [M80] LayerFS CoW Branch Interactive Management (`POST /v1beta1/management/runtime/layerfs-branch`)
+    if (method === "POST" && pathname === "/v1beta1/management/runtime/layerfs-branch") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeLayerFsBranchManagement({
+        action: body.action ?? "fork_branch",
+
+
+
+
+        branchName: String(body.branchName ?? ""),
+        sourceBranch: body.sourceBranch ? String(body.sourceBranch) : undefined,
+        filePath: body.filePath ? String(body.filePath) : undefined,
+        content: body.content !== undefined ? String(body.content) : undefined,
+        targetCommitId: body.targetCommitId ? String(body.targetCommitId) : undefined,
+        actor: auth.actor,
+        role: auth.role
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M79] Management Plane Interactive Queue Workbench (`POST /v1beta1/management/queues/action`)
     if (method === "POST" && pathname === "/v1beta1/management/queues/action") {
       const body = await this.readJsonBody(req);
@@ -3292,6 +3337,12 @@ class AnstsLocalAndComposeServer {
         return;
       }
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
       const result = this.managementPlane.executeConfigurationCenterGovernance({
         action: body.action ?? "validate_and_apply_config",
 
@@ -3302,8 +3353,8 @@ class AnstsLocalAndComposeServer {
         runtimeOverrides: body.runtimeOverrides ? body.runtimeOverrides : undefined,
         sampleTaskSpec: body.sampleTaskSpec ? body.sampleTaskSpec : undefined,
         note: body.note ? String(body.note) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN")
+        actor: auth.actor,
+        role: auth.role
       });
       if (result.status < 400) {
         await this.managementPlane.pushManagementStateToS3();

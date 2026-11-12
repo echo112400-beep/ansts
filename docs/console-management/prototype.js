@@ -99,7 +99,8 @@
     { id: 'tenants', label: '租户配额与 FinOps 治理', badgeKey: 'tenants' },
     { id: 'tasks', label: '任务运行与回合诊断', badgeKey: 'tasks' },
     { id: 'approvals', label: '高危审批与变更审计', badgeKey: 'approvals' },
-    { id: 'runtime', label: '分布式运行面与 LayerFS 编排', badgeKey: 'runtime' }
+    { id: 'configs', label: '配置中心与版本治理', badgeKey: 'configs' },
+    { id: 'runtime', label: '分布式运行面与 LayerFS 可视', badgeKey: 'runtime' }
   ];
 
   function createBaselineState() {
@@ -141,6 +142,8 @@
       queueVisualization: null,
       healthMatrix: null,
       stateVisualization: null,
+      configVisualization: null,
+      runtimeVisualization: null,
       allTenantIds: [],
       regions: [],
       nodes: [],
@@ -255,6 +258,8 @@
       if (d.queueVisualization) state.queueVisualization = d.queueVisualization;
       if (d.healthMatrix) state.healthMatrix = d.healthMatrix;
       if (d.stateVisualization) state.stateVisualization = d.stateVisualization;
+      if (d.configVisualization) state.configVisualization = d.configVisualization;
+      if (d.runtimeVisualization) state.runtimeVisualization = d.runtimeVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -380,7 +385,12 @@
       const pending = state.approvals.filter((a) => a.status.startsWith('PENDING')).length;
       return { text: `${pending} 待审`, cls: pending > 0 ? 'warn' : '' };
     }
-    return { text: '256 槽', cls: '' };
+    if (key === 'configs') {
+      const rev = state.configVisualization?.activeRevision ?? 1;
+      return { text: `Rev #${rev}`, cls: rev > 1 ? 'ok' : '' };
+    }
+    const brCount = state.runtimeVisualization?.layerfsBranches?.length ?? 4;
+    return { text: `${brCount} 分支`, cls: '' };
   }
 
   function renderNavigation() {
@@ -1110,6 +1120,147 @@
     `;
   }
 
+  function renderConfigsSection() {
+    const cv = state.configVisualization || {
+      activeRevision: 1,
+      sha256Checksum: '',
+      activeConfig: {
+        clusterName: 'ansts-v2-celld-scheduler',
+        compatibilityDate: '2026-01-01',
+        maxCellConcurrentRequests: 64,
+        maxQueueConcurrentProducers: 256,
+        durabilityMode: 'fleet',
+        logPipelineLimit: 4,
+        ltxCompactionEnabled: true,
+        ltxTruncatePages: 128,
+        thinkCpuCores: 0.25,
+        actCpuCores: 4.0,
+        actMemoryMb: 8192,
+        psiFullFreezePct: 70.0,
+        targetSloRatio: 0.999
+      },
+      revisions: [],
+      schemaRules: []
+    };
+    const cfg = cv.activeConfig || {};
+    const perm = canMutateTarget('all', 'all', true);
+    const revsDesc = (cv.revisions || []).slice().sort((a, b) => Number(b.revision) - Number(a.revision));
+
+    return `
+      <section class="kpi-grid" aria-label="配置中心核心指标">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>当前生效配置版本 (Config Revision)</span><span class="status-pill ok">CAS 已同步</span></div>
+          <div class="kpi-value">Rev #${cv.activeRevision ?? 1}</div>
+          <div class="kpi-sub">SHA-256: <span class="mono">${esc((cv.sha256Checksum || '').slice(0, 16))}...</span> · 历史版本: ${(cv.revisions || []).length} 个</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>DO Cell 并发与队列流控阈值</span><span class="status-pill ok">${esc(cfg.durabilityMode || 'fleet')} 模式</span></div>
+          <div class="kpi-value">${cfg.maxCellConcurrentRequests ?? 64} / ${cfg.maxQueueConcurrentProducers ?? 256}</div>
+          <div class="kpi-sub">单 Cell 并发上限 / 队列并发生产者 · Pipeline=${cfg.logPipelineLimit ?? 4}</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Cgroup v2 双相算力与 PSI 冻结水位</span><span class="status-pill ok">动态热重载</span></div>
+          <div class="kpi-value">${cfg.thinkCpuCores ?? 0.25}c → ${cfg.actCpuCores ?? 4.0}c</div>
+          <div class="kpi-sub">ACT 内存上限: <span class="mono">${cfg.actMemoryMb ?? 8192} MB</span> · PSI Freeze: <span class="mono">${cfg.psiFullFreezePct ?? 70}%</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>LTX / WAL 压缩策略与目标 SLO</span><span class="status-pill ${cfg.ltxCompactionEnabled !== false ? 'ok' : 'warn'}">${cfg.ltxCompactionEnabled !== false ? 'LTX 压缩开启' : '已暂停'}</span></div>
+          <div class="kpi-value">${cfg.ltxTruncatePages ?? 128} Pages</div>
+          <div class="kpi-sub">目标可用性 SLO: <span class="mono">${Number((Number(cfg.targetSloRatio ?? 0.999) * 100).toFixed(2))}%</span></div>
+        </div>
+      </section>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">版本化动态配置中心、Schema 契约守卫与在线 CAS 热更新 (GET /v1beta1/console/configs · POST /v1beta1/management/config/center)</h2>
+            <p class="panel-subtitle">所有配置变更均经过 <code>TaskSpecValidator</code> 与数值边界 Schema 校验，通过 SQLite <code>v25_mgmt_config_revisions</code> 持久化并实时热更新至 <code>HotCellOverloadAndQueueGuard</code> 与 <code>FleetReplicatedDurabilityEngine</code>。</p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="open-config-editor-dialog" ${!perm.ok ? 'disabled' : ''}>+ 在线编辑并热更新配置 (CAS Apply)</button>
+            <button type="button" class="small" data-action="open-config-diff-preview">字段级 JSON Diff 对比预览</button>
+            <button type="button" class="small" data-action="open-dual-key-rotation" ${!perm.ok ? 'disabled' : ''}>Outbox Webhook 双密钥平滑轮换</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>配置项名称 (Key)</th>
+                <th>当前生效值 (Live Value)</th>
+                <th>类型与取值约束 (Schema Rule)</th>
+                <th>绑定后端子系统</th>
+                <th>热重载能力</th>
+                <th>参数治理说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(cv.schemaRules || []).map((rule) => `
+                <tr>
+                  <td class="mono"><strong>${esc(rule.field)}</strong></td>
+                  <td class="mono"><span class="status-pill ok">${esc(JSON.stringify(cfg[rule.field]))}</span></td>
+                  <td class="mono">${esc(rule.type)} · <code>${esc(rule.rangeOrEnum)}</code></td>
+                  <td class="mono">${esc(rule.subsystem)}</td>
+                  <td><span class="status-pill ok">${rule.hotReloadable ? 'HOT_RELOAD' : 'STATIC'}</span></td>
+                  <td class="muted">${esc(rule.description)}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">配置中心历史版本链与一键原子回滚 (SQLite v25_mgmt_config_revisions)</h2>
+            <p class="panel-subtitle">每次热更新或回滚均生成带 SHA-256 校验和的不可变修订记录，支持任意历史版本快照审查与秒级原子回滚。</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>版本号 (Revision)</th>
+                <th>SHA-256 校验和</th>
+                <th>提交作者</th>
+                <th>时间戳</th>
+                <th>变更备注 (Release Note)</th>
+                <th>核心参数摘要</th>
+                <th>版本治理操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${revsDesc.map((r) => {
+                const isCurrent = Number(r.revision) === Number(cv.activeRevision);
+                const rc = r.config || {};
+                return `
+                  <tr>
+                    <td class="mono">
+                      <strong>Rev #${r.revision}</strong>
+                      ${isCurrent ? ' <span class="status-pill ok">★ 当前生效</span>' : ''}
+                    </td>
+                    <td class="mono">${esc(String(r.sha256Checksum || '').slice(0, 16))}...</td>
+                    <td><strong>${esc(r.author)}</strong></td>
+                    <td class="mono">${esc(r.createdAt)}</td>
+                    <td>${esc(r.note)}</td>
+                    <td class="mono">CellMax=${rc.maxCellConcurrentRequests ?? 64} · QueueMax=${rc.maxQueueConcurrentProducers ?? 256} · ACT=${rc.actCpuCores ?? 4}c</td>
+                    <td>
+                      <div class="btn-row">
+                        <button type="button" class="small" data-action="inspect-config-revision" data-rev="${r.revision}">查看 JSON</button>
+                        <button type="button" class="small primary" data-action="rollback-config-revision" data-rev="${r.revision}" ${!perm.ok || isCurrent ? 'disabled' : ''}>一键回滚至此版本</button>
+                      </div>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
   function renderRuntimeSection() {
     const bDist = state.slotDistribution || { 'brain-node-01': 85, 'brain-node-02': 86, 'brain-node-03': 85 };
     const slotBoxes = [];
@@ -1120,8 +1271,149 @@
       const owner = cls === 'b1' ? 'brain-node-01' : cls === 'b2' ? 'brain-node-02' : 'brain-node-03';
       slotBoxes.push(`<div class="slot-box ${cls}" title="Slot #${i} → ${owner}"></div>`);
     }
+    const rv = state.runtimeVisualization || {
+      layerfsBranches: [],
+      layerfsStorage: { totalObjects: 0, fullObjects: 0, deltaObjects: 0, totalLogicalBytes: 0, totalCompressedBytes: 0, compressionRatioPct: 0 },
+      sandboxAndCgroup: { warmPool: { warmCount: 8, activeCount: 0, maxWarmCount: 8 }, phaseSpecs: [], psiFullFreezePct: 70 },
+      celldRuntime: { facets: [], facetsCount: 0, maxCellConcurrentRequests: 64, maxQueueConcurrentProducers: 256, durabilityMode: 'fleet', topologyCas: { generation: 1, members: [] } },
+      cognitiveRouterEndpoints: [],
+      zeroTrustSecurity: { spiffeTrustDomain: 'spiffe://ansts.io', spiffeCaKeyDigest: '', teePlatform: 'AMD_SEV_SNP', teePublicKeyDigest: '', ebpfPosture: { lsmActive: true } }
+    };
+    const perm = canMutateTarget(state.region, state.tenant, false);
+    const wp = rv.sandboxAndCgroup?.warmPool || { warmCount: 8, activeCount: 0, maxWarmCount: 8 };
+    const st = rv.layerfsStorage || {};
 
     return `
+      <section class="kpi-grid" aria-label="分布式运行面核心指标">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>LayerFS CoW 活跃分支与 CAS 存储</span><span class="status-pill ok">压缩节省 ${st.compressionRatioPct ?? 0}%</span></div>
+          <div class="kpi-value">${(rv.layerfsBranches || []).length} 活跃分支</div>
+          <div class="kpi-sub">CAS 对象: <span class="mono">${st.totalObjects ?? 0} (Full ${st.fullObjects ?? 0} / Delta ${st.deltaObjects ?? 0})</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Warm Sandbox Pool 热沙箱池</span><span class="status-pill ok">Multiplexer #1..16</span></div>
+          <div class="kpi-value">Warm ${wp.warmCount ?? 8} / ${wp.maxWarmCount ?? 8}</div>
+          <div class="kpi-sub">当前活跃分配沙箱: <span class="mono">${wp.activeCount ?? 0} 个</span> · DO Facets: <span class="mono">${rv.celldRuntime?.facetsCount ?? 0} 个</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Cgroup v2 THINK/ACT 双相隔离</span><span class="status-pill ok">PSI &lt; ${rv.sandboxAndCgroup?.psiFullFreezePct ?? 70}%</span></div>
+          <div class="kpi-value">${rv.sandboxAndCgroup?.phaseSpecs?.[0]?.cpuCores ?? 0.25}c / ${rv.sandboxAndCgroup?.phaseSpecs?.[1]?.cpuCores ?? 4.0}c</div>
+          <div class="kpi-sub">Topology CAS: <span class="mono">Gen #${rv.celldRuntime?.topologyCas?.generation ?? 1} (${(rv.celldRuntime?.topologyCas?.members || []).length} 节点)</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>零信任安全围栏 (SPIFFE / SEV-SNP / eBPF)</span><span class="status-pill ok">STRICT mTLS</span></div>
+          <div class="kpi-value">${esc(rv.zeroTrustSecurity?.teePlatform || 'AMD_SEV_SNP')}</div>
+          <div class="kpi-sub">SPIFFE: <span class="mono">${esc(rv.zeroTrustSecurity?.spiffeTrustDomain || 'spiffe://ansts.io')}</span> · CA: <span class="mono">${esc((rv.zeroTrustSecurity?.spiffeCaKeyDigest || '').slice(0, 12))}...</span></div>
+        </div>
+      </section>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">LayerFS 零拷贝写时复制 (CoW) 分支树、工作区文件快照与行级 Blame 溯源工作台 (GET /v1beta1/console/runtime · POST /v1beta1/management/runtime/layerfs-branch)</h2>
+            <p class="panel-subtitle">实时展示 <code>LayerFsWorkspaceDriver</code> 内所有分支的 HEAD Commit、最近执行步骤、文件树结构，支持在线零拷贝派生分支、写入文件快照、回滚分支及回收孤儿块。</p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="open-layerfs-fork-dialog" ${!perm.ok ? 'disabled' : ''}>+ 零拷贝派生新分支 (Fork Branch)</button>
+            <button type="button" class="small" data-action="open-layerfs-commit-dialog" ${!perm.ok ? 'disabled' : ''}>+ 写入并提交文件快照 (Commit File)</button>
+            <button type="button" class="small" data-action="runtime-layerfs-merge" ${!perm.ok ? 'disabled' : ''}>三路分支合并 (/v1/layerfs/merge)</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>分支名称 (Branch)</th>
+                <th>HEAD Commit</th>
+                <th>最近提交 Agent / Step</th>
+                <th>执行通道与挂载耗时</th>
+                <th>文件数 / 总字节</th>
+                <th>工作区文件树预览</th>
+                <th>分支运行操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(rv.layerfsBranches || []).map((br) => `
+                <tr>
+                  <td class="mono">
+                    <strong>⎇ ${esc(br.branchName)}</strong>
+                    ${br.isProtected ? ' <span class="status-pill ok">PROTECTED</span>' : ''}
+                  </td>
+                  <td class="mono"><span class="status-pill ok">${esc(br.headCommitId)}</span></td>
+                  <td class="mono">${esc(br.agentId)} · <code>${esc(br.stepId)}</code></td>
+                  <td class="mono">${esc(br.toolCategory)} (${br.mountLatencyMs}ms)</td>
+                  <td class="mono">${br.fileCount} files · ${br.totalSizeBytes} B</td>
+                  <td class="mono">${(br.files || []).slice(0, 3).map((f) => `${esc(f.filePath)} (${f.sizeBytes}B)`).join(', ')}${(br.files || []).length > 3 ? ' ...' : ''}</td>
+                  <td>
+                    <div class="btn-row">
+                      <button type="button" class="small primary" data-action="layerfs-quick-commit" data-branch="${esc(br.branchName)}" ${!perm.ok ? 'disabled' : ''}>+快照提交</button>
+                      <button type="button" class="small" data-action="layerfs-inspect-blame" data-branch="${esc(br.branchName)}" data-file="${esc(br.files?.[0]?.filePath || 'package.json')}">查看 Blame</button>
+                      <button type="button" class="small danger" data-action="layerfs-delete-branch" data-branch="${esc(br.branchName)}" ${!perm.ok || br.isProtected ? 'disabled' : ''}>删除分支</button>
+                    </div>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">Cgroup v2 THINK/ACT 双相隔离配额与 DO Sub-Actor Facets 可视</h2>
+              <p class="panel-subtitle">展示 Linux Cgroup v2 相位算力限额及当前已派生的 Durable Object Sub-Actor Facets。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>执行相位 (Phase)</th><th>CPU 核数配额</th><th>cpu.max 规则</th><th>memory.max 上限</th><th>PSI P0 豁免</th></tr></thead>
+              <tbody>
+                ${(rv.sandboxAndCgroup?.phaseSpecs || []).map((ps) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(ps.phase)}</strong></td>
+                    <td class="mono">${ps.cpuCores} Cores</td>
+                    <td class="mono"><code>${esc(ps.cpuMaxRule)}</code></td>
+                    <td class="mono">${ps.memoryMaxMb} MB</td>
+                    <td><span class="status-pill ${ps.psiFreezeExempt ? 'ok' : 'warn'}">${ps.psiFreezeExempt ? 'EXEMPT (Burst)' : 'THROTTLEABLE'}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+          <div class="muted" style="margin-top:8px;">
+            已派生 DO Sub-Actor Facets (<strong class="mono">${rv.celldRuntime?.facetsCount ?? 0}</strong>):
+            <code class="mono">${(rv.celldRuntime?.facets || []).map((f) => f.facetName).join(', ') || '尚未派生（点击下方 DO Sub-Actor Facets 按钮即可动态生成）'}</code>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">认知路由器 (CognitiveRouter) 模型端点池与熔断器状态可视</h2>
+              <p class="panel-subtitle">实时追踪各 LLM 推理端点的 TTFT EWMA 延迟、三态熔断器 (CircuitBreaker) 与 RPM/TPM 令牌桶余量。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>端点 ID</th><th>提供商 / 模型</th><th>TTFT EWMA</th><th>熔断器状态</th><th>剩余配额 (RPM / TPM)</th></tr></thead>
+              <tbody>
+                ${(rv.cognitiveRouterEndpoints || []).map((ep) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(ep.endpointId)}</strong></td>
+                    <td>${esc(ep.provider)} · <code class="mono">${esc(ep.modelName)}</code></td>
+                    <td class="mono">${ep.ttftEwmaMs} ms</td>
+                    <td><span class="status-pill ${ep.circuitState === 'CLOSED' ? 'ok' : 'danger'}">${esc(ep.circuitState)}</span></td>
+                    <td class="mono">${ep.rpmRemaining} RPM / ${ep.tpmRemaining} TPM</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <div class="split-grid">
         <div class="panel">
           <div class="panel-header">
@@ -1493,6 +1785,9 @@
         break;
       case 'approvals':
         sectionHtml = renderApprovalsSection();
+        break;
+      case 'configs':
+        sectionHtml = renderConfigsSection();
         break;
       case 'runtime':
         sectionHtml = renderRuntimeSection();
@@ -2984,6 +3279,247 @@
         "关闭成本归因报告",
         () => closeDialog()
       );
+      return;
+    }
+    if (action === "open-config-editor-dialog") {
+      const cv = state.configVisualization || {};
+      const cfg = cv.activeConfig || {};
+      const curRev = cv.activeRevision ?? 1;
+      openDialog(
+        "在线编辑并热更新集群配置中心 (POST /v1beta1/management/config/center · CAS 校验)",
+        `
+          <div class="form-field">
+            <label for="dlg-cfg-cell-conc">单 DO Cell 最大并发请求数 (maxCellConcurrentRequests)</label>
+            <input id="dlg-cfg-cell-conc" type="number" value="${cfg.maxCellConcurrentRequests ?? 64}" min="1" max="1024" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-cfg-queue-prod">单队列最大并发生产者数 (maxQueueConcurrentProducers)</label>
+            <input id="dlg-cfg-queue-prod" type="number" value="${cfg.maxQueueConcurrentProducers ?? 256}" min="1" max="4096" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-cfg-durability">持久化复制模式 (durabilityMode)</label>
+            <select id="dlg-cfg-durability">
+              <option value="fleet" ${cfg.durabilityMode !== 'bucket' ? 'selected' : ''}>fleet (跨节点流式低延迟复制)</option>
+              <option value="bucket" ${cfg.durabilityMode === 'bucket' ? 'selected' : ''}>bucket (S3/R2 桶段归档)</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="dlg-cfg-act-cores">ACT 相位沙箱突发 CPU 核数 (actCpuCores)</label>
+            <input id="dlg-cfg-act-cores" type="number" step="0.5" value="${cfg.actCpuCores ?? 4.0}" min="0.5" max="16" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-cfg-psi-pct">Linux PSI 内存冻结触发水位 % (psiFullFreezePct)</label>
+            <input id="dlg-cfg-psi-pct" type="number" step="1" value="${cfg.psiFullFreezePct ?? 70.0}" min="10" max="95" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-cfg-note">版本变更备注 (Release Note)</label>
+            <input id="dlg-cfg-note" type="text" value="Console SRE hot-reload configuration update" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-cfg-expected-rev">乐观锁期望基线版本 (expectedRevision)</label>
+            <input id="dlg-cfg-expected-rev" type="number" value="${curRev}" readonly class="mono" />
+          </div>
+        `,
+        "校验 Schema 并热更新配置",
+        async () => {
+          const errEl = document.getElementById("dialog-error");
+          const maxCellConcurrentRequests = Number(document.getElementById("dlg-cfg-cell-conc")?.value || 64);
+          const maxQueueConcurrentProducers = Number(document.getElementById("dlg-cfg-queue-prod")?.value || 256);
+          const durabilityMode = document.getElementById("dlg-cfg-durability")?.value || "fleet";
+          const actCpuCores = Number(document.getElementById("dlg-cfg-act-cores")?.value || 4.0);
+          const psiFullFreezePct = Number(document.getElementById("dlg-cfg-psi-pct")?.value || 70.0);
+          const note = (document.getElementById("dlg-cfg-note")?.value || "").trim();
+          const expectedRevision = Number(document.getElementById("dlg-cfg-expected-rev")?.value || curRev);
+          const p = getPrincipal();
+          const res = await callBackendApi("POST", "/v1beta1/management/config/center", {
+            action: "validate_and_apply_config",
+            expectedRevision,
+            runtimeOverrides: {
+              maxCellConcurrentRequests,
+              maxQueueConcurrentProducers,
+              durabilityMode,
+              actCpuCores,
+              psiFullFreezePct
+            },
+            note,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            if (errEl) errEl.textContent = res.data?.message || "配置校验或 CAS 版本冲突失败";
+            return;
+          }
+          state.lastApiOutput = JSON.stringify(res.data, null, 2);
+          closeDialog();
+          await fetchBackendState();
+          showToast(`配置中心已热更新至 Rev #${res.data.activeRevision} (变更: ${(res.data.changedKeys || []).join(", ") || "none"})`);
+        }
+      );
+      return;
+    }
+    if (action === "inspect-config-revision") {
+      const revNum = Number(target.getAttribute("data-rev") || 1);
+      const revObj = (state.configVisualization?.revisions || []).find((r) => Number(r.revision) === revNum);
+      openDialog(
+        `配置版本快照详情 · Rev #${revNum}`,
+        `<div class="muted" style="margin-bottom:6px;">作者: <strong>${esc(revObj?.author || 'system')}</strong> · 时间: <code class="mono">${esc(revObj?.createdAt || '')}</code> · SHA-256: <code class="mono">${esc(revObj?.sha256Checksum || '')}</code></div>` +
+        `<pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11.5px;max-height:280px;overflow:auto;">${esc(JSON.stringify(revObj?.config || {}, null, 2))}</pre>`,
+        "关闭预览",
+        () => closeDialog()
+      );
+      return;
+    }
+    if (action === "rollback-config-revision") {
+      const targetRev = Number(target.getAttribute("data-rev") || 1);
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/config/center", {
+        action: "rollback_revision",
+        targetRevision: targetRev,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || `回滚版本 Rev #${targetRev} 失败`);
+        return;
+      }
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast(`已原子回滚至历史配置 Rev #${targetRev}（生成新版本 Rev #${res.data.activeRevision}）`);
+      return;
+    }
+    if (action === "open-layerfs-fork-dialog") {
+      const branches = state.runtimeVisualization?.layerfsBranches || [{ branchName: "main" }];
+      openDialog(
+        "零拷贝派生 LayerFS CoW 分支 (POST /v1beta1/management/runtime/layerfs-branch)",
+        `
+          <div class="form-field">
+            <label for="dlg-lfs-source">源基线分支 (Source Branch)</label>
+            <select id="dlg-lfs-source">
+              ${branches.map((b) => `<option value="${esc(b.branchName)}">${esc(b.branchName)} (HEAD: ${esc(b.headCommitId)})</option>`).join("")}
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="dlg-lfs-new-branch">新分支名称 (New Branch Name)</label>
+            <input id="dlg-lfs-new-branch" type="text" value="feat-cow-${Math.floor(100 + Math.random() * 899)}" />
+          </div>
+        `,
+        "执行 O(1) 零拷贝分叉",
+        async () => {
+          const sourceBranch = document.getElementById("dlg-lfs-source")?.value || "main";
+          const branchName = (document.getElementById("dlg-lfs-new-branch")?.value || "").trim();
+          const p = getPrincipal();
+          const res = await callBackendApi("POST", "/v1beta1/management/runtime/layerfs-branch", {
+            action: "fork_branch",
+            sourceBranch,
+            branchName,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            const errEl = document.getElementById("dialog-error");
+            if (errEl) errEl.textContent = res.data?.message || "派生分支失败";
+            return;
+          }
+          closeDialog();
+          await fetchBackendState();
+          showToast(`已从 ${sourceBranch} 零拷贝派生分支 ${branchName} (HEAD=${res.data.headCommitId})`);
+        }
+      );
+      return;
+    }
+    if (action === "open-layerfs-commit-dialog") {
+      const branches = state.runtimeVisualization?.layerfsBranches || [{ branchName: "feat-ns-auth" }];
+      openDialog(
+        "在 LayerFS 分支写入并提交工作区文件快照 (POST /v1beta1/management/runtime/layerfs-branch)",
+        `
+          <div class="form-field">
+            <label for="dlg-lfs-commit-branch">目标分支 (Target Branch)</label>
+            <select id="dlg-lfs-commit-branch">
+              ${branches.map((b) => `<option value="${esc(b.branchName)}" ${b.branchName === 'feat-ns-auth' ? 'selected' : ''}>${esc(b.branchName)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="dlg-lfs-file-path">工作区相对文件路径 (Safe Workspace Path)</label>
+            <input id="dlg-lfs-file-path" type="text" value="src/runtime_verified.ts" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-lfs-file-content">写入文件内容 (File Content)</label>
+            <input id="dlg-lfs-file-content" type="text" value="export const runtimeVerified = true;" />
+          </div>
+        `,
+        "写入并生成 CoW Commit",
+        async () => {
+          const branchName = document.getElementById("dlg-lfs-commit-branch")?.value || "feat-ns-auth";
+          const filePath = (document.getElementById("dlg-lfs-file-path")?.value || "src/runtime_verified.ts").trim();
+          const content = document.getElementById("dlg-lfs-file-content")?.value || "";
+          const p = getPrincipal();
+          const res = await callBackendApi("POST", "/v1beta1/management/runtime/layerfs-branch", {
+            action: "commit_file",
+            branchName,
+            filePath,
+            content,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            const errEl = document.getElementById("dialog-error");
+            if (errEl) errEl.textContent = res.data?.message || "写入快照失败";
+            return;
+          }
+          closeDialog();
+          await fetchBackendState();
+          showToast(`分支 ${branchName} 已提交新快照 Commit ${res.data.commitId}`);
+        }
+      );
+      return;
+    }
+    if (action === "layerfs-quick-commit") {
+      const branchName = target.getAttribute("data-branch") || "feat-ns-auth";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/runtime/layerfs-branch", {
+        action: "commit_file",
+        branchName,
+        filePath: `src/snap_${Date.now() % 10000}.ts`,
+        content: `export const snapshotBranch = "${branchName}";
+`,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast(`已在分支 ${branchName} 提交快照 Commit ${res.data?.commitId || "OK"}`);
+      return;
+    }
+    if (action === "layerfs-inspect-blame") {
+      const branchName = target.getAttribute("data-branch") || "main";
+      const filePath = target.getAttribute("data-file") || "package.json";
+      const res = await callBackendApi("GET", `/v1beta1/management/layerfs/blame?branch=${encodeURIComponent(branchName)}&filePath=${encodeURIComponent(filePath)}`);
+      const d = res.data || {};
+      openDialog(
+        `LayerFS 行级溯源 (Line-Level Blame) · ${branchName}:${filePath}`,
+        `<div class="muted" style="margin-bottom:6px;">Commit: <code class="mono">${esc(d.commitId || 'C0')}</code> · 文件路径: <code class="mono">${esc(d.filePath || filePath)}</code></div>` +
+        `<div class="table-wrap"><table class="data-table"><thead><tr><th>行号</th><th>负责 Step ID (Blame)</th><th>代码内容</th></tr></thead><tbody>` +
+        (d.lines || []).map((ln) => `<tr><td class="mono">${ln.lineNumber}</td><td class="mono"><span class="status-pill ok">${esc(ln.stepId)}</span></td><td class="mono">${esc(ln.text)}</td></tr>`).join("") +
+        `</tbody></table></div>`,
+        "关闭溯源视图",
+        () => closeDialog()
+      );
+      return;
+    }
+    if (action === "layerfs-delete-branch") {
+      const branchName = target.getAttribute("data-branch") || "";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/runtime/layerfs-branch", {
+        action: "delete_branch",
+        branchName,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || `删除分支 ${branchName} 失败`);
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已删除分支 ${branchName} 并执行 B-Tree 不可达块 GC`);
       return;
     }
     if (action === "open-config-diff-preview") {
