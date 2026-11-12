@@ -694,6 +694,29 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-observability") {
+    const action = (rest[0] ?? "inspect").trim();
+    if (action === "inspect") {
+      const resp = await fetch(`${baseUrl}/v1beta1/console/observability`);
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    const arg1 = rest[1] ? rest[1].trim() : undefined;
+    const resp = await fetch(`${baseUrl}/v1beta1/management/ops/observability`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action,
+        runbookId: action === "execute_auto_remediation_runbook" ? (arg1 ?? "RB-SLO-BURN-AND-DLQ-HEAL") : undefined,
+        operationName: action === "record_custom_trace" ? (arg1 ?? "CLI /v1/tasks Trace") : undefined,
+        actor: "chen",
+        role: "SRE_ADMIN",
+      }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-runtime") {
     const action = (rest[0] ?? "inspect").trim();
     if (action === "inspect") {

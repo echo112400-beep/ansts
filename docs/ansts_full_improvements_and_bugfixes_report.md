@@ -668,3 +668,18 @@
    - 升级 **`runtime` (`分布式运行面与 LayerFS 可视`)** 视图 (`renderRuntimeSection()`)，新增运行面 4 张 KPI 指标卡、LayerFS CoW 分支树交互工作台（支持派生分支、写入文件快照、查看行级 Blame 溯源与删除分支）以及 Cgroup v2 双相配额 / DO Facets / 认知路由端点池可视表。
 4. **端到端回归验证 (`tests/m80_console_config_management_and_runtime_visualization.test.ts`)**：
    - 全量 **89 个 `src/` 源码模块**、**73 个测试套件（共 207 项测试）100% 通过**。
+
+
+---
+
+## 31. M81: TanStack Console 全链路可观测性、W3C 分布式追踪瀑布流、SLO 燃烧率告警与自动化自愈 Runbook 套件 (`GET /v1beta1/console/observability`, `POST /v1beta1/management/ops/observability`, `anstsctl mgmt-observability`)
+
+1. **全链路可观测性聚合与 W3C Trace 瀑布流 (`buildObservabilityVisualization` & `GET /v1beta1/console/observability`)**：
+   - 在 `PlatformManagementPlaneEngine.buildObservabilityVisualization()` 中实时聚合 `OtelAndPrometheusExporter` 的 `ansts_task_dispatch_latency_ms` 分位数 (`P50`/`P95`/`P99`)、多窗口 SLO 燃烧率 (`burnRate1h`、剩余错误预算百分比、`alertSeverity`: `HEALTHY` / `TICKET_P1` / `PAGE_P0`) 以及按 `traceId` 分组的 W3C `00-traceId-spanId-01` 分布式追踪瀑布流（含各阶段 `offsetPct` 与 `widthPct` 时序占比）。
+   - 支持在线采样自定义 W3C Trace (`record_custom_trace`) 并实时反映在控制台瀑布流时间轴中。
+2. **自动化 SRE 闭环自愈 Runbook 编排中心 (`sreRunbooks` & `execute_auto_remediation_runbook`)**：
+   - 提供 4 套生产级可执行 SRE 自愈 Runbook：`RB-SLO-BURN-AND-DLQ-HEAL`（模型熔断器重置 + DLQ 死信自动重放 + PagerDuty HMAC Webhook 投递）、`RB-CANARY-AND-BREAKER-RESET`（金丝雀异常回退与熔断恢复）、`RB-HOT-CELL-SHARD-REBALANCE`（256-Slot 哈希环重平衡与热点泄压）、`RB-PSI-MEMORY-THROTTLE-RECOVER`（P3/P2 优先级削峰与热沙箱池补充），记录每个 Runbook 的累计执行次数、最近执行 UTC 时间与恢复结果。
+3. **死信队列 (DLQ) 与 Transactional Outbox 在线重放工作台 (`dlqAndOutbox`)**：
+   - 在可观测性视图内嵌死信任务与失败 Outbox Webhook 实时列表，支持一键注入故障样本 (`obs-seed-dlq`)、单条死信任务重放 (`obs-replay-dlq-task`) 与 Outbox Webhook 改址重放 (`obs-replay-outbox-msg`)，并在 `/v1beta1/management/ops/observability` 与 `/v1beta1/management/ops/dlq-replay` 强制执行 RBAC JWT 鉴权（`VIEWER` 写操作返回 `403 RBAC_FORBIDDEN`）。
+4. **端到端回归验证 (`tests/m81_console_observability_traces_slo_and_runbooks.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**74 个测试套件（共 208 项测试）100% 通过**。

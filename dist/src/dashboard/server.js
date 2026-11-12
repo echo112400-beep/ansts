@@ -329,6 +329,8 @@ class PlatformManagementPlaneEngine {
   initialized = false;
   rbacGuard = new _console_rbac_guard.ConsoleRbacAuthGuard();
   mgmtQueueManager = new _queue_manager.HierarchicalQueueManager();
+  runbookStats = new Map();
+  lastSimulatedErrorRequests = 4;
 
   constructor(deps) {
     this.deps = deps;
@@ -1416,7 +1418,148 @@ class PlatformManagementPlaneEngine {
       })(),
       configVisualization: this.buildConfigVisualization(),
       runtimeVisualization: this.buildRuntimeVisualization(),
+      observabilityVisualization: this.buildObservabilityVisualization(),
       status: "HEALTHY"
+    };
+  }
+
+  buildObservabilityVisualization() {
+    this.ensureInitialized();
+    this.ensureConfigCenterTable();
+
+    // Ensure baseline latency samples & W3C trace waterfall exist on cold start
+    if (this.metrics.computeQuantiles("ansts_task_dispatch_latency_ms").count === 0) {
+      for (const sample of [12, 16, 19, 24, 31, 38, 49, 64, 88]) {
+        this.metrics.observeHistogram("ansts_task_dispatch_latency_ms", sample);
+      }
+    }
+    if (this.metrics.getRecordedSpans().length === 0) {
+      this.metrics.recordTraceWaterfall("POST /v1/tasks (Full-Chain 5D Dispatch)", [
+      { name: "GatewayIngressAndSchemaValidate", durationMs: 4, attributes: { component: "gateway" } },
+      { name: "Scheduler5DPlacementAndFence", durationMs: 9, attributes: { component: "scheduler-cell" } },
+      { name: "CelldKataContainerActStep", durationMs: 38, attributes: { component: "kata-runtime" } },
+      { name: "RustFsLtxCasSegmentFlush", durationMs: 12, attributes: { component: "rpo-zero-ltx" } }]);
+
+    }
+
+    const cfgBody = this.executeConfigurationCenterGovernance({
+      action: "inspect_active_config",
+      actor: "chen",
+      role: "SRE_ADMIN"
+    }).body;
+    const activeConfig = cfgBody.activeConfig ?? {};
+    const targetSloRatio = Number(activeConfig.targetSloRatio ?? 0.999);
+    const quantiles = this.metrics.computeQuantiles("ansts_task_dispatch_latency_ms");
+    const effectiveP99 =
+    this.scenario === "verification" && !this.verificationRetried ?
+    410 :
+    this.scenario === "capacity" && !this.loadSheddingActive ?
+    340 :
+    quantiles.p99;
+    const effectiveErrReqs =
+    this.scenario === "capacity" && !this.loadSheddingActive ?
+    45 :
+    this.lastSimulatedErrorRequests;
+
+    const sloEvaluation = this.metrics.evaluateSloBurnRate({
+      targetSloRatio,
+      totalRequests: 10_000,
+      errorRequests: effectiveErrReqs,
+      p99LatencyMs: effectiveP99,
+      latencySloTargetMs: 250
+    });
+
+    // Group recorded spans by traceId into structured W3C waterfalls
+    const allSpans = this.metrics.getRecordedSpans();
+    const byTrace = new Map();
+    for (const sp of allSpans) {
+      const list = byTrace.get(sp.traceId) ?? [];
+      list.push(sp);
+      byTrace.set(sp.traceId, list);
+    }
+    const traceWaterfalls = Array.from(byTrace.entries()).
+    slice(-4).
+    reverse().
+    map(([traceId, spans]) => {
+      const root = spans.find((s) => !s.parentSpanId) ?? spans[0];
+      const children = spans.filter((s) => s !== root);
+      const minStart = Math.min(...spans.map((s) => s.startTimeMs));
+      const maxEnd = Math.max(...spans.map((s) => s.endTimeMs));
+      const totalDurationMs = Math.max(1, maxEnd - minStart);
+      return {
+        traceId,
+        traceparent: _otel_prometheus.OtelAndPrometheusExporter.createTraceparent(traceId, root.spanId),
+        operationName: root.name,
+        totalDurationMs,
+        spans: (children.length > 0 ? children : [root]).map((sp) => {
+          const dur = Math.max(1, sp.endTimeMs - sp.startTimeMs);
+          const offsetPct = Math.min(95, Math.max(0, Math.round((sp.startTimeMs - minStart) / totalDurationMs * 100)));
+          const widthPct = Math.min(100 - offsetPct, Math.max(5, Math.round(dur / totalDurationMs * 100)));
+          return {
+            spanId: sp.spanId,
+            name: sp.name,
+            component: String(sp.attributes?.component ?? "core"),
+            durationMs: dur,
+            offsetPct,
+            widthPct
+          };
+        })
+      };
+    });
+
+    const dlqSnap = this.executeDlqAndOutboxReplayWorkbench({
+      action: "inspect_dlq",
+      actor: "chen",
+      role: "SRE_ADMIN"
+    }).body;
+    const outboxKeyRotation = this.deps.outboxDispatcher.getKeyRotationStatus();
+
+    const runbookCatalog = [
+    {
+      runbookId: "RB-SLO-BURN-AND-DLQ-HEAL",
+      title: "SLO 燃烧率超标与死信队列 (DLQ) 自动自愈",
+      triggerCondition: "BurnRate 1h >= 14.4x 或 DLQ 积压 > 0",
+      remediationSteps: "重置 LLM 端点三态熔断器 + 自动重放 DEAD_LETTER 任务 + 投递 PagerDuty HMAC Webhook"
+    },
+    {
+      runbookId: "RB-CANARY-AND-BREAKER-RESET",
+      title: "金丝雀发布异常回滚与认知路由熔断恢复",
+      triggerCondition: "Canary 错误率 > 1.0% 或 P99 > 250ms",
+      remediationSteps: "金丝雀流量权重回退至 5% + 清理半开探针锁 + 恢复 ep-deepseek-r1/ep-qwen-38"
+    },
+    {
+      runbookId: "RB-HOT-CELL-SHARD-REBALANCE",
+      title: "256-Slot 一致性哈希环重平衡与热点 Cell 泄压",
+      triggerCondition: "单 DO Cell 并发触顶 (64 fetches) 或验证场景 P99 > 400ms",
+      remediationSteps: "重新均衡 3 个 Brain 节点 256 哈希槽分布 + 清除验证超标标志"
+    },
+    {
+      runbookId: "RB-PSI-MEMORY-THROTTLE-RECOVER",
+      title: "宿主机 Linux PSI 内存风暴削峰与热沙箱池扩容",
+      triggerCondition: "PSI memory.pressure full > 20% 或 Warm Pool 命中率 < 70%",
+      remediationSteps: "开启 P3/P2 优先级削峰 + 补充 WarmSandboxPool 热备实例并下调节点 PSI 水位"
+    }].
+    map((rb) => {
+      const st = this.runbookStats.get(rb.runbookId) ?? {
+        executedCount: 0,
+        lastExecutedUtc: "尚未触发",
+        lastOutcome: "STANDBY"
+      };
+      return {
+        ...rb,
+        ...st
+      };
+    });
+
+    return {
+      sloEvaluation,
+      latencyQuantiles: quantiles,
+      traceWaterfalls,
+      dlqAndOutbox: {
+        ...dlqSnap,
+        keyRotation: outboxKeyRotation
+      },
+      sreRunbooks: runbookCatalog
     };
   }
 
@@ -5432,16 +5575,45 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
 
 
 
+
   {
     this.ensureInitialized();
-    if (params.role === "VIEWER" && params.action === "execute_auto_remediation_runbook") {
+    if (params.role === "VIEWER" && params.action !== "probe_slo_traces_and_metrics") {
       return {
         status: 403,
-        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发 SRE 自动化自愈 Runbook" }
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发 SRE 自动化自愈 Runbook 或写入自定义追踪" }
+      };
+    }
+
+    if (params.action === "record_custom_trace") {
+      const opName = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.operationName ?? "POST /v1/layerfs/exec (CoW Snapshot)").trim());
+      const wf = this.metrics.recordTraceWaterfall(opName, [
+      { name: "GatewayBearerJwtVerify", durationMs: 2, attributes: { component: "gateway-auth" } },
+      { name: "SchedulerShardSlotLookup", durationMs: 6, attributes: { component: "shard-ring" } },
+      { name: "LayerFsCowBranchOverlayExec", durationMs: 24, attributes: { component: "layerfs-cow" } },
+      { name: "SqliteWalCrc32Commit", durationMs: 7, attributes: { component: "sqlite-rpo0" } }]);
+
+      this.metrics.observeHistogram("ansts_task_dispatch_latency_ms", 39);
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `采样全链路 W3C Trace 瀑布流 [${opName}] (traceId=${wf.traceId.slice(0, 12)}, 4 Spans, 39ms)`,
+      "Observability / W3C-Trace",
+      `TRACE_RECORDED (${wf.traceId.slice(0, 8)})`);
+
+      return {
+        status: 200,
+        body: {
+          recordedTrace: wf,
+          observabilityVisualization: this.buildObservabilityVisualization()
+        }
       };
     }
 
     if (params.action === "probe_slo_traces_and_metrics") {
+      if (params.simulatedErrorRequests !== undefined) {
+        this.lastSimulatedErrorRequests = Number(params.simulatedErrorRequests);
+      }
       for (const sample of [14, 18, 22, 29, 35, 42, 68, 95, 145]) {
         this.metrics.observeHistogram("ansts_task_dispatch_latency_ms", sample);
       }
@@ -5532,6 +5704,29 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       });
     }
 
+    this.lastSimulatedErrorRequests = 2;
+    if (runbookId === "RB-CANARY-AND-BREAKER-RESET") {
+      this.canaryController.resetCanary();
+    } else if (runbookId === "RB-HOT-CELL-SHARD-REBALANCE") {
+      for (const bId of ["brain-node-01", "brain-node-02", "brain-node-03"]) {
+        this.deps.shardCoordinator.registerBrainShardNode(bId);
+      }
+      this.verificationRetried = true;
+      if (this.scenario === "verification") this.scenario = "normal";
+    } else if (runbookId === "RB-PSI-MEMORY-THROTTLE-RECOVER") {
+      this.loadSheddingActive = true;
+      this.warmPool.replenishPool();
+      if (this.scenario === "capacity") this.scenario = "normal";
+    }
+
+    const prevStat = this.runbookStats.get(runbookId) ?? { executedCount: 0, lastExecutedUtc: "", lastOutcome: "" };
+    const nowUtc = `${new Date().toISOString().slice(11, 19)} UTC`;
+    this.runbookStats.set(runbookId, {
+      executedCount: prevStat.executedCount + 1,
+      lastExecutedUtc: nowUtc,
+      lastOutcome: `REMEDIATED (Delivered=${outboxDelivery.deliveredCount})`
+    });
+
     this.appendAudit(
     params.actor,
     params.role,
@@ -5550,7 +5745,8 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         webhookOutbox: {
           messageId: outboxMsgId,
           ...outboxDelivery
-        }
+        },
+        observabilityVisualization: this.buildObservabilityVisualization()
       }
     };
   }

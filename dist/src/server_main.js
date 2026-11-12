@@ -2430,6 +2430,13 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M81] TanStack Console BFF: Full-Link SRE Observability, W3C Trace Waterfall, DLQ & Self-Healing Runbooks (`GET /v1beta1/console/observability`)
+    if (method === "GET" && pathname === "/v1beta1/console/observability") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildObservabilityVisualization()));
+      return;
+    }
+
     // [M80] LayerFS CoW Branch Interactive Management (`POST /v1beta1/management/runtime/layerfs-branch`)
     if (method === "POST" && pathname === "/v1beta1/management/runtime/layerfs-branch") {
       const body = await this.readJsonBody(req);
@@ -2913,9 +2920,15 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M70-1] DLQ Dead-Letter Task & Outbox Webhook Replay Workbench (`POST /v1beta1/management/ops/dlq-replay`)
+    // [M70-1 & M81] DLQ Dead-Letter Task & Outbox Webhook Replay Workbench (`POST /v1beta1/management/ops/dlq-replay`)
     if (method === "POST" && pathname === "/v1beta1/management/ops/dlq-replay") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
       const result = this.managementPlane.executeDlqAndOutboxReplayWorkbench({
         action: body.action ?? "inspect_dlq",
 
@@ -2925,9 +2938,12 @@ class AnstsLocalAndComposeServer {
         taskId: body.taskId ? String(body.taskId) : undefined,
         messageId: body.messageId ? String(body.messageId) : undefined,
         newTargetUrl: body.newTargetUrl ? String(body.newTargetUrl) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN")
+        actor: auth.actor,
+        role: auth.role
       });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
       return;
@@ -3384,19 +3400,30 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M50-4] Closed-Loop SRE Observability, SLO Burn-Rate Alerting & Self-Healing Runbooks (`POST /v1beta1/management/ops/observability`)
+    // [M50-4 & M81] Closed-Loop SRE Observability, SLO Burn-Rate Alerting & Self-Healing Runbooks (`POST /v1beta1/management/ops/observability`)
     if (method === "POST" && pathname === "/v1beta1/management/ops/observability") {
       const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
       const result = this.managementPlane.executeObservabilityAndSreOps({
         action: body.action ?? "probe_slo_traces_and_metrics",
+
 
 
         simulatedErrorRequests: body.simulatedErrorRequests !== undefined ? Number(body.simulatedErrorRequests) : undefined,
         simulatedP99LatencyMs: body.simulatedP99LatencyMs !== undefined ? Number(body.simulatedP99LatencyMs) : undefined,
         runbookId: body.runbookId ? String(body.runbookId) : undefined,
-        actor: String(body.actor ?? "chen"),
-        role: String(body.role ?? "SRE_ADMIN")
+        operationName: body.operationName ? String(body.operationName) : undefined,
+        actor: auth.actor,
+        role: auth.role
       });
+      if (result.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify(result.body));
       return;

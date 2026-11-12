@@ -100,7 +100,8 @@
     { id: 'tasks', label: '任务运行与回合诊断', badgeKey: 'tasks' },
     { id: 'approvals', label: '高危审批与变更审计', badgeKey: 'approvals' },
     { id: 'configs', label: '配置中心与版本治理', badgeKey: 'configs' },
-    { id: 'runtime', label: '分布式运行面与 LayerFS 可视', badgeKey: 'runtime' }
+    { id: 'runtime', label: '分布式运行面与 LayerFS 可视', badgeKey: 'runtime' },
+    { id: 'observability', label: '可观测性、SLO 与自愈运维', badgeKey: 'observability' }
   ];
 
   function createBaselineState() {
@@ -144,6 +145,7 @@
       stateVisualization: null,
       configVisualization: null,
       runtimeVisualization: null,
+      observabilityVisualization: null,
       allTenantIds: [],
       regions: [],
       nodes: [],
@@ -260,6 +262,7 @@
       if (d.stateVisualization) state.stateVisualization = d.stateVisualization;
       if (d.configVisualization) state.configVisualization = d.configVisualization;
       if (d.runtimeVisualization) state.runtimeVisualization = d.runtimeVisualization;
+      if (d.observabilityVisualization) state.observabilityVisualization = d.observabilityVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -388,6 +391,13 @@
     if (key === 'configs') {
       const rev = state.configVisualization?.activeRevision ?? 1;
       return { text: `Rev #${rev}`, cls: rev > 1 ? 'ok' : '' };
+    }
+    if (key === 'observability') {
+      const sev = state.observabilityVisualization?.sloEvaluation?.alertSeverity || 'HEALTHY';
+      const dlqCnt = state.observabilityVisualization?.dlqAndOutbox?.deadLetterTaskCount ?? 0;
+      if (sev === 'PAGE_P0' || dlqCnt > 0) return { text: dlqCnt > 0 ? `${dlqCnt} DLQ` : 'P0 告警', cls: 'danger' };
+      if (sev === 'TICKET_P1') return { text: 'P1 预警', cls: 'warn' };
+      return { text: 'SLO 正常', cls: '' };
     }
     const brCount = state.runtimeVisualization?.layerfsBranches?.length ?? 4;
     return { text: `${brCount} 分支`, cls: '' };
@@ -1765,6 +1775,209 @@
     `;
   }
 
+  function renderObservabilitySection() {
+    const ov = state.observabilityVisualization || {
+      sloEvaluation: {
+        targetSloRatio: 0.999,
+        actualAvailabilityRatio: 0.9996,
+        errorBudgetRemainingPct: 60.0,
+        burnRate1h: 0.4,
+        p99LatencyMs: 88,
+        latencySloTargetMs: 250,
+        alertSeverity: 'HEALTHY',
+        recommendedRunbook: 'NONE'
+      },
+      latencyQuantiles: { count: 9, sum: 341, p50: 31, p95: 88, p99: 88 },
+      traceWaterfalls: [],
+      dlqAndOutbox: {
+        deadLetterTaskCount: 0,
+        deadLetterTasks: [],
+        deadLetterWebhookCount: 0,
+        deadLetterWebhooks: [],
+        keyRotation: { keyRotationGeneration: 1, secondaryActive: false }
+      },
+      sreRunbooks: []
+    };
+    const slo = ov.sloEvaluation || {};
+    const q = ov.latencyQuantiles || {};
+    const dlq = ov.dlqAndOutbox || {};
+    const perm = canMutateTarget('all', 'all', false);
+    const sevCls = slo.alertSeverity === 'PAGE_P0' ? 'danger' : slo.alertSeverity === 'TICKET_P1' ? 'warn' : 'ok';
+
+    return `
+      <section class="kpi-grid" aria-label="可观测性与自愈核心指标">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>多窗口 SLO 燃烧率与错误预算</span><span class="status-pill ${sevCls}">${esc(slo.alertSeverity || 'HEALTHY')}</span></div>
+          <div class="kpi-value">${slo.burnRate1h ?? 0.4}x Burn</div>
+          <div class="kpi-sub">剩余错误预算: <span class="mono">${slo.errorBudgetRemainingPct ?? 60}%</span> · 目标 SLO: <span class="mono">${Number(((slo.targetSloRatio ?? 0.999) * 100).toFixed(2))}%</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>全链路调度与执行延迟分位数 (Otel Histogram)</span><span class="status-pill ${Number(slo.p99LatencyMs ?? 88) > 250 ? 'danger' : 'ok'}">阈值 &lt; ${slo.latencySloTargetMs ?? 250}ms</span></div>
+          <div class="kpi-value">P99 ${slo.p99LatencyMs ?? q.p99 ?? 88} ms</div>
+          <div class="kpi-sub">P50: <span class="mono">${q.p50 ?? 31}ms</span> · P95: <span class="mono">${q.p95 ?? 88}ms</span> · 采样数: <span class="mono">${q.count ?? 9}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>死信队列 (DLQ) 与 Outbox Webhook 状态</span><span class="status-pill ${(dlq.deadLetterTaskCount || 0) + (dlq.deadLetterWebhookCount || 0) > 0 ? 'danger' : 'ok'}">Gen #${dlq.keyRotation?.keyRotationGeneration ?? 1} HMAC</span></div>
+          <div class="kpi-value">${dlq.deadLetterTaskCount ?? 0} 任务 / ${dlq.deadLetterWebhookCount ?? 0} 消息</div>
+          <div class="kpi-sub">双密钥宽限窗口: <span class="mono">${dlq.keyRotation?.secondaryActive ? 'ACTIVE' : 'SINGLE_PRIMARY'}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>自动化 SRE 自愈 Runbook 编排器</span><span class="status-pill ok">${(ov.sreRunbooks || []).length} 个就绪</span></div>
+          <div class="kpi-value">${esc(slo.recommendedRunbook && slo.recommendedRunbook !== 'NONE' ? slo.recommendedRunbook : 'STANDBY')}</div>
+          <div class="kpi-sub">支持一键触发模型熔断重置、DLQ 重放、256 槽重平衡与 PSI 削峰</div>
+        </div>
+      </section>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">W3C Traceparent 全链路分布式追踪瀑布流与 OpenTelemetry 延迟剖析 (GET /v1beta1/console/observability · POST /v1beta1/management/ops/observability)</h2>
+            <p class="panel-subtitle">实时展示跨 <code>Gateway → Scheduler 5D → celld Kata/LayerFS → RustFS RPO=0 LTX</code> 的 W3C <code>00-traceId-spanId-01</code> 瀑布时间轴。</p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="obs-record-trace" ${!perm.ok ? 'disabled' : ''}>+ 采样新全链路 W3C Trace 瀑布流</button>
+            <button type="button" class="small warn" data-action="obs-simulate-slo-burn" ${!perm.ok ? 'disabled' : ''}>模拟 SLO 燃烧率激增 (触发 PAGE_P0)</button>
+            <button type="button" class="small" data-action="run-fleet-diagnostics">导出 Prometheus /metrics 指标</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>W3C Traceparent / 操作入口</th>
+                <th>子阶段 Span 名称</th>
+                <th>所属子系统组件</th>
+                <th>Span 耗时</th>
+                <th>瀑布流时序占比 (Waterfall Timeline)</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(ov.traceWaterfalls || []).map((tw) =>
+                (tw.spans || []).map((sp, idx) => `
+                  <tr>
+                    <td class="mono">
+                      ${idx === 0 ? `<strong>${esc(tw.operationName)}</strong><div class="muted">${esc(tw.traceparent)} (总计 ${tw.totalDurationMs}ms)</div>` : `<span class="muted">↳ Trace ${esc(tw.traceId.slice(0, 10))}...</span>`}
+                    </td>
+                    <td class="mono"><strong>${esc(sp.name)}</strong> <span class="muted">(${esc(sp.spanId.slice(0, 8))})</span></td>
+                    <td><span class="status-pill ok">${esc(sp.component)}</span></td>
+                    <td class="mono">${sp.durationMs} ms</td>
+                    <td style="min-width:200px;">
+                      <div style="background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:4px;height:14px;position:relative;overflow:hidden;">
+                        <div style="position:absolute;left:${sp.offsetPct}%;width:${sp.widthPct}%;top:1px;bottom:1px;background:var(--accent,#3b82f6);border-radius:3px;"></div>
+                      </div>
+                    </td>
+                  </tr>
+                `).join('')
+              ).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">自动化 SRE 闭环自愈 Runbook 编排中心 (POST /v1beta1/management/ops/observability)</h2>
+            <p class="panel-subtitle">当 SLO 燃烧率、金丝雀错误率或宿主机 PSI 触发阈值时，可一键执行确定性自愈 Runbook 并自动发送 CloudEvents 与 PagerDuty HMAC Webhook。</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Runbook 编号与名称</th>
+                <th>自动触发条件 (SLO / 探针阈值)</th>
+                <th>闭环自愈恢复动作链</th>
+                <th>累计执行 / 最近状态</th>
+                <th>运维执行操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(ov.sreRunbooks || []).map((rb) => `
+                <tr>
+                  <td class="mono">
+                    <strong>${esc(rb.runbookId)}</strong>
+                    <div>${esc(rb.title)}</div>
+                  </td>
+                  <td class="mono">${esc(rb.triggerCondition)}</td>
+                  <td class="muted">${esc(rb.remediationSteps)}</td>
+                  <td class="mono">
+                    <span class="status-pill ${rb.executedCount > 0 ? 'ok' : ''}">${rb.executedCount} 次</span>
+                    <div class="muted">${esc(rb.lastExecutedUtc)} · ${esc(rb.lastOutcome)}</div>
+                  </td>
+                  <td>
+                    <button type="button" class="small primary" data-action="obs-exec-runbook" data-runbook="${esc(rb.runbookId)}" ${!perm.ok ? 'disabled' : ''}>▶ 立即执行自愈 Runbook</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">死信队列 (DLQ) 任务与 Transactional Outbox Webhook 重放工作台 (POST /v1beta1/management/ops/dlq-replay)</h2>
+              <p class="panel-subtitle">支持在线注入死信故障样本，并对死信任务或投递失败的 Outbox Webhook 执行单条精准重放。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small warn" data-action="obs-seed-dlq" ${!perm.ok ? 'disabled' : ''}>+ 注入 DLQ 死信故障样本</button>
+              <button type="button" class="small" data-action="open-dual-key-rotation" ${!perm.ok ? 'disabled' : ''}>Outbox 双密钥平滑轮换</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>类型 / ID</th><th>关联目标 / 租户</th><th>死信原因 / 错误详情</th><th>尝试次数</th><th>重放操作</th></tr></thead>
+              <tbody>
+                ${(dlq.deadLetterTasks || []).length === 0 && (dlq.deadLetterWebhooks || []).length === 0 ? `
+                  <tr><td colspan="5" class="muted" style="text-align:center;padding:14px;">当前无死信任务或失败 Outbox Webhook（可点击上方“+ 注入 DLQ 死信故障样本”验证在线重放）</td></tr>
+                ` : ''}
+                ${(dlq.deadLetterTasks || []).map((t) => `
+                  <tr>
+                    <td class="mono"><span class="status-pill danger">TASK</span> <strong>${esc(t.taskId)}</strong></td>
+                    <td>${esc(t.tenantId)} · <code class="mono">epoch:${t.fencingToken}</code></td>
+                    <td class="mono">${esc(t.deadLetterReason)}</td>
+                    <td class="mono">${t.retryCount} 次</td>
+                    <td><button type="button" class="small primary" data-action="obs-replay-dlq-task" data-task="${esc(t.taskId)}" ${!perm.ok ? 'disabled' : ''}>重放死信任务</button></td>
+                  </tr>
+                `).join('')}
+                ${(dlq.deadLetterWebhooks || []).map((m) => `
+                  <tr>
+                    <td class="mono"><span class="status-pill warn">WEBHOOK</span> <strong>${esc(m.messageId)}</strong></td>
+                    <td class="mono">${esc(m.taskId)} → ${esc(m.targetUrl)}</td>
+                    <td class="mono">${esc(m.lastError || 'DELIVERY_EXHAUSTED')}</td>
+                    <td class="mono">${m.attempts} 次</td>
+                    <td><button type="button" class="small primary" data-action="obs-replay-outbox-msg" data-msg="${esc(m.messageId)}" ${!perm.ok ? 'disabled' : ''}>重放 Webhook</button></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">零信任安全围栏巡检与全链路健康评分卡 (M60–M69 Scorecard)</h2>
+              <p class="panel-subtitle">实时验证 4 层容器/内核安全边界 (<code>celld-fence</code>、<code>eBPF LSM</code>、<code>ZeroTrustVsockBridge</code>) 与 10 大可靠性专项。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small" data-action="open-security-fence-alerts">查看 4 层安全围栏实时拦截流</button>
+              <button type="button" class="small primary" data-action="run-health-scorecard">★ 运行 M60–M69 健康评分卡</button>
+            </div>
+          </div>
+          <div class="muted" style="padding:8px 0;">
+            1. <strong>celld-fence 容器网络围栏</strong>：默认阻断 RFC1918 私网、<code>127.0.0.0/8</code> 环回、<code>169.254.169.254</code> (含十六进制 <code>0xa9fea9fe</code>) 云元数据 SSRF。<br/>
+            2. <strong>eBPF LSM 内核文件钩子</strong>：在内核态拦截 <code>/etc/shadow</code> 与 <code>/proc/&lt;pid&gt;/environ</code> 敏感路径逃逸访问 (返回 <code>EACCES</code>)。<br/>
+            3. <strong>ZeroTrustVsockBridge 代理</strong>：强制校验出站域名白名单并阻断 URL 内嵌凭据注入。
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   function renderMainContent() {
     const main = document.getElementById('content');
     if (!main) return;
@@ -1791,6 +2004,9 @@
         break;
       case 'runtime':
         sectionHtml = renderRuntimeSection();
+        break;
+      case 'observability':
+        sectionHtml = renderObservabilitySection();
         break;
       case 'overview':
       default:
@@ -3279,6 +3495,102 @@
         "关闭成本归因报告",
         () => closeDialog()
       );
+      return;
+    }
+    if (action === "obs-record-trace") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/observability", {
+        action: "record_custom_trace",
+        operationName: `POST /v1/layerfs/exec (Trace #${Date.now() % 1000})`,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "采样 W3C Trace 失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已采样新全链路 W3C Trace 瀑布流 (${res.data?.recordedTrace?.traceId?.slice(0, 12) || "OK"})`);
+      return;
+    }
+    if (action === "obs-simulate-slo-burn") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/observability", {
+        action: "probe_slo_traces_and_metrics",
+        simulatedErrorRequests: 180,
+        simulatedP99LatencyMs: 420,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast(`已模拟 SLO 燃烧率告警：${res.data?.sloEvaluation?.alertSeverity || "PAGE_P0"} (BurnRate=${res.data?.sloEvaluation?.burnRate1h || 18}x)`);
+      return;
+    }
+    if (action === "obs-exec-runbook") {
+      const runbookId = target.getAttribute("data-runbook") || "RB-SLO-BURN-AND-DLQ-HEAL";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/observability", {
+        action: "execute_auto_remediation_runbook",
+        runbookId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || `执行 Runbook ${runbookId} 失败`);
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已执行自动化自愈 Runbook [${runbookId}]，SLO 燃烧率与死信队列已恢复`);
+      return;
+    }
+    if (action === "obs-seed-dlq") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+        action: "seed_dlq_samples",
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "注入 DLQ 样本失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast("已注入死信任务 task-dlq-9901 与失败 Outbox Webhook outbox-dlq-9901");
+      return;
+    }
+    if (action === "obs-replay-dlq-task") {
+      const taskId = target.getAttribute("data-task") || "task-dlq-9901";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+        action: "replay_dead_letter_task",
+        taskId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "重放死信任务失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`死信任务 ${taskId} 已重置重试计数并重新入队 (epoch:${res.data.newFencingToken})`);
+      return;
+    }
+    if (action === "obs-replay-outbox-msg") {
+      const messageId = target.getAttribute("data-msg") || "outbox-dlq-9901";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/ops/dlq-replay", {
+        action: "replay_outbox_webhook",
+        messageId,
+        newTargetUrl: "https://audit-sink.ansts.internal/webhook",
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "重放 Outbox Webhook 失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`Outbox Webhook ${messageId} 已重放投递成功`);
       return;
     }
     if (action === "open-config-editor-dialog") {
