@@ -42,6 +42,12 @@ export interface CelldNodeState {
   stateAgeMs: number;
 }
 
+/**
+ * Outcome of claiming a placed task: this gateway won it, a sibling gateway already holds it, or the fleet could
+ * not answer at all. Callers must treat `TAKEN` as "stay out of the way" and `UNREACHABLE` as "proceed anyway".
+ */
+export type CelldClaimOutcome = "CLAIMED" | "TAKEN" | "UNREACHABLE";
+
 export interface CelldOwnershipRecord {
   className: string;
   cellId: string;
@@ -343,6 +349,57 @@ export class CelldFleetClient {
       signal: AbortSignal.timeout(5_000),
     });
     return resp.ok;
+  }
+
+  /**
+   * Claims a placed task for this gateway. The cell arbitrates claim conflicts, so exactly one gateway runs a
+   * task even when several of them poll the same cell.
+   *
+   * The three outcomes are deliberately distinct: `TAKEN` means a sibling gateway already owns the task and this
+   * one must stay out of the way, while `UNREACHABLE` means the fleet could not answer — there the caller keeps
+   * executing, because not running the task at all is worse than a rare duplicate while the fleet is down.
+   */
+  public async claimTask(taskId: string, holderId: string): Promise<CelldClaimOutcome> {
+    for (const node of this.nodes) {
+      try {
+        const resp = await this.fetchImpl(`${node.publicUrl}/v1/scheduler/claim`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task_id: taskId, holder_id: holderId }),
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (resp.ok) {
+          const body = (await resp.json()) as Record<string, unknown>;
+          return body.claimed ? "CLAIMED" : "TAKEN";
+        }
+        // 409 = held by a sibling gateway; 404 = gone from the cell. Both mean "do not execute".
+        if (resp.status === 409 || resp.status === 404) return "TAKEN";
+      } catch {
+        // Try the next celld node; the cell is forwarded to its owner node either way.
+      }
+    }
+    return "UNREACHABLE";
+  }
+
+  /**
+   * Reads the tasks the cell holds. Used to adopt placed tasks this gateway did not schedule itself, so a
+   * gateway restart (or a submission that landed on a sibling gateway) cannot strand a task in `LEASED`.
+   */
+  public async listTasks(): Promise<{ celldNodeId: string; tasks: Array<Record<string, unknown>> }> {
+    for (const node of this.nodes) {
+      try {
+        const resp = await this.fetchImpl(`${node.publicUrl}/internal/v1beta1/brain/tasks`, {
+          method: "GET",
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!resp.ok) continue;
+        const body = (await resp.json()) as { tasks?: Array<Record<string, unknown>> };
+        return { celldNodeId: node.id, tasks: Array.isArray(body.tasks) ? body.tasks : [] };
+      } catch {
+        // Try the next celld node.
+      }
+    }
+    return { celldNodeId: "", tasks: [] };
   }
 
   /**

@@ -76,4 +76,40 @@ describe("M7 Cloudflare Workers & denoland/celld Integration Suite", () => {
       });
     }, /Stale fencing token/);
   });
+
+  it("6. AnstsSchedulerCell /claim arbitrates a placed task to exactly one gateway", async () => {
+    const state = new MockDurableObjectState("sched-cell-claim");
+    const cell = new AnstsSchedulerCell(state);
+    cell.registerNode(new NodeDaemon("cf-node-claim").emitHeartbeat());
+    await cell.submitTask(new TaskSpec({ task_id: "cf-claim-1", tenant_id: "t1" }));
+    await cell.alarm();
+
+    const claim = (taskId: string, holderId: string) =>
+      cell.fetch(
+        new Request("https://cell.internal/v1/scheduler/claim", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task_id: taskId, holder_id: holderId }),
+        })
+      );
+
+    const first = await claim("cf-claim-1", "gw-01");
+    assert.equal(first.status, 200);
+    assert.equal(((await first.json()) as { claimed: boolean }).claimed, true);
+
+    // A sibling gateway must lose the arbitration instead of executing the same task twice.
+    const second = await claim("cf-claim-1", "gw-02");
+    assert.equal(second.status, 409);
+    const secondBody = (await second.json()) as { claimed: boolean; holder_id: string };
+    assert.equal(secondBody.claimed, false);
+    assert.equal(secondBody.holder_id, "gw-01");
+
+    // Re-claiming by the winner is idempotent, which is what a restarted gateway relies on.
+    const again = await claim("cf-claim-1", "gw-01");
+    assert.equal(again.status, 200);
+    assert.equal(((await again.json()) as { claimed: boolean }).claimed, true);
+
+    const missing = await claim("cf-claim-unknown", "gw-01");
+    assert.equal(missing.status, 404);
+  });
 });

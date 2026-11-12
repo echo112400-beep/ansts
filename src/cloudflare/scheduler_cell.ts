@@ -35,6 +35,9 @@ export class AnstsSchedulerCell {
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS ansts_nodes (node_id TEXT PRIMARY KEY, heartbeat_json TEXT, updated_at INTEGER)"
     );
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS ansts_claims (task_id TEXT PRIMARY KEY, holder_id TEXT, claimed_at INTEGER)"
+    );
   }
 
   public rehydrateSchedulerFromSql(): number {
@@ -339,6 +342,43 @@ export class AnstsSchedulerCell {
       });
     }
 
+    if (request.method === "POST" && normalizedPath === "/claim") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const taskId = String(body.task_id ?? "");
+      const holderId = String(body.holder_id ?? "");
+      const task = this.scheduler.allTasks.get(taskId);
+      if (!task) {
+        return new Response(JSON.stringify({ claimed: false, reason: "TASK_NOT_FOUND" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      // The cell is a single-threaded Durable Object, so this check-then-insert is the atomic arbiter that
+      // makes exactly one gateway execute a placed task even when several gateways poll the same cell.
+      const existingRow = this.ctx.storage.sql
+        .exec<Record<string, unknown>>("SELECT holder_id FROM ansts_claims WHERE task_id = ?", taskId)
+        .toArray()[0];
+      const existingHolder = existingRow ? String(existingRow.holder_id) : null;
+      if (existingHolder && existingHolder !== holderId) {
+        return new Response(JSON.stringify({ claimed: false, holder_id: existingHolder, state: task.state }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (!existingHolder) {
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO ansts_claims (task_id, holder_id, claimed_at) VALUES (?, ?, ?)",
+          taskId,
+          holderId,
+          Date.now()
+        );
+      }
+      return new Response(JSON.stringify({ claimed: true, holder_id: holderId, state: task.state }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
     if (request.method === "POST" && normalizedPath === "/lease-renew") {
       const body = (await request.json()) as Record<string, unknown>;
       const taskId = String(body.task_id ?? "");
@@ -371,6 +411,7 @@ export class AnstsSchedulerCell {
       if (completed) {
         const task = this.scheduler.allTasks.get(taskId);
         if (task) this.persistTask(task);
+        this.ctx.storage.sql.exec("DELETE FROM ansts_claims WHERE task_id = ?", taskId);
       }
       return new Response(JSON.stringify({ completed, task_id: taskId }), {
         status: completed ? 200 : 409,

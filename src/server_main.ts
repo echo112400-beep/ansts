@@ -176,7 +176,15 @@ export class AnstsLocalAndComposeServer {
   /** Leases this gateway holds through celld, renewed on every heartbeat tick until the cell forgets them. */
   private readonly celldPlacedLeases = new Map<
     string,
-    { nodeId: string; fencingToken: number; celldNodeId: string }
+    {
+      nodeId: string;
+      fencingToken: number;
+      celldNodeId: string;
+      tenantId: string;
+      promptText: string;
+      /** True while an execution attempt for this lease is in flight, so one lease is never run twice. */
+      dispatched: boolean;
+    }
   >();
   private readonly host: string;
   private readonly defaultApiPort: number;
@@ -466,12 +474,14 @@ export class AnstsLocalAndComposeServer {
         if (!this.draining) {
           this.syncBodiesToCelldFleet().catch(() => {});
           this.renewCelldLeases().catch(() => {});
+          this.driveCelldPlacedTasks().catch(() => {});
         }
       }, 5_000);
     }
 
     this.tickTimer = setInterval(() => {
       if (!this.draining) {
+        this.refreshBodyHeartbeats();
         const recovered = this.scheduler.reconcileOrphanedLeases();
         const placements = this.scheduler.scheduleTick();
         if (recovered.length > 0 || placements.length > 0) {
@@ -600,11 +610,32 @@ export class AnstsLocalAndComposeServer {
   }
 
   /**
+   * Refreshes this gateway's body-host heartbeats. Body hosts are configured endpoints, so their heartbeat has
+   * to be re-emitted on every tick: the scheduler marks a node unhealthy once its heartbeat is older than
+   * 30s, and an unhealthy node is never selected for placement (locally or inside a celld node).
+   */
+  private refreshBodyHeartbeats(): void {
+    const bodyIds = Object.keys(this.peerBodyUrls);
+    for (const bodyId of bodyIds) {
+      const existing = this.scheduler.nodes.get(bodyId);
+      const runningTasks = existing?.running_tasks ?? 0;
+      const daemon = new NodeDaemon(
+        bodyId,
+        existing?.total_cpu_cores ?? 32,
+        existing?.total_memory_mb ?? 65536,
+        existing?.warm_pool_ready ?? 8
+      );
+      this.scheduler.registerOrUpdateNode(daemon.emitHeartbeat(runningTasks));
+    }
+  }
+
+  /**
    * Pushes this gateway's body-host heartbeats into the celld fleet. celld nodes hold the scheduler cell
    * that places tasks, so without this the cell has no body capacity and every task stays QUEUED.
    */
   private async syncBodiesToCelldFleet(): Promise<void> {
     if (!this.celldFleet) return;
+    this.refreshBodyHeartbeats();
     const bodyIds = new Set(Object.keys(this.peerBodyUrls));
     if (bodyIds.size === 0) return;
     const heartbeats = Array.from(this.scheduler.nodes.values())
@@ -632,10 +663,116 @@ export class AnstsLocalAndComposeServer {
    */
   private async renewCelldLeases(): Promise<void> {
     if (!this.celldFleet || this.celldPlacedLeases.size === 0) return;
-    const leases = Array.from(this.celldPlacedLeases.entries()).map(([taskId, lease]) => ({ taskId, ...lease }));
+    const leases = Array.from(this.celldPlacedLeases.entries()).map(([taskId, lease]) => ({
+      taskId,
+      nodeId: lease.nodeId,
+      fencingToken: lease.fencingToken,
+      celldNodeId: lease.celldNodeId,
+    }));
     const dropped = await this.celldFleet.renewLeases(leases);
     for (const taskId of dropped) {
       this.celldPlacedLeases.delete(taskId);
+    }
+  }
+
+  /**
+   * Executes tasks that celld placed on a body host and reports them back to the cell. Without this a
+   * celld-scheduled task stays `LEASED` forever: the cell owns placement, so the body side has to drive
+   * the work and then release the lease, otherwise the cell retries it until it dead-letters.
+   */
+  private async driveCelldPlacedTasks(): Promise<void> {
+    if (!this.celldFleet) return;
+    await this.adoptOrphanedCelldLeases();
+    if (this.celldPlacedLeases.size === 0) return;
+    for (const [taskId, lease] of Array.from(this.celldPlacedLeases.entries())) {
+      if (lease.dispatched) continue;
+      // Claim the lease before awaiting so a slow body RPC cannot make the next tick dispatch it again.
+      lease.dispatched = true;
+      const result = await this.executeOnBodyHost(lease.nodeId, {
+        taskId,
+        tenantId: lease.tenantId,
+        promptText: lease.promptText,
+      });
+      if (!result) {
+        lease.dispatched = false;
+        continue;
+      }
+      try {
+        await this.celldFleet.completeTask(taskId, lease.celldNodeId, lease.nodeId, lease.fencingToken);
+      } catch {
+        this.metrics.incCounter("ansts_celld_fleet_unavailable_total", 1);
+      }
+      this.celldPlacedLeases.delete(taskId);
+      this.invalidatePeerTasksCache();
+      this.metrics.incCounter("ansts_celld_tasks_executed_total", 1);
+    }
+  }
+
+  /**
+   * Adopts placed tasks this gateway is not tracking — after a restart, or when the submission landed on a
+   * sibling gateway. The cell arbitrates the claim, so a task is executed by exactly one gateway; a task that
+   * another gateway already claimed is skipped rather than duplicated.
+   */
+  private async adoptOrphanedCelldLeases(): Promise<void> {
+    if (!this.celldFleet) return;
+    const tasks = await this.celldFleet.listTasks();
+    if (!tasks.celldNodeId) return;
+    const bodyIds = new Set(Object.keys(this.peerBodyUrls));
+    for (const task of tasks.tasks) {
+      const taskId = String(task.task_id ?? "");
+      const state = String(task.state ?? "");
+      const assignedNodeId = String(task.assigned_node_id ?? "");
+      if (!taskId || this.celldPlacedLeases.has(taskId)) continue;
+      // Only LEASED tasks are in flight; anything RUNNING/terminal belongs to someone else's claim.
+      if (state !== "LEASED" || !assignedNodeId) continue;
+      if (bodyIds.size > 0 && !bodyIds.has(assignedNodeId)) continue;
+      const claimed = await this.celldFleet.claimTask(taskId, this.nodeId);
+      if (claimed === "TAKEN") continue;
+      this.celldPlacedLeases.set(taskId, {
+        nodeId: assignedNodeId,
+        fencingToken: Number(task.lease_fencing_token ?? 1),
+        celldNodeId: tasks.celldNodeId,
+        tenantId: String(task.tenant_id ?? "default"),
+        promptText: String(task.prompt ?? ""),
+        dispatched: false,
+      });
+      this.metrics.incCounter("ansts_celld_leases_adopted_total", 1);
+    }
+  }
+
+  /**
+   * Runs one task on a body host: direct HTTP RPC first, dual-homed reverse tunnel second. Returns the
+   * body's execution result, or null when neither path reached a live body.
+   */
+  private async executeOnBodyHost(
+    hostId: string,
+    payload: { taskId: string; tenantId: string; promptText: string },
+    opts?: { dispatchMode?: string }
+  ): Promise<Record<string, unknown> | null> {
+    const useReverseTunnel = opts?.dispatchMode === "reverse_tunnel" || !this.peerBodyUrls[hostId];
+    if (!useReverseTunnel && this.peerBodyUrls[hostId]) {
+      try {
+        const resp = await fetch(`${this.peerBodyUrls[hostId]}/internal/v1beta1/body/execute`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (resp.ok) {
+          return (await resp.json()) as Record<string, unknown>;
+        }
+      } catch {
+        // Body host unreachable over HTTP; fall back to the reverse tunnel below.
+      }
+    }
+    try {
+      const tunnelDispatch = await this.tunnelRouter.dispatchOverReverseTunnel(hostId, payload, 3000);
+      return {
+        ...tunnelDispatch.executionResult,
+        routedViaGatewayId: tunnelDispatch.routedViaGatewayId,
+        tunnelRole: tunnelDispatch.role,
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -816,11 +953,21 @@ export class AnstsLocalAndComposeServer {
             });
             const placement = celldResult.placements[0];
             if (placement) {
-              this.celldPlacedLeases.set(spec.task_id, {
-                nodeId: placement[1],
-                fencingToken: placement[2],
-                celldNodeId: celldResult.celldNodeId,
-              });
+              // Claim before executing: a sibling gateway ticks against the same cell and would otherwise adopt
+              // this LEASED task and run it a second time.
+              const claim = await this.celldFleet.claimTask(spec.task_id, this.nodeId);
+              if (claim === "TAKEN") {
+                this.metrics.incCounter("ansts_celld_claims_lost_total", 1);
+              } else {
+                this.celldPlacedLeases.set(spec.task_id, {
+                  nodeId: placement[1],
+                  fencingToken: placement[2],
+                  celldNodeId: celldResult.celldNodeId,
+                  tenantId: spec.tenant_id,
+                  promptText: spec.prompt,
+                  dispatched: false,
+                });
+              }
             }
             res.writeHead(202, { "content-type": "application/json" });
             res.end(
@@ -1260,6 +1407,8 @@ export class AnstsLocalAndComposeServer {
 
       // Forward to live peer Brain shard owner; if unreachable, automatically evict & failover to surviving Brain shard!
       let remoteBrainResult: Record<string, unknown> | null = null;
+      // Set when celld placed the task: the cell's chosen body is the one that must execute it.
+      let celldPlacedBodyHostId: string | null = null;
       let failoverEvent: Record<string, unknown> | null = null;
       // A real denoland/celld fleet owns the brain layer when configured. celld forwards a call to the
       // cell's owner node, so the gateway only needs one ready entry node instead of a static shard map.
@@ -1282,11 +1431,21 @@ export class AnstsLocalAndComposeServer {
           };
           const celldPlacement = celldResult.placements[0];
           if (celldPlacement) {
-            this.celldPlacedLeases.set(taskId, {
-              nodeId: celldPlacement[1],
-              fencingToken: celldPlacement[2],
-              celldNodeId: celldResult.celldNodeId,
-            });
+            celldPlacedBodyHostId = celldPlacement[1];
+            // Same claim-first rule as the celld submit path: claim, then execute, so no sibling duplicates it.
+            const claim = await this.celldFleet.claimTask(taskId, this.nodeId);
+            if (claim === "TAKEN") {
+              this.metrics.incCounter("ansts_celld_claims_lost_total", 1);
+            } else {
+              this.celldPlacedLeases.set(taskId, {
+                nodeId: celldPlacement[1],
+                fencingToken: celldPlacement[2],
+                celldNodeId: celldResult.celldNodeId,
+                tenantId,
+                promptText,
+                dispatched: false,
+              });
+            }
           }
         } catch {
           this.metrics.incCounter("ansts_celld_fleet_unavailable_total", 1);
@@ -1362,35 +1521,33 @@ export class AnstsLocalAndComposeServer {
       }
 
       let remoteBodyResult: Record<string, unknown> | null = null;
-      const useReverseTunnel = body.dispatchMode === "reverse_tunnel" || !this.peerBodyUrls[targetBodyHostId];
-      if (!useReverseTunnel && this.peerBodyUrls[targetBodyHostId]) {
-        try {
-          const resp = await fetch(`${this.peerBodyUrls[targetBodyHostId]}/internal/v1beta1/body/execute`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ taskId, tenantId, promptText }),
-          });
-          if (resp.ok) {
-            remoteBodyResult = (await resp.json()) as Record<string, unknown>;
-          }
-        } catch {
-          // fallback to reverse tunnel below
-        }
+      // celld owns placement: the cell's chosen body runs the task. When the cell has not placed the task yet
+      // (no free body capacity, or higher-priority work queued ahead of it) executing on a guessed body would
+      // do the work twice — once now and once when the cell places it — so the dispatch is deferred instead.
+      const awaitingCelldPlacement = Boolean(this.celldFleet) && celldPlacedBodyHostId === null;
+      const placedBodyHostId = celldPlacedBodyHostId ?? targetBodyHostId;
+      if (!awaitingCelldPlacement) {
+        remoteBodyResult = await this.executeOnBodyHost(
+          placedBodyHostId,
+          { taskId, tenantId, promptText },
+          { dispatchMode: body.dispatchMode as string | undefined }
+        );
       }
-      if (!remoteBodyResult) {
-        try {
-          const tunnelDispatch = await this.tunnelRouter.dispatchOverReverseTunnel(
-            targetBodyHostId,
-            { taskId, tenantId, promptText },
-            3000
-          );
-          remoteBodyResult = {
-            ...tunnelDispatch.executionResult,
-            routedViaGatewayId: tunnelDispatch.routedViaGatewayId,
-            tunnelRole: tunnelDispatch.role,
-          };
-        } catch {
-          // ignore if no reverse tunnel active
+      const celldLease = this.celldPlacedLeases.get(taskId);
+      if (celldLease) {
+        if (remoteBodyResult && this.celldFleet) {
+          // Release the lease now instead of waiting for the next heartbeat tick to report the execution.
+          celldLease.dispatched = true;
+          try {
+            await this.celldFleet.completeTask(taskId, celldLease.celldNodeId, celldLease.nodeId, celldLease.fencingToken);
+            this.celldPlacedLeases.delete(taskId);
+            this.metrics.incCounter("ansts_celld_tasks_executed_total", 1);
+          } catch {
+            this.metrics.incCounter("ansts_celld_fleet_unavailable_total", 1);
+          }
+        } else {
+          // No body answered: leave the lease to the heartbeat tick so it is retried, not lost.
+          celldLease.dispatched = false;
         }
       }
 
@@ -1409,6 +1566,7 @@ export class AnstsLocalAndComposeServer {
           state: remoteBrainResult?.state ?? localState,
           targetBodyHostId,
           bodyExecution: remoteBodyResult,
+          deferred: awaitingCelldPlacement ? "AWAITING_CELLD_PLACEMENT" : null,
           placements: remoteBrainResult?.placements ?? localPlacements,
         })
       );

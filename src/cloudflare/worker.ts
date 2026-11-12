@@ -93,7 +93,12 @@ export default {
     if (url.pathname.startsWith("/internal/v1beta1/brain/tasks/") && request.method === "GET") {
       const taskId = decodeURIComponent(url.pathname.slice("/internal/v1beta1/brain/tasks/".length));
       const tasks = await listCellTasks(env, "global-shard-0");
-      const found = tasks.find((task) => String((task as { taskId?: unknown }).taskId ?? "") === taskId);
+      // The cell hands back raw `TaskSpec` objects keyed `task_id`; older callers used `taskId`. Accept both
+      // shapes, otherwise every single-task lookup 404s even though the task is in the list.
+      const found = tasks.find((task) => {
+        const shaped = task as { taskId?: unknown; task_id?: unknown };
+        return String(shaped.task_id ?? shaped.taskId ?? "") === taskId;
+      });
       if (!found) {
         return new Response(JSON.stringify({ error: "TASK_NOT_FOUND", task_id: taskId }), {
           status: 404,

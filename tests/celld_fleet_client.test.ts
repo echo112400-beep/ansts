@@ -206,6 +206,73 @@ describe("M-FLEET-1 CelldFleetClient", () => {
     assert.equal(renewed.nodeId, "celld-node-02");
   });
 
+  it("8. claimTask reports the cell's arbitration: granted, taken by a sibling gateway, or task gone", async () => {
+    const captured: CapturedCall[] = [];
+    let status = 200;
+    const client = new CelldFleetClient({
+      nodes: NODES,
+      fetchImpl: jsonFetch(() => ({ status, body: { claimed: status === 200, state: "LEASED" } }), captured),
+    });
+
+    assert.equal(await client.claimTask("task-1", "gw-01"), "CLAIMED");
+    assert.equal(captured[0].url, "http://celld-01:8081/v1/scheduler/claim");
+    assert.deepEqual(captured[0].body, { task_id: "task-1", holder_id: "gw-01" });
+
+    status = 409;
+    captured.length = 0;
+    assert.equal(await client.claimTask("task-1", "gw-02"), "TAKEN");
+
+    status = 404;
+    captured.length = 0;
+    assert.equal(await client.claimTask("task-gone", "gw-02"), "TAKEN");
+  });
+
+  it("11. claimTask reports UNREACHABLE — not TAKEN — when the fleet cannot answer", async () => {
+    const client = new CelldFleetClient({
+      nodes: NODES,
+      fetchImpl: (async () => {
+        throw new Error("ECONNREFUSED");
+      }) as unknown as typeof fetch,
+    });
+    // A transport failure must not be mistaken for "a sibling owns it", which would silently drop the task.
+    assert.equal(await client.claimTask("task-1", "gw-01"), "UNREACHABLE");
+  });
+
+  it("9. listTasks returns the tasks and the celld node that answered, for lease adoption", async () => {
+    const captured: CapturedCall[] = [];
+    const client = new CelldFleetClient({
+      nodes: NODES,
+      fetchImpl: jsonFetch((url) => {
+        if (!url.endsWith("/internal/v1beta1/brain/tasks")) return null;
+        if (url.includes("celld-01")) return { status: 503, body: { error: "NODE_DRAINING" } };
+        return {
+          body: {
+            totalTasks: 1,
+            tasks: [{ task_id: "task-9", state: "LEASED", assigned_node_id: "body-host-01" }],
+          },
+        };
+      }, captured),
+    });
+
+    const listed = await client.listTasks();
+    // celld-01 answered 503, so the client must fall through to celld-02 and report which node served the read.
+    assert.equal(listed.celldNodeId, "celld-node-02");
+    assert.equal(listed.tasks.length, 1);
+    assert.equal(listed.tasks[0].task_id, "task-9");
+  });
+
+  it("10. completeTask posts the lease release and surfaces an unplaceable target as false", async () => {
+    const captured: CapturedCall[] = [];
+    const client = new CelldFleetClient({
+      nodes: NODES,
+      fetchImpl: jsonFetch(() => ({ body: { completed: true } }), captured),
+    });
+    assert.equal(await client.completeTask("task-1", "celld-node-02", "body-host-01", 4), true);
+    assert.equal(captured[0].url, "http://celld-02:8081/v1/scheduler/complete");
+    assert.deepEqual(captured[0].body, { task_id: "task-1", node_id: "body-host-01", fencing_token: 4 });
+    assert.equal(await client.completeTask("task-1", "celld-unknown", "body-host-01", 4), false);
+  });
+
   it("7. fromEnv parses fleet url maps and rejects unsafe cell ids", () => {
     const client = CelldFleetClient.fromEnv({
       ANSTS_CELLD_FLEET_URLS: '{"celld-node-01":"http://celld-01:8081/"}',
