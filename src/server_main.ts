@@ -2437,6 +2437,62 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M82] TanStack Console BFF: Multi-Agent Swarm, Policy-as-Code Formal Guardrail, Episodic Golden Store & Spot Market (`GET /v1beta1/console/swarm`)
+    if (method === "GET" && pathname === "/v1beta1/console/swarm") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildSwarmAndCognitiveVisualization()));
+      return;
+    }
+
+    // [M82] Interactive Swarm, Formal Guardrail, Spot Market & Episodic Hatchery Action (`POST /v1beta1/management/swarm/action`)
+    if (method === "POST" && pathname === "/v1beta1/management/swarm/action") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeSwarmAndCognitiveGovernanceAction({
+        action: (body.action ?? "evaluate_policy_probe") as
+          | "register_policy_rule"
+          | "delete_policy_rule"
+          | "evaluate_policy_probe"
+          | "publish_spot_offer"
+          | "match_spot_bid"
+          | "recall_spot_quota"
+          | "hatch_golden_episode",
+        ruleId: body.ruleId ? String(body.ruleId) : undefined,
+        description: body.description ? String(body.description) : undefined,
+        toolNamePattern: body.toolNamePattern ? String(body.toolNamePattern) : undefined,
+        forbiddenArgRegex: body.forbiddenArgRegex ? String(body.forbiddenArgRegex) : undefined,
+        maxAffectedRows: body.maxAffectedRows !== undefined ? Number(body.maxAffectedRows) : undefined,
+        effect: body.effect ? (String(body.effect) as "ALLOW" | "REQUIRE_4EYES_APPROVAL" | "DENY") : undefined,
+        toolName: body.toolName ? String(body.toolName) : undefined,
+        toolArgs: body.toolArgs && typeof body.toolArgs === "object" ? (body.toolArgs as Record<string, unknown>) : undefined,
+        offerId: body.offerId ? String(body.offerId) : undefined,
+        lenderTenantId: body.lenderTenantId ? String(body.lenderTenantId) : undefined,
+        borrowerTenantId: body.borrowerTenantId ? String(body.borrowerTenantId) : undefined,
+        offeredSlots: body.offeredSlots !== undefined ? Number(body.offeredSlots) : undefined,
+        requestedSlots: body.requestedSlots !== undefined ? Number(body.requestedSlots) : undefined,
+        minBidPricePerSlotUsd: body.minBidPricePerSlotUsd !== undefined ? Number(body.minBidPricePerSlotUsd) : undefined,
+        maxBidPricePerSlotUsd: body.maxBidPricePerSlotUsd !== undefined ? Number(body.maxBidPricePerSlotUsd) : undefined,
+        episodeId: body.episodeId ? String(body.episodeId) : undefined,
+        sourceBranch: body.sourceBranch ? String(body.sourceBranch) : undefined,
+        repoSignature: body.repoSignature ? String(body.repoSignature) : undefined,
+        problemPattern: body.problemPattern ? String(body.problemPattern) : undefined,
+        resolutionSummary: body.resolutionSummary ? String(body.resolutionSummary) : undefined,
+        actor: auth.actor,
+        role: auth.role,
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M80] LayerFS CoW Branch Interactive Management (`POST /v1beta1/management/runtime/layerfs-branch`)
     if (method === "POST" && pathname === "/v1beta1/management/runtime/layerfs-branch") {
       const body = await this.readJsonBody(req);

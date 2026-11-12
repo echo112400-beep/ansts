@@ -355,6 +355,10 @@ class CapacitySlaEnforcer {
     };
   }
 
+  listSpotOffers() {
+    return Array.from(this.spotOffers.values());
+  }
+
   listSpotLeases() {
     return Array.from(this.spotLeases.values());
   }

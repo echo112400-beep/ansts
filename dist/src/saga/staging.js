@@ -324,6 +324,14 @@ class StagingCommitAndApprovalGate {
     }
   }
 
+  deletePolicyRule(ruleId) {
+    const existed = this.policyRules.delete(ruleId);
+    if (existed && this.sql) {
+      this.sql.exec("DELETE FROM persisted_guardrail_policies WHERE rule_id = ?", ruleId);
+    }
+    return existed;
+  }
+
   listPolicyRules() {
     return Array.from(this.policyRules.values());
   }

@@ -683,3 +683,19 @@
    - 在可观测性视图内嵌死信任务与失败 Outbox Webhook 实时列表，支持一键注入故障样本 (`obs-seed-dlq`)、单条死信任务重放 (`obs-replay-dlq-task`) 与 Outbox Webhook 改址重放 (`obs-replay-outbox-msg`)，并在 `/v1beta1/management/ops/observability` 与 `/v1beta1/management/ops/dlq-replay` 强制执行 RBAC JWT 鉴权（`VIEWER` 写操作返回 `403 RBAC_FORBIDDEN`）。
 4. **端到端回归验证 (`tests/m81_console_observability_traces_slo_and_runbooks.test.ts`)**：
    - 全量 **89 个 `src/` 源码模块**、**74 个测试套件（共 208 项测试）100% 通过**。
+
+
+---
+
+## 32. M82: TanStack Console 多智能体协同、Policy-as-Code 形式化安全门控、跨租户 Spot 算力借贷市场与 Golden Base 黄金镜像工作台套件 (`GET /v1beta1/console/swarm`, `POST /v1beta1/management/swarm/action`, `anstsctl mgmt-swarm`)
+
+1. **Policy-as-Code 形式化安全门控可视与在线 AST 证明探针 (`StagingCommitAndApprovalGate` & `formalGuardrail`)**：
+   - 将 `StagingCommitAndApprovalGate` 绑定至持久化 SQLite `persisted_guardrail_policies`，支持在线新增 (`register_policy_rule`)、删除 (`delete_policy_rule`) 自定义声明式策略，并与 3 条内置 AST 证明规则（`BUILTIN_SQL_DESTRUCTIVE_DDL`、`BUILTIN_SQL_UNSCOPED_MUTATION`、`BUILTIN_PATH_SECRET_BOUNDARY`）共同展示在控制台策略表中。
+   - 支持在线执行 `evaluate_policy_probe`，实时验证 SQL / 路径工具调用的形式化证明结果（`ALLOW` / `REQUIRE_4EYES_APPROVAL` / `DENY_FORMAL_VIOLATION`）与爆炸半径评分 (`0..100`)。
+2. **跨租户 Spot 空闲算力借贷与亚秒级 WAL 紧急召回市场 (`CapacitySlaEnforcer` & `spotQuotaMarket`)**：
+   - 新增 `CapacitySlaEnforcer.listSpotOffers()`，在 `swarmVisualization.spotQuotaMarket` 中实时暴露所有空闲算力挂单 (`offers`) 与活跃借贷租约 (`leases`)。
+   - 支持在控制台直接发布空闲槽位挂单 (`publish_spot_offer`)、按中间价撮合借入方竞标 (`match_spot_bid`)，以及在出借方高优 P0 任务到达时一键触发亚秒级 WAL 断点冻结与槽位召回 (`recall_spot_quota`)。
+3. **跨任务语义经验库与 LayerFS Golden Base 黄金镜像孵化器 (`LayerFsContentStoreEngine` & `episodicGoldenStore`)**：
+   - 新增 `LayerFsContentStoreEngine.listEpisodicTrajectories()`，实时展示已固化的 `golden/<episodeId>` 黄金镜像分支、HEAD Commit、仓库签名与预计节省冷启动时间 (`savedColdStartMs`)，并支持通过控制台或 CLI `anstsctl mgmt-swarm hatch_golden_episode` 从活跃分支孵化新黄金镜像。
+4. **端到端回归验证 (`tests/m82_console_swarm_guardrail_spot_market_and_episodic_store.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**75 个测试套件（共 209 项测试）100% 通过**。

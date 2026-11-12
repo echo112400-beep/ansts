@@ -455,4 +455,32 @@ export class LayerFsContentStoreEngine {
       matches,
     };
   }
+
+  public listEpisodicTrajectories(): Array<{
+    episodeId: string;
+    taskId: string;
+    repoSignature: string;
+    problemPattern: string;
+    resolutionSummary: string;
+    verifiedCommitId: string;
+    goldenBaseBranch: string;
+    reusableFilePaths: string[];
+    tags: string[];
+    savedColdStartMs: number;
+    createdAtMs: number;
+  }> {
+    return Array.from(this.episodicMemories.values()).map((ep) => ({
+      episodeId: ep.episodeId,
+      taskId: ep.taskId,
+      repoSignature: ep.repoSignature,
+      problemPattern: ep.problemPattern,
+      resolutionSummary: ep.resolutionSummary,
+      verifiedCommitId: ep.verifiedCommitId,
+      goldenBaseBranch: ep.goldenBaseBranch,
+      reusableFilePaths: ep.reusableFilePaths,
+      tags: ep.tags,
+      savedColdStartMs: ep.savedColdStartMs,
+      createdAtMs: ep.createdAtMs,
+    }));
+  }
 }

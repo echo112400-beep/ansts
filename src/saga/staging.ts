@@ -324,6 +324,14 @@ export class StagingCommitAndApprovalGate {
     }
   }
 
+  public deletePolicyRule(ruleId: string): boolean {
+    const existed = this.policyRules.delete(ruleId);
+    if (existed && this.sql) {
+      this.sql.exec("DELETE FROM persisted_guardrail_policies WHERE rule_id = ?", ruleId);
+    }
+    return existed;
+  }
+
   public listPolicyRules(): FormalGuardrailPolicyRule[] {
     return Array.from(this.policyRules.values());
   }

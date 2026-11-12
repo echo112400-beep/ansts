@@ -331,6 +331,7 @@ class PlatformManagementPlaneEngine {
   mgmtQueueManager = new _queue_manager.HierarchicalQueueManager();
   runbookStats = new Map();
   lastSimulatedErrorRequests = 4;
+  lastGuardrailEvaluation = null;
 
   constructor(deps) {
     this.deps = deps;
@@ -410,7 +411,7 @@ class PlatformManagementPlaneEngine {
       sovereigntyZone: "APAC"
     });
     this.velocityBreaker = new _velocity_breaker.SyntacticAndVelocityBreaker(3, 120_000);
-    this.stagingGate = new _staging.StagingCommitAndApprovalGate();
+    this.stagingGate = new _staging.StagingCommitAndApprovalGate(deps.v25Store.sql);
     this.schedulerCell = new _scheduler_cell.AnstsSchedulerCell({
       id: { toString: () => "AnstsSchedulerCell:shard-01" },
       storage: {
@@ -878,6 +879,52 @@ class PlatformManagementPlaneEngine {
       });
       qSpec.state = _models.TaskState.QUEUED;
       this.mgmtQueueManager.enqueue(qSpec);
+    }
+
+    // [M82] Seed initial Policy-as-Code rules, Spot Quota Offer, and Episodic Golden Base Image
+    if (this.stagingGate.listPolicyRules().length === 0) {
+      this.stagingGate.registerPolicyRule({
+        ruleId: "RULE-PROD-BULK-MIGRATION-4EYES",
+        description: "生产环境影响行数 > 5000 的数据迁移强制要求 4-Eyes 双人审批",
+        toolNamePattern: "schema_migrate|sql_exec|db_patch",
+        maxAffectedRows: 5000,
+        effect: "REQUIRE_4EYES_APPROVAL"
+      });
+      this.stagingGate.registerPolicyRule({
+        ruleId: "RULE-BLOCK-RAW-CREDENTIAL-DUMP",
+        description: "严禁在任何工具参数中导出私钥或生产凭据文件",
+        toolNamePattern: ".*",
+        forbiddenArgRegex: "(PRIVATE_KEY|aws_secret_access_key|dump_secrets)",
+        effect: "DENY"
+      });
+    }
+    if (this.deps.slaEnforcer.listSpotOffers().length === 0) {
+      this.deps.slaEnforcer.publishIdleQuotaOffer({
+        offerId: "offer-helios-idle-01",
+        lenderTenantId: "Helios",
+        offeredSlots: 12,
+        minBidPricePerSlotUsd: 0.04,
+        region: "eu-central-1"
+      });
+      this.deps.slaEnforcer.publishIdleQuotaOffer({
+        offerId: "offer-vanguard-idle-02",
+        lenderTenantId: "Vanguard",
+        offeredSlots: 8,
+        minBidPricePerSlotUsd: 0.05,
+        region: "ap-northeast-1"
+      });
+    }
+    if (this.deps.layerfs.storeEngine.listEpisodicTrajectories().length === 0) {
+      this.deps.layerfs.hatchGoldenBaseBranch({
+        episodeId: "ep-ns-zero-trust-auth",
+        taskId: "task-ns-8841",
+        sourceBranchOrCommit: "feat-ns-auth",
+        repoSignature: "ansts-core-v25",
+        problemPattern: "Zero-trust SPIFFE mTLS & JWT auth header propagation",
+        resolutionSummary: "Verified Bearer JWT middleware and Ed25519 SVID rotation",
+        tags: ["auth", "spiffe", "jwt"],
+        savedColdStartMs: 4600
+      });
     }
 
     this.appendAudit("chen", "SRE_ADMIN", "初始化平台管理面控制基线与 256-Slot 分片映射", "Global", "已生效 (RPO=0)");
@@ -1419,7 +1466,316 @@ class PlatformManagementPlaneEngine {
       configVisualization: this.buildConfigVisualization(),
       runtimeVisualization: this.buildRuntimeVisualization(),
       observabilityVisualization: this.buildObservabilityVisualization(),
+      swarmVisualization: this.buildSwarmAndCognitiveVisualization(),
       status: "HEALTHY"
+    };
+  }
+
+  buildSwarmAndCognitiveVisualization() {
+    this.ensureInitialized();
+    const builtinRules = [
+    {
+      ruleId: "BUILTIN_SQL_DESTRUCTIVE_DDL",
+      description: "内置 SQL AST 静态证明：拦截 DROP TABLE / DROP DATABASE / TRUNCATE 等破坏性 DDL",
+      toolNamePattern: "sql_exec|db_query|schema_migrate",
+      effect: "DENY",
+      builtin: true
+    },
+    {
+      ruleId: "BUILTIN_SQL_UNSCOPED_MUTATION",
+      description: "内置 SQL AST 静态证明：拦截无 WHERE 子句或 WHERE 1=1 的全表更新/删除",
+      toolNamePattern: "sql_exec|db_query|schema_migrate",
+      effect: "DENY",
+      builtin: true
+    },
+    {
+      ruleId: "BUILTIN_PATH_SECRET_BOUNDARY",
+      description: "内置路径与凭据边界证明：拦截 ../ 目录穿越及 /etc/、/proc/、.ssh/、.env 访问",
+      toolNamePattern: ".*",
+      effect: "DENY",
+      builtin: true
+    }];
+
+    const customRules = this.stagingGate.listPolicyRules().map((r) => ({
+      ...r,
+      builtin: false
+    }));
+
+    const offers = this.deps.slaEnforcer.listSpotOffers();
+    const leases = this.deps.slaEnforcer.listSpotLeases();
+    const episodes = this.deps.layerfs.storeEngine.listEpisodicTrajectories();
+
+    return {
+      formalGuardrail: {
+        builtinRules,
+        customRules,
+        totalRulesCount: builtinRules.length + customRules.length,
+        lastEvaluation: this.lastGuardrailEvaluation
+      },
+      spotQuotaMarket: {
+        offers,
+        leases,
+        totalAvailableSpotSlots: offers.reduce((acc, o) => acc + o.availableSlots, 0),
+        activeLeasedSpotSlots: leases.
+        filter((l) => l.status === "ACTIVE").
+        reduce((acc, l) => acc + l.leasedSlots, 0)
+      },
+      episodicGoldenStore: {
+        episodes,
+        totalEpisodesCount: episodes.length,
+        totalSavedColdStartMs: episodes.reduce((acc, e) => acc + e.savedColdStartMs, 0)
+      },
+      a2aGovernance: this.getA2aGovernanceSnapshot()
+    };
+  }
+
+  executeSwarmAndCognitiveGovernanceAction(params)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权变更形式化策略门控、Spot 算力市场或孵化黄金镜像" }
+      };
+    }
+
+    if (params.action === "register_policy_rule") {
+      const ruleId = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.ruleId ?? `RULE-CUSTOM-${Date.now() % 10000}`).trim());
+      if (!ruleId) {
+        return { status: 400, body: { error: "MISSING_REQUIRED_PARAMETERS", message: "Required: ruleId" } };
+      }
+      const rule = {
+        ruleId,
+        description: (0, _console_rbac_guard.sanitizeHtmlString)(String(params.description ?? "Custom declarative guardrail policy")),
+        toolNamePattern: String(params.toolNamePattern ?? ".*"),
+        forbiddenArgRegex: params.forbiddenArgRegex ? String(params.forbiddenArgRegex) : undefined,
+        maxAffectedRows: params.maxAffectedRows !== undefined ? Number(params.maxAffectedRows) : undefined,
+        effect: params.effect ?? "REQUIRE_4EYES_APPROVAL"
+      };
+      this.stagingGate.registerPolicyRule(rule);
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `注册 Policy-as-Code 形式化安全规则 [${rule.ruleId}] (Effect=${rule.effect}, Pattern=${rule.toolNamePattern})`,
+      "Swarm / FormalGuardrail",
+      `RULE_REGISTERED (${rule.effect})`);
+
+      return {
+        status: 201,
+        body: {
+          rule,
+          swarmVisualization: this.buildSwarmAndCognitiveVisualization()
+        }
+      };
+    }
+
+    if (params.action === "delete_policy_rule") {
+      const ruleId = String(params.ruleId ?? "").trim();
+      const deleted = this.stagingGate.deletePolicyRule(ruleId);
+      if (!deleted) {
+        return { status: 404, body: { error: "RULE_NOT_FOUND", ruleId } };
+      }
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `删除自定义 Policy-as-Code 规则 [${ruleId}]`,
+      "Swarm / FormalGuardrail",
+      "RULE_DELETED");
+
+      return {
+        status: 200,
+        body: {
+          deleted: true,
+          ruleId,
+          swarmVisualization: this.buildSwarmAndCognitiveVisualization()
+        }
+      };
+    }
+
+    if (params.action === "evaluate_policy_probe") {
+      const toolName = String(params.toolName ?? "sql_exec").trim();
+      const toolArgs = params.toolArgs ?? {
+        sql: "DELETE FROM orders WHERE 1=1; DROP TABLE audit_logs;",
+        filePath: "/etc/shadow"
+      };
+      const probeTask = new _models.TaskSpec({
+        task_id: `task-guardrail-probe-${Date.now() % 1000}`,
+        tenant_id: "Northstar",
+        priority: _models.TaskPriority.P1_HIGH
+      });
+      const evalRes = this.stagingGate.evaluateFormalGuardrailPolicy({
+        task: probeTask,
+        turnIndex: 1,
+        toolName,
+        args: toolArgs,
+        environment: "prod"
+      });
+      this.lastGuardrailEvaluation = {
+        toolName,
+        toolArgs,
+        ...evalRes,
+        evaluatedAtUtc: `${new Date().toISOString().slice(11, 19)} UTC`
+      };
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `执行 Policy-as-Code 形式化安全证明探针 [${toolName}] → ${evalRes.decision} (BlastRadius=${evalRes.blastRadiusScore}, Violations=${evalRes.violatedRuleIds.join(",") || "none"})`,
+      "Swarm / FormalGuardrail",
+      evalRes.decision);
+
+      return {
+        status: 200,
+        body: {
+          evaluation: this.lastGuardrailEvaluation,
+          swarmVisualization: this.buildSwarmAndCognitiveVisualization()
+        }
+      };
+    }
+
+    if (params.action === "publish_spot_offer") {
+      const lender = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.lenderTenantId ?? "Helios").trim());
+      const offerId = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.offerId ?? `offer-${lender.toLowerCase()}-${Date.now() % 10000}`).trim());
+      const slots = Number(params.offeredSlots ?? 6);
+      const minPrice = Number(params.minBidPricePerSlotUsd ?? 0.04);
+      const offer = this.deps.slaEnforcer.publishIdleQuotaOffer({
+        offerId,
+        lenderTenantId: lender,
+        offeredSlots: slots,
+        minBidPricePerSlotUsd: minPrice,
+        region: "us-west-2"
+      });
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `发布跨租户 Spot 空闲算力挂单 [${offer.offerId}] (出借租户=${lender}, 槽位=${offer.offeredSlots}, 最低单价=$${offer.minBidPricePerSlotUsd}/slot)`,
+      `SpotMarket / ${lender}`,
+      `OFFER_PUBLISHED (${offer.offeredSlots} slots)`);
+
+      return {
+        status: 201,
+        body: {
+          offer,
+          swarmVisualization: this.buildSwarmAndCognitiveVisualization()
+        }
+      };
+    }
+
+    if (params.action === "match_spot_bid") {
+      const borrower = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.borrowerTenantId ?? "Northstar").trim());
+      const reqSlots = Number(params.requestedSlots ?? 4);
+      const maxBid = Number(params.maxBidPricePerSlotUsd ?? 0.08);
+      const taskId = `task-spot-${borrower.toLowerCase()}-${Date.now() % 10000}`;
+      const matchRes = this.deps.slaEnforcer.matchSpotQuotaBid({
+        borrowerTenantId: borrower,
+        taskId,
+        requestedSlots: reqSlots,
+        maxBidPricePerSlotUsd: maxBid
+      });
+      if (!matchRes.matched || !matchRes.lease) {
+        return {
+          status: 409,
+          body: {
+            error: "SPOT_BID_UNMATCHED",
+            reason: matchRes.reason ?? "NO_MATCHING_LENDER_OFFER",
+            message: `Spot 算力竞标未成交：${matchRes.reason ?? "无满足条件的空闲挂单"}`
+          }
+        };
+      }
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `撮合跨租户 Spot 算力租约 [${matchRes.lease.leaseId}] (${matchRes.lease.lenderTenantId} → ${borrower}, 槽位=${matchRes.lease.leasedSlots}, 清算单价=$${matchRes.lease.clearingPricePerSlotUsd})`,
+      `SpotMarket / ${borrower}`,
+      `MATCHED ($${matchRes.lease.clearingPricePerSlotUsd}/slot)`);
+
+      return {
+        status: 200,
+        body: {
+          ...matchRes,
+          swarmVisualization: this.buildSwarmAndCognitiveVisualization()
+        }
+      };
+    }
+
+    if (params.action === "recall_spot_quota") {
+      const lender = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.lenderTenantId ?? "Helios").trim());
+      const recallRes = this.deps.slaEnforcer.recallLenderQuotaOnUrgentArrival({
+        lenderTenantId: lender,
+        urgentTaskId: `task-p0-urgent-${Date.now() % 1000}`,
+        requiredSlots: Number(params.requestedSlots ?? 8)
+      });
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `触发出借方 [${lender}] P0 紧急算力召回：亚秒级 WAL 冻结并回收 ${recallRes.reclaimedSlots} 个 Spot 槽位 (${recallRes.recalledLeaseIds.length} 个租约)`,
+      `SpotMarket / ${lender}`,
+      `RECALLED (${recallRes.reclaimedSlots} slots)`);
+
+      return {
+        status: 200,
+        body: {
+          ...recallRes,
+          swarmVisualization: this.buildSwarmAndCognitiveVisualization()
+        }
+      };
+    }
+
+    // action === "hatch_golden_episode"
+    const episodeId = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.episodeId ?? `ep-golden-${Date.now() % 10000}`).trim());
+    const sourceBranch = (0, _console_rbac_guard.sanitizeHtmlString)(String(params.sourceBranch ?? "feat-ns-auth").trim());
+    const hatched = this.deps.layerfs.hatchGoldenBaseBranch({
+      episodeId,
+      taskId: "task-ns-8841",
+      sourceBranchOrCommit: sourceBranch,
+      repoSignature: (0, _console_rbac_guard.sanitizeHtmlString)(String(params.repoSignature ?? "ansts-core-v25")),
+      problemPattern: (0, _console_rbac_guard.sanitizeHtmlString)(String(params.problemPattern ?? "High-concurrency shard rebalance & WAL recovery")),
+      resolutionSummary: (0, _console_rbac_guard.sanitizeHtmlString)(String(params.resolutionSummary ?? "Pre-warmed golden LayerFS workspace with verified dependencies")),
+      tags: ["golden", "layerfs", "cow"],
+      savedColdStartMs: 4800
+    });
+    this.appendAudit(
+    params.actor,
+    params.role,
+    `从分支 [${sourceBranch}] 孵化跨任务语义经验与 Golden Base 黄金镜像 [${hatched.goldenBaseBranch}] (Commit=${hatched.goldenCommitId}, 预计节省冷启=${hatched.savedColdStartMs}ms)`,
+    `EpisodicMemory / ${episodeId}`,
+    `HATCHED (${hatched.goldenCommitId})`);
+
+    return {
+      status: 201,
+      body: {
+        ...hatched,
+        swarmVisualization: this.buildSwarmAndCognitiveVisualization()
+      }
     };
   }
 

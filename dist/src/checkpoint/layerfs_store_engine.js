@@ -455,4 +455,32 @@ class LayerFsContentStoreEngine {
       matches
     };
   }
+
+  listEpisodicTrajectories()
+
+
+
+
+
+
+
+
+
+
+
+  {
+    return Array.from(this.episodicMemories.values()).map((ep) => ({
+      episodeId: ep.episodeId,
+      taskId: ep.taskId,
+      repoSignature: ep.repoSignature,
+      problemPattern: ep.problemPattern,
+      resolutionSummary: ep.resolutionSummary,
+      verifiedCommitId: ep.verifiedCommitId,
+      goldenBaseBranch: ep.goldenBaseBranch,
+      reusableFilePaths: ep.reusableFilePaths,
+      tags: ep.tags,
+      savedColdStartMs: ep.savedColdStartMs,
+      createdAtMs: ep.createdAtMs
+    }));
+  }
 }exports.LayerFsContentStoreEngine = LayerFsContentStoreEngine;

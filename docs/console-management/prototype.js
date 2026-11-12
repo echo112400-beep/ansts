@@ -101,7 +101,8 @@
     { id: 'approvals', label: '高危审批与变更审计', badgeKey: 'approvals' },
     { id: 'configs', label: '配置中心与版本治理', badgeKey: 'configs' },
     { id: 'runtime', label: '分布式运行面与 LayerFS 可视', badgeKey: 'runtime' },
-    { id: 'observability', label: '可观测性、SLO 与自愈运维', badgeKey: 'observability' }
+    { id: 'observability', label: '可观测性、SLO 与自愈运维', badgeKey: 'observability' },
+    { id: 'swarm', label: '智能体协同、策略与算力市场', badgeKey: 'swarm' }
   ];
 
   function createBaselineState() {
@@ -146,6 +147,7 @@
       configVisualization: null,
       runtimeVisualization: null,
       observabilityVisualization: null,
+      swarmVisualization: null,
       allTenantIds: [],
       regions: [],
       nodes: [],
@@ -263,6 +265,7 @@
       if (d.configVisualization) state.configVisualization = d.configVisualization;
       if (d.runtimeVisualization) state.runtimeVisualization = d.runtimeVisualization;
       if (d.observabilityVisualization) state.observabilityVisualization = d.observabilityVisualization;
+      if (d.swarmVisualization) state.swarmVisualization = d.swarmVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -398,6 +401,11 @@
       if (sev === 'PAGE_P0' || dlqCnt > 0) return { text: dlqCnt > 0 ? `${dlqCnt} DLQ` : 'P0 告警', cls: 'danger' };
       if (sev === 'TICKET_P1') return { text: 'P1 预警', cls: 'warn' };
       return { text: 'SLO 正常', cls: '' };
+    }
+    if (key === 'swarm') {
+      const rulesCnt = state.swarmVisualization?.formalGuardrail?.totalRulesCount ?? 5;
+      const spotSlots = state.swarmVisualization?.spotQuotaMarket?.totalAvailableSpotSlots ?? 20;
+      return { text: `${rulesCnt} 策略 · ${spotSlots} Spot`, cls: 'ok' };
     }
     const brCount = state.runtimeVisualization?.layerfsBranches?.length ?? 4;
     return { text: `${brCount} 分支`, cls: '' };
@@ -1978,6 +1986,194 @@
     `;
   }
 
+  function renderSwarmSection() {
+    const sv = state.swarmVisualization || {
+      formalGuardrail: { builtinRules: [], customRules: [], totalRulesCount: 3, lastEvaluation: null },
+      spotQuotaMarket: { offers: [], leases: [], totalAvailableSpotSlots: 0, activeLeasedSpotSlots: 0 },
+      episodicGoldenStore: { episodes: [], totalEpisodesCount: 0, totalSavedColdStartMs: 0 },
+      a2aGovernance: { blackboardEntries: [], deadlock: { hasDeadlock: false, cyclePath: [] } }
+    };
+    const fg = sv.formalGuardrail || {};
+    const sm = sv.spotQuotaMarket || {};
+    const eg = sv.episodicGoldenStore || {};
+    const allRules = [...(fg.builtinRules || []), ...(fg.customRules || [])];
+    const perm = canMutateTarget('all', 'all', false);
+    const lastEval = fg.lastEvaluation;
+
+    return `
+      <section class="kpi-grid" aria-label="多智能体协同与策略算力核心指标">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Policy-as-Code 形式化安全门控</span><span class="status-pill ok">AST 静态证明</span></div>
+          <div class="kpi-value">${fg.totalRulesCount ?? allRules.length} 条策略</div>
+          <div class="kpi-sub">内置证明: <span class="mono">${(fg.builtinRules || []).length}</span> · 自定义规则: <span class="mono">${(fg.customRules || []).length}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>跨租户 Spot 空闲算力借贷市场</span><span class="status-pill ok">亚秒级 WAL 召回</span></div>
+          <div class="kpi-value">${sm.totalAvailableSpotSlots ?? 0} 可借槽位</div>
+          <div class="kpi-sub">当前活跃借贷: <span class="mono">${sm.activeLeasedSpotSlots ?? 0} 槽 (${(sm.leases || []).length} 租约)</span> · 挂单: <span class="mono">${(sm.offers || []).length}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>跨任务语义经验库与 Golden Base 镜像</span><span class="status-pill ok">0ms CoW 挂载</span></div>
+          <div class="kpi-value">${eg.totalEpisodesCount ?? 0} 黄金镜像</div>
+          <div class="kpi-sub">累计节省冷启动耗时: <span class="mono">${eg.totalSavedColdStartMs ?? 0} ms</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Swarm 认知加速与拜占庭容错套件</span><span class="status-pill ok">F1–F8 &amp; N1–N6</span></div>
+          <div class="kpi-value">14 项引擎就绪</div>
+          <div class="kpi-sub">覆盖 CNP 竞标、BFT 共识、向量时钟割截、eBPF 熔断与 RS(4,2) 纠删码</div>
+        </div>
+      </section>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Policy-as-Code 形式化安全门控规则表与在线 AST 证明探针 (GET /v1beta1/console/swarm · POST /v1beta1/management/swarm/action)</h2>
+            <p class="panel-subtitle">在工具执行前对 SQL 破坏性 DDL、无界 DML、路径穿越及影响行数执行静态证明与爆炸半径评分 (0–100)，持久化于 SQLite <code>persisted_guardrail_policies</code>。</p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="open-add-policy-rule-dialog" ${!perm.ok ? 'disabled' : ''}>+ 新增 Policy-as-Code 规则</button>
+            <button type="button" class="small warn" data-action="swarm-probe-policy" data-mode="deny" ${!perm.ok ? 'disabled' : ''}>▶ 探测高危 DROP TABLE + /etc/shadow (触发 DENY)</button>
+            <button type="button" class="small" data-action="swarm-probe-policy" data-mode="allow" ${!perm.ok ? 'disabled' : ''}>▶ 探测只读 SELECT (验证 ALLOW)</button>
+          </div>
+        </div>
+        ${lastEval ? `
+          <div class="state-banner ${lastEval.decision === 'ALLOW' ? 'info' : 'warn'}" style="margin-bottom:10px;">
+            <div>
+              <strong>最近形式化门控证明结果 (${esc(lastEval.toolName)})：</strong>
+              <span class="status-pill ${lastEval.decision === 'ALLOW' ? 'ok' : lastEval.decision === 'REQUIRE_4EYES_APPROVAL' ? 'warn' : 'danger'}">${esc(lastEval.decision)}</span>
+              · 爆炸半径评分: <code class="mono">${lastEval.blastRadiusScore}/100</code>
+              · 触发规则: <code class="mono">${(lastEval.violatedRuleIds || []).join(', ') || 'NONE'}</code>
+              <div class="muted">${esc(lastEval.rationale)}</div>
+            </div>
+          </div>
+        ` : ''}
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>规则 ID</th>
+                <th>规则类型</th>
+                <th>匹配工具正则 (toolNamePattern)</th>
+                <th>拦截条件 (正则 / 行数阈值)</th>
+                <th>门控动作 (Effect)</th>
+                <th>规则说明</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${allRules.map((r) => `
+                <tr>
+                  <td class="mono"><strong>${esc(r.ruleId)}</strong></td>
+                  <td><span class="status-pill ${r.builtin ? 'ok' : 'warn'}">${r.builtin ? 'BUILTIN_AST' : 'CUSTOM_SQL'}</span></td>
+                  <td class="mono"><code>${esc(r.toolNamePattern)}</code></td>
+                  <td class="mono">${r.forbiddenArgRegex ? `regex: ${esc(r.forbiddenArgRegex)}` : r.maxAffectedRows ? `rows > ${r.maxAffectedRows}` : 'AST Static Proof'}</td>
+                  <td><span class="status-pill ${r.effect === 'DENY' ? 'danger' : r.effect === 'REQUIRE_4EYES_APPROVAL' ? 'warn' : 'ok'}">${esc(r.effect)}</span></td>
+                  <td class="muted">${esc(r.description)}</td>
+                  <td>
+                    <button type="button" class="small danger" data-action="swarm-delete-policy-rule" data-rule="${esc(r.ruleId)}" ${!perm.ok || r.builtin ? 'disabled' : ''}>删除</button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">跨租户 Spot 空闲算力借贷与亚秒级 WAL 紧急召回市场 (CapacitySlaEnforcer)</h2>
+              <p class="panel-subtitle">低负载租户可将空闲保底槽位挂单出借，高优 P0 任务到达时自动执行亚秒级 WAL 断点冻结并无损召回槽位。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small primary" data-action="open-publish-spot-offer-dialog" ${!perm.ok ? 'disabled' : ''}>+ 发布空闲算力挂单</button>
+              <button type="button" class="small" data-action="swarm-match-spot-bid" ${!perm.ok ? 'disabled' : ''}>▶ Northstar 竞标租用 4 槽</button>
+              <button type="button" class="small danger" data-action="swarm-recall-spot-quota" ${!perm.ok ? 'disabled' : ''}>⚡ 出借方 P0 紧急召回</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>挂单/租约 ID</th><th>出借方 → 借入方</th><th>槽位数 (可用/总计)</th><th>单价 ($/Slot)</th><th>状态</th></tr></thead>
+              <tbody>
+                ${(sm.offers || []).map((o) => `
+                  <tr>
+                    <td class="mono"><span class="status-pill ok">OFFER</span> <strong>${esc(o.offerId)}</strong></td>
+                    <td><strong>${esc(o.lenderTenantId)}</strong> → <span class="muted">Market (${esc(o.region)})</span></td>
+                    <td class="mono">${o.availableSlots} / ${o.offeredSlots} 槽</td>
+                    <td class="mono">min $${o.minBidPricePerSlotUsd}</td>
+                    <td><span class="status-pill ${o.availableSlots > 0 ? 'ok' : 'warn'}">${o.availableSlots > 0 ? 'OPEN' : 'FULLY_LEASED'}</span></td>
+                  </tr>
+                `).join('')}
+                ${(sm.leases || []).map((l) => `
+                  <tr>
+                    <td class="mono"><span class="status-pill ${l.status === 'ACTIVE' ? 'ok' : 'warn'}">LEASE</span> <strong>${esc(l.leaseId)}</strong></td>
+                    <td><strong>${esc(l.lenderTenantId)}</strong> → <strong>${esc(l.borrowerTenantId)}</strong> <span class="muted">(${esc(l.taskId)})</span></td>
+                    <td class="mono">${l.leasedSlots} 槽</td>
+                    <td class="mono">clear $${l.clearingPricePerSlotUsd}</td>
+                    <td><span class="status-pill ${l.status === 'ACTIVE' ? 'ok' : 'danger'}">${esc(l.status)}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">跨任务语义经验库 (Episodic Memory) 与 Golden Base 黄金镜像孵化器</h2>
+              <p class="panel-subtitle">将已验证成功的任务工作区固化为不可变 Golden Base 分支 (<code>golden/&lt;episodeId&gt;</code>)，后续相似任务支持 0ms 零拷贝挂载。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small primary" data-action="swarm-hatch-golden-episode" ${!perm.ok ? 'disabled' : ''}>+ 从活跃分支孵化新黄金镜像</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>Episode ID</th><th>Golden Base 分支 / Commit</th><th>仓库签名 / 问题模式</th><th>节省冷启耗时</th></tr></thead>
+              <tbody>
+                ${(eg.episodes || []).map((ep) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(ep.episodeId)}</strong></td>
+                    <td class="mono"><code>${esc(ep.goldenBaseBranch)}</code> <span class="status-pill ok">${esc(ep.verifiedCommitId)}</span></td>
+                    <td><strong>${esc(ep.repoSignature)}</strong><div class="muted">${esc(ep.problemPattern)}</div></td>
+                    <td class="mono"><span class="status-pill ok">-${ep.savedColdStartMs} ms</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">M71–M75 认知投机加速与多智能体拜占庭容错 (Swarm) 专项工作台直达</h2>
+            <p class="panel-subtitle">点击任意专项按钮即可直接调用后端对应引擎并查看完整执行报告。</p>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button type="button" class="small" data-action="open-adaptive-dag-replan">[F1] 动态 DAG 自适应重规划</button>
+          <button type="button" class="small" data-action="open-best-of-n-verifier">[F2] Best-of-N 投机并行择优</button>
+          <button type="button" class="small" data-action="open-cascade-jury-router">[F3] 级联置信度路由 &amp; 陪审团</button>
+          <button type="button" class="small" data-action="open-episodic-hatchery">[F4] 语义经验库检索验证</button>
+          <button type="button" class="small" data-action="open-formal-guardrail">[F5] Policy-as-Code 批量自检</button>
+          <button type="button" class="small" data-action="open-shadow-wal-replay">[F6] 生产 WAL 影子流量回放</button>
+          <button type="button" class="small" data-action="open-context-compactor">[F7] 分层工作记忆 URI 压缩</button>
+          <button type="button" class="small" data-action="open-spot-quota-market">[F8] Spot 算力借贷全流程演练</button>
+          <button type="button" class="small primary" data-action="open-contract-net">[N1] 合同网协议 (CNP) 竞标</button>
+          <button type="button" class="small primary" data-action="open-bft-consensus">[N2] BFT 黑板共识与语义合并</button>
+          <button type="button" class="small primary" data-action="open-causal-vector-cut">[N3] 向量时钟因果一致性割截</button>
+          <button type="button" class="small primary" data-action="open-ebpf-breaker">[N4] eBPF 网络追踪与微秒熔断</button>
+          <button type="button" class="small primary" data-action="open-byzantine-slashing">[N5] 拜占庭信用惩戒与隔离</button>
+          <button type="button" class="small primary" data-action="open-erasure-coding">[N6] 跨地域 RS(4,2) 纠删码重构</button>
+        </div>
+      </div>
+    `;
+  }
+
   function renderMainContent() {
     const main = document.getElementById('content');
     if (!main) return;
@@ -2007,6 +2203,9 @@
         break;
       case 'observability':
         sectionHtml = renderObservabilitySection();
+        break;
+      case 'swarm':
+        sectionHtml = renderSwarmSection();
         break;
       case 'overview':
       default:
@@ -3495,6 +3694,196 @@
         "关闭成本归因报告",
         () => closeDialog()
       );
+      return;
+    }
+    if (action === "open-add-policy-rule-dialog") {
+      openDialog(
+        "新增 Policy-as-Code 形式化安全门控规则 (POST /v1beta1/management/swarm/action)",
+        `
+          <div class="form-field">
+            <label for="dlg-pol-id">规则 ID (Rule ID)</label>
+            <input id="dlg-pol-id" type="text" value="RULE-PROD-K8S-${Math.floor(100 + Math.random() * 899)}" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-pol-pattern">匹配工具名正则 (toolNamePattern)</label>
+            <input id="dlg-pol-pattern" type="text" value="kubectl_apply|helm_upgrade|terraform_apply" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-pol-regex">禁止参数正则 (forbiddenArgRegex, 可选)</label>
+            <input id="dlg-pol-regex" type="text" value="--force|kube-system" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-pol-effect">触发门控动作 (Effect)</label>
+            <select id="dlg-pol-effect">
+              <option value="DENY">DENY (直接阻断并记录形式化违规)</option>
+              <option value="REQUIRE_4EYES_APPROVAL" selected>REQUIRE_4EYES_APPROVAL (暂存副作用并转交双人复核)</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="dlg-pol-desc">规则说明 (Description)</label>
+            <input id="dlg-pol-desc" type="text" value="生产集群高危 K8s 变更需经过形式化校验或双人复核" />
+          </div>
+        `,
+        "保存并持久化策略规则",
+        async () => {
+          const ruleId = (document.getElementById("dlg-pol-id")?.value || "").trim();
+          const toolNamePattern = (document.getElementById("dlg-pol-pattern")?.value || ".*").trim();
+          const forbiddenArgRegex = (document.getElementById("dlg-pol-regex")?.value || "").trim();
+          const effect = document.getElementById("dlg-pol-effect")?.value || "REQUIRE_4EYES_APPROVAL";
+          const description = (document.getElementById("dlg-pol-desc")?.value || "").trim();
+          const p = getPrincipal();
+          const res = await callBackendApi("POST", "/v1beta1/management/swarm/action", {
+            action: "register_policy_rule",
+            ruleId,
+            toolNamePattern,
+            forbiddenArgRegex: forbiddenArgRegex || undefined,
+            effect,
+            description,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            const errEl = document.getElementById("dialog-error");
+            if (errEl) errEl.textContent = res.data?.message || "注册策略规则失败";
+            return;
+          }
+          closeDialog();
+          await fetchBackendState();
+          showToast(`已注册并持久化形式化安全规则 ${ruleId}`);
+        }
+      );
+      return;
+    }
+    if (action === "swarm-delete-policy-rule") {
+      const ruleId = target.getAttribute("data-rule") || "";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/swarm/action", {
+        action: "delete_policy_rule",
+        ruleId,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "删除规则失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已删除自定义策略规则 ${ruleId}`);
+      return;
+    }
+    if (action === "swarm-probe-policy") {
+      const mode = target.getAttribute("data-mode") || "deny";
+      const p = getPrincipal();
+      const payload = mode === "allow"
+        ? {
+            action: "evaluate_policy_probe",
+            toolName: "db_explain_plan",
+            toolArgs: { sql: "SELECT id, status FROM orders WHERE tenant_id = 'Northstar' LIMIT 10" },
+            actor: p.id,
+            role: p.role
+          }
+        : {
+            action: "evaluate_policy_probe",
+            toolName: "sql_exec",
+            toolArgs: { sql: "DELETE FROM orders WHERE 1=1; DROP TABLE audit_logs;", filePath: "/etc/shadow" },
+            actor: p.id,
+            role: p.role
+          };
+      const res = await callBackendApi("POST", "/v1beta1/management/swarm/action", payload);
+      await fetchBackendState();
+      showToast(`形式化证明完成：${res.data?.evaluation?.decision || "OK"} (BlastRadius=${res.data?.evaluation?.blastRadiusScore ?? 0})`);
+      return;
+    }
+    if (action === "open-publish-spot-offer-dialog") {
+      openDialog(
+        "发布跨租户 Spot 空闲算力挂单 (POST /v1beta1/management/swarm/action)",
+        `
+          <div class="form-field">
+            <label for="dlg-spot-lender">出借方租户 (Lender Tenant)</label>
+            <select id="dlg-spot-lender">
+              ${(state.allTenantIds || ['Helios', 'Vanguard', 'Aegis']).map((tid) => `<option value="${esc(tid)}" ${tid === 'Helios' ? 'selected' : ''}>${esc(tid)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="dlg-spot-slots">出借空闲槽位数量 (Offered Slots)</label>
+            <input id="dlg-spot-slots" type="number" value="8" min="1" max="100" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-spot-price">最低竞标单价 ($ USD / Slot)</label>
+            <input id="dlg-spot-price" type="number" step="0.01" value="0.04" min="0.01" max="5.00" />
+          </div>
+        `,
+        "发布 Spot 算力挂单",
+        async () => {
+          const lenderTenantId = document.getElementById("dlg-spot-lender")?.value || "Helios";
+          const offeredSlots = Number(document.getElementById("dlg-spot-slots")?.value || 8);
+          const minBidPricePerSlotUsd = Number(document.getElementById("dlg-spot-price")?.value || 0.04);
+          const p = getPrincipal();
+          const res = await callBackendApi("POST", "/v1beta1/management/swarm/action", {
+            action: "publish_spot_offer",
+            lenderTenantId,
+            offeredSlots,
+            minBidPricePerSlotUsd,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            const errEl = document.getElementById("dialog-error");
+            if (errEl) errEl.textContent = res.data?.message || "发布挂单失败";
+            return;
+          }
+          closeDialog();
+          await fetchBackendState();
+          showToast(`已发布 ${lenderTenantId} 的 ${offeredSlots} 个 Spot 空闲算力槽位挂单`);
+        }
+      );
+      return;
+    }
+    if (action === "swarm-match-spot-bid") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/swarm/action", {
+        action: "match_spot_bid",
+        borrowerTenantId: "Northstar",
+        requestedSlots: 4,
+        maxBidPricePerSlotUsd: 0.08,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "Spot 竞标未匹配到足够可用槽位，请先发布新挂单");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已撮合 Spot 租约 ${res.data?.lease?.leaseId} (清算价 $${res.data?.lease?.clearingPricePerSlotUsd}/slot)`);
+      return;
+    }
+    if (action === "swarm-recall-spot-quota") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/swarm/action", {
+        action: "recall_spot_quota",
+        lenderTenantId: "Helios",
+        requestedSlots: 8,
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast(`已触发 Helios P0 紧急召回：回收 ${res.data?.reclaimedSlots ?? 0} 个槽位`);
+      return;
+    }
+    if (action === "swarm-hatch-golden-episode") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/swarm/action", {
+        action: "hatch_golden_episode",
+        episodeId: `ep-ns-golden-${Date.now() % 10000}`,
+        sourceBranch: "feat-ns-auth",
+        repoSignature: "ansts-core-v25",
+        problemPattern: "Distributed 256-slot consistent hash & LTX compaction",
+        resolutionSummary: "Verified zero-copy LayerFS Golden Base workspace",
+        actor: p.id,
+        role: p.role
+      });
+      await fetchBackendState();
+      showToast(`已孵化新黄金镜像 ${res.data?.goldenBaseBranch || "OK"} (节省 ${res.data?.savedColdStartMs || 4800}ms)`);
       return;
     }
     if (action === "obs-record-trace") {

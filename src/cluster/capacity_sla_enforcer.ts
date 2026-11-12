@@ -355,6 +355,10 @@ export class CapacitySlaEnforcer {
     };
   }
 
+  public listSpotOffers(): SpotQuotaOffer[] {
+    return Array.from(this.spotOffers.values());
+  }
+
   public listSpotLeases(): SpotQuotaLease[] {
     return Array.from(this.spotLeases.values());
   }
