@@ -118,6 +118,8 @@
       identity: 'chen',
       liveBackendConnected: false,
       lastApiOutput: '等待调用后端接口...',
+      configDiffResult: null,
+      configDryRunResult: null,
       lastSyncUtc: null,
       loadSheddingActive: false,
       verificationRetried: false,
@@ -1470,6 +1472,63 @@
             </tbody>
           </table>
         </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>配置版本 Diff 对比与变更影响面 Dry-Run 预演 (Config Diff &amp; Blast-Radius Simulator)</h2>
+            <p class="panel-desc">对比任意两个历史 Revision 的逐字段差异、风险分级与受影响子系统，或对拟变更配置执行无副作用 Dry-Run 校验与爆炸半径评估</p>
+          </div>
+          <div class="btn-row">
+            <select id="cfg-diff-from" style="height:30px;">
+              ${revsDesc.map((r, idx) => `<option value="${r.revision}" ${idx === revsDesc.length - 1 ? 'selected' : ''}>From Rev #${r.revision}</option>`).join('')}
+            </select>
+            <select id="cfg-diff-to" style="height:30px;">
+              ${revsDesc.map((r, idx) => `<option value="${r.revision}" ${idx === 0 ? 'selected' : ''}>To Rev #${r.revision}</option>`).join('')}
+            </select>
+            <button type="button" class="small" data-action="config-diff-revisions">对比版本 Diff</button>
+            <button type="button" class="small primary" data-action="open-config-dry-run-dialog" ${!perm.ok ? 'disabled' : ''}>Dry-Run 变更预演</button>
+          </div>
+        </div>
+        ${state.configDiffResult ? `
+          <div class="subcard" style="margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+              <div>
+                <strong>Diff 范围:</strong> <span class="mono">Rev #${esc(String(state.configDiffResult.fromRev))} → Rev #${esc(String(state.configDiffResult.toRev))}</span>
+                · 变更字段: <strong>${state.configDiffResult.changedCount ?? 0} 项</strong>
+                · 最高风险: <span class="status-pill ${state.configDiffResult.blastRadius?.highestRisk === 'HIGH_DURABILITY_OR_SLO' ? 'danger' : state.configDiffResult.blastRadius?.highestRisk === 'MEDIUM_CAPACITY_SHIFT' ? 'warn' : 'ok'}">${esc(state.configDiffResult.blastRadius?.highestRisk || 'NONE')}</span>
+              </div>
+              <div class="mono">推荐发布策略: <strong>${esc(state.configDiffResult.blastRadius?.recommendedRolloutStrategy || 'NO_OP')}</strong> · ACT 内存变化: ${state.configDiffResult.blastRadius?.estimatedActMemoryDeltaMb ?? 0} MB</div>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>配置字段 (Field)</th>
+                  <th>旧值 (From)</th>
+                  <th>新值 (To)</th>
+                  <th>风险分级</th>
+                  <th>受影响子系统</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${(state.configDiffResult.diffs || []).length === 0 ? `
+                  <tr><td colspan="5" class="muted">两个版本配置完全一致，无字段差异。</td></tr>
+                ` : (state.configDiffResult.diffs || []).map((d) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(d.field)}</strong></td>
+                    <td class="mono">${esc(JSON.stringify(d.fromValue))}</td>
+                    <td class="mono"><strong>${esc(JSON.stringify(d.toValue))}</strong></td>
+                    <td><span class="status-pill ${d.riskLevel === 'HIGH_DURABILITY_OR_SLO' ? 'danger' : d.riskLevel === 'MEDIUM_CAPACITY_SHIFT' ? 'warn' : 'ok'}">${esc(d.riskLevel)}</span></td>
+                    <td class="mono">${esc(d.subsystem)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        ` : `<p class="muted">选择上方两个配置版本点击「对比版本 Diff」，或点击「Dry-Run 变更预演」模拟新参数的影响面与合法性。</p>`}
       </div>
     `;
   }
@@ -5067,6 +5126,79 @@
       });
       await fetchBackendState();
       showToast(`已在分支 ${branchName} 提交快照 Commit ${res.data?.commitId || "OK"}`);
+      return;
+    }
+    if (action === "config-diff-revisions") {
+      const fromRev = document.getElementById("cfg-diff-from")?.value || "1";
+      const toRev = document.getElementById("cfg-diff-to")?.value || "1";
+      const res = await callBackendApi(
+        "GET",
+        `/v1beta1/console/configs/diff?fromRev=${encodeURIComponent(fromRev)}&toRev=${encodeURIComponent(toRev)}`
+      );
+      if (res.ok && res.data) {
+        state.configDiffResult = res.data;
+        render();
+        showToast(`配置 Diff 完成：Rev #${fromRev} → Rev #${toRev} 共 ${res.data.changedCount ?? 0} 项差异`);
+      }
+      return;
+    }
+    if (action === "open-config-dry-run-dialog") {
+      const cv = state.configVisualization?.activeConfig || {};
+      openDialog(
+        "配置变更 Dry-Run 预演与爆炸半径评估",
+        `
+          <div class="form-field">
+            <label for="dlg-dry-cell-max">maxCellConcurrentRequests (1..1024)</label>
+            <input id="dlg-dry-cell-max" type="number" value="${esc(String(cv.maxCellConcurrentRequests ?? 64))}" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-dry-act-mem">actMemoryMb (256..65536)</label>
+            <input id="dlg-dry-act-mem" type="number" value="${esc(String(cv.actMemoryMb ?? 8192))}" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-dry-psi">psiFullFreezePct (10..99)</label>
+            <input id="dlg-dry-psi" type="number" step="0.5" value="${esc(String(cv.psiFullFreezePct ?? 70))}" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-dry-durability">durabilityMode</label>
+            <select id="dlg-dry-durability">
+              <option value="fleet" ${cv.durabilityMode !== "bucket" ? "selected" : ""}>fleet</option>
+              <option value="bucket" ${cv.durabilityMode === "bucket" ? "selected" : ""}>bucket</option>
+            </select>
+          </div>
+        `,
+        "执行 Dry-Run 预演",
+        async () => {
+          const p = getPrincipal();
+          const patch = {
+            maxCellConcurrentRequests: Number(document.getElementById("dlg-dry-cell-max")?.value || 64),
+            actMemoryMb: Number(document.getElementById("dlg-dry-act-mem")?.value || 8192),
+            psiFullFreezePct: Number(document.getElementById("dlg-dry-psi")?.value || 70),
+            durabilityMode: document.getElementById("dlg-dry-durability")?.value || "fleet",
+          };
+          closeDialog();
+          const res = await callBackendApi("POST", "/v1beta1/management/configs/dry-run", {
+            patch,
+            actor: p.id,
+            role: p.role,
+          });
+          if (res.ok && res.data) {
+            state.configDiffResult = {
+              fromRev: res.data.activeRevision,
+              toRev: `${res.data.activeRevision}+dry-run`,
+              changedCount: (res.data.diffs || []).length,
+              diffs: res.data.diffs || [],
+              blastRadius: res.data.blastRadius || {},
+            };
+            render();
+            showToast(
+              res.data.valid
+                ? `Dry-Run 校验通过：${(res.data.diffs || []).length} 项变更 (${res.data.blastRadius?.recommendedRolloutStrategy || "NO_OP"})`
+                : `Dry-Run 校验失败：${(res.data.validationErrors || []).join("; ")}`
+            );
+          }
+        }
+      );
       return;
     }
     if (action === "layerfs-open-file-explorer") {

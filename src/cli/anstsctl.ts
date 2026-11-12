@@ -694,6 +694,27 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-config-diff") {
+    const fromRev = (rest[0] ?? "1").trim();
+    const toRev = (rest[1] ?? "1").trim();
+    const resp = await fetch(
+      `${baseUrl}/v1beta1/console/configs/diff?fromRev=${encodeURIComponent(fromRev)}&toRev=${encodeURIComponent(toRev)}`
+    );
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-config-dry-run") {
+    const patchJson = rest[0] ? (JSON.parse(rest[0]) as Record<string, unknown>) : {};
+    const resp = await fetch(`${baseUrl}/v1beta1/management/configs/dry-run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ patch: patchJson, actor: "cli-admin", role: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-layerfs-file") {
     const branch = (rest[0] ?? "main").trim();
     const filePath = (rest[1] ?? "package.json").trim();

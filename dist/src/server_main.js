@@ -2472,6 +2472,31 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M89] TanStack Console BFF: Config Revision Diff & Dry-Run Blast-Radius Simulator
+    if (method === "GET" && pathname === "/v1beta1/console/configs/diff") {
+      const fromParam = urlObj.searchParams.get("fromRev");
+      const toParam = urlObj.searchParams.get("toRev");
+      const out = this.managementPlane.diffConfigRevisions({
+        fromRev: fromParam !== null ? Number(fromParam) : undefined,
+        toRev: toParam !== null ? Number(toParam) : undefined
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/configs/dry-run") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.dryRunConfigPatch({
+        patch: body.patch ?? {},
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M88] TanStack Console BFF: LayerFS Workspace File Content & Line-Level Blame Reader (`GET /v1beta1/console/layerfs/file`)
     if (method === "GET" && pathname === "/v1beta1/console/layerfs/file") {
       const out = this.managementPlane.readLayerFsBranchFile({

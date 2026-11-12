@@ -1614,6 +1614,233 @@ message:err.message
 }
 }
 
+diffConfigRevisions(params)
+
+
+
+{
+this.ensureInitialized();
+this.ensureConfigCenterTable();
+const sql=this.deps.v25Store.sql;
+const rows=sql.
+exec("SELECT * FROM v25_mgmt_config_revisions ORDER BY revision ASC").
+toArray();
+if(rows.length===0){
+return{status:404,body:{error:"NO_CONFIG_REVISIONS",message:"暂无配置版本记录"}};
+}
+const latestRow=rows[rows.length-1];
+const fromRevNum=params.fromRev!==undefined?Number(params.fromRev):Number(rows[0].revision);
+const toRevNum=params.toRev!==undefined?Number(params.toRev):Number(latestRow.revision);
+const fromRow=rows.find((r)=>Number(r.revision)===fromRevNum);
+const toRow=rows.find((r)=>Number(r.revision)===toRevNum);
+if(!fromRow||!toRow){
+return{
+status:404,
+body:{
+error:"CONFIG_REVISION_NOT_FOUND",
+fromRev:fromRevNum,
+toRev:toRevNum,
+message:`未找到指定配置版本 (fromRev=${fromRevNum}, toRev=${toRevNum})`
+}
+};
+}
+
+const fromConfig=JSON.parse(String(fromRow.config_json));
+const baseToConfig=JSON.parse(String(toRow.config_json));
+const toConfig=params.candidatePatch?
+{...baseToConfig,...params.candidatePatch}:
+baseToConfig;
+
+const subsystemMap={
+maxCellConcurrentRequests:"HotCellOverloadAndQueueGuard",
+maxQueueConcurrentProducers:"HotCellOverloadAndQueueGuard",
+durabilityMode:"FleetReplicatedDurabilityEngine",
+logPipelineLimit:"FleetReplicatedDurabilityEngine",
+ltxCompactionEnabled:"WalCompactorAndPagedRestorer",
+ltxTruncatePages:"WalCompactorAndPagedRestorer",
+thinkCpuCores:"CgroupV2DualPhaseController",
+actCpuCores:"CgroupV2DualPhaseController",
+actMemoryMb:"CgroupV2DualPhaseController",
+psiFullFreezePct:"CgroupV2DualPhaseController",
+targetSloRatio:"ReleaseReadinessGate",
+clusterName:"ClusterMetadata",
+compatibilityDate:"ClusterMetadata"
+};
+
+const highRiskKeys=new Set(["durabilityMode","ltxCompactionEnabled","ltxTruncatePages","targetSloRatio"]);
+const mediumRiskKeys=new Set([
+"maxCellConcurrentRequests",
+"maxQueueConcurrentProducers",
+"logPipelineLimit",
+"thinkCpuCores",
+"actCpuCores",
+"actMemoryMb",
+"psiFullFreezePct"]);
+
+
+const allKeys=Array.from(new Set([...Object.keys(fromConfig),...Object.keys(toConfig)]));
+const diffs=[];
+let highestRiskRank=0;
+
+for(const key of allKeys){
+const oldVal=fromConfig[key];
+const newVal=toConfig[key];
+if(JSON.stringify(oldVal)!==JSON.stringify(newVal)){
+const riskLevel=highRiskKeys.has(key)?
+"HIGH_DURABILITY_OR_SLO":
+mediumRiskKeys.has(key)?
+"MEDIUM_CAPACITY_SHIFT":
+"LOW_HOT_RELOAD";
+const rank=riskLevel==="HIGH_DURABILITY_OR_SLO"?3:riskLevel==="MEDIUM_CAPACITY_SHIFT"?2:1;
+if(rank>highestRiskRank)highestRiskRank=rank;
+diffs.push({
+field:key,
+fromValue:oldVal??null,
+toValue:newVal??null,
+riskLevel,
+subsystem:subsystemMap[key]??"ClusterCore"
+});
+}
+}
+
+const highestRisk=
+highestRiskRank===3?
+"HIGH_DURABILITY_OR_SLO":
+highestRiskRank===2?
+"MEDIUM_CAPACITY_SHIFT":
+highestRiskRank===1?
+"LOW_HOT_RELOAD":
+"NONE";
+
+const recommendedRolloutStrategy=
+diffs.length===0?
+"NO_OP":
+highestRisk==="HIGH_DURABILITY_OR_SLO"?
+"DUAL_APPROVAL_AND_CANARY":
+highestRisk==="MEDIUM_CAPACITY_SHIFT"?
+"CANARY_10PCT_5M":
+"INSTANT_HOT_RELOAD";
+
+return{
+status:200,
+body:{
+fromRev:fromRevNum,
+toRev:params.candidatePatch?`${toRevNum}+dry-run`:toRevNum,
+fromSha256:String(fromRow.sha256_checksum),
+toSha256:String(toRow.sha256_checksum),
+changedCount:diffs.length,
+diffs,
+blastRadius:{
+changedCount:diffs.length,
+highestRisk,
+requiresRestart:false,
+affectedSubsystems:Array.from(new Set(diffs.map((d)=>String(d.subsystem)))),
+estimatedActMemoryDeltaMb:Number(toConfig.actMemoryMb??8192)-Number(fromConfig.actMemoryMb??8192),
+estimatedConcurrentCapacityDelta:
+Number(toConfig.maxCellConcurrentRequests??64)-Number(fromConfig.maxCellConcurrentRequests??64),
+recommendedRolloutStrategy
+}
+}
+};
+}
+
+dryRunConfigPatch(params)
+
+
+
+{
+this.ensureInitialized();
+this.ensureConfigCenterTable();
+if(params.role==="VIEWER"){
+return{
+status:403,
+body:{error:"RBAC_FORBIDDEN",message:"VIEWER 角色无权执行配置变更 Dry-Run 预演"}
+};
+}
+
+const sql=this.deps.v25Store.sql;
+const rows=sql.
+exec("SELECT * FROM v25_mgmt_config_revisions ORDER BY revision ASC").
+toArray();
+const latestRow=rows[rows.length-1];
+const activeRevision=Number(latestRow.revision);
+const activeConfig=JSON.parse(String(latestRow.config_json));
+const patch=params.patch??{};
+const candidateConfig={...activeConfig,...patch};
+const validationErrors=[];
+
+if(patch.maxCellConcurrentRequests!==undefined){
+const v=Number(patch.maxCellConcurrentRequests);
+if(!Number.isInteger(v)||v<1||v>1024){
+validationErrors.push("maxCellConcurrentRequests 必须为 1..1024 之间的整数");
+}
+}
+if(patch.maxQueueConcurrentProducers!==undefined){
+const v=Number(patch.maxQueueConcurrentProducers);
+if(!Number.isInteger(v)||v<1||v>4096){
+validationErrors.push("maxQueueConcurrentProducers 必须为 1..4096 之间的整数");
+}
+}
+if(patch.durabilityMode!==undefined){
+if(patch.durabilityMode!=="fleet"&&patch.durabilityMode!=="bucket"){
+validationErrors.push("durabilityMode 必须为 fleet 或 bucket");
+}
+}
+if(patch.logPipelineLimit!==undefined){
+const v=Number(patch.logPipelineLimit);
+if(!Number.isInteger(v)||v<1||v>64){
+validationErrors.push("logPipelineLimit 必须为 1..64 之间的整数");
+}
+}
+if(patch.ltxTruncatePages!==undefined){
+const v=Number(patch.ltxTruncatePages);
+if(!Number.isInteger(v)||v<16||v>4096){
+validationErrors.push("ltxTruncatePages 必须为 16..4096 之间的整数");
+}
+}
+if(patch.actMemoryMb!==undefined){
+const v=Number(patch.actMemoryMb);
+if(!Number.isInteger(v)||v<256||v>65536){
+validationErrors.push("actMemoryMb 必须为 256..65536 之间的整数");
+}
+}
+if(patch.psiFullFreezePct!==undefined){
+const v=Number(patch.psiFullFreezePct);
+if(!Number.isFinite(v)||v<10||v>99){
+validationErrors.push("psiFullFreezePct 必须为 10..99 之间的数值");
+}
+}
+if(patch.targetSloRatio!==undefined){
+const v=Number(patch.targetSloRatio);
+if(!Number.isFinite(v)||v<0.9||v>0.9999){
+validationErrors.push("targetSloRatio 必须为 0.9..0.9999 之间的数值");
+}
+}
+
+const diffRes=this.diffConfigRevisions({
+fromRev:activeRevision,
+toRev:activeRevision,
+candidatePatch:patch
+});
+const simulatedSha256=crypto.
+createHash("sha256").
+update(JSON.stringify(candidateConfig)).
+digest("hex");
+
+return{
+status:200,
+body:{
+valid:validationErrors.length===0,
+validationErrors,
+activeRevision,
+simulatedSha256,
+candidateConfig,
+diffs:diffRes.body.diffs,
+blastRadius:diffRes.body.blastRadius
+}
+};
+}
+
 buildFinOpsVisualization(){
 this.ensureInitialized();
 const attrBody=this.executeDay2GovernanceOperation({
