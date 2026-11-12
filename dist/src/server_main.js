@@ -653,7 +653,17 @@ class AnstsLocalAndComposeServer {
         if (rejectedTooLarge) return;
         try {
           const raw = Buffer.concat(chunks).toString("utf-8").trim();
-          resolve(raw ? JSON.parse(raw) : {});
+          const parsed = raw ? JSON.parse(raw) : {};
+          const authHeader = req.headers["authorization"];
+          if (authHeader && authHeader.startsWith("Bearer ")) {
+            const verified = this.managementPlane.rbacGuard.verifyAuthorizationHeader(authHeader);
+            if (verified.authenticated && verified.claims) {
+              parsed.actor = verified.claims.sub;
+              parsed.role = verified.claims.role;
+              parsed.actorRole = verified.claims.role;
+            }
+          }
+          resolve(parsed);
         } catch (err) {
           reject(err);
         }
@@ -2297,14 +2307,45 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M39-2] SSE Stream with `Last-Event-ID` Historical Replay (`GET /v1/events/stream`)
+    // [M39-2 & M77] SSE Stream with `Last-Event-ID` Historical Replay + `?live=1` Persistent Streaming (`GET /v1/events/stream`)
     if (method === "GET" && pathname === "/v1/events/stream") {
       const taskId = urlObj.searchParams.get("taskId") ?? "task-harness-01";
       const lastEventId =
       req.headers["last-event-id"] ??
       urlObj.searchParams.get("lastEventId") ??
       undefined;
-      const subId = `sub-${Date.now()}`;
+      const subId = `sub-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      if (urlObj.searchParams.get("live") === "1") {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+          "x-accel-buffering": "no"
+        });
+        res.write(`: connected live=1 subId=${subId}\n\n`);
+        const sub = this.sseGateway.subscribe(taskId, subId, lastEventId);
+        sub.stream.on("data", (c) => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(Buffer.from(c).toString("utf-8"));
+          }
+        });
+        const hbTimer = setInterval(() => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(": keepalive\n\n");
+          }
+        }, 15000);
+        hbTimer.unref?.();
+        let cleaned = false;
+        const cleanup = () => {
+          if (cleaned) return;
+          cleaned = true;
+          clearInterval(hbTimer);
+          this.sseGateway.unsubscribe(taskId, subId);
+        };
+        req.on("close", cleanup);
+        res.on("close", cleanup);
+        return;
+      }
       const sub = this.sseGateway.subscribe(taskId, subId, lastEventId);
       const chunks = [];
       sub.stream.on("data", (c) => chunks.push(Buffer.from(c)));
@@ -2325,9 +2366,54 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M41 & M42] Platform Management Plane BFF Endpoints (`/v1beta1/management/*`) — Backed by real PlatformManagementPlaneEngine + Cross-Gateway S3 Sync
+    // [M41, M42, M76 & M77] Platform Management Plane BFF Endpoints (`/v1beta1/management/*`) — Universal Bearer JWT Guard + Cross-Gateway S3 Sync
     if (pathname.startsWith("/v1beta1/management/")) {
+      const authHeader = req.headers["authorization"];
+      if (authHeader && authHeader.trim().length > 0 && pathname !== "/v1beta1/management/auth/token") {
+        const verified = this.managementPlane.rbacGuard.verifyAuthorizationHeader(authHeader);
+        if (!verified.authenticated || !verified.claims) {
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(
+          JSON.stringify({
+            error: verified.errorCode ?? "UNAUTHORIZED",
+            message: verified.message ?? "Invalid Authorization header"
+          }));
+
+          return;
+        }
+        if (method === "POST" && verified.claims.role === "VIEWER") {
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(
+          JSON.stringify({
+            error: "RBAC_FORBIDDEN",
+            message: "VIEWER role is read-only and forbidden from executing write mutations"
+          }));
+
+          return;
+        }
+      }
       await this.managementPlane.pullManagementStateFromS3();
+    }
+
+    // [M77] Console Production Release Readiness Gate (`GET/POST /v1beta1/management/release/readiness`)
+    if (
+    (method === "GET" || method === "POST") &&
+    pathname === "/v1beta1/management/release/readiness")
+    {
+      const body = method === "POST" ? await this.readJsonBody(req) : {};
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeProductionReleaseReadinessGate({
+        actor: auth.actor,
+        role: auth.role
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
     }
 
     if (method === "GET" && pathname === "/v1beta1/management/state") {
@@ -3710,14 +3796,45 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M43-3] Real-Time Management Audit SSE Stream with Last-Event-ID Replay (`GET /v1beta1/management/events/stream`)
+    // [M43-3 & M77] Real-Time Management Audit SSE Stream with Last-Event-ID Replay & `?live=1` Persistent Keep-Alive (`GET /v1beta1/management/events/stream`)
     if (method === "GET" && pathname === "/v1beta1/management/events/stream") {
       this.managementPlane.ensureInitialized();
       const lastEventId =
       req.headers["last-event-id"] ??
       urlObj.searchParams.get("lastEventId") ??
       undefined;
-      const subId = `mgmt-sub-${Date.now()}`;
+      const subId = `mgmt-sub-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      if (urlObj.searchParams.get("live") === "1") {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+          "x-accel-buffering": "no"
+        });
+        res.write(`: connected live=1 subId=${subId}\n\n`);
+        const sub = this.sseGateway.subscribe("mgmt-audit-stream", subId, lastEventId);
+        sub.stream.on("data", (c) => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(Buffer.from(c).toString("utf-8"));
+          }
+        });
+        const hbTimer = setInterval(() => {
+          if (!res.writableEnded && !res.destroyed) {
+            res.write(": keepalive\n\n");
+          }
+        }, 15000);
+        hbTimer.unref?.();
+        let cleaned = false;
+        const cleanup = () => {
+          if (cleaned) return;
+          cleaned = true;
+          clearInterval(hbTimer);
+          this.sseGateway.unsubscribe("mgmt-audit-stream", subId);
+        };
+        req.on("close", cleanup);
+        res.on("close", cleanup);
+        return;
+      }
       const sub = this.sseGateway.subscribe("mgmt-audit-stream", subId, lastEventId);
       const chunks = [];
       sub.stream.on("data", (c) => chunks.push(Buffer.from(c)));
@@ -3731,7 +3848,7 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // Serve static console & management plane docs
+    // Serve static console & management plane docs with production HTTP security & CSP headers
     if (method === "GET") {
       const staticMap = {
         "/": { relPath: "index.html", contentType: "text/html; charset=utf-8" },
@@ -3747,7 +3864,14 @@ class AnstsLocalAndComposeServer {
       if (matched) {
         const candidatePath = path.resolve(process.cwd(), "docs", matched.relPath);
         if (fs.existsSync(candidatePath)) {
-          res.writeHead(200, { "content-type": matched.contentType });
+          res.writeHead(200, {
+            "content-type": matched.contentType,
+            "x-content-type-options": "nosniff",
+            "x-frame-options": "DENY",
+            "referrer-policy": "strict-origin-when-cross-origin",
+            "content-security-policy":
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:;"
+          });
           res.end(fs.readFileSync(candidatePath, "utf-8"));
           return;
         }

@@ -588,3 +588,27 @@
 | **[P1-4 & P1-5] 修复 Nginx `=200` 挂死并打通 `/v1/` 与无缓冲 SSE 流** | `nginx-tanstack-console.conf` 使用 `try_files $uri $uri/ =200;` 导致未知路径挂死；未代理 `/v1/`；SSE 被缓冲且前端未接入 `EventSource`。 | 1. `deploy/dev-cluster/nginx-tanstack-console.conf` 改为 `try_files $uri $uri/ /index.html;`，新增 `location /v1/` 反代，并为 `/v1/events/stream` 与 `/v1beta1/management/events/stream` 单独配置 `proxy_buffering off; proxy_cache off; proxy_read_timeout 1h;`；<br>2. 前端 `init()` 接入 `new EventSource('/v1beta1/management/events/stream')` 实时监听 `management.audit` 事件流。 | `tests/m76_console_security_rbac_zero_fake_state.test.ts` Subtest 1 & 2 PASS |
 | **[P1-6] 消除危险缺省参数（缺失必填项一律返回 400）** | `shards/rebalance`、`nodes/batch`、`tasks/cancel`、`nodes/scale`、`capacity/action`、`tenants/config`、`approvals/create`、`approvals/decide`、`tasks/time-travel` 在空 `POST {}` 时使用危险默认值执行破坏性操作。 | 移除全部高危写接口的破坏性缺省值，强制校验必填参数（如 `action`、`brainNodeId`、`operation`、`nodeIds`、`taskId`、`mode`、`nodeId` 等），参数缺失或非法立即返回 `HTTP 400 MISSING_REQUIRED_PARAMETERS`。 | `tests/m76_console_security_rbac_zero_fake_state.test.ts` Subtest 3 PASS |
 | **[P1-7 & P2] 自动刷新、清理重复静态资产与有界并发缓存 Fan-out** | 页面停留无自动刷新；`docs/index.html` 与 `docs/ansts_console_live.html` 双份重复维护；`/v1beta1/console/tasks` 每次无缓存全量打向所有 Brain。 | 1. 前端接入 `EventSource` 实时推送 + 5s `setInterval` 自动刷新（弹窗打开时暂停重绘以保护表单输入）；<br>2. 删除重复文件 `docs/ansts_console_live.html`，收敛至单一权威交付面 `docs/index.html` + `docs/console-management/prototype.js`；<br>3. `AnstsLocalAndComposeServer` 新增 `fetchPeerBrainTasksCached()`，实现 Single-Flight 请求合并、1.5s TTL 缓存、最大并发度 4 限制与 `AbortController` 超时保护，并在任务提交/派发时自动失效缓存。 | 全仓 **89 个源码模块**、**69 个测试套件（198 项子测试）100% 通过** |
+
+---
+
+## 27. M77 Console 管理面去打桩重构、全量真实后端系统管理与生产发布准入门控 (Console Zero-Stub Refactoring, Live System Management & Production Release Readiness Gate)
+
+针对管理面 UI 中残余前端初始化打桩数据与生产上线标准要求，完成了端到端去打桩重构与 8 维生产发布准入门控：
+
+1. **彻底移除前端打桩数据 (`docs/console-management/prototype.js` & `docs/index.html`)**：
+   - **清空 `createBaselineState()` 硬编码数组**：移除原本内置在 `createBaselineState()` 中的 6 台节点、4 个租户、4 条任务、3 张审批单、3 条审计日志、2 条黑板记录与 MCP 工具打桩列表，全部初始化为空数组 (`nodes: []`, `tenants: []`, `tasks: []`, `approvals: []`, `auditLogs: []`, `regions: []`, `allTenantIds: []`)，所有状态 100% 由真实后端 `GET /v1beta1/management/state` 驱动。
+   - **移除历史回合诊断静态兜底 (`openTurnHistoryDialog`)**：移除 `turnsRes.data.turns` 为空时的 3 条硬编码回退数据 (`9a01b2c3` 等)，严格展示后端 `TurnWalEngine` 返回的真实 WAL CRC32 回合帧。
+   - **移除多区域看板静态 HTML 行 (`renderOverviewSection`)**：将原先写死在模板中的 `us-west-2`、`eu-central-1`、`ap-northeast-1` 三行静态 HTML 替换为基于后端 `state.regions` 动态渲染，并绑定真实容灾切流按钮 (`data-action="toggle-region-availability"`)。
+   - **移除租户下拉框静态列表 (`populateTenantFilter`)**：由后端 SQLite `v25_mgmt_tenants` 实时返回的 `state.allTenantIds` 动态生成筛选器。
+
+2. **全量真实后端系统管理能力闭环 (`src/dashboard/server.ts` & `src/server_main.ts`)**：
+   - **动态租户创建与持久化 (`POST /v1beta1/management/tenants/config`)**：支持在控制台新建租户 (`expectedVersion: 0`)，真实写入 SQLite `v25_mgmt_tenants` 并同步注册 `FinOpsBudgetController` 预算与降级策略。
+   - **动态区域遥测聚合与容灾切流 (`POST /v1beta1/management/canary`)**：后端 `buildFullManagementState` 实时聚合各区域活跃节点数、Brain 分片槽位分布、平均 CPU/PSI 压力与跨区复制延迟，支持按区域一键执行容灾切流 (`toggle_region`)。
+   - **单节点隔离/排水/下线全周期管理 (`renderNodesSection`)**：每一行节点均支持真实后端 `Cordon/Uncordon`、单节点 `Drain`（自动迁移 P0 租约并递增 Fencing Token）与节点下线 `Decommission`（从 `v25_mgmt_node_overrides` 与 256 槽一致性哈希环移除）。
+   - **全路由 Bearer JWT 强鉴权与动态签发 (`syncLiveAuthToken`)**：前端切换身份时实时调用 `POST /v1beta1/management/auth/token` 获取 `ConsoleRbacAuthGuard` 签发的 HMAC-SHA256 JWT；服务端对所有 `/v1beta1/management/*` 写接口执行统一 Bearer JWT 验签与 `VIEWER` 403 拦截。
+   - **真实长连接 SSE 实时推送 (`?live=1`) 与生产 CSP 响应头**：`/v1/events/stream?live=1` 与 `/v1beta1/management/events/stream?live=1` 保持 HTTP 长连接并实时推送 `management.audit` 事件流；静态资源与 Nginx 统一附加 `Content-Security-Policy`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 与 `Referrer-Policy` 生产安全响应头。
+
+3. **8 维生产上线准入门控 (`GET/POST /v1beta1/management/release/readiness` & `anstsctl mgmt-release-gate`)**：
+   - 实时核查 `GATE-01`（零伪造状态与零前端打桩数据）、`GATE-02`（XSS 转义与 CSP 安全头）、`GATE-03`（HMAC-SHA256 JWT RBAC 与防篡改审计哈希链）、`GATE-04`（高危写接口 400 严格入参校验）、`GATE-05`（Nginx SPA 回退与无缓冲实时 SSE）、`GATE-06`（SQLite RPO=0 持久化）、`GATE-07`（Brain 单飞缓存并发防放大）与 `GATE-08`（256 哈希槽与核心子系统在线），并输出关键交付物 SHA-256 摘要。
+   - 全量通过 **70 个测试套件（201 项端到端测试）** (`tests/m77_console_production_release_readiness.test.ts`)。
+

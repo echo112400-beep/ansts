@@ -1004,6 +1004,7 @@ dialog#dialog::backdrop {
   ];
 
   function createBaselineState() {
+    // [M77 Zero-Stub Principle] All collections initialize empty; 100% of data is populated from live GET /v1beta1/management/state
     return {
       activeNav: 'overview',
       region: 'all',
@@ -1013,75 +1014,38 @@ dialog#dialog::backdrop {
       identity: 'chen',
       liveBackendConnected: false,
       lastApiOutput: '等待调用后端接口...',
-      lastSyncUtc: '2026-11-10 09:30:00 UTC',
+      lastSyncUtc: null,
       loadSheddingActive: false,
       verificationRetried: false,
-      sla: {
-        p0QueueWaitP99Ms: 68,
-        warmPoolHitRatio: 0.948,
-        utilizationRatio: 0.742,
-        compliant: true,
-        breaches: []
-      },
-      canary: { state: 'CANARY_ACTIVE', trafficWeightPct: 5 },
+      sla: null,
+      canary: null,
       a2aState: {
-        blackboardEntries: [
-          { key: 'arch/zero-trust-policy', value: { mTLS: 'STRICT', spiffeTrustDomain: 'ansts.io' }, version: 1, authorAgentId: 'agent-northstar' },
-          { key: 'ledger/shard-cursor', value: { shardRange: '0..127', checkpointTurn: 5 }, version: 1, authorAgentId: 'agent-helios' }
-        ],
+        blackboardEntries: [],
         deadlock: { hasDeadlock: false, cyclePath: [] },
         lastGitArbitration: null,
         lastBisectResult: null
       },
-      layerfsStats: { totalObjects: 18, fullObjects: 6, deltaObjects: 12, totalLogicalBytes: 49152, totalCompressedBytes: 18432 },
+      layerfsStats: null,
       mcpState: {
-        tools: [
-          { toolName: 'mcp_pg_migration_apply', serverName: 'mcp-postgres-prod', description: 'Apply reversible schema migration with Saga LIFO rollback hook', effectClass: 'COMPENSATABLE_WRITE', registeredBy: 'chen' }
-        ],
+        tools: [],
         lastSagaRollbackReport: null
       },
-      runtimeSandboxState: {
-        warmPoolStats: { warmCount: 8, activeCount: 1 },
-        teePublicKeyDerHex: '302a300506032b6570032100a8f19c...',
-        spiffeCaPublicKeyDerHex: '302a300506032b65700321007d44e2...'
-      },
+      runtimeSandboxState: null,
       gcSweepReport: null,
+      auditChainIntegrity: null,
       taskFilterSearch: '',
       taskFilterState: 'ALL',
       auditFilterQuery: '',
       auditFilterRole: 'ALL',
-      slotDistribution: { 'brain-node-01': 85, 'brain-node-02': 86, 'brain-node-03': 85 },
+      slotDistribution: {},
       batchReport: null,
-      nodes: [
-        { id: 'celld-brain-01', role: 'Brain Shard #1', region: 'us-west-2', slots: 85, cpuPct: 62, psiPct: 4.2, status: 'READY', activeLeases: 14, pinnedP0Tasks: ['task-ns-8841'], tunnelGw: 'celld-gw-01' },
-        { id: 'celld-brain-02', role: 'Brain Shard #2', region: 'us-west-2', slots: 86, cpuPct: 68, psiPct: 5.8, status: 'READY', activeLeases: 15, pinnedP0Tasks: [], tunnelGw: 'celld-gw-01' },
-        { id: 'celld-brain-03', role: 'Brain Shard #3', region: 'eu-central-1', slots: 85, cpuPct: 54, psiPct: 3.1, status: 'READY', activeLeases: 13, pinnedP0Tasks: [], tunnelGw: 'celld-gw-02' },
-        { id: 'body-host-01', role: 'Body LayerFS #1', region: 'us-west-2', slots: 0, cpuPct: 74, psiPct: 8.4, status: 'READY', activeLeases: 13, pinnedP0Tasks: [], tunnelGw: 'celld-gw-01 (PRIMARY)' },
-        { id: 'body-host-02', role: 'Body LayerFS #2', region: 'eu-central-1', slots: 0, cpuPct: 79, psiPct: 11.2, status: 'READY', activeLeases: 14, pinnedP0Tasks: ['task-ns-8841'], tunnelGw: 'celld-gw-02 (SECONDARY)' },
-        { id: 'body-host-03', role: 'Body LayerFS #3', region: 'ap-northeast-1', slots: 0, cpuPct: 48, psiPct: 2.5, status: 'READY', activeLeases: 13, pinnedP0Tasks: [], tunnelGw: 'celld-gw-01 (PRIMARY)' }
-      ],
-      tenants: [
-        { id: 'Northstar', region: 'us-west-2', tier: 'P0_STRATEGIC', usedSlots: 88, maxSlots: 120, escrowReserved: 16, dailyBudgetUsd: 1200, spentUsd: 840, budgetStatus: 'OK', modelPolicy: 'DeepSeek-R1 → Qwen-3.8 (80%)', configVersion: 14, updatedBy: 'chen' },
-        { id: 'Helios', region: 'eu-central-1', tier: 'P1_ENTERPRISE', usedSlots: 46, maxSlots: 80, escrowReserved: 8, dailyBudgetUsd: 800, spentUsd: 490, budgetStatus: 'OK', modelPolicy: 'DeepSeek-R1 → Qwen-3.8 (80%)', configVersion: 9, updatedBy: 'chen' },
-        { id: 'Vanguard', region: 'ap-northeast-1', tier: 'P1_ENTERPRISE', usedSlots: 34, maxSlots: 60, escrowReserved: 6, dailyBudgetUsd: 600, spentUsd: 310, budgetStatus: 'OK', modelPolicy: 'DeepSeek-R1 → Qwen-3.8 (80%)', configVersion: 7, updatedBy: 'chen' },
-        { id: 'Aegis', region: 'us-west-2', tier: 'P2_STANDARD', usedSlots: 19, maxSlots: 40, escrowReserved: 4, dailyBudgetUsd: 300, spentUsd: 145, budgetStatus: 'OK', modelPolicy: 'Qwen-3.8 Economy', configVersion: 5, updatedBy: 'chen' }
-      ],
-      tasks: [
-        { id: 'task-ns-8841', tenant: 'Northstar', region: 'us-west-2', priority: 'P0', shardSlot: 42, brain: 'celld-brain-01', body: 'body-host-02', fence: 12, turn: 5, branch: 'feat-ns-auth', state: 'RUNNING_ACT' },
-        { id: 'task-ns-8842', tenant: 'Northstar', region: 'us-west-2', priority: 'P1', shardSlot: 118, brain: 'celld-brain-02', body: 'body-host-01', fence: 8, turn: 3, branch: 'fix-ns-ledger', state: 'LEASED' },
-        { id: 'task-hl-3019', tenant: 'Helios', region: 'eu-central-1', priority: 'P1', shardSlot: 203, brain: 'celld-brain-03', body: 'body-host-02', fence: 6, turn: 4, branch: 'gdpr-audit-eu', state: 'RUNNING_ACT' },
-        { id: 'task-vg-1044', tenant: 'Vanguard', region: 'ap-northeast-1', priority: 'P2', shardSlot: 19, brain: 'celld-brain-01', body: 'body-host-03', fence: 4, turn: 2, branch: 'apac-settlement', state: 'COMPLETED' }
-      ],
-      approvals: [
-        { id: 'APR-2026-091', type: 'QUOTA_EMERGENCY_BOOST', target: 'Northstar (120 → 180 并发槽)', region: 'us-west-2', tenant: 'Northstar', initiator: 'chen', status: 'PENDING_SECOND_ADMIN', risk: 'HIGH', createdAt: '09:24 UTC' },
-        { id: 'APR-2026-092', type: 'SAGA_HIGH_RISK_TOOL', target: 'task-ns-8841 · prod_db_schema_drop', region: 'us-west-2', tenant: 'Northstar', initiator: 'lin', status: 'PENDING_SECOND_ADMIN', risk: 'CRITICAL', createdAt: '09:27 UTC' },
-        { id: 'APR-2026-088', type: 'BRAIN_SHARD_DRAIN', target: 'celld-brain-02 维护排水与槽位迁移', region: 'us-west-2', tenant: 'all', initiator: 'zhou', status: 'APPROVED (chen)', risk: 'HIGH', createdAt: '09:05 UTC' }
-      ],
-      auditLogs: [
-        { ts: '09:28:14 UTC', actor: 'chen', role: 'SRE_ADMIN', action: '初始化平台管理面控制基线与 256-Slot 分片映射', scope: 'Global', outcome: '已生效 (RPO=0)' },
-        { ts: '09:21:05 UTC', actor: 'lin', role: 'OPERATOR', action: '触发 LayerFS 分支 feat-ns-auth 快照同步至 s3://ansts-fleet', scope: 'us-west-2 / Northstar', outcome: '成功 (Commit C1)' },
-        { ts: '09:05:42 UTC', actor: 'chen', role: 'SRE_ADMIN', action: '复核通过周发起的分片维护单 APR-2026-088', scope: 'us-west-2 / Global', outcome: 'APPROVED (chen)' }
-      ]
+      allTenantIds: [],
+      regions: [],
+      nodes: [],
+      tenants: [],
+      tasks: [],
+      approvals: [],
+      auditLogs: []
     };
   }
 
@@ -1185,11 +1149,14 @@ dialog#dialog::backdrop {
       if (d.gcSweepReport !== undefined) state.gcSweepReport = d.gcSweepReport;
       if (d.slotDistribution) state.slotDistribution = d.slotDistribution;
       state.batchReport = d.batchReport || null;
-      state.nodes = d.nodes || state.nodes;
-      state.tenants = d.tenants || state.tenants;
-      state.tasks = d.tasks || state.tasks;
-      state.approvals = d.approvals || state.approvals;
-      state.auditLogs = d.auditLogs || state.auditLogs;
+      state.auditChainIntegrity = d.auditChainIntegrity || null;
+      state.regions = Array.isArray(d.regions) ? d.regions : [];
+      state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
+      state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
+      state.allTenantIds = Array.isArray(d.allTenantIds) ? d.allTenantIds : state.tenants.map((t) => t.id);
+      state.tasks = Array.isArray(d.tasks) ? d.tasks : [];
+      state.approvals = Array.isArray(d.approvals) ? d.approvals : [];
+      state.auditLogs = Array.isArray(d.auditLogs) ? d.auditLogs : [];
       const scSel = document.getElementById('scenario');
       if (scSel && scSel.value !== state.scenario) scSel.value = state.scenario;
     }
@@ -1237,13 +1204,15 @@ dialog#dialog::backdrop {
     const sel = document.getElementById('tenant-filter');
     if (!sel) return;
     const currentVal = state.tenant;
-    const baseTenants = ['Northstar', 'Helios', 'Vanguard', 'Aegis'];
+    const dynamicTenants = Array.isArray(state.allTenantIds) && state.allTenantIds.length > 0
+      ? state.allTenantIds
+      : state.tenants.map((t) => t.id);
     const options = [
       { value: 'all', label: '所有租户' },
-      ...baseTenants.map((id) => ({ value: id, label: id }))
+      ...dynamicTenants.map((id) => ({ value: id, label: id }))
     ];
     sel.innerHTML = options
-      .map((o) => `<option value="${o.value}" ${o.value === currentVal ? 'selected' : ''}>${o.label}</option>`)
+      .map((o) => `<option value="${esc(o.value)}" ${o.value === currentVal ? 'selected' : ''}>${esc(o.label)}</option>`)
       .join('');
   }
 
@@ -1576,33 +1545,37 @@ dialog#dialog::backdrop {
                   <th>CPU / PSI 内存压力</th>
                   <th>S3 LTX 跨区复制</th>
                   <th>SLO 验证状态</th>
+                  <th>后端容灾操作</th>
                 </tr>
               </thead>
               <tbody>
-                <tr>
-                  <td class="mono"><strong>us-west-2</strong></td>
-                  <td><span class="status-pill">US_FED</span></td>
-                  <td class="mono">brain-01 (${bDist['brain-node-01'] ?? 85}), brain-02 (${bDist['brain-node-02'] ?? 86})</td>
-                  <td class="mono">${isCap && !state.loadSheddingActive ? '96.4% / PSI 22.1%' : '66.0% / PSI 5.1%'}</td>
-                  <td class="mono">RPO=0 (12ms)</td>
-                  <td><span class="status-pill ${isVer || (isCap && !state.loadSheddingActive) ? 'danger' : 'ok'}">${isVer ? '复测超标 (410ms)' : isCap && !state.loadSheddingActive ? '容量告警 (340ms)' : '验证通过 (68ms)'}</span></td>
-                </tr>
-                <tr>
-                  <td class="mono"><strong>eu-central-1</strong></td>
-                  <td><span class="status-pill ok">GDPR_EU 锁定</span></td>
-                  <td class="mono">brain-03 (${bDist['brain-node-03'] ?? 85} 槽)</td>
-                  <td class="mono">54.2% / PSI 3.1%</td>
-                  <td class="mono">→ eu-west-1 (18ms)</td>
-                  <td><span class="status-pill ok">验证通过</span></td>
-                </tr>
-                <tr>
-                  <td class="mono"><strong>ap-northeast-1</strong></td>
-                  <td><span class="status-pill">APAC_SG</span></td>
-                  <td class="mono">边缘接入 → brain-01</td>
-                  <td class="mono">48.0% / PSI 2.5%</td>
-                  <td class="mono">RPO=0 (29ms)</td>
-                  <td><span class="status-pill ok">验证通过</span></td>
-                </tr>
+                ${(state.regions || []).map((reg) => {
+                  const isDrained = reg.capacityAvailable === false;
+                  const sloCls = isDrained ? 'warn' : reg.sloStatus && reg.sloStatus !== 'COMPLIANT' ? 'danger' : 'ok';
+                  const sloText = isDrained
+                    ? '已切流排水 (FAILOVER)'
+                    : reg.sloStatus === 'BREACH_410MS'
+                    ? '复测超标 (410ms)'
+                    : reg.sloStatus === 'CAPACITY_ALERT_340MS'
+                    ? '容量告警 (340ms)'
+                    : `验证通过 (${p99Ms}ms)`;
+                  const regPerm = canMutateTarget(reg.regionId, 'all', true);
+                  return `
+                    <tr>
+                      <td class="mono"><strong>${esc(reg.regionId)}</strong></td>
+                      <td><span class="status-pill ${reg.residencyZone === 'GDPR_EU' ? 'ok' : ''}">${esc(reg.residencyZone)}</span></td>
+                      <td class="mono">${esc(reg.brainSummary || '边缘接入')}</td>
+                      <td class="mono">${reg.avgCpuPct ?? 0}% / PSI ${reg.avgPsiPct ?? 0}%</td>
+                      <td class="mono">${esc(reg.replicationLabel || ('RPO=0 (' + (reg.rttMs ?? 15) + 'ms)'))}</td>
+                      <td><span class="status-pill ${sloCls}">${esc(sloText)}</span></td>
+                      <td>
+                        <button type="button" class="small ${isDrained ? 'primary' : ''}" data-action="toggle-region-availability" data-region="${esc(reg.regionId)}" data-avail="${reg.capacityAvailable !== false ? '1' : '0'}" ${!regPerm.ok ? 'disabled' : ''}>
+                          ${isDrained ? '恢复区域接入 (Restore)' : '容灾切流 (Failover)'}
+                        </button>
+                      </td>
+                    </tr>
+                  `;
+                }).join('')}
               </tbody>
             </table>
           </div>
@@ -1708,8 +1681,14 @@ dialog#dialog::backdrop {
                     </td>
                     <td>
                       <div class="btn-row">
-                        <button type="button" class="small" data-action="toggle-node-cordon" data-node="${n.id}" data-status="${n.status}" ${!nodePerm.ok ? 'disabled' : ''}>
+                        <button type="button" class="small" data-action="toggle-node-cordon" data-node="${esc(n.id)}" data-status="${esc(n.status)}" ${!nodePerm.ok ? 'disabled' : ''}>
                           ${n.status === 'CORDONED' ? '恢复调度 (Uncordon)' : '隔离节点 (Cordon)'}
+                        </button>
+                        <button type="button" class="small" data-action="drain-single-node" data-node="${esc(n.id)}" ${!nodePerm.ok ? 'disabled' : ''}>
+                          排水 (Drain)
+                        </button>
+                        <button type="button" class="small danger" data-action="decommission-node" data-node="${esc(n.id)}" data-region="${esc(n.region)}" ${!canMutateTarget('all', 'all', true).ok ? 'disabled' : ''}>
+                          下线 (Decommission)
                         </button>
                       </div>
                     </td>
@@ -1732,7 +1711,8 @@ dialog#dialog::backdrop {
             <p class="panel-subtitle">调用 <code>POST /v1beta1/management/tenants/config</code> 修改配额与预算，强制执行乐观锁 CAS 版本校验 (expectedVersion)。</p>
           </div>
           <div class="btn-row">
-            <button type="button" class="small primary" data-action="open-finops-attribution">FinOps 多维成本归因 (LLM 推理 vs 沙箱核时)</button>
+            <button type="button" class="small" data-action="open-finops-attribution">FinOps 多维成本归因 (LLM 推理 vs 沙箱核时)</button>
+            <button type="button" class="small primary" data-action="open-create-tenant-dialog" ${!canMutateTarget('all', 'all', true).ok ? 'disabled' : ''}>+ 新增租户配额策略 (/v1beta1/management/tenants/config)</button>
           </div>
         </div>
         <div class="table-wrap">
@@ -1819,6 +1799,7 @@ dialog#dialog::backdrop {
 <button type="button" class="small" data-action="open-ebpf-breaker">[N4] eBPF 网络追踪与微秒熔断</button>
             <button type="button" class="small" data-action="open-byzantine-slashing">[N5] 拜占庭信用惩戒与隔离</button>
             <button type="button" class="small" data-action="open-erasure-coding">[N6] 跨地域日志纠删码重构</button>
+            <button type="button" class="small primary" data-action="open-release-readiness-gate">[Prod] 生产发布准入核查 (Release Gate)</button>
             <button type="button" class="primary" data-action="open-dispatch-task-dialog" ${!permGlobal.ok ? 'disabled' : ''}>+ 派发新分布式任务</button>
           </div>
         </div>
@@ -2393,13 +2374,9 @@ dialog#dialog::backdrop {
   async function openTurnHistoryDialog(taskId) {
     const task = state.tasks.find((t) => t.id === taskId) || state.tasks[0];
     const turnsRes = await callBackendApi('GET', '/v1beta1/management/tasks/' + encodeURIComponent(task.id) + '/turns');
-    const turnsList = (turnsRes.data && Array.isArray(turnsRes.data.turns) && turnsRes.data.turns.length > 0)
+    const turnsList = (turnsRes.data && Array.isArray(turnsRes.data.turns))
       ? turnsRes.data.turns
-      : [
-          { turnIndex: 1, commitId: 'C0', crc32Hex: '9a01b2c3', sqliteWalPages: 5, changedFiles: ['src/init.ts'], ltxStatus: 'VERIFIED' },
-          { turnIndex: 2, commitId: 'C1', crc32Hex: '4d12e8f0', sqliteWalPages: 6, changedFiles: ['src/auth.ts'], ltxStatus: 'VERIFIED' },
-          { turnIndex: 3, commitId: 'C2', crc32Hex: '7c89a112', sqliteWalPages: 7, changedFiles: ['src/ledger.ts'], ltxStatus: 'VERIFIED' }
-        ];
+      : [];
 
     openDialog(
       '任务回合 WAL 帧 CRC32 校验与零拷贝分叉 · ' + task.id + ' (GET /v1beta1/management/tasks/' + task.id + '/turns)',
@@ -2597,20 +2574,42 @@ dialog#dialog::backdrop {
     );
   }
 
-  function applyIdentityChange(newIdentity) {
+  async function syncLiveAuthToken(principalId) {
+    try {
+      const origin = getBackendOrigin();
+      const resp = await fetch(`${origin}/v1beta1/management/auth/token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ principalId })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data && data.token && IDENTITIES[principalId]) {
+          IDENTITIES[principalId].jwtToken = data.token;
+        }
+        if (data && data.auditChainIntegrity) {
+          state.auditChainIntegrity = data.auditChainIntegrity;
+        }
+      }
+    } catch (_e) {
+      // keep existing deterministic signed token if offline
+    }
+  }
+
+  async function applyIdentityChange(newIdentity) {
     if (!IDENTITIES[newIdentity]) return;
     state.identity = newIdentity;
     const idSel = document.getElementById('identity');
     if (idSel) idSel.value = newIdentity;
+    await syncLiveAuthToken(newIdentity);
     const p = getPrincipal();
     if (p.scopeRegion !== 'all') {
       state.region = p.scopeRegion;
       const regSel = document.getElementById('region');
       if (regSel) regSel.value = p.scopeRegion;
     }
-    updateHeaderAndRail();
-    renderMainContent();
-    showToast(`已切换操作员身份：${p.name} (${p.role})`);
+    await fetchBackendState();
+    showToast(`已切换操作员身份并签发 RBAC JWT：${p.name} (${p.role})`);
   }
 
   async function handleActionClick(target) {
@@ -2722,6 +2721,123 @@ dialog#dialog::backdrop {
       });
       await fetchBackendState();
       showToast('后端已热迁移 body-host-02 上的 P0 租约并完成节点隔离排水');
+      return;
+    }
+    if (action === 'toggle-region-availability') {
+      const regionId = target.getAttribute('data-region') || 'eu-central-1';
+      const curAvail = target.getAttribute('data-avail') === '1';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/canary', {
+        action: 'toggle_region',
+        regionId,
+        capacityAvailable: !curAvail,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '区域容灾切换被后端拒绝');
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已切换区域 ${regionId} 接入状态为: ${!curAvail ? 'ONLINE' : 'FAILOVER_DRAINED'}`);
+      return;
+    }
+    if (action === 'drain-single-node') {
+      const nodeId = target.getAttribute('data-node') || 'body-host-01';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/nodes/batch', {
+        operation: 'drain',
+        nodeIds: [nodeId],
+        forceMigrateLeases: true,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '单节点排水被后端拒绝');
+        return;
+      }
+      await fetchBackendState();
+      showToast(`后端已完成节点 ${nodeId} 安全排水与活跃租约迁移`);
+      return;
+    }
+    if (action === 'decommission-node') {
+      const nodeId = target.getAttribute('data-node') || 'body-host-03';
+      const region = target.getAttribute('data-region') || 'us-west-2';
+      const role = nodeId.startsWith('celld-brain-') ? 'brain' : 'body';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/nodes/scale', {
+        action: 'decommission',
+        nodeId,
+        role,
+        region,
+        actor: p.id,
+        actorRole: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '节点下线被后端拒绝');
+        return;
+      }
+      await fetchBackendState();
+      showToast(`后端已安全下线并移除节点 ${nodeId}`);
+      return;
+    }
+    if (action === 'open-create-tenant-dialog') {
+      openDialog(
+        '新增多租户 DRF 配额与 FinOps 预算策略 (POST /v1beta1/management/tenants/config)',
+        '<div class="form-field"><label for="dlg-new-tenant-id">新租户名称 (Tenant ID)</label>' +
+        '<input id="dlg-new-tenant-id" type="text" value="Orion" class="mono" /></div>' +
+        '<div class="form-field"><label for="dlg-new-tenant-slots">并发沙箱槽位上限 (Max Slots)</label>' +
+        '<input id="dlg-new-tenant-slots" type="number" value="100" min="10" max="500" /></div>' +
+        '<div class="form-field"><label for="dlg-new-tenant-budget">FinOps 日预算上限 (Daily Budget USD)</label>' +
+        '<input id="dlg-new-tenant-budget" type="number" value="900" min="50" max="10000" /></div>',
+        '创建租户并写入 SQLite',
+        async () => {
+          const tenantId = document.getElementById('dlg-new-tenant-id').value.trim();
+          const maxSlots = Number(document.getElementById('dlg-new-tenant-slots').value);
+          const dailyBudgetUsd = Number(document.getElementById('dlg-new-tenant-budget').value);
+          const p = getPrincipal();
+          const res = await callBackendApi('POST', '/v1beta1/management/tenants/config', {
+            tenantId,
+            maxSlots,
+            dailyBudgetUsd,
+            expectedVersion: 0,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            const errEl = document.getElementById('dialog-error');
+            if (errEl) errEl.textContent = res.data?.message || '创建租户失败';
+            return;
+          }
+          closeDialog();
+          await fetchBackendState();
+          showToast(`后端已持久化新租户 ${tenantId} (v${res.data.configVersion || 1})`);
+        }
+      );
+      return;
+    }
+    if (action === 'open-release-readiness-gate') {
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/release/readiness', {
+        actor: p.id,
+        role: p.role
+      });
+      const d = res.data || {};
+      state.lastApiOutput = JSON.stringify(d, null, 2);
+      const gateRows = (d.gates || []).map((g) =>
+        '<tr><td class="mono"><strong>' + esc(g.id) + '</strong></td><td>' + esc(g.name) + '</td><td><span class="status-pill ' + (g.passed ? 'ok' : 'danger') + '">' + (g.passed ? 'PASS' : 'BLOCKED') + '</span></td></tr>'
+      ).join('');
+      const digests = d.assetDigestsSha256 || {};
+      openDialog(
+        '[Prod] Console 生产上线准入核查报告 (POST /v1beta1/management/release/readiness)',
+        '<div><strong>发布版本：</strong> <code class="mono">' + esc(d.releaseVersion || 'v2.5.0-prod') + '</code> · <strong>准入判定：</strong> <span class="status-pill ' + (d.releaseReady ? 'ok' : 'danger') + '">' + (d.releaseReady ? 'RELEASE READY (' + (d.passedGatesCount || 8) + '/' + (d.totalGatesCount || 8) + ' GATES PASSED)' : 'RELEASE BLOCKED') + '</span></div>' +
+        '<div class="muted" style="margin-top:6px;">审计哈希链完整性: <code class="mono">valid=' + Boolean(d.auditChainIntegrity?.valid) + ' (entries=' + (d.auditChainIntegrity?.totalEntries || 0) + ', head=' + String(d.auditChainIntegrity?.headHashHex || '').slice(0, 16) + '...)</code></div>' +
+        '<div class="table-wrap" style="margin-top:8px;"><table class="data-table"><thead><tr><th>门控编号</th><th>生产上线质量门控项</th><th>核查状态</th></tr></thead><tbody>' + gateRows + '</tbody></table></div>' +
+        '<div class="muted" style="margin-top:6px;">关键产物 SHA-256 摘要: <code class="mono">index.html=' + String(digests['docs/index.html'] || '').slice(0, 12) + '... · prototype.js=' + String(digests['docs/console-management/prototype.js'] || '').slice(0, 12) + '...</code></div>',
+        '确认生产发布准入',
+        () => closeDialog()
+      );
+      await fetchBackendState();
       return;
     }
     if (action === 'toggle-node-cordon') {
@@ -3743,7 +3859,7 @@ dialog#dialog::backdrop {
         liveSseSource.close();
       }
       const origin = getBackendOrigin();
-      liveSseSource = new EventSource(`${origin}/v1beta1/management/events/stream`);
+      liveSseSource = new EventSource(`${origin}/v1beta1/management/events/stream?live=1`);
       liveSseSource.addEventListener('management.audit', () => {
         const dialog = document.getElementById('dialog');
         if (!dialog || !dialog.open) {
@@ -3766,6 +3882,7 @@ dialog#dialog::backdrop {
     updateHeaderAndRail();
     renderMainContent();
     bindGlobalEvents();
+    await syncLiveAuthToken(state.identity);
     await fetchBackendState();
     connectLiveEventStream();
     if (!autoRefreshTimer) {
