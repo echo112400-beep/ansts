@@ -32,6 +32,37 @@ export interface SpotQuotaLease {
   walFrozenTurnIndex?: number;
 }
 
+export interface CapacitySlaViolation {
+  rule: string;
+  detail: string;
+}
+
+export interface BrainIsolateAdmission {
+  isolateId: string;
+  allowed: boolean;
+  heapUsedRatioPct: number;
+  gcTriggered: boolean;
+  circuitBreakerTripped: boolean;
+  activeCells: number;
+  slaViolations: CapacitySlaViolation[];
+}
+
+export interface BodyHostAdmission {
+  hostId: string;
+  allowed: boolean;
+  availableSlots: number;
+  slaViolations: CapacitySlaViolation[];
+}
+
+export interface RustFsEc4ReliabilityVerdict {
+  rpoZeroGuaranteed: boolean;
+  remainingFaultToleranceDrives: number;
+  totalDrives: number;
+  dataBlocks: number;
+  parityBlocks: number;
+  slaViolations: CapacitySlaViolation[];
+}
+
 export class CapacitySlaEnforcer {
   private policy: CapacitySlaPolicy;
   private emergencyHeadroomActive = false;
@@ -361,5 +392,131 @@ export class CapacitySlaEnforcer {
 
   public listSpotLeases(): SpotQuotaLease[] {
     return Array.from(this.spotLeases.values());
+  }
+
+  /**
+   * [TASK-84] Brain isolate admission: 128MB heap watermark with a GC band and a circuit breaker.
+   * The isolate is admitted until the heap crosses the breaker threshold, because a rehydrate under
+   * a nearly full heap is exactly how an OOM cascade starts.
+   */
+  public evaluateBrainIsolateAdmission(params: {
+    isolateId: string;
+    heapUsedMb: number;
+    heapLimitMb: number;
+    activeCells: number;
+    lastRehydrateRtoMs: number;
+  }): BrainIsolateAdmission {
+    const violations: CapacitySlaViolation[] = [];
+    const limit = Math.max(1, params.heapLimitMb);
+    const heapRatio = params.heapUsedMb / limit;
+    const gcTriggered = heapRatio >= 0.75;
+    const circuitBreakerTripped = heapRatio >= 0.9;
+
+    if (circuitBreakerTripped) {
+      violations.push({
+        rule: "BRAIN_HEAP_CIRCUIT_BREAKER",
+        detail: `heap ${params.heapUsedMb}MB / ${limit}MB (${(heapRatio * 100).toFixed(1)}%) breached 90% breaker`,
+      });
+    }
+    if (params.lastRehydrateRtoMs > 3000) {
+      violations.push({
+        rule: "BRAIN_REHYDRATE_RTO",
+        detail: `last rehydrate RTO ${params.lastRehydrateRtoMs}ms exceeded 3000ms`,
+      });
+    }
+
+    return {
+      isolateId: params.isolateId,
+      allowed: !circuitBreakerTripped,
+      heapUsedRatioPct: Number((heapRatio * 100).toFixed(1)),
+      gcTriggered,
+      circuitBreakerTripped,
+      activeCells: params.activeCells,
+      slaViolations: violations,
+    };
+  }
+
+  /**
+   * [TASK-84] Body host admission: hard 32-sandbox cap plus the cgroup-boost / vsock fast-path latencies.
+   */
+  public evaluateBodyHostAdmission(params: {
+    hostId: string;
+    vcpuCount: number;
+    ramGb: number;
+    activeSandboxes: number;
+    maxSandboxesLimit: number;
+    lastCgroupBoostLatencyMs: number;
+    lastVsockFastpathLatencyMs: number;
+  }): BodyHostAdmission {
+    const violations: CapacitySlaViolation[] = [];
+    const limit = Math.max(0, params.maxSandboxesLimit);
+    const availableSlots = Math.max(0, limit - params.activeSandboxes);
+
+    if (params.activeSandboxes >= limit) {
+      violations.push({
+        rule: "BODY_SANDBOX_CAP",
+        detail: `${params.activeSandboxes}/${limit} sandbox slots in use`,
+      });
+    }
+    if (params.lastCgroupBoostLatencyMs > 1.5) {
+      violations.push({
+        rule: "BODY_CGROUP_BOOST_LATENCY",
+        detail: `cgroup boost ${params.lastCgroupBoostLatencyMs}ms exceeded 1.5ms`,
+      });
+    }
+    if (params.lastVsockFastpathLatencyMs > 0.2) {
+      violations.push({
+        rule: "BODY_VSOCK_FASTPATH_LATENCY",
+        detail: `vsock fastpath ${params.lastVsockFastpathLatencyMs}ms exceeded 0.2ms`,
+      });
+    }
+
+    return {
+      hostId: params.hostId,
+      allowed: availableSlots > 0 && violations.length === 0,
+      availableSlots,
+      slaViolations: violations,
+    };
+  }
+
+  /**
+   * [TASK-84] RustFS EC:4 reliability: whether the array can still reconstruct every block (RPO=0).
+   * Fault tolerance is spent one drive at a time, so parity leaving zero spare drives is still RPO=0 —
+   * losing one more is not.
+   */
+  public evaluateRustFsEc4Reliability(params: {
+    totalDrives: number;
+    dataBlocks: number;
+    parityBlocks: number;
+    healthyDrives: number;
+    failedDrives: number;
+    lastEtagCasLatencyMs: number;
+  }): RustFsEc4ReliabilityVerdict {
+    const violations: CapacitySlaViolation[] = [];
+    const remainingFaultToleranceDrives = params.parityBlocks - params.failedDrives;
+    const canReconstruct = params.healthyDrives >= params.dataBlocks;
+    const rpoZeroGuaranteed = remainingFaultToleranceDrives >= 0 && canReconstruct;
+
+    if (remainingFaultToleranceDrives < 0) {
+      violations.push({
+        rule: "RUSTFS_EC4_QUORUM_LOST",
+        detail: `${params.failedDrives} failed drives exceeded ${params.parityBlocks} parity blocks`,
+      });
+    }
+    if (params.lastEtagCasLatencyMs > 12) {
+      violations.push({
+        rule: "RUSTFS_ETAG_CAS_LATENCY",
+        detail: `etag CAS ${params.lastEtagCasLatencyMs}ms exceeded 12ms`,
+      });
+    }
+
+    return {
+      rpoZeroGuaranteed,
+      remainingFaultToleranceDrives,
+      totalDrives: params.totalDrives,
+      dataBlocks: params.dataBlocks,
+      parityBlocks: params.parityBlocks,
+      slaViolations: violations,
+    };
   }
 }

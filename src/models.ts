@@ -99,6 +99,10 @@ export class TurnWalFrame {
   public readonly sqliteWalPages: number;
   public readonly crc32Hex: string;
   public readonly createdAtMs: number;
+  /** Serialized stream payload carried alongside the on-disk diff, so a WAL replay can re-emit the event. */
+  public readonly diffSnapshot: string;
+  /** Task state at the moment the turn was written; lets a replay reconstruct the lifecycle view. */
+  public readonly state: TaskState;
 
   constructor(params: {
     frameId: string;
@@ -109,6 +113,8 @@ export class TurnWalFrame {
     sqliteWalPages: number;
     crc32Hex?: string;
     createdAtMs?: number;
+    diffSnapshot?: string;
+    state?: TaskState;
   }) {
     this.frameId = params.frameId;
     this.taskId = params.taskId;
@@ -117,9 +123,43 @@ export class TurnWalFrame {
     this.changedFiles = [...params.changedFiles];
     this.sqliteWalPages = params.sqliteWalPages;
     this.createdAtMs = params.createdAtMs ?? Date.now();
+    this.diffSnapshot = params.diffSnapshot ?? "";
+    this.state = params.state ?? TaskState.SUBMITTED;
     this.crc32Hex =
       params.crc32Hex ??
       TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+  }
+
+  /**
+   * Builds a frame from whatever the caller knows; unspecified fields are derived.
+   * Stream publishers do not invent frame ids, so they can hand over the fence and payload only.
+   */
+  public static fromPartial(params: {
+    taskId: string;
+    fence: FenceToken;
+    frameId?: string;
+    turnIndex?: number;
+    changedFiles?: string[];
+    sqliteWalPages?: number;
+    crc32Hex?: string;
+    timestampMs?: number;
+    createdAtMs?: number;
+    diffSnapshot?: string;
+    state?: TaskState;
+  }): TurnWalFrame {
+    const turnIndex = params.turnIndex ?? params.fence.turnSeq;
+    return new TurnWalFrame({
+      frameId: params.frameId ?? `frame-${params.taskId}-t${turnIndex}-e${params.fence.epoch}`,
+      taskId: params.taskId,
+      turnIndex,
+      fence: params.fence,
+      changedFiles: params.changedFiles ?? [],
+      sqliteWalPages: params.sqliteWalPages ?? 0,
+      crc32Hex: params.crc32Hex,
+      createdAtMs: params.createdAtMs ?? params.timestampMs,
+      diffSnapshot: params.diffSnapshot,
+      state: params.state,
+    });
   }
 
   public static computeCrc32Hex(

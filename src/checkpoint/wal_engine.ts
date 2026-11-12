@@ -216,6 +216,65 @@ export class TurnWalEngine {
     return (this.logsByTask.get(taskId) ?? []).map((e) => e.frame);
   }
 
+  /** Alias used by the SSE stream publisher when slicing catch-up frames. */
+  public listTaskFrames(taskId: string): TurnWalFrame[] {
+    return this.getTaskWalFrames(taskId);
+  }
+
+  /**
+   * [TASK-85] Persists a pre-built frame under an `If-None-Match` (epoch, turnSeq) guard.
+   * A retried publish of the same turn must not append a duplicate frame, otherwise a reconnect
+   * would replay the same event twice.
+   */
+  public writeWalFrameIfNoneMatch(frame: TurnWalFrame): string {
+    const list = this.logsByTask.get(frame.taskId) ?? [];
+    const duplicate = list.find(
+      (e) => e.frame.fence.epoch === frame.fence.epoch && e.frame.fence.turnSeq === frame.fence.turnSeq,
+    );
+    if (duplicate) return duplicate.frame.frameId;
+
+    const raw = `${frame.taskId}:${frame.turnIndex}:${frame.fence.turnSeq}:${frame.changedFiles.join(",")}`;
+    const checksumSha256 = crypto.createHash("sha256").update(raw, "utf-8").digest("hex");
+    this.globalSeq += 1;
+    const createdAt = Date.now() / 1000;
+    const entry: WalDeltaEntry = {
+      walSeq: this.globalSeq,
+      taskId: frame.taskId,
+      turnIndex: frame.turnIndex,
+      fencingToken: frame.fence.turnSeq,
+      changedFiles: [...frame.changedFiles],
+      sqliteWalPages: frame.sqliteWalPages,
+      checksumSha256,
+      checkpoint: {
+        checkpoint_id: `wal-${frame.taskId}-t${frame.turnIndex}-s${this.globalSeq}`,
+        task_id: frame.taskId,
+        turn_index: frame.turnIndex,
+        fencing_token: frame.fence.turnSeq,
+        state_hash: checksumSha256.slice(0, 16),
+        overlayfs_diff_uri: `s3://ansts-wal/${frame.taskId}/turn-${frame.turnIndex}.zst`,
+        created_at: createdAt,
+      },
+      frame,
+    };
+    list.push(entry);
+    this.logsByTask.set(frame.taskId, list);
+    if (this.sql) {
+      this.sql.exec(
+        "INSERT OR REPLACE INTO turn_wal_entries (task_id, wal_seq, turn_index, fencing_token, changed_files_json, sqlite_wal_pages, checksum_sha256, frame_crc32, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        entry.taskId,
+        entry.walSeq,
+        entry.turnIndex,
+        entry.fencingToken,
+        JSON.stringify(entry.changedFiles),
+        entry.sqliteWalPages,
+        entry.checksumSha256,
+        entry.frame.crc32Hex,
+        createdAt
+      );
+    }
+    return frame.frameId;
+  }
+
   /**
    * [M67-5] Purges WAL frames for a terminated/archived task from both memory and SQLite.
    */

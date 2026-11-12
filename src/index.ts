@@ -91,3 +91,9 @@ export * from "./storage/distributed_gc_sweeper.js";
 export * from "./dashboard/console_rbac_guard.js";
 export * from "./checkpoint/erasure_coder.js";
 export * from "./runtime/ebpf_network_tracker.js";
+
+export * from "./gateway/stream_queue_publisher.js";
+export * from "./telemetry/observability_recovery.js";
+export * from "./saga/mcp_streamable_hub.js";
+export * from "./dashboard/shadow_eval_lab.js";
+export * from "./harness/speculative_prefetcher.js";

@@ -50,10 +50,21 @@ export class ClientStreamSubscription {
   }
 }
 
+export interface SseEventFrame extends SseEventEnvelope {
+  clientId: string;
+}
+
+export interface ClientCreditState {
+  clientId: string;
+  credits: number;
+  droppedForNoCredit: number;
+}
+
 export class SseEventStreamGateway {
   private readonly subscriptionsByTask: Map<string, Map<string, ClientStreamSubscription>> = new Map();
   private readonly historyByTask: Map<string, SseEventEnvelope[]> = new Map();
   private readonly seenEventIdsByTask: Map<string, Set<string>> = new Map();
+  private readonly clientCredits: Map<string, ClientCreditState> = new Map();
   private readonly maxHistoryPerTask: number;
 
   constructor(maxHistoryPerTask = 100) {
@@ -192,6 +203,71 @@ export class SseEventStreamGateway {
 
   public getTaskHistory(taskId: string): SseEventEnvelope[] {
     return [...(this.historyByTask.get(taskId) ?? [])];
+  }
+
+  /**
+   * [TASK-86] Registers a stream client with an initial credit window.
+   * A client with no credits receives no frames: that is the backpressure signal, not a dropped client.
+   */
+  public registerClient(clientId: string, creditWindow = 64): ClientCreditState {
+    const state: ClientCreditState = {
+      clientId,
+      credits: Math.max(0, Math.floor(creditWindow)),
+      droppedForNoCredit: 0,
+    };
+    this.clientCredits.set(clientId, state);
+    return state;
+  }
+
+  /** Replenishes a client's credit window (ack/consumed frames) and returns the new balance. */
+  public ackCredits(clientId: string, replenish: number): number {
+    const state = this.clientCredits.get(clientId);
+    if (!state) return 0;
+    state.credits += Math.max(0, Math.floor(replenish));
+    return state.credits;
+  }
+
+  public getClientCreditState(clientId: string): ClientCreditState | undefined {
+    return this.clientCredits.get(clientId);
+  }
+
+  /**
+   * [TASK-86] Emits one event to every registered client inside its credit window and records it in
+   * the per-task history so a reconnect can replay what was missed. Frames with no credit are counted
+   * as dropped rather than silently discarded.
+   */
+  public publishEvent(
+    clientId: string,
+    eventType: string,
+    taskId: string,
+    payload: string,
+    turnIndex = 0,
+  ): SseEventFrame[] {
+    const state = this.clientCredits.get(clientId);
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(payload) as Record<string, unknown>;
+    } catch {
+      data = { raw: payload };
+    }
+    const timestampMs = Date.now();
+    const envelope: SseEventEnvelope = {
+      id: `${taskId}:${eventType}:${turnIndex}:${timestampMs}`,
+      event: eventType,
+      taskId,
+      turnIndex,
+      timestampMs,
+      data,
+    };
+    this.publish(envelope);
+
+    if (!state) return [];
+    if (state.credits <= 0) {
+      state.droppedForNoCredit += 1;
+      return [];
+    }
+    state.credits -= 1;
+    return [{ ...envelope, clientId }];
   }
 
   public listRecentEvents(limit = 15): SseEventEnvelope[] {
