@@ -694,6 +694,26 @@ gatewayUrl = process.env.ANSTS_GATEWAY_URL ?? "http://127.0.0.1:18080")
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-queue-backpressure") {
+    const util = (rest[0] ?? "0.88").trim();
+    const resp = await fetch(
+    `${baseUrl}/v1beta1/console/queues/backpressure?utilizationRatio=${encodeURIComponent(util)}`);
+
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-queue-dlq-replay") {
+    const taskIds = rest[0] ? rest[0].split(",").map((s) => s.trim()).filter(Boolean) : [];
+    const resp = await fetch(`${baseUrl}/v1beta1/management/queues/dead-letter/replay`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ taskIds, actor: "cli-admin", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-config-diff") {
     const fromRev = (rest[0] ?? "1").trim();
     const toRev = (rest[1] ?? "1").trim();

@@ -1614,6 +1614,140 @@ export class PlatformManagementPlaneEngine {
     }
   }
 
+  public simulateQueueLoadSheddingAndBackpressure(params: {
+    utilizationRatio: number;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const rawUtil = Number(params.utilizationRatio);
+    if (!Number.isFinite(rawUtil) || rawUtil < 0 || rawUtil > 1.5) {
+      return {
+        status: 400,
+        body: {
+          error: "INVALID_UTILIZATION_RATIO",
+          message: "utilizationRatio 必须为 0 .. 1.5 之间的有效数值",
+        },
+      };
+    }
+
+    const priorityLabels: Record<number, string> = {
+      0: "P0_EMERGENCY",
+      1: "P1_INTERACTIVE",
+      2: "P2_STANDARD",
+      3: "P3_BATCH",
+    };
+
+    const admissionMatrix = [0, 1, 2, 3].map((prio) => {
+      const admitted = this.deps.loadShedder.shouldAdmitUnderLoad(prio as TaskPriority, rawUtil);
+      return {
+        priority: prio,
+        label: priorityLabels[prio],
+        admitted,
+        action: admitted ? "ADMIT" : "SHED_LOAD",
+      };
+    });
+
+    const queuedSnapshot = this.mgmtQueueManager.inspectQueueSnapshot();
+    const allQueued: Array<{ taskId: string; tenantId: string; priority: number }> = [];
+    for (const heap of queuedSnapshot.tenantHeaps) {
+      for (const item of heap.queuedItems) {
+        allQueued.push({
+          taskId: item.taskId,
+          tenantId: item.tenantId,
+          priority: item.priority,
+        });
+      }
+    }
+
+    const shedCandidateTaskIds = allQueued
+      .filter((t) => !this.deps.loadShedder.shouldAdmitUnderLoad(t.priority as TaskPriority, rawUtil))
+      .map((t) => t.taskId);
+
+    const deadLetterTasks = Array.from(this.deps.scheduler.allTasks.values())
+      .filter((t) => t.state === TaskState.DEAD_LETTER)
+      .map((t) => ({
+        taskId: t.task_id,
+        tenantId: t.tenant_id,
+        priority: t.priority,
+        retryCount: t.retry_count,
+      }));
+
+    const backpressureActive = rawUtil >= 0.9;
+    return {
+      status: 200,
+      body: {
+        utilizationRatio: Number(rawUtil.toFixed(3)),
+        backpressureActive,
+        backpressureHttpStatus: backpressureActive ? 429 : 200,
+        retryAfterSec: backpressureActive ? Math.max(1, Math.ceil((rawUtil - 0.8) * 30)) : 0,
+        admissionMatrix,
+        queuedTotalCount: allQueued.length,
+        shedCandidateCount: shedCandidateTaskIds.length,
+        shedCandidateTaskIds,
+        deadLetterCount: deadLetterTasks.length,
+        deadLetterTasks,
+      },
+    };
+  }
+
+  public replayDeadLetterTasks(params: {
+    taskIds?: string[];
+    targetPriority?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权重放死信队列任务" },
+      };
+    }
+
+    const filterSet =
+      Array.isArray(params.taskIds) && params.taskIds.length > 0
+        ? new Set(params.taskIds.map((id) => String(id).trim()))
+        : null;
+
+    const dlqTasks = Array.from(this.deps.scheduler.allTasks.values()).filter(
+      (t) => t.state === TaskState.DEAD_LETTER && (!filterSet || filterSet.has(t.task_id))
+    );
+
+    const replayedTaskIds: string[] = [];
+    const targetPrio =
+      params.targetPriority !== undefined && Number.isInteger(Number(params.targetPriority))
+        ? (Math.max(0, Math.min(3, Number(params.targetPriority))) as TaskPriority)
+        : undefined;
+
+    for (const task of dlqTasks) {
+      task.state = TaskState.QUEUED;
+      task.retry_count = 0;
+      if (targetPrio !== undefined) {
+        task.priority = targetPrio;
+      }
+      this.mgmtQueueManager.enqueue(task);
+      replayedTaskIds.push(task.task_id);
+    }
+
+    if (replayedTaskIds.length > 0) {
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `重放死信队列 (DLQ Replay) ${replayedTaskIds.length} 个任务至调度队列: ${replayedTaskIds.join(", ")}`,
+        "Queue / DLQ",
+        "REPLAYED"
+      );
+    }
+
+    return {
+      status: 200,
+      body: {
+        replayedCount: replayedTaskIds.length,
+        replayedTaskIds,
+        targetPriority: targetPrio ?? null,
+      },
+    };
+  }
+
   public diffConfigRevisions(params: {
     fromRev?: number;
     toRev?: number;

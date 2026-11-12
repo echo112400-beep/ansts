@@ -1036,6 +1036,7 @@ html.dark-theme .data-table tbody tr:hover {
       lastApiOutput: '等待调用后端接口...',
       configDiffResult: null,
       configDryRunResult: null,
+      queueBackpressureResult: null,
       lastSyncUtc: null,
       loadSheddingActive: false,
       verificationRetried: false,
@@ -2950,6 +2951,52 @@ html.dark-theme .data-table tbody tr:hover {
             </table>
           </div>
         </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>队列背压矩阵、优先级负载驱逐仿真与死信重放 (Backpressure &amp; DLQ Replay Workbench)</h2>
+            <p class="panel-desc">基于 PriorityLoadShedder 实时测算不同集群负载水位下 P0–P3 准入/驱逐策略与 HTTP 429 Retry-After，并支持死信队列 (DEAD_LETTER) 一键重放</p>
+          </div>
+          <div class="btn-row">
+            <label for="queue-util-input" class="muted" style="font-size:12px;">负载水位 (0.0–1.2):</label>
+            <input id="queue-util-input" type="number" min="0" max="1.2" step="0.05" value="${esc(String(state.queueBackpressureResult?.utilizationRatio ?? 0.90))}" style="width:80px;height:30px;" />
+            <button type="button" class="small" data-action="simulate-queue-backpressure">仿真负载驱逐矩阵</button>
+            <button type="button" class="small primary" data-action="replay-queue-dead-letters" ${!perm.ok ? 'disabled' : ''}>一键重放全部死信 (DLQ Replay)</button>
+          </div>
+        </div>
+        ${state.queueBackpressureResult ? `
+          <div class="subcard" style="margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+              <div>
+                <strong>仿真水位:</strong> <span class="mono">${Math.round((state.queueBackpressureResult.utilizationRatio ?? 0) * 100)}%</span>
+                · 准入状态: <span class="status-pill ${state.queueBackpressureResult.backpressureActive ? 'danger' : 'ok'}">HTTP ${state.queueBackpressureResult.backpressureHttpStatus} ${state.queueBackpressureResult.backpressureActive ? '(Retry-After: ' + state.queueBackpressureResult.retryAfterSec + 's)' : '(NORMAL)'}</span>
+              </div>
+              <div class="mono">当前排队受影响驱逐: <strong>${state.queueBackpressureResult.shedCandidateCount ?? 0}</strong> / ${state.queueBackpressureResult.queuedTotalCount ?? 0} · 死信待重放: <strong>${state.queueBackpressureResult.deadLetterCount ?? 0}</strong></div>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>优先级 (Priority)</th>
+                  <th>准入决策 (Action)</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${(state.queueBackpressureResult.admissionMatrix || []).map((row) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(row.label)}</strong></td>
+                    <td><span class="status-pill ${row.admitted ? 'ok' : 'danger'}">${esc(row.action)}</span></td>
+                    <td class="muted">${row.admitted ? '允许进入租户二项最大堆并参与 DRF 锦标赛调度' : '触发优先级负载驱逐 (429 Load Shedding)，保护高优 SLA'}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        ` : `<p class="muted">设置负载水位并点击「仿真负载驱逐矩阵」查看 P0–P3 准入矩阵与受影响排队任务，或点击「一键重放全部死信」恢复 DEAD_LETTER 任务。</p>`}
       </div>
     `;
   }
@@ -6042,6 +6089,31 @@ html.dark-theme .data-table tbody tr:hover {
       });
       await fetchBackendState();
       showToast(`已在分支 ${branchName} 提交快照 Commit ${res.data?.commitId || "OK"}`);
+      return;
+    }
+    if (action === "simulate-queue-backpressure") {
+      const util = document.getElementById("queue-util-input")?.value || "0.90";
+      const res = await callBackendApi(
+        "GET",
+        `/v1beta1/console/queues/backpressure?utilizationRatio=${encodeURIComponent(util)}`
+      );
+      if (res.ok && res.data) {
+        state.queueBackpressureResult = res.data;
+        render();
+        showToast(`队列背压仿真完成：水位 ${Math.round(Number(util) * 100)}% (HTTP ${res.data.backpressureHttpStatus})`);
+      }
+      return;
+    }
+    if (action === "replay-queue-dead-letters") {
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/queues/dead-letter/replay", {
+        actor: p.id,
+        role: p.role,
+      });
+      if (res.ok && res.data) {
+        await fetchBackendState();
+        showToast(`死信队列重放完成：已恢复 ${res.data.replayedCount ?? 0} 个任务至调度队列`);
+      }
       return;
     }
     if (action === "config-diff-revisions") {

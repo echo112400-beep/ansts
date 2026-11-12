@@ -2472,6 +2472,30 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M90] TanStack Console BFF: Queue Backpressure, Load-Shedding Simulator & DLQ Replay
+    if (method === "GET" && pathname === "/v1beta1/console/queues/backpressure") {
+      const utilParam = urlObj.searchParams.get("utilizationRatio") ?? "0.88";
+      const out = this.managementPlane.simulateQueueLoadSheddingAndBackpressure({
+        utilizationRatio: Number(utilParam)
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/queues/dead-letter/replay") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.replayDeadLetterTasks({
+        taskIds: Array.isArray(body.taskIds) ? body.taskIds : undefined,
+        targetPriority: body.targetPriority !== undefined ? Number(body.targetPriority) : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M89] TanStack Console BFF: Config Revision Diff & Dry-Run Blast-Radius Simulator
     if (method === "GET" && pathname === "/v1beta1/console/configs/diff") {
       const fromParam = urlObj.searchParams.get("fromRev");
