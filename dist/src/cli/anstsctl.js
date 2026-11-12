@@ -694,6 +694,38 @@ gatewayUrl = process.env.ANSTS_GATEWAY_URL ?? "http://127.0.0.1:18080")
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-approvals-saga") {
+    const resp = await fetch(`${baseUrl}/v1beta1/console/approvals/saga`);
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-approvals-batch") {
+    const decision = (rest[0] ?? "approve").trim();
+    const approvalIds = (rest[1] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    const approver = (rest[2] ?? "zhou").trim();
+    const resp = await fetch(`${baseUrl}/v1beta1/management/approvals/batch`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision, approvalIds, approver, role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-saga-action") {
+    const action = (rest[0] ?? "stage_high_risk_effect").trim();
+    const taskId = (rest[1] ?? "task-ns-8841").trim();
+    const toolName = (rest[2] ?? "schema_migrate").trim();
+    const resp = await fetch(`${baseUrl}/v1beta1/management/approvals/saga-action`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, taskId, toolName, actor: "cli-admin", role: "SRE_ADMIN" })
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-task-blueprints") {
     const resp = await fetch(`${baseUrl}/v1beta1/console/tasks/blueprints`);
     const data = await resp.json();

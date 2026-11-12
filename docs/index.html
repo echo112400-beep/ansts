@@ -1076,6 +1076,7 @@ html.dark-theme .data-table tbody tr:hover {
       securityVisualization: null,
       dagVisualization: null,
       finopsVisualization: null,
+      approvalsSagaVisualization: null,
       autoRefreshPaused: false,
       darkTheme: false,
       lastBffRttMs: 0,
@@ -1205,6 +1206,7 @@ html.dark-theme .data-table tbody tr:hover {
       if (d.securityVisualization) state.securityVisualization = d.securityVisualization;
       if (d.dagVisualization) state.dagVisualization = d.dagVisualization;
       if (d.finopsVisualization) state.finopsVisualization = d.finopsVisualization;
+      if (d.approvalsSagaVisualization) state.approvalsSagaVisualization = d.approvalsSagaVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -2217,15 +2219,47 @@ html.dark-theme .data-table tbody tr:hover {
 
   function renderApprovalsSection() {
     const p = getPrincipal();
+    const asv = state.approvalsSagaVisualization || {
+      approvalStats: { totalCount: state.approvals.length, pendingCount: 0, approvedCount: 0, rejectedCount: 0 },
+      stagingStats: { totalEffects: 0, uncommittedCount: 0, committedCount: 0, abortedCount: 0 },
+      sagaStats: { totalSteps: 0, activeForwardCount: 0, compensatedCount: 0 },
+      stagedEffects: [],
+      sagaSteps: []
+    };
     return `
+      <section class="kpi-grid" aria-label="高危审批与 Saga 事务核心指标">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>待复核高危审批单 (4-Eyes Gate)</span><span class="status-pill ${asv.approvalStats?.pendingCount > 0 ? 'warn' : 'ok'}">异体复核激活</span></div>
+          <div class="kpi-value">${asv.approvalStats?.pendingCount ?? 0} 待批</div>
+          <div class="kpi-sub">累计单据: <span class="mono">${asv.approvalStats?.totalCount ?? state.approvals.length} · 已批准:${asv.approvalStats?.approvedCount ?? 0} · 已驳回:${asv.approvalStats?.rejectedCount ?? 0}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Staging 暂存副作用缓冲池</span><span class="status-pill ${asv.stagingStats?.uncommittedCount > 0 ? 'warn' : 'ok'}">Hold-and-Commit</span></div>
+          <div class="kpi-value">${asv.stagingStats?.uncommittedCount ?? 0} 待提交</div>
+          <div class="kpi-sub">已提交: <span class="mono">${asv.stagingStats?.committedCount ?? 0}</span> · 已中止: <span class="mono">${asv.stagingStats?.abortedCount ?? 0}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>Saga 逆序补偿事务账本 (LIFO)</span><span class="status-pill ok">幂等防重</span></div>
+          <div class="kpi-value">${asv.sagaStats?.activeForwardCount ?? 0} 活跃步</div>
+          <div class="kpi-sub">总事务步: <span class="mono">${asv.sagaStats?.totalSteps ?? 0}</span> · 已逆序回滚: <span class="mono">${asv.sagaStats?.compensatedCount ?? 0}</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>不可篡改变更审计日志</span><span class="status-pill ok">SQLite 落盘</span></div>
+          <div class="kpi-value">${state.auditLogs.length} 条</div>
+          <div class="kpi-sub">当前身份: <strong>${esc(p.name)}</strong> (<span class="mono">${esc(p.role)}</span>)</div>
+        </div>
+      </section>
+
       <div class="panel">
         <div class="panel-header">
           <div>
-            <h2 class="panel-title">高危操作双人复核 (4-Eyes Principle) 与 Saga 审批门控 (对接 /v1beta1/management/approvals/decide)</h2>
-            <p class="panel-subtitle">后端强制校验：仅 <code>SRE_ADMIN</code> 可审批（否则返回 403），且发起人与审批人不得为同一人（否则返回 409 SELF_APPROVAL_FORBIDDEN）。当前身份：<strong>${p.name}</strong></p>
+            <h2 class="panel-title">高危操作双人复核 (4-Eyes Principle) 与批量审批门控 (对接 /v1beta1/management/approvals/batch)</h2>
+            <p class="panel-subtitle">后端强制校验：仅 <code>SRE_ADMIN</code> 可审批（否则返回 403），且批量复核时自动识别并跳过本人发起单据（409 SELF_APPROVAL_SKIPPED）。当前身份：<strong>${p.name}</strong></p>
           </div>
           <div class="btn-row">
-            <button type="button" class="small primary" data-action="open-create-approval-dialog" ${p.role === 'VIEWER' || state.scenario === 'offline' ? 'disabled' : ''}>+ 提交高危变更审批单 (/v1beta1/management/approvals/create)</button>
+            <button type="button" class="small primary" data-action="batch-decide-approvals" data-decision="approve" ${p.role !== 'SRE_ADMIN' || state.scenario === 'offline' ? 'disabled' : ''}>批量批准选中单据</button>
+            <button type="button" class="small danger" data-action="batch-decide-approvals" data-decision="reject" ${p.role !== 'SRE_ADMIN' || state.scenario === 'offline' ? 'disabled' : ''}>批量驳回选中单据</button>
+            <button type="button" class="small primary" data-action="open-create-approval-dialog" ${p.role === 'VIEWER' || state.scenario === 'offline' ? 'disabled' : ''}>+ 提交高危变更审批单</button>
             <button type="button" class="small" data-action="open-identity-dialog">切换陈/周身份完成双人复核</button>
           </div>
         </div>
@@ -2249,7 +2283,7 @@ html.dark-theme .data-table tbody tr:hover {
                 const canClick = isPending && state.scenario !== 'offline';
                 return `
                   <tr>
-                    <td class="mono"><strong>${esc(a.id)}</strong></td>
+                    <td class="mono"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" class="approval-batch-check" value="${esc(a.id)}" ${!isPending ? 'disabled' : ''} /><strong>${esc(a.id)}</strong></label></td>
                     <td class="mono">${esc(a.type)}</td>
                     <td>${esc(a.target)}</td>
                     <td class="mono">${esc(a.region)} / ${esc(a.tenant)}</td>
@@ -2309,6 +2343,61 @@ html.dark-theme .data-table tbody tr:hover {
                   <td class="mono">${esc(log.scope)}</td>
                   <td>${esc(log.action)}</td>
                   <td><span class="status-pill ok">${esc(log.outcome)}</span></td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Staging 暂存提交缓冲区与 Saga 逆序补偿回滚工作台 (GET /v1beta1/console/approvals/saga)</h2>
+            <p class="panel-subtitle">对接 <code>StagingCommitAndApprovalGate</code> 与 <code>SagaCompensatorEngine</code>，支持暂存高危工具副作用、一键提交转入正向账本或触发 LIFO 逆序补偿回滚。</p>
+          </div>
+          <div class="btn-row">
+            <select id="saga-target-task" style="height:30px;">
+              <option value="task-ns-8841" selected>task-ns-8841 (Northstar)</option>
+              <option value="task-ns-8842">task-ns-8842 (Northstar)</option>
+              <option value="task-hl-3019">task-hl-3019 (Helios)</option>
+            </select>
+            <button type="button" class="small" data-action="saga-stage-effect" ${p.role === 'VIEWER' ? 'disabled' : ''}>+ 暂存高危工具副作用 (Stage Effect)</button>
+            <button type="button" class="small primary" data-action="saga-commit-effects" ${p.role === 'VIEWER' ? 'disabled' : ''}>提交暂存至 Saga 账本 (Commit)</button>
+            <button type="button" class="small danger" data-action="saga-abort-rollback" ${p.role === 'VIEWER' ? 'disabled' : ''}>中止暂存并执行 LIFO 逆序回滚 (Rollback)</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>账本类型</th>
+                <th>记录 ID / 幂等键</th>
+                <th>所属任务 / 回合</th>
+                <th>工具名称 (Tool)</th>
+                <th>参数或载荷摘要</th>
+                <th>事务状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(asv.stagedEffects || []).map((eff) => `
+                <tr>
+                  <td><span class="status-pill warn">STAGING_BUFFER</span></td>
+                  <td class="mono"><strong>${esc(eff.effectId)}</strong></td>
+                  <td class="mono">${esc(eff.taskId)} · Turn #${eff.turnIndex}</td>
+                  <td class="mono">${esc(eff.toolName)}</td>
+                  <td class="mono">${esc(JSON.stringify(eff.args || {}))}</td>
+                  <td><span class="status-pill ${eff.status === 'COMMITTED' ? 'ok' : eff.status === 'ABORTED' ? 'danger' : 'warn'}">${esc(eff.status)}</span></td>
+                </tr>
+              `).join('')}
+              ${(asv.sagaSteps || []).map((st) => `
+                <tr>
+                  <td><span class="status-pill ok">SAGA_LEDGER</span></td>
+                  <td class="mono"><strong>${esc(st.stepId)}</strong><div class="muted">${esc(st.idempotencyKey)}</div></td>
+                  <td class="mono">${esc(st.taskId)} · Turn #${st.turnIndex}</td>
+                  <td class="mono">${esc(st.toolName)}</td>
+                  <td class="mono">${esc(JSON.stringify(st.forwardPayload || {}))}</td>
+                  <td><span class="status-pill ${st.compensated ? 'danger' : 'ok'}">${esc(st.status)}</span></td>
                 </tr>
               `).join('')}
             </tbody>
@@ -6155,6 +6244,60 @@ html.dark-theme .data-table tbody tr:hover {
       });
       await fetchBackendState();
       showToast(`已在分支 ${branchName} 提交快照 Commit ${res.data?.commitId || "OK"}`);
+      return;
+    }
+    if (action === "batch-decide-approvals") {
+      const p = getPrincipal();
+      const decision = target.getAttribute("data-decision") === "reject" ? "reject" : "approve";
+      const checked = Array.from(document.querySelectorAll(".approval-batch-check:checked")).map((el) => el.value);
+      const pendingIds = checked.length > 0
+        ? checked
+        : state.approvals.filter((a) => String(a.status).startsWith("PENDING")).map((a) => a.id);
+      if (pendingIds.length === 0) {
+        showToast("当前没有处于 PENDING 状态的审批单可供批量处理");
+        return;
+      }
+      const res = await callBackendApi("POST", "/v1beta1/management/approvals/batch", {
+        approvalIds: pendingIds,
+        decision,
+        approver: p.id,
+        role: p.role,
+      });
+      if (res.ok && res.data) {
+        await fetchBackendState();
+        showToast(
+          `批量审批完成：已处理 ${res.data.decidedCount} 单，4-Eyes 异体规则自动跳过本人单据 ${res.data.skippedSelfApprovalCount} 单`
+        );
+      }
+      return;
+    }
+    if (action === "saga-stage-effect" || action === "saga-commit-effects" || action === "saga-abort-rollback") {
+      const p = getPrincipal();
+      const taskId = document.getElementById("saga-target-task")?.value || "task-ns-8841";
+      const apiAction =
+        action === "saga-commit-effects"
+          ? "commit_staged_effects"
+          : action === "saga-abort-rollback"
+          ? "abort_and_rollback_saga"
+          : "stage_high_risk_effect";
+      const res = await callBackendApi("POST", "/v1beta1/management/approvals/saga-action", {
+        action: apiAction,
+        taskId,
+        toolName: "schema_migrate",
+        args: { table: "v25_tasks", op: "ALTER_ADD_INDEX", verifiedBy: p.id },
+        actor: p.id,
+        role: p.role,
+      });
+      if (res.ok && res.data) {
+        await fetchBackendState();
+        showToast(
+          apiAction === "commit_staged_effects"
+            ? `已提交任务 ${taskId} 的 ${res.data.committedCount ?? 0} 项暂存副作用至 Saga 账本`
+            : apiAction === "abort_and_rollback_saga"
+            ? `已中止暂存并逆序回滚任务 ${taskId} 的 ${res.data.rolledBackSagaCount ?? 0} 步 Saga 事务`
+            : `已为任务 ${taskId} 暂存高危副作用 ${res.data.stagedEffect?.effectId || "OK"}`
+        );
+      }
       return;
     }
     if (action === "batch-plan-dry-run" || action === "batch-plan-commit-dispatch") {

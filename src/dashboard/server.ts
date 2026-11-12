@@ -889,6 +889,35 @@ export class PlatformManagementPlaneEngine {
       this.mgmtQueueManager.enqueue(qSpec);
     }
 
+    // [M92] Seed initial Staging Hold-and-Commit effect and Saga forward step on task-ns-8842 if empty
+    if (this.stagingGate.getStagedEffects("task-ns-8842").length === 0) {
+      this.stagingGate.stageEffect({
+        effectId: "eff-ns-8842-schema-v2",
+        taskId: "task-ns-8842",
+        turnIndex: 3,
+        toolName: "schema_migrate",
+        args: { migration: "0002_add_tenant_sharding_index.sql", affectedRows: 12400 },
+      });
+    }
+    if (this.deps.sagaGateway.compensator.getTaskSteps("task-ns-8842").length === 0) {
+      this.deps.sagaGateway.compensator.recordForwardStep({
+        stepId: "saga-ns-8842-step-1",
+        taskId: "task-ns-8842",
+        turnIndex: 1,
+        toolName: "s3_bucket_policy_update",
+        idempotencyKey: "idem-ns-8842-s3-1",
+        forwardPayload: { bucket: "ansts-ltx-us-west-2", versioning: "Enabled" },
+      });
+      this.deps.sagaGateway.compensator.recordForwardStep({
+        stepId: "saga-ns-8842-step-2",
+        taskId: "task-ns-8842",
+        turnIndex: 2,
+        toolName: "route_table_switch",
+        idempotencyKey: "idem-ns-8842-rt-2",
+        forwardPayload: { region: "us-west-2", weightCanaryPct: 25 },
+      });
+    }
+
     // [M82] Seed initial Policy-as-Code rules, Spot Quota Offer, and Episodic Golden Base Image
     if (this.stagingGate.listPolicyRules().length === 0) {
       this.stagingGate.registerPolicyRule({
@@ -1570,6 +1599,7 @@ export class PlatformManagementPlaneEngine {
       securityVisualization: this.buildSecurityAndReleaseVisualization(),
       dagVisualization: this.buildDagAndCognitiveSnapshot(),
       finopsVisualization: this.buildFinOpsVisualization(),
+      approvalsSagaVisualization: this.buildApprovalsAndSagaVisualization(),
       status: "HEALTHY",
     };
   }
@@ -1612,6 +1642,260 @@ export class PlatformManagementPlaneEngine {
         },
       };
     }
+  }
+
+  public buildApprovalsAndSagaVisualization(): Record<string, unknown> {
+    this.ensureInitialized();
+    const sql = this.deps.v25Store.sql;
+    const approvalRows = sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_approvals ORDER BY approval_id ASC")
+      .toArray();
+    const pendingCount = approvalRows.filter((r) => String(r.status).startsWith("PENDING")).length;
+    const approvedCount = approvalRows.filter((r) => String(r.status).startsWith("APPROVED")).length;
+    const rejectedCount = approvalRows.filter((r) => String(r.status).startsWith("REJECTED")).length;
+
+    const trackedTaskIds = Array.from(
+      new Set([
+        "task-ns-8841",
+        "task-ns-8842",
+        "task-hl-3019",
+        ...Array.from(this.deps.scheduler.allTasks.keys()),
+      ])
+    );
+
+    const stagedEffects: Array<Record<string, unknown>> = [];
+    const sagaSteps: Array<Record<string, unknown>> = [];
+
+    for (const tId of trackedTaskIds) {
+      for (const eff of this.stagingGate.getStagedEffects(tId)) {
+        stagedEffects.push({
+          effectId: eff.effectId,
+          taskId: eff.taskId,
+          turnIndex: eff.turnIndex,
+          toolName: eff.toolName,
+          args: eff.args,
+          status: eff.aborted ? "ABORTED" : eff.committed ? "COMMITTED" : "HELD_UNCOMMITTED",
+          committed: eff.committed,
+          aborted: eff.aborted,
+        });
+      }
+      for (const st of this.deps.sagaGateway.compensator.getTaskSteps(tId)) {
+        sagaSteps.push({
+          stepId: st.stepId,
+          taskId: st.taskId,
+          turnIndex: st.turnIndex,
+          toolName: st.toolName,
+          idempotencyKey: st.idempotencyKey ?? "",
+          forwardPayload: st.forwardPayload,
+          compensated: st.compensated,
+          status: st.compensated ? "COMPENSATED_ROLLED_BACK" : "FORWARD_ACTIVE",
+        });
+      }
+    }
+
+    return {
+      approvalStats: {
+        totalCount: approvalRows.length,
+        pendingCount,
+        approvedCount,
+        rejectedCount,
+      },
+      stagingStats: {
+        totalEffects: stagedEffects.length,
+        uncommittedCount: stagedEffects.filter((e) => e.status === "HELD_UNCOMMITTED").length,
+        committedCount: stagedEffects.filter((e) => e.status === "COMMITTED").length,
+        abortedCount: stagedEffects.filter((e) => e.status === "ABORTED").length,
+      },
+      sagaStats: {
+        totalSteps: sagaSteps.length,
+        activeForwardCount: sagaSteps.filter((s) => !s.compensated).length,
+        compensatedCount: sagaSteps.filter((s) => s.compensated).length,
+      },
+      stagedEffects,
+      sagaSteps,
+    };
+  }
+
+  public executeBatchApprovalDecision(params: {
+    approvalIds: string[];
+    decision: "approve" | "reject";
+    approver: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role !== "SRE_ADMIN") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "仅 SRE_ADMIN 角色可执行批量高危审批决策" },
+      };
+    }
+
+    const ids = Array.isArray(params.approvalIds)
+      ? params.approvalIds.map((id) => String(id).trim()).filter(Boolean)
+      : [];
+    if (ids.length === 0) {
+      return {
+        status: 400,
+        body: { error: "EMPTY_APPROVAL_IDS", message: "请至少选择 1 个待复核审批单 (approvalIds)" },
+      };
+    }
+
+    const results: Array<{
+      approvalId: string;
+      outcome: "DECIDED" | "SELF_APPROVAL_SKIPPED" | "NOT_FOUND";
+      status: number;
+      detail: string;
+    }> = [];
+
+    for (const appId of ids) {
+      const res = this.decideApprovalTicket({
+        approvalId: appId,
+        approver: params.approver,
+        role: params.role,
+        decision: params.decision,
+      });
+      if (res.status === 409) {
+        results.push({
+          approvalId: appId,
+          outcome: "SELF_APPROVAL_SKIPPED",
+          status: 409,
+          detail: String(res.body.message ?? "4-Eyes 双人异体复核拦截：跳过本人发起的审批单"),
+        });
+      } else {
+        results.push({
+          approvalId: appId,
+          outcome: "DECIDED",
+          status: res.status,
+          detail: String(res.body.status ?? "OK"),
+        });
+      }
+    }
+
+    const decidedCount = results.filter((r) => r.outcome === "DECIDED").length;
+    const skippedCount = results.filter((r) => r.outcome === "SELF_APPROVAL_SKIPPED").length;
+
+    this.appendAudit(
+      params.approver,
+      params.role,
+      `执行批量双人复核 [${params.decision.toUpperCase()}] (共 ${ids.length} 单: 通过 ${decidedCount} 单, 4-Eyes 异体拦截跳过 ${skippedCount} 单)`,
+      "Approvals / Batch4Eyes",
+      `DECIDED=${decidedCount}, SKIPPED=${skippedCount}`
+    );
+
+    return {
+      status: 200,
+      body: {
+        decision: params.decision,
+        approver: params.approver,
+        totalRequested: ids.length,
+        decidedCount,
+        skippedSelfApprovalCount: skippedCount,
+        results,
+        approvalsSagaVisualization: this.buildApprovalsAndSagaVisualization(),
+      },
+    };
+  }
+
+  public executeStagingAndSagaGovernanceAction(params: {
+    action: "stage_high_risk_effect" | "commit_staged_effects" | "abort_and_rollback_saga";
+    taskId?: string;
+    toolName?: string;
+    args?: Record<string, unknown>;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权操作 Staging 暂存缓冲区或 Saga 补偿引擎" },
+      };
+    }
+
+    const taskId = sanitizeHtmlString(String(params.taskId ?? "task-ns-8841").trim());
+    const toolName = sanitizeHtmlString(String(params.toolName ?? "schema_migrate").trim());
+
+    if (params.action === "stage_high_risk_effect") {
+      const effectId = `eff-${taskId}-${Date.now() % 10000}`;
+      const existingSteps = this.deps.sagaGateway.compensator.getTaskSteps(taskId);
+      const nextTurn = existingSteps.length + this.stagingGate.getStagedEffects(taskId).length + 1;
+      const staged = this.stagingGate.stageEffect({
+        effectId,
+        taskId,
+        turnIndex: nextTurn,
+        toolName,
+        args: params.args ?? { target: "production-shard-ring", dryRunVerified: true },
+      });
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `向 Staging Hold-and-Commit 缓冲区暂存副作用 [${effectId}] (task=${taskId}, tool=${toolName})`,
+        `Staging / ${taskId}`,
+        "STAGED_HELD"
+      );
+      return {
+        status: 201,
+        body: {
+          action: params.action,
+          stagedEffect: staged,
+          approvalsSagaVisualization: this.buildApprovalsAndSagaVisualization(),
+        },
+      };
+    }
+
+    if (params.action === "commit_staged_effects") {
+      const committed = this.stagingGate.commitStagedEffects(taskId, (tName, tArgs, turnIdx) => {
+        const stepId = `saga-${taskId}-turn-${turnIdx}-${Date.now() % 1000}`;
+        this.deps.sagaGateway.compensator.recordForwardStep({
+          stepId,
+          taskId,
+          turnIndex: turnIdx,
+          toolName: tName,
+          idempotencyKey: `idem-${stepId}`,
+          forwardPayload: tArgs,
+        });
+        return { committedStepId: stepId, status: "COMMITTED" };
+      });
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `提交任务 [${taskId}] Staging 暂存副作用并转入 Saga 正向事务账本 (${committed.length} 项)`,
+        `Staging / ${taskId}`,
+        `COMMITTED (${committed.length})`
+      );
+      return {
+        status: 200,
+        body: {
+          action: params.action,
+          taskId,
+          committedCount: committed.length,
+          committedEffects: committed,
+          approvalsSagaVisualization: this.buildApprovalsAndSagaVisualization(),
+        },
+      };
+    }
+
+    // abort_and_rollback_saga
+    const abortedCount = this.stagingGate.abortStagedEffects(taskId);
+    const rolledBackSteps = this.deps.sagaGateway.compensator.rollbackTask(taskId, 0);
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `中止任务 [${taskId}] 未提交 Staging 副作用 (${abortedCount} 项) 并执行 LIFO Saga 逆序补偿回滚 (${rolledBackSteps.length} 步)`,
+      `Saga / ${taskId}`,
+      `ABORTED=${abortedCount}, ROLLED_BACK=${rolledBackSteps.length}`
+    );
+    return {
+      status: 200,
+      body: {
+        action: params.action,
+        taskId,
+        abortedStagingCount: abortedCount,
+        rolledBackSagaCount: rolledBackSteps.length,
+        rolledBackSteps,
+        approvalsSagaVisualization: this.buildApprovalsAndSagaVisualization(),
+      },
+    };
   }
 
   private ensureTaskBlueprintsTable(): void {

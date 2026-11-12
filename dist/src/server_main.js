@@ -2472,6 +2472,47 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M92] TanStack Console BFF: Batch 4-Eyes Approval Governance, Staging Hold-and-Commit & Saga LIFO Compensation
+    if (method === "GET" && pathname === "/v1beta1/console/approvals/saga") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildApprovalsAndSagaVisualization()));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/approvals/batch") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.executeBatchApprovalDecision({
+        approvalIds: Array.isArray(body.approvalIds) ? body.approvalIds : [],
+        decision: body.decision === "reject" ? "reject" : "approve",
+        approver: String(body.approver ?? body.actor ?? "zhou"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/approvals/saga-action") {
+      const body = await this.readJsonBody(req);
+      const act = String(body.action ?? "stage_high_risk_effect");
+      const out = this.managementPlane.executeStagingAndSagaGovernanceAction({
+        action:
+        act === "commit_staged_effects" ?
+        "commit_staged_effects" :
+        act === "abort_and_rollback_saga" ?
+        "abort_and_rollback_saga" :
+        "stage_high_risk_effect",
+        taskId: body.taskId ? String(body.taskId) : undefined,
+        toolName: body.toolName ? String(body.toolName) : undefined,
+        args: body.args && typeof body.args === "object" ? body.args : undefined,
+        actor: String(body.actor ?? "chen"),
+        role: String(body.role ?? "SRE_ADMIN")
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M91] TanStack Console BFF: Batch Task Planning & DAG Blueprint Designer
     if (method === "GET" && pathname === "/v1beta1/console/tasks/blueprints") {
       const out = this.managementPlane.listTaskBlueprints();
