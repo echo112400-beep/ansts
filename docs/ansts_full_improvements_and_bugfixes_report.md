@@ -770,3 +770,15 @@
    - 支持在控制台对任意租户执行 `+$200 计费模拟` (`simulate_spend_step`)，实时触发 `80%` 预算软降级（`DeepSeek-R1 → Qwen-3.8`）及 `100%` 预算耗尽时的 `HTTP 402 PAYMENT_REQUIRED_BUDGET_EXHAUSTED` 硬门控拦截，并支持一键重置日账单至 `$0` (`reset_tenant_spend`)。
 3. **端到端回归验证 (`tests/m87_console_finops_attribution_and_budget_simulator.test.ts`)**：
    - 全量 **89 个 `src/` 源码模块**、**80 个测试套件（共 214 项测试）100% 通过**。
+
+
+---
+
+## 38. M88: LayerFS 工作区在线文件读写编辑器与控制台 URL 深度链接水合 (`GET /v1beta1/console/layerfs/file`, `anstsctl mgmt-layerfs-file`, `hydrateStateFromUrl`)
+
+1. **LayerFS 工作区在线文件读写编辑器 (`readLayerFsBranchFile` & `GET /v1beta1/console/layerfs/file`)**：
+   - 在 `runtime` 视图的 LayerFS CoW 分支表中新增“读写文件” (`layerfs-open-file-explorer`) 按钮，支持直接读取任意分支与安全工作区路径的完整文件内容及行级 Blame 溯源，并可在弹窗内修改内容后一键提交为新的 CoW Commit（同时拦截 `../` 路径穿越并返回 `400 LAYERFS_FILE_READ_FAILED`）。
+2. **控制台 URL 查询参数深度链接水合 (`hydrateStateFromUrl`)**：
+   - 支持通过 `?nav=<tab>&region=<reg>&tenant=<id>&time=<cur|history>&id=<actor>&theme=dark` 在页面加载/刷新时自动水合目标工作台视图、筛选器、操作员身份与暗色主题。
+3. **端到端回归验证 (`tests/m88_console_layerfs_file_explorer_and_url_deeplink.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**81 个测试套件（共 215 项测试）100% 通过**。

@@ -2476,6 +2476,7 @@ html.dark-theme .data-table tbody tr:hover {
                   <td>
                     <div class="btn-row">
                       <button type="button" class="small primary" data-action="layerfs-quick-commit" data-branch="${esc(br.branchName)}" ${!perm.ok ? 'disabled' : ''}>+快照提交</button>
+                      <button type="button" class="small" data-action="layerfs-open-file-explorer" data-branch="${esc(br.branchName)}" data-file="${esc(br.files?.[0]?.filePath || 'package.json')}">读写文件</button>
                       <button type="button" class="small" data-action="layerfs-inspect-blame" data-branch="${esc(br.branchName)}" data-file="${esc(br.files?.[0]?.filePath || 'package.json')}">查看 Blame</button>
                       <button type="button" class="small danger" data-action="layerfs-delete-branch" data-branch="${esc(br.branchName)}" ${!perm.ok || br.isProtected ? 'disabled' : ''}>删除分支</button>
                     </div>
@@ -5984,6 +5985,52 @@ html.dark-theme .data-table tbody tr:hover {
       showToast(`已在分支 ${branchName} 提交快照 Commit ${res.data?.commitId || "OK"}`);
       return;
     }
+    if (action === "layerfs-open-file-explorer") {
+      const branchName = target.getAttribute("data-branch") || "main";
+      const filePath = target.getAttribute("data-file") || "package.json";
+      const res = await callBackendApi(
+        "GET",
+        `/v1beta1/console/layerfs/file?branch=${encodeURIComponent(branchName)}&filePath=${encodeURIComponent(filePath)}`
+      );
+      const d = res.data || {};
+      openDialog(
+        `LayerFS 工作区文件编辑器 · ${branchName}:${filePath}`,
+        `
+          <div class="muted" style="margin-bottom:6px;">当前 HEAD Commit: <code class="mono">${esc(d.commitId || 'C0')}</code> · 分支: <code class="mono">${esc(branchName)}</code></div>
+          <div class="form-field">
+            <label for="dlg-lfs-edit-path">文件路径 (Workspace Path)</label>
+            <input id="dlg-lfs-edit-path" type="text" value="${esc(filePath)}" class="mono" />
+          </div>
+          <div class="form-field">
+            <label for="dlg-lfs-edit-content">文件内容 (可直接修改并提交新 CoW Commit)</label>
+            <textarea id="dlg-lfs-edit-content" rows="8" class="mono" style="width:100%;font-family:monospace;font-size:12px;">${esc(d.content || '')}</textarea>
+          </div>
+        `,
+        "保存并提交 CoW 快照",
+        async () => {
+          const nextPath = (document.getElementById("dlg-lfs-edit-path")?.value || filePath).trim();
+          const nextContent = document.getElementById("dlg-lfs-edit-content")?.value ?? "";
+          const p = getPrincipal();
+          const saveRes = await callBackendApi("POST", "/v1beta1/management/runtime/layerfs-branch", {
+            action: "commit_file",
+            branchName,
+            filePath: nextPath,
+            content: nextContent,
+            actor: p.id,
+            role: p.role
+          });
+          if (!saveRes.ok) {
+            const errEl = document.getElementById("dialog-error");
+            if (errEl) errEl.textContent = saveRes.data?.message || "保存文件失败";
+            return;
+          }
+          closeDialog();
+          await fetchBackendState();
+          showToast(`已将 ${nextPath} 提交至 ${branchName} (Commit ${saveRes.data?.commitId})`);
+        }
+      );
+      return;
+    }
     if (action === "layerfs-inspect-blame") {
       const branchName = target.getAttribute("data-branch") || "main";
       const filePath = target.getAttribute("data-file") || "package.json";
@@ -6381,7 +6428,7 @@ html.dark-theme .data-table tbody tr:hover {
     const shareBtn = document.getElementById('share-view');
     if (shareBtn) {
       shareBtn.addEventListener('click', () => {
-        const qs = `?nav=${state.activeNav}&region=${state.region}&tenant=${state.tenant}&time=${state.timeRange}&scenario=${state.scenario}&id=${state.identity}`;
+        const qs = `?nav=${state.activeNav}&region=${state.region}&tenant=${state.tenant}&time=${state.timeRange}&scenario=${state.scenario}&id=${state.identity}${state.darkTheme ? '&theme=dark' : ''}`;
         try {
           window.history.replaceState(null, '', qs);
         } catch (_e) {
@@ -6524,7 +6571,45 @@ html.dark-theme .data-table tbody tr:hover {
     }
   }
 
+  function hydrateStateFromUrl() {
+    try {
+      if (typeof window === 'undefined' || !window.location || !window.location.search) return;
+      const params = new URLSearchParams(window.location.search);
+      const nav = params.get('nav');
+      if (nav && NAV_ITEMS.some((i) => i.id === nav)) state.activeNav = nav;
+      const reg = params.get('region');
+      if (reg) {
+        state.region = reg;
+        const el = document.getElementById('region');
+        if (el) el.value = reg;
+      }
+      const ten = params.get('tenant');
+      if (ten) state.tenant = ten;
+      const tm = params.get('time');
+      if (tm === 'history' || tm === 'current') {
+        state.timeRange = tm;
+        const el = document.getElementById('time-range');
+        if (el) el.value = tm;
+      }
+      const id = params.get('id');
+      if (id && IDENTITIES[id]) {
+        state.identity = id;
+        const el = document.getElementById('identity');
+        if (el) el.value = id;
+      }
+      if (params.get('theme') === 'dark') {
+        state.darkTheme = true;
+        document.documentElement.classList.add('dark-theme');
+        const btn = document.getElementById('theme-toggle-btn');
+        if (btn) btn.textContent = '☀ 亮色模式';
+      }
+    } catch (_e) {
+      // ignore invalid URLSearchParams
+    }
+  }
+
   async function init() {
+    hydrateStateFromUrl();
     populateTenantFilter();
     updateHeaderAndRail();
     renderMainContent();

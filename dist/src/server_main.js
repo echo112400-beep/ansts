@@ -2472,6 +2472,17 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M88] TanStack Console BFF: LayerFS Workspace File Content & Line-Level Blame Reader (`GET /v1beta1/console/layerfs/file`)
+    if (method === "GET" && pathname === "/v1beta1/console/layerfs/file") {
+      const out = this.managementPlane.readLayerFsBranchFile({
+        branchName: urlObj.searchParams.get("branch") ?? "main",
+        filePath: urlObj.searchParams.get("filePath") ?? "package.json"
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M87] TanStack Console BFF: FinOps Multi-Dimensional Cost Attribution & Budget Gate (`GET /v1beta1/console/finops`)
     if (method === "GET" && pathname === "/v1beta1/console/finops") {
       res.writeHead(200, { "content-type": "application/json" });

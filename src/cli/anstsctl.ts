@@ -694,6 +694,16 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-layerfs-file") {
+    const branch = (rest[0] ?? "main").trim();
+    const filePath = (rest[1] ?? "package.json").trim();
+    const resp = await fetch(
+      `${baseUrl}/v1beta1/console/layerfs/file?branch=${encodeURIComponent(branch)}&filePath=${encodeURIComponent(filePath)}`
+    );
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-finops") {
     const action = (rest[0] ?? "inspect").trim();
     if (action === "inspect") {

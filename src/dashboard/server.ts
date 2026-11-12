@@ -1574,6 +1574,46 @@ export class PlatformManagementPlaneEngine {
     };
   }
 
+  public readLayerFsBranchFile(params: {
+    branchName: string;
+    filePath: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const branchName = String(params.branchName || "main").trim();
+    const filePath = String(params.filePath || "package.json").trim();
+    try {
+      const readRes = this.deps.layerfs.executeInProcessFileTool({
+        branchName,
+        agentId: "console-inspector",
+        stepId: "inspect-read",
+        operation: "read",
+        filePath,
+      });
+      const blameRes = this.inspectLayerFsFileBlame({
+        branchOrCommit: branchName,
+        filePath,
+      });
+      return {
+        status: 200,
+        body: {
+          branchName,
+          filePath,
+          commitId: readRes.commitId,
+          content: readRes.readResult ?? "",
+          blameLines: (blameRes.body as { lines?: unknown[] }).lines ?? [],
+        },
+      };
+    } catch (err) {
+      return {
+        status: 400,
+        body: {
+          error: "LAYERFS_FILE_READ_FAILED",
+          message: (err as Error).message,
+        },
+      };
+    }
+  }
+
   public buildFinOpsVisualization(): Record<string, unknown> {
     this.ensureInitialized();
     const attrBody = this.executeDay2GovernanceOperation({
