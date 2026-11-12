@@ -1,5 +1,6 @@
 name: ansts-v25-dev-cluster
 
+# Shared cluster wiring: object storage + credentials every node speaks to.
 x-ansts-common-env: &ansts-common-env
   ANSTS_RUNTIME_PROFILE: "development"
   CELLD_BUCKET: "s3://ansts-fleet"
@@ -8,7 +9,20 @@ x-ansts-common-env: &ansts-common-env
   AWS_SECRET_ACCESS_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
   AWS_REGION: "us-east-1"
   CELLD_DURABILITY: "fleet"
-  ANSTS_PEER_BRAIN_URLS: '{"brain-node-01":"http://celld-brain-01:8081","brain-node-02":"http://celld-brain-02:8082","brain-node-03":"http://celld-brain-03:8083"}'
+
+# celld node identity: public Worker listener 8081, peer/operator listener 8082, peers dial `addr`.
+x-ansts-celld-env: &ansts-celld-env
+  CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
+  CELLD_TTL_MS: "10000"
+  CELLD_REBALANCE_INTERVAL_MS: "5000"
+  CELLD_READY_FLEET_GATE_MS: "15000"
+  RUST_LOG: "info"
+
+# Gateway view of the fleet: dispatch goes through the celld HTTP client, reads fan out to the same listeners.
+x-ansts-gateway-routing-env: &ansts-gateway-routing-env
+  ANSTS_CELLD_FLEET_URLS: '{"celld-node-01":"http://celld-brain-01:8081","celld-node-02":"http://celld-brain-02:8081","celld-node-03":"http://celld-brain-03:8081"}'
+  ANSTS_CELLD_INTERNAL_URLS: '{"celld-node-01":"http://celld-brain-01:8082","celld-node-02":"http://celld-brain-02:8082","celld-node-03":"http://celld-brain-03:8082"}'
+  ANSTS_PEER_BRAIN_URLS: '{"celld-node-01":"http://celld-brain-01:8081","celld-node-02":"http://celld-brain-02:8081","celld-node-03":"http://celld-brain-03:8081"}'
   ANSTS_PEER_BODY_URLS: '{"body-host-01":"http://body-daemon-01:9501","body-host-02":"http://body-daemon-02:9502"}'
 
 services:
@@ -28,75 +42,158 @@ services:
       RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
       RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
     command: ["/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health/live 2>/dev/null || curl -fsS http://127.0.0.1:9000/ 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     networks:
       - ansts_mesh_net
 
+  # Real denoland/celld fleet: each node runs the ANSTS brain Worker as its own Durable Object host.
   celld-brain-01:
-    build:
-      context: ../..
-      dockerfile: Dockerfile.dev
+    image: ghcr.io/denoland/celld:0.6.3
     container_name: ansts-celld-brain-01
+    command:
+      - "--bucket"
+      - "s3://ansts-fleet"
+      - "--endpoint"
+      - "http://rustfs:9000"
+      - "--region"
+      - "us-east-1"
+      - "--listen"
+      - "0.0.0.0:8081"
+      - "--internal-listen"
+      - "0.0.0.0:8082"
+      - "--advertise"
+      - "celld-brain-01:8082"
+    depends_on:
+      rustfs:
+        condition: service_healthy
     ports:
       - "18082:8081"
     volumes:
-      - brain_01_data:/var/lib/ansts/brain-node-01
+      - celld_01_data:/var/lib/celld
     environment:
-      <<: *ansts-common-env
-      ANSTS_NODE_ID: "brain-node-01"
-      ANSTS_NODE_ROLE: "brain"
-      ANSTS_LISTEN_PORT: "8081"
-      ANSTS_STORAGE_DIR: "/var/lib/ansts/brain-node-01"
+      <<: [*ansts-common-env, *ansts-celld-env]
+      CELLD_NODE: "celld-node-01"
+      CELLD_WATCH: "/var/lib/celld"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/state"]
+      test:
+        - "CMD"
+        - "/usr/bin/bash"
+        - "-c"
+        - "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /.well-known/celld/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 24
+      start_period: 45s
     networks:
       - ansts_mesh_net
 
   celld-brain-02:
-    build:
-      context: ../..
-      dockerfile: Dockerfile.dev
+    image: ghcr.io/denoland/celld:0.6.3
     container_name: ansts-celld-brain-02
+    command:
+      - "--bucket"
+      - "s3://ansts-fleet"
+      - "--endpoint"
+      - "http://rustfs:9000"
+      - "--region"
+      - "us-east-1"
+      - "--listen"
+      - "0.0.0.0:8081"
+      - "--internal-listen"
+      - "0.0.0.0:8082"
+      - "--advertise"
+      - "celld-brain-02:8082"
+    depends_on:
+      rustfs:
+        condition: service_healthy
     ports:
-      - "18083:8082"
+      - "18083:8081"
     volumes:
-      - brain_02_data:/var/lib/ansts/brain-node-02
+      - celld_02_data:/var/lib/celld
     environment:
-      <<: *ansts-common-env
-      ANSTS_NODE_ID: "brain-node-02"
-      ANSTS_NODE_ROLE: "brain"
-      ANSTS_LISTEN_PORT: "8082"
-      ANSTS_STORAGE_DIR: "/var/lib/ansts/brain-node-02"
+      <<: [*ansts-common-env, *ansts-celld-env]
+      CELLD_NODE: "celld-node-02"
+      CELLD_WATCH: "/var/lib/celld"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/state"]
+      test:
+        - "CMD"
+        - "/usr/bin/bash"
+        - "-c"
+        - "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /.well-known/celld/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 24
+      start_period: 45s
     networks:
       - ansts_mesh_net
 
   celld-brain-03:
-    build:
-      context: ../..
-      dockerfile: Dockerfile.dev
+    image: ghcr.io/denoland/celld:0.6.3
     container_name: ansts-celld-brain-03
+    command:
+      - "--bucket"
+      - "s3://ansts-fleet"
+      - "--endpoint"
+      - "http://rustfs:9000"
+      - "--region"
+      - "us-east-1"
+      - "--listen"
+      - "0.0.0.0:8081"
+      - "--internal-listen"
+      - "0.0.0.0:8082"
+      - "--advertise"
+      - "celld-brain-03:8082"
+    depends_on:
+      rustfs:
+        condition: service_healthy
     ports:
-      - "18084:8083"
+      - "18084:8081"
     volumes:
-      - brain_03_data:/var/lib/ansts/brain-node-03
+      - celld_03_data:/var/lib/celld
     environment:
-      <<: *ansts-common-env
-      ANSTS_NODE_ID: "brain-node-03"
-      ANSTS_NODE_ROLE: "brain"
-      ANSTS_LISTEN_PORT: "8083"
-      ANSTS_STORAGE_DIR: "/var/lib/ansts/brain-node-03"
+      <<: [*ansts-common-env, *ansts-celld-env]
+      CELLD_NODE: "celld-node-03"
+      CELLD_WATCH: "/var/lib/celld"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8083/state"]
+      test:
+        - "CMD"
+        - "/usr/bin/bash"
+        - "-c"
+        - "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /.well-known/celld/health HTTP/1.0\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 24
+      start_period: 45s
+    networks:
+      - ansts_mesh_net
+
+  # Publishes dist/cloudflare/worker.js into the fleet bucket; every celld node adopts it in place.
+  celld-deploy:
+    image: ghcr.io/denoland/celld:0.6.3
+    container_name: ansts-celld-deploy
+    entrypoint: ["/usr/bin/bash", "/app/scripts/celld_deploy.sh"]
+    working_dir: /app
+    depends_on:
+      rustfs:
+        condition: service_healthy
+      celld-brain-01:
+        condition: service_started
+      celld-brain-02:
+        condition: service_started
+      celld-brain-03:
+        condition: service_started
+    volumes:
+      - ../..:/app:ro
+    environment:
+      <<: *ansts-common-env
+      CELLD_CONFIG: "/app/deploy/celld/wrangler.celld.json"
+      CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
+    restart: "no"
     networks:
       - ansts_mesh_net
 
@@ -158,12 +255,8 @@ services:
       dockerfile: Dockerfile.dev
     container_name: ansts-gateway-01
     depends_on:
-      celld-brain-01:
-        condition: service_healthy
-      celld-brain-02:
-        condition: service_healthy
-      celld-brain-03:
-        condition: service_healthy
+      celld-deploy:
+        condition: service_completed_successfully
       body-daemon-01:
         condition: service_healthy
       body-daemon-02:
@@ -171,7 +264,7 @@ services:
     ports:
       - "18080:8080"
     environment:
-      <<: *ansts-common-env
+      <<: [*ansts-common-env, *ansts-gateway-routing-env]
       ANSTS_NODE_ID: "celld-gw-01"
       ANSTS_NODE_ROLE: "gateway"
       ANSTS_LISTEN_PORT: "8080"
@@ -190,12 +283,8 @@ services:
       dockerfile: Dockerfile.dev
     container_name: ansts-gateway-02
     depends_on:
-      celld-brain-01:
-        condition: service_healthy
-      celld-brain-02:
-        condition: service_healthy
-      celld-brain-03:
-        condition: service_healthy
+      celld-deploy:
+        condition: service_completed_successfully
       body-daemon-01:
         condition: service_healthy
       body-daemon-02:
@@ -203,7 +292,7 @@ services:
     ports:
       - "18081:8080"
     environment:
-      <<: *ansts-common-env
+      <<: [*ansts-common-env, *ansts-gateway-routing-env]
       ANSTS_NODE_ID: "celld-gw-02"
       ANSTS_NODE_ROLE: "gateway"
       ANSTS_LISTEN_PORT: "8080"
@@ -274,9 +363,9 @@ networks:
 
 volumes:
   rustfs_dev_data:
-  brain_01_data:
-  brain_02_data:
-  brain_03_data:
+  celld_01_data:
+  celld_02_data:
+  celld_03_data:
   body_01_data:
   body_02_data:
   prometheus_data:

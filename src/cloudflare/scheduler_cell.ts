@@ -339,6 +339,45 @@ export class AnstsSchedulerCell {
       });
     }
 
+    if (request.method === "POST" && normalizedPath === "/lease-renew") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const taskId = String(body.task_id ?? "");
+      const nodeId = String(body.node_id ?? "");
+      const fencingToken = Number(body.fencing_token ?? 0);
+      const task = this.scheduler.allTasks.get(taskId);
+      if (!task) {
+        return new Response(JSON.stringify({ renewed: false, reason: "TASK_NOT_FOUND" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const renewed = this.scheduler.leaseCoordinator.renewLease(taskId, nodeId, fencingToken);
+      return new Response(JSON.stringify({ renewed, task_id: taskId, state: task.state }), {
+        status: renewed ? 200 : 409,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (request.method === "POST" && normalizedPath === "/complete") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const taskId = String(body.task_id ?? "");
+      const completed = this.scheduler.completeTaskExecution(
+        taskId,
+        String(body.node_id ?? ""),
+        Number(body.fencing_token ?? 0),
+        Number(body.observed_peak_cpu ?? 1.0),
+        Number(body.observed_peak_memory_mb ?? 1024)
+      );
+      if (completed) {
+        const task = this.scheduler.allTasks.get(taskId);
+        if (task) this.persistTask(task);
+      }
+      return new Response(JSON.stringify({ completed, task_id: taskId }), {
+        status: completed ? 200 : 409,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
     if (request.method === "POST" && normalizedPath === "/schedule-tick") {
       const res = await this.alarm();
       return new Response(JSON.stringify(res), {

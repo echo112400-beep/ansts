@@ -24,6 +24,7 @@ import { SagaCompensatorEngine } from "./saga/compensator.js";
 import { StagingCommitAndApprovalGate } from "./saga/staging.js";
 import { SagaToolGateway } from "./saga_gateway.js";
 import { HaSchedulerShardCoordinator } from "./cloudflare/ha_scheduler_shard_coordinator.js";
+import { CelldFleetClient } from "./cluster/celld_fleet_client.js";
 import { SchedulerV25SingleWritePathStore } from "./cloudflare/scheduler_v25_persistence.js";
 import { EdgeTunnelHaRouter } from "./runtime/edge_tunnel_ha_router.js";
 import { DurableDiskCellSqlStorage } from "./cloudflare/env.js";
@@ -81,6 +82,7 @@ export interface AnstsServiceRuntimeOptions {
   nodeRole?: "brain" | "body" | "gateway";
   peerBrainUrls?: Record<string, string>;
   peerBodyUrls?: Record<string, string>;
+  celldFleet?: CelldFleetClient | null;
   storageDir?: string;
   s3Endpoint?: string;
   primaryGatewayUrl?: string;
@@ -112,6 +114,8 @@ export class AnstsLocalAndComposeServer {
   public readonly secondaryGatewayUrl: string | null;
   public readonly peerBrainUrls: Record<string, string>;
   public readonly peerBodyUrls: Record<string, string>;
+  /** Real denoland/celld fleet that owns the brain layer; null when the deployment has no celld nodes. */
+  public readonly celldFleet: CelldFleetClient | null;
   public readonly scheduler: CoreScheduler5D;
   public readonly backpressure: IngressBackpressureController;
   public readonly sseGateway: SseEventStreamGateway;
@@ -168,6 +172,12 @@ export class AnstsLocalAndComposeServer {
   private apiServer: http.Server | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private tunnelPollTimer: ReturnType<typeof setInterval> | null = null;
+  private celldBodyHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Leases this gateway holds through celld, renewed on every heartbeat tick until the cell forgets them. */
+  private readonly celldPlacedLeases = new Map<
+    string,
+    { nodeId: string; fencingToken: number; celldNodeId: string }
+  >();
   private readonly host: string;
   private readonly defaultApiPort: number;
   private readonly defaultDashboardPort: number;
@@ -191,6 +201,11 @@ export class AnstsLocalAndComposeServer {
     this.secondaryGatewayUrl = options.secondaryGatewayUrl ?? process.env.ANSTS_SECONDARY_GATEWAY_URL ?? null;
     this.peerBrainUrls = options.peerBrainUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BRAIN_URLS);
     this.peerBodyUrls = options.peerBodyUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BODY_URLS);
+    this.celldFleet =
+      options.celldFleet ??
+      (process.env.ANSTS_CELLD_FLEET_URLS || process.env.ANSTS_CELLD_INTERNAL_URLS
+        ? CelldFleetClient.fromEnv(process.env)
+        : null);
 
     this.tickIntervalMs = options.tickIntervalMs ?? Number(process.env.ANSTS_TICK_INTERVAL_MS ?? 1000);
     this.scheduler = new CoreScheduler5D(15.0);
@@ -446,6 +461,15 @@ export class AnstsLocalAndComposeServer {
       }, 40);
     }
 
+    if (this.celldFleet) {
+      this.celldBodyHeartbeatTimer = setInterval(() => {
+        if (!this.draining) {
+          this.syncBodiesToCelldFleet().catch(() => {});
+          this.renewCelldLeases().catch(() => {});
+        }
+      }, 5_000);
+    }
+
     this.tickTimer = setInterval(() => {
       if (!this.draining) {
         const recovered = this.scheduler.reconcileOrphanedLeases();
@@ -573,6 +597,46 @@ export class AnstsLocalAndComposeServer {
    */
   public invalidatePeerTasksCache(): void {
     this.peerTasksCache = null;
+  }
+
+  /**
+   * Pushes this gateway's body-host heartbeats into the celld fleet. celld nodes hold the scheduler cell
+   * that places tasks, so without this the cell has no body capacity and every task stays QUEUED.
+   */
+  private async syncBodiesToCelldFleet(): Promise<void> {
+    if (!this.celldFleet) return;
+    const bodyIds = new Set(Object.keys(this.peerBodyUrls));
+    if (bodyIds.size === 0) return;
+    const heartbeats = Array.from(this.scheduler.nodes.values())
+      .filter((hb) => bodyIds.has(hb.node_id))
+      .map((hb) => ({
+        node_id: hb.node_id,
+        total_cpu_cores: hb.total_cpu_cores,
+        free_cpu_cores: hb.free_cpu_cores,
+        total_memory_mb: hb.total_memory_mb,
+        free_memory_mb: hb.free_memory_mb,
+        warm_pool_ready: hb.warm_pool_ready,
+        running_tasks: hb.running_tasks,
+        healthy: hb.healthy,
+      }));
+    try {
+      await this.celldFleet.registerNodes(heartbeats);
+    } catch {
+      this.metrics.incCounter("ansts_celld_fleet_unavailable_total", 1);
+    }
+  }
+
+  /**
+   * Renews every lease this gateway holds through celld. celld expires leases that are not renewed and then
+   * reconciles the task as orphaned, retrying it up to 3 times before it dead-letters.
+   */
+  private async renewCelldLeases(): Promise<void> {
+    if (!this.celldFleet || this.celldPlacedLeases.size === 0) return;
+    const leases = Array.from(this.celldPlacedLeases.entries()).map(([taskId, lease]) => ({ taskId, ...lease }));
+    const dropped = await this.celldFleet.renewLeases(leases);
+    for (const taskId of dropped) {
+      this.celldPlacedLeases.delete(taskId);
+    }
   }
 
   private async fetchPeerBrainTasksCached(ttlMs = 1500): Promise<TaskSpec[]> {
@@ -740,6 +804,42 @@ export class AnstsLocalAndComposeServer {
       try {
         const body = await this.readJsonBody(req);
         const spec = TaskSpecValidator.validateAndNormalize(body);
+        // A configured celld fleet owns the brain layer: submit there instead of this gateway's in-process
+        // scheduler, so the cell that owns the shard schedules the task rather than a local copy of it.
+        if (this.celldFleet) {
+          try {
+            await this.syncBodiesToCelldFleet();
+            const celldResult = await this.celldFleet.scheduleTask({
+              taskId: spec.task_id,
+              tenantId: spec.tenant_id,
+              promptText: spec.prompt,
+            });
+            const placement = celldResult.placements[0];
+            if (placement) {
+              this.celldPlacedLeases.set(spec.task_id, {
+                nodeId: placement[1],
+                fencingToken: placement[2],
+                celldNodeId: celldResult.celldNodeId,
+              });
+            }
+            res.writeHead(202, { "content-type": "application/json" });
+            res.end(
+              JSON.stringify({
+                task_id: spec.task_id,
+                state: celldResult.state,
+                assigned_node_id: placement ? placement[1] : null,
+                lease_fencing_token: celldResult.fencingToken,
+                deduplicated: celldResult.deduplicated,
+                merged_duplicate_count: 0,
+                placements: celldResult.placements,
+                routed_brain_node_id: celldResult.celldNodeId,
+              })
+            );
+            return;
+          } catch {
+            this.metrics.incCounter("ansts_celld_fleet_unavailable_total", 1);
+          }
+        }
         const mergeDuplicateInFlight = Boolean(
           body.merge_duplicate ?? body.deduplicate_by_fingerprint ?? false
         );
@@ -1161,8 +1261,39 @@ export class AnstsLocalAndComposeServer {
       // Forward to live peer Brain shard owner; if unreachable, automatically evict & failover to surviving Brain shard!
       let remoteBrainResult: Record<string, unknown> | null = null;
       let failoverEvent: Record<string, unknown> | null = null;
+      // A real denoland/celld fleet owns the brain layer when configured. celld forwards a call to the
+      // cell's owner node, so the gateway only needs one ready entry node instead of a static shard map.
+      if (this.celldFleet) {
+        try {
+          await this.syncBodiesToCelldFleet();
+          const celldResult = await this.celldFleet.scheduleTask({
+            taskId,
+            tenantId,
+            promptText,
+            targetBodyHostId,
+            slot: slotResolution.slotIndex,
+          });
+          remoteBrainResult = {
+            scheduledByBrainId: celldResult.celldNodeId,
+            state: celldResult.state,
+            fencingToken: celldResult.fencingToken,
+            deduplicated: celldResult.deduplicated,
+            placements: celldResult.placements,
+          };
+          const celldPlacement = celldResult.placements[0];
+          if (celldPlacement) {
+            this.celldPlacedLeases.set(taskId, {
+              nodeId: celldPlacement[1],
+              fencingToken: celldPlacement[2],
+              celldNodeId: celldResult.celldNodeId,
+            });
+          }
+        } catch {
+          this.metrics.incCounter("ansts_celld_fleet_unavailable_total", 1);
+        }
+      }
       const brainBaseUrl = this.peerBrainUrls[ownerBrainId];
-      if (brainBaseUrl) {
+      if (!remoteBrainResult && brainBaseUrl) {
         try {
           const resp = await fetch(`${brainBaseUrl}/internal/v1beta1/brain/schedule`, {
             method: "POST",
@@ -4286,6 +4417,10 @@ export class AnstsLocalAndComposeServer {
     if (this.tunnelPollTimer) {
       clearInterval(this.tunnelPollTimer);
       this.tunnelPollTimer = null;
+    }
+    if (this.celldBodyHeartbeatTimer) {
+      clearInterval(this.celldBodyHeartbeatTimer);
+      this.celldBodyHeartbeatTimer = null;
     }
     await this.dashboardServer.close();
     if (this.apiServer) {

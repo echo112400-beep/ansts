@@ -1,0 +1,74 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ansts-celld-brain",
+  "main": "src/cloudflare/worker.ts",
+  "compatibility_date": "2025-08-15",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ANSTS_SCHEDULER_CELL",
+        "class_name": "AnstsSchedulerCell"
+      },
+      {
+        "name": "ANSTS_HARNESS_CELL",
+        "class_name": "AgentTaskHarnessCell"
+      },
+      {
+        "name": "ANSTS_TUNNEL_CELL",
+        "class_name": "TunnelGatewayCell"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "AnstsSchedulerCell",
+        "AgentTaskHarnessCell",
+        "TunnelGatewayCell"
+      ]
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "ANSTS_ROUTING_KV",
+      "id": "00000000000000000000000000000001"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ANSTS_LAYERFS_BUCKET",
+      "bucket_name": "ansts-fleet"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "ANSTS_SCHEDULER_D1",
+      "database_name": "ansts-scheduler",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "ANSTS_TELEMETRY_QUEUE",
+        "queue": "ansts-telemetry"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "ansts-telemetry",
+        "max_batch_size": 100,
+        "max_batch_timeout": 5
+      }
+    ]
+  },
+  "vars": {
+    "CELLD_REGION": "celld-brain",
+    "CELLD_REBALANCE_INTERVAL_MS": "5000"
+  }
+}

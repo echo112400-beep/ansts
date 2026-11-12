@@ -73,6 +73,7 @@ export * from "./cluster/geo_routing.js";
 export * from "./cluster/multi_node_dev_server.js";
 export * from "./cluster/priority_load_shedder.js";
 export * from "./cluster/topology_cas_coordinator.js";
+export * from "./cluster/celld_fleet_client.js";
 export * from "./runtime/confidential_tee_bridge.js";
 export * from "./runtime/deterministic_envelope.js";
 export * from "./runtime/ebpf_lsm_bridge.js";
