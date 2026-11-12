@@ -103,7 +103,8 @@
     { id: 'runtime', label: '分布式运行面与 LayerFS 可视', badgeKey: 'runtime' },
     { id: 'observability', label: '可观测性、SLO 与自愈运维', badgeKey: 'observability' },
     { id: 'swarm', label: '智能体协同、策略与算力市场', badgeKey: 'swarm' },
-    { id: 'federation', label: '多地域联邦、隧道与灾备纠删码', badgeKey: 'federation' }
+    { id: 'federation', label: '多地域联邦、隧道与灾备纠删码', badgeKey: 'federation' },
+    { id: 'security', label: '安全合规、RBAC 与发布门控', badgeKey: 'security' }
   ];
 
   function createBaselineState() {
@@ -151,6 +152,10 @@
       swarmVisualization: null,
       federationVisualization: null,
       profilerVisualization: null,
+      securityVisualization: null,
+      autoRefreshPaused: false,
+      darkTheme: false,
+      lastBffRttMs: 0,
       allTenantIds: [],
       regions: [],
       nodes: [],
@@ -181,6 +186,7 @@
     try {
       const ctrl = new AbortController();
       const tid = setTimeout(() => ctrl.abort(), 2500);
+      const reqStartMs = performance.now ? performance.now() : Date.now();
       const resp = await fetch(fullUrl, {
         method,
         headers: {
@@ -192,6 +198,8 @@
         signal: ctrl.signal
       });
       clearTimeout(tid);
+      const reqEndMs = performance.now ? performance.now() : Date.now();
+      state.lastBffRttMs = Math.max(1, Math.round(reqEndMs - reqStartMs));
       const data = await resp.json();
       state.liveBackendConnected = true;
       updateConnectionIndicators(true);
@@ -224,7 +232,7 @@
         demoLabel.textContent = '503 OFFLINE · 接口离线锁定';
         demoLabel.className = 'demo-label warn';
       } else {
-        demoLabel.textContent = 'REAL BFF · 真实后端已连接';
+        demoLabel.textContent = `REAL BFF · 真实后端已连接 (${state.lastBffRttMs || 1}ms)`;
         demoLabel.className = 'demo-label';
       }
     }
@@ -271,6 +279,7 @@
       if (d.swarmVisualization) state.swarmVisualization = d.swarmVisualization;
       if (d.federationVisualization) state.federationVisualization = d.federationVisualization;
       if (d.profilerVisualization) state.profilerVisualization = d.profilerVisualization;
+      if (d.securityVisualization) state.securityVisualization = d.securityVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -417,6 +426,12 @@
       if (pCnt > 0) return { text: `${pCnt} 分区故障`, cls: 'danger' };
       const tCnt = state.federationVisualization?.reverseTunnels?.healthyBindingsCount ?? 6;
       return { text: `${tCnt} 隧道 · RS(4,2)`, cls: 'ok' };
+    }
+    if (key === 'security') {
+      const ready = state.securityVisualization?.releaseReadiness?.readyForProduction !== false;
+      const passed = state.securityVisualization?.releaseReadiness?.passedCount ?? 8;
+      const total = state.securityVisualization?.releaseReadiness?.totalGates ?? 8;
+      return { text: `${passed}/${total} Gate`, cls: ready ? 'ok' : 'danger' };
     }
     const brCount = state.runtimeVisualization?.layerfsBranches?.length ?? 4;
     return { text: `${brCount} 分支`, cls: '' };
@@ -2440,6 +2455,137 @@
     `;
   }
 
+  function renderSecuritySection() {
+    const sv = state.securityVisualization || {
+      rbacPrincipals: [],
+      auditChainIntegrity: state.auditChainIntegrity || { valid: true, totalEntries: 0, headHashHex: '' },
+      zeroTrustPosture: {
+        spiffeTrustDomain: 'spiffe://ansts.io',
+        spiffeCaKeyDigest: '',
+        teePlatform: 'AMD_SEV_SNP',
+        teePublicKeyDigest: '',
+        ebpfLsmPosture: { lsmActive: true, kernelVersion: '6.8-ansts' },
+        webhookKeyRotation: { keyRotationGeneration: 1, secondaryActive: false }
+      },
+      releaseReadiness: { readyForProduction: true, passedCount: 8, totalGates: 8, gates: [], evaluatedAtUtc: '' },
+      lastIntrusionProbe: null
+    };
+    const ac = sv.auditChainIntegrity || { valid: true, totalEntries: 0, headHashHex: '' };
+    const zt = sv.zeroTrustPosture || {};
+    const rr = sv.releaseReadiness || { readyForProduction: true, passedCount: 8, totalGates: 8, gates: [] };
+    const probe = sv.lastIntrusionProbe;
+    const perm = canMutateTarget('all', 'all', false);
+
+    return `
+      <section class="kpi-grid" aria-label="安全合规与发布门控核心指标">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>HMAC-SHA256 JWT RBAC 权限矩阵</span><span class="status-pill ok">timingSafeEqual</span></div>
+          <div class="kpi-value">${(sv.rbacPrincipals || []).length || 4} 认证主体</div>
+          <div class="kpi-sub">强制校验 Bearer JWT · VIEWER 写拦截 (403) · 自审拦截 (409)</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>SHA-256 密码学防篡改审计链</span><span class="status-pill ${ac.valid !== false ? 'ok' : 'danger'}">${ac.valid !== false ? 'CHAIN INTACT' : 'TAMPERED'}</span></div>
+          <div class="kpi-value">${ac.totalEntries ?? 0} 条链式审计</div>
+          <div class="kpi-sub">Head Hash: <span class="mono">${esc(String(ac.headHashHex || '').slice(0, 18))}...</span></div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>零信任内核与机密计算底座</span><span class="status-pill ok">${esc(zt.teePlatform || 'AMD_SEV_SNP')}</span></div>
+          <div class="kpi-value">SPIFFE + eBPF LSM</div>
+          <div class="kpi-sub">CA: <span class="mono">${esc(String(zt.spiffeCaKeyDigest || '').slice(0, 12))}...</span> · Outbox HMAC Gen #${zt.webhookKeyRotation?.keyRotationGeneration ?? 1}</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>生产发布准入门控 (Release Gate)</span><span class="status-pill ${rr.readyForProduction ? 'ok' : 'danger'}">${rr.readyForProduction ? 'READY_FOR_PROD' : 'BLOCKED'}</span></div>
+          <div class="kpi-value">${rr.passedCount ?? 8} / ${rr.totalGates ?? 8} 通过</div>
+          <div class="kpi-sub">最近评估: <span class="mono">${esc(rr.evaluatedAtUtc || state.lastSyncUtc || 'LIVE')}</span></div>
+        </div>
+      </section>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">零信任安全边界在线渗透探针工作台 (GET /v1beta1/console/security · POST /v1beta1/management/security/probe)</h2>
+            <p class="panel-subtitle">实时向后端 <code>celld-fence</code>、<code>eBPF LSM</code> 与 <code>ZeroTrustVsockBridge</code> 发起 SSRF、云元数据及敏感文件逃逸探测并验证拦截效果。</p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small danger" data-action="sec-run-probe" data-probe="ssrf_loopback" ${!perm.ok ? 'disabled' : ''}>探测 127.0.0.2 环回 SSRF</button>
+            <button type="button" class="small danger" data-action="sec-run-probe" data-probe="ssrf_imds_hex" ${!perm.ok ? 'disabled' : ''}>探测 0xa9fea9fe 十六进制 IMDS</button>
+            <button type="button" class="small danger" data-action="sec-run-probe" data-probe="lsm_proc_escape" ${!perm.ok ? 'disabled' : ''}>探测 /proc/42/environ 逃逸</button>
+            <button type="button" class="small danger" data-action="sec-run-probe" data-probe="vsock_cred_injection" ${!perm.ok ? 'disabled' : ''}>探测 Vsock URL 凭据注入</button>
+          </div>
+        </div>
+        ${probe ? `
+          <div class="state-banner ${probe.blocked ? 'info' : 'warn'}" style="margin-bottom:10px;">
+            <div>
+              <strong>最近安全边界渗透探针结果 (${esc(probe.layer)})：</strong>
+              目标 <code class="mono">${esc(probe.target)}</code> →
+              <span class="status-pill ${probe.blocked ? 'ok' : 'danger'}">${probe.blocked ? 'BLOCKED (拦截成功)' : 'ALLOWED'}</span>
+              · 时间: <code class="mono">${esc(probe.probedAtUtc)}</code>
+              <div class="muted">拦截原因: <code class="mono">${esc(probe.reason)}</code></div>
+            </div>
+          </div>
+        ` : ''}
+        <div class="btn-row">
+          <input id="sec-custom-probe-target" type="text" value="/etc/shadow" placeholder="输入自定义探测目标 (如 /etc/shadow 或 169.254.169.254)..." style="width:320px;" />
+          <button type="button" class="small primary" data-action="sec-run-custom-probe" ${!perm.ok ? 'disabled' : ''}>执行自定义安全边界探测</button>
+          <button type="button" class="small" data-action="open-dual-key-rotation" ${!perm.ok ? 'disabled' : ''}>执行 Outbox Webhook 双密钥零停机轮换</button>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">8 项生产发布准入核查矩阵 (GET /v1beta1/management/release/readiness)</h2>
+              <p class="panel-subtitle">实时校验零伪造状态、RBAC JWT、审计链完整性、SQLite 持久化、256 哈希槽与 CSP 安全头。</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="small primary" data-action="open-release-readiness-gate">重新执行全量发布准入核查</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>门控编号 (Gate ID)</th><th>生产准入核查项</th><th>状态</th></tr></thead>
+              <tbody>
+                ${(rr.gates || []).map((g) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(g.id)}</strong></td>
+                    <td>${esc(g.label)}</td>
+                    <td><span class="status-pill ${g.passed ? 'ok' : 'danger'}">${g.passed ? 'PASS' : 'FAIL'}</span></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">RBAC 认证主体与 HMAC-SHA256 JWT 签发验签台 (POST /v1beta1/management/auth/token)</h2>
+              <p class="panel-subtitle">展示控制台 4 类内置主体的区域/租户作用域及实时签发的 Bearer JWT 摘要。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>主体 ID</th><th>RBAC 角色</th><th>作用域 (区域 / 租户)</th><th>权限 (全局/审批)</th><th>JWT 签发操作</th></tr></thead>
+              <tbody>
+                ${(sv.rbacPrincipals || []).map((pr) => `
+                  <tr>
+                    <td class="mono"><strong>${esc(pr.sub)}</strong></td>
+                    <td><span class="status-pill ${pr.role === 'SRE_ADMIN' ? 'ok' : pr.role === 'OPERATOR' ? 'warn' : 'danger'}">${esc(pr.role)}</span></td>
+                    <td class="mono">${esc(pr.scopeRegion)} / ${esc(pr.scopeTenant)}</td>
+                    <td class="mono">${pr.canWriteGlobal ? 'GLOBAL_RW' : pr.canWriteScoped ? 'SCOPED_RW' : 'READ_ONLY'} · ${pr.canApprove ? 'APPROVE' : 'NO_APPROVE'}</td>
+                    <td><button type="button" class="small" data-action="sec-issue-verify-jwt" data-sub="${esc(pr.sub)}">签发并验签 JWT</button></td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   function renderMainContent() {
     const main = document.getElementById('content');
     if (!main) return;
@@ -2475,6 +2621,9 @@
         break;
       case 'federation':
         sectionHtml = renderFederationSection();
+        break;
+      case 'security':
+        sectionHtml = renderSecuritySection();
         break;
       case 'overview':
       default:
@@ -3965,6 +4114,67 @@
       );
       return;
     }
+    if (action === "toggle-theme") {
+      state.darkTheme = !state.darkTheme;
+      document.documentElement.classList.toggle("dark-theme", state.darkTheme);
+      const btn = document.getElementById("theme-toggle-btn");
+      if (btn) btn.textContent = state.darkTheme ? "☀ 亮色模式" : "☾ 暗色模式";
+      showToast(state.darkTheme ? "已切换至暗色 SRE 夜间运维主题" : "已切换至亮色控制台主题");
+      return;
+    }
+    if (action === "toggle-auto-refresh") {
+      state.autoRefreshPaused = !state.autoRefreshPaused;
+      const btn = document.getElementById("auto-refresh-btn");
+      if (btn) btn.textContent = state.autoRefreshPaused ? "⏸ 轮询已暂停" : "⟳ 自动轮询: 5s";
+      showToast(state.autoRefreshPaused ? "已暂停 5s 自动轮询（SSE 实时推送仍保持连接）" : "已恢复 5s 后台状态同步");
+      return;
+    }
+    if (action === "sec-run-probe") {
+      const probeType = target.getAttribute("data-probe") || "ssrf_loopback";
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/security/probe", {
+        probeType,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "安全探针执行失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`零信任安全探针 [${probeType}] → ${res.data?.probe?.blocked ? "BLOCKED (已成功拦截)" : "ALLOWED"}`);
+      return;
+    }
+    if (action === "sec-run-custom-probe") {
+      const customTarget = (document.getElementById("sec-custom-probe-target")?.value || "/etc/shadow").trim();
+      const p = getPrincipal();
+      const res = await callBackendApi("POST", "/v1beta1/management/security/probe", {
+        probeType: "custom",
+        target: customTarget,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || "自定义安全探针执行失败");
+        return;
+      }
+      await fetchBackendState();
+      showToast(`自定义探针 [${customTarget}] → ${res.data?.probe?.blocked ? "BLOCKED (已拦截)" : "ALLOWED"}`);
+      return;
+    }
+    if (action === "sec-issue-verify-jwt") {
+      const sub = target.getAttribute("data-sub") || "chen";
+      const res = await callBackendApi("POST", "/v1beta1/management/auth/token", { principalId: sub });
+      const d = res.data || {};
+      openDialog(
+        `HMAC-SHA256 Bearer JWT 签发与审计链验签结果 · ${sub}`,
+        `<div class="muted" style="margin-bottom:6px;">角色: <span class="status-pill ok">${esc(d.claims?.role || "")}</span> · 作用域: <code class="mono">${esc(d.claims?.scopeRegion || "")}/${esc(d.claims?.scopeTenant || "")}</code> · 审计链有效: <span class="status-pill ok">${Boolean(d.auditChainIntegrity?.valid)}</span></div>` +
+        `<pre class="mono" style="background:var(--bg-elevated);border:1px solid var(--border-subtle);padding:10px;border-radius:5px;font-size:11px;word-break:break-all;white-space:pre-wrap;">${esc(d.token || "")}</pre>`,
+        "关闭",
+        () => closeDialog()
+      );
+      return;
+    }
     if (action === "open-command-palette") {
       openDialog(
         "⌘K 全局快速导航与 SRE 运维命令面板 (Command Palette)",
@@ -5232,6 +5442,7 @@
     connectLiveEventStream();
     if (!autoRefreshTimer) {
       autoRefreshTimer = setInterval(() => {
+        if (state.autoRefreshPaused) return;
         const dialog = document.getElementById('dialog');
         if (!dialog || !dialog.open) {
           fetchBackendState();

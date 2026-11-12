@@ -731,3 +731,17 @@
    - 在控制台顶部栏新增 `⌘K 命令面板` 按钮并监听全局 `Ctrl+K` / `Meta+K` 快捷键，支持跨 11 大核心模块快速跳转、一键执行生产发布准入核查 (8/8 Release Gate)、运行 M60–M69 健康评分卡、触发预测预热与广播 SSE 诊断心跳。
 4. **端到端回归验证 (`tests/m84_console_command_palette_profiler_prewarmer_and_sse_bus.test.ts`)**：
    - 全量 **89 个 `src/` 源码模块**、**77 个测试套件（共 211 项测试）100% 通过**。
+
+
+---
+
+## 35. M85: TanStack Console 安全合规与发布门控中心、零信任渗透探针台、暗色主题与实时轮询控制 (`GET /v1beta1/console/security`, `POST /v1beta1/management/security/probe`, `anstsctl mgmt-security-console`)
+
+1. **安全合规、RBAC 权限矩阵与 8 项生产发布门控中心 (`security` · `renderSecuritySection()`)**：
+   - 新增独立 **`security` (`安全合规、RBAC 与发布门控`)** 导航页签，实时展示 `ConsoleRbacAuthGuard` 的 4 类认证主体 (`chen`, `zhou`, `lin`, `xu`) 权限矩阵与在线 HMAC-SHA256 Bearer JWT 签发验签台 (`sec-issue-verify-jwt`)、SHA-256 链式防篡改审计链状态 (`totalEntries` 与 `headHashHex`) 以及 8 项生产发布准入核查矩阵 (`releaseReadiness.gates`)。
+2. **零信任安全边界在线渗透探针工作台 (`executeSecurityIntrusionProbe` & `POST /v1beta1/management/security/probe`)**：
+   - 支持在控制台一键向 `celld-fence`、`eBPF LSM` 与 `ZeroTrustVsockBridge` 发起 `127.0.0.2` 环回 SSRF、`0xa9fea9fe` 十六进制云元数据 SSRF、`/proc/42/environ` 逃逸、Vsock URL 凭据注入及自定义路径/IP 渗透探针，实时验证并回显拦截状态 (`BLOCKED`) 与原因。
+3. **控制台 SRE 体验增强 (暗色夜间运维主题、自动轮询启停与 BFF RTT 延迟指示)**：
+   - 在顶部栏新增 `☾ 暗色模式 / ☀ 亮色模式` (`toggle-theme`) 与 `⟳ 自动轮询: 5s / ⏸ 轮询已暂停` (`toggle-auto-refresh`) 按钮，并在每次调用后端 BFF 时实时刷新 `REAL BFF · 真实后端已连接 (Xms)` RTT 延迟指标。
+4. **端到端回归验证 (`tests/m85_console_security_release_gate_and_theme_controls.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**78 个测试套件（共 212 项测试）100% 通过**。

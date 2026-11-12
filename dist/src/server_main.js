@@ -2458,6 +2458,41 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M85] TanStack Console BFF: Security, RBAC, Cryptographic Audit Chain & Release Readiness (`GET /v1beta1/console/security`)
+    if (method === "GET" && pathname === "/v1beta1/console/security") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildSecurityAndReleaseVisualization()));
+      return;
+    }
+
+    // [M85] Interactive Zero-Trust Intrusion Probe (`POST /v1beta1/management/security/probe`)
+    if (method === "POST" && pathname === "/v1beta1/management/security/probe") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeSecurityIntrusionProbe({
+        probeType: body.probeType ?? "ssrf_imds_hex",
+
+
+
+
+
+        target: body.target ? String(body.target) : undefined,
+        actor: auth.actor,
+        role: auth.role
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M84] Interactive Resource Profiler, Predictive Prewarmer & SSE Broadcast Action (`POST /v1beta1/management/profiler/action`)
     if (method === "POST" && pathname === "/v1beta1/management/profiler/action") {
       const body = await this.readJsonBody(req);
