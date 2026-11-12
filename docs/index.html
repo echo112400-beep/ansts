@@ -1668,7 +1668,7 @@ dialog#dialog::backdrop {
                 const pinnedList = n.pinnedP0Tasks && n.pinnedP0Tasks.length > 0 ? `P0: ${n.pinnedP0Tasks.join(',')}` : '无 P0 锁';
                 return `
                   <tr>
-                    <td class="mono"><strong>${n.id}</strong></td>
+                    <td class="mono"><label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;"><input type="checkbox" class="node-batch-check" value="${esc(n.id)}" checked /><strong>${esc(n.id)}</strong></label></td>
                     <td>${n.role} ${n.slots > 0 ? `<span class="mono">(${n.slots} 槽)</span>` : ''}</td>
                     <td class="mono">${n.region}</td>
                     <td class="mono">${n.cpuPct}% / PSI ${n.psiPct}%</td>
@@ -1750,9 +1750,10 @@ dialog#dialog::backdrop {
                     <td class="mono">v${t.configVersion} <span class="muted">(${t.updatedBy || 'chen'})</span></td>
                     <td>
                       <div class="btn-row">
-                        <button type="button" class="small primary" data-action="open-quota-dialog" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''}>编辑配额</button>
-                        <button type="button" class="small" data-action="tenant-finops-step" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''} title="累加计费流水测试 80% 软降级与 100% 熔断">+计费步进</button>
-                        <button type="button" class="small" data-action="tenant-escrow-step" data-tenant="${t.id}" ${!perm.ok ? 'disabled' : ''} title="增加 DAG 子任务并发担保槽位">+DAG预留</button>
+                        <button type="button" class="small primary" data-action="open-quota-dialog" data-tenant="${esc(t.id)}" ${!perm.ok ? 'disabled' : ''}>编辑配额</button>
+                        <button type="button" class="small" data-action="tenant-finops-step" data-tenant="${esc(t.id)}" ${!perm.ok ? 'disabled' : ''} title="累加计费流水测试 80% 软降级与 100% 熔断">+计费步进</button>
+                        <button type="button" class="small" data-action="tenant-escrow-step" data-tenant="${esc(t.id)}" ${!perm.ok ? 'disabled' : ''} title="增加 DAG 子任务并发担保槽位">+DAG预留</button>
+                        <button type="button" class="small danger" data-action="delete-tenant" data-tenant="${esc(t.id)}" ${!canMutateTarget('all', 'all', true).ok ? 'disabled' : ''} title="删除无活跃任务的租户配额策略">删除</button>
                       </div>
                     </td>
                   </tr>
@@ -2060,7 +2061,7 @@ dialog#dialog::backdrop {
             </div>
           </div>
           <div class="btn-row">
-            <button type="button" class="small primary" data-action="a2a-action" data-op="put_blackboard_cas">+ 黑板 CAS 更新</button>
+            <button type="button" class="small primary" data-action="open-blackboard-cas-dialog">+ 黑板 CAS 写入/更新</button>
             <button type="button" class="small" data-action="a2a-action" data-op="arbitrate_git_patches">Git 补丁冲突仲裁</button>
             <button type="button" class="small danger" data-action="a2a-action" data-op="inject_deadlock_cycle">注入 WFG 环形死锁</button>
             <button type="button" class="small primary" data-action="a2a-action" data-op="break_deadlock">抢占解除死锁</button>
@@ -2069,7 +2070,7 @@ dialog#dialog::backdrop {
           <div class="table-wrap">
             <table class="data-table">
               <thead>
-                <tr><th>黑板键 (Blackboard Key)</th><th>CAS 版本</th><th>写入智能体</th><th>当前协同载荷</th></tr>
+                <tr><th>黑板键 (Blackboard Key)</th><th>CAS 版本</th><th>写入智能体</th><th>当前协同载荷</th><th>后端操作</th></tr>
               </thead>
               <tbody>
                 ${(state.a2aState?.blackboardEntries || []).map((entry) => `
@@ -2078,6 +2079,12 @@ dialog#dialog::backdrop {
                     <td><span class="status-pill ok">v${entry.version}</span></td>
                     <td class="mono">${esc(entry.authorAgentId)}</td>
                     <td class="mono">${esc(JSON.stringify(entry.value))}</td>
+                    <td>
+                      <div class="btn-row">
+                        <button type="button" class="small" data-action="open-blackboard-cas-dialog" data-key="${esc(entry.key)}" data-ver="${entry.version}">编辑 CAS</button>
+                        <button type="button" class="small danger" data-action="delete-blackboard-key" data-key="${esc(entry.key)}">删除</button>
+                      </div>
+                    </td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -2096,20 +2103,26 @@ dialog#dialog::backdrop {
             </div>
           </div>
           <div class="btn-row">
-            <button type="button" class="small primary" data-action="mcp-action" data-op="register_mcp_tool">+ 注册动态 MCP 工具</button>
+            <button type="button" class="small primary" data-action="open-register-mcp-dialog">+ 注册动态 MCP 工具</button>
             <button type="button" class="small" data-action="mcp-action" data-op="invoke_mcp_tool">调用 MCP 事务工具 (Saga 挂载)</button>
             <button type="button" class="small danger" data-action="mcp-action" data-op="saga_rollback_task">触发 Saga 逆序 (LIFO) 补偿回滚</button>
           </div>
           <div class="table-wrap">
             <table class="data-table">
-              <thead><tr><th>MCP 工具名称</th><th>所属服务 (Server)</th><th>副作用级别</th><th>描述</th></tr></thead>
+              <thead><tr><th>MCP 工具名称</th><th>所属服务 (Server)</th><th>副作用级别</th><th>描述</th><th>后端操作</th></tr></thead>
               <tbody>
                 ${(state.mcpState?.tools || []).map((t) => `
                   <tr>
                     <td class="mono"><strong>${esc(t.toolName)}</strong></td>
                     <td class="mono">${esc(t.serverName)}</td>
-                    <td><span class="status-pill warn">${t.effectClass}</span></td>
+                    <td><span class="status-pill warn">${esc(t.effectClass)}</span></td>
                     <td>${esc(t.description)}</td>
+                    <td>
+                      <div class="btn-row">
+                        <button type="button" class="small primary" data-action="invoke-specific-mcp-tool" data-tool="${esc(t.toolName)}">调用</button>
+                        <button type="button" class="small danger" data-action="unregister-mcp-tool" data-tool="${esc(t.toolName)}">注销</button>
+                      </div>
+                    </td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -2695,9 +2708,13 @@ dialog#dialog::backdrop {
     if (action === 'run-batch-node-op') {
       const op = target.getAttribute('data-op') || 'drain';
       const p = getPrincipal();
+      const checkedBoxes = Array.from(document.querySelectorAll('.node-batch-check:checked'));
+      const selectedNodeIds = checkedBoxes.length > 0
+        ? checkedBoxes.map((cb) => cb.value)
+        : state.nodes.map((n) => n.id);
       const res = await callBackendApi('POST', '/v1beta1/management/nodes/batch', {
         operation: op,
-        nodeIds: ['celld-brain-01', 'body-host-01', 'body-host-02'],
+        nodeIds: selectedNodeIds,
         forceMigrateLeases: false,
         actor: p.id,
         role: p.role
@@ -2721,6 +2738,158 @@ dialog#dialog::backdrop {
       });
       await fetchBackendState();
       showToast('后端已热迁移 body-host-02 上的 P0 租约并完成节点隔离排水');
+      return;
+    }
+    if (action === 'delete-tenant') {
+      const tenantId = target.getAttribute('data-tenant') || '';
+      if (!tenantId) return;
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/tenants/config', {
+        action: 'delete',
+        tenantId,
+        expectedVersion: 0,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || `删除租户 ${tenantId} 被后端拦截 (HTTP ${res.status})`);
+        return;
+      }
+      await fetchBackendState();
+      showToast(`已从后端 SQLite 删除租户 ${tenantId}`);
+      return;
+    }
+    if (action === 'open-blackboard-cas-dialog') {
+      const presetKey = target.getAttribute('data-key') || 'arch/zero-trust-policy';
+      const existingEntry = (state.a2aState?.blackboardEntries || []).find((e) => e.key === presetKey);
+      const presetVer = existingEntry ? existingEntry.version : Number(target.getAttribute('data-ver') || 0);
+      const presetVal = existingEntry ? JSON.stringify(existingEntry.value) : '{"mTLS":"STRICT","spiffeTrustDomain":"ansts.io"}';
+      openDialog(
+        'A2A 共享黑板乐观锁 CAS 写入 / 更新 (POST /v1beta1/management/a2a)',
+        '<div class="form-field"><label for="dlg-bb-key">黑板键名 (Blackboard Key)</label>' +
+        '<input id="dlg-bb-key" type="text" value="' + esc(presetKey) + '" class="mono" /></div>' +
+        '<div class="form-field"><label for="dlg-bb-ver">期望 CAS 基线版本 (Expected Version, 新键填 0)</label>' +
+        '<input id="dlg-bb-ver" type="number" value="' + presetVer + '" min="0" class="mono" /></div>' +
+        '<div class="form-field"><label for="dlg-bb-val">协同载荷 (JSON Value)</label>' +
+        '<input id="dlg-bb-val" type="text" value="' + esc(presetVal) + '" class="mono" /></div>',
+        '提交 CAS 黑板更新',
+        async () => {
+          const key = document.getElementById('dlg-bb-key').value.trim();
+          const expectedVersion = Number(document.getElementById('dlg-bb-ver').value);
+          const rawVal = document.getElementById('dlg-bb-val').value.trim();
+          let parsedVal = rawVal;
+          try { parsedVal = JSON.parse(rawVal); } catch (_e) { /* keep string */ }
+          const p = getPrincipal();
+          const res = await callBackendApi('POST', '/v1beta1/management/a2a', {
+            action: 'put_blackboard_cas',
+            key,
+            expectedVersion,
+            value: parsedVal,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            const errEl = document.getElementById('dialog-error');
+            if (errEl) errEl.textContent = res.data?.message || `CAS 版本冲突 (HTTP ${res.status})`;
+            return;
+          }
+          state.lastApiOutput = JSON.stringify(res.data, null, 2);
+          closeDialog();
+          await fetchBackendState();
+          showToast(`已通过 CAS 写入黑板键 [${key}] → v${res.data?.entry?.version || (expectedVersion + 1)}`);
+        }
+      );
+      return;
+    }
+    if (action === 'delete-blackboard-key') {
+      const key = target.getAttribute('data-key') || '';
+      if (!key) return;
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/a2a', {
+        action: 'delete_blackboard_key',
+        key,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '删除黑板键失败');
+        return;
+      }
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast(`已从后端 SQLite 删除 A2A 黑板键 [${key}]`);
+      return;
+    }
+    if (action === 'open-register-mcp-dialog') {
+      const nextId = Math.floor(100 + Math.random() * 899);
+      openDialog(
+        '注册动态 MCP JSON-RPC 2.0 事务工具 (POST /v1beta1/management/mcp)',
+        '<div class="form-field"><label for="dlg-mcp-name">MCP 工具名称 (Tool Name)</label>' +
+        '<input id="dlg-mcp-name" type="text" value="mcp_k8s_rollout_' + nextId + '" class="mono" /></div>' +
+        '<div class="form-field"><label for="dlg-mcp-srv">所属 MCP 服务 (Server Name)</label>' +
+        '<input id="dlg-mcp-srv" type="text" value="mcp-k8s-fleet" class="mono" /></div>' +
+        '<div class="form-field"><label for="dlg-mcp-desc">工具描述与 Saga 逆序补偿说明</label>' +
+        '<input id="dlg-mcp-desc" type="text" value="Execute reversible K8s deployment rollout with automatic Saga LIFO rollback" /></div>',
+        '注册工具并持久化至 SQLite',
+        async () => {
+          const toolName = document.getElementById('dlg-mcp-name').value.trim();
+          const serverName = document.getElementById('dlg-mcp-srv').value.trim();
+          const description = document.getElementById('dlg-mcp-desc').value.trim();
+          const p = getPrincipal();
+          const res = await callBackendApi('POST', '/v1beta1/management/mcp', {
+            action: 'register_mcp_tool',
+            toolName,
+            serverName,
+            description,
+            actor: p.id,
+            role: p.role
+          });
+          if (!res.ok) {
+            const errEl = document.getElementById('dialog-error');
+            if (errEl) errEl.textContent = res.data?.message || '注册 MCP 工具失败';
+            return;
+          }
+          state.lastApiOutput = JSON.stringify(res.data, null, 2);
+          closeDialog();
+          await fetchBackendState();
+          showToast(`已注册动态 MCP 工具 ${serverName}/${toolName}`);
+        }
+      );
+      return;
+    }
+    if (action === 'invoke-specific-mcp-tool') {
+      const toolName = target.getAttribute('data-tool') || 'mcp_pg_migration_apply';
+      const activeTask = (state.tasks && state.tasks[0]) ? state.tasks[0].id : 'task-ns-8841';
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/mcp', {
+        action: 'invoke_mcp_tool',
+        toolName,
+        taskId: activeTask,
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast(`已调用 MCP 事务工具 [${toolName}] (已挂载 Saga 补偿钩子)`);
+      return;
+    }
+    if (action === 'unregister-mcp-tool') {
+      const toolName = target.getAttribute('data-tool') || '';
+      if (!toolName) return;
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/mcp', {
+        action: 'unregister_mcp_tool',
+        toolName,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || '注销 MCP 工具失败');
+        return;
+      }
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast(`已从后端 SQLite 注销 MCP 工具 [${toolName}]`);
       return;
     }
     if (action === 'toggle-region-availability') {

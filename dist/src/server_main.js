@@ -2498,7 +2498,11 @@ class AnstsLocalAndComposeServer {
         res.end(JSON.stringify({ error: auth.error, message: auth.message }));
         return;
       }
-      if (typeof body.tenantId !== "string" || body.tenantId.trim().length === 0 || body.expectedVersion === undefined) {
+      if (
+      typeof body.tenantId !== "string" ||
+      body.tenantId.trim().length === 0 ||
+      body.expectedVersion === undefined && body.action !== "delete" && body.action !== "create")
+      {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(
         JSON.stringify({
@@ -2509,10 +2513,13 @@ class AnstsLocalAndComposeServer {
         return;
       }
       const result = this.managementPlane.updateTenantConfig({
+        action: body.action ? String(body.action) : undefined,
         tenantId: body.tenantId.trim(),
+        region: body.region ? String(body.region) : undefined,
+        tier: body.tier ? String(body.tier) : undefined,
         maxSlots: Number(body.maxSlots ?? 160),
         dailyBudgetUsd: Number(body.dailyBudgetUsd ?? 1200),
-        expectedVersion: Number(body.expectedVersion),
+        expectedVersion: Number(body.expectedVersion ?? 0),
         actor: auth.actor,
         role: auth.role
       });
@@ -3463,6 +3470,10 @@ class AnstsLocalAndComposeServer {
       const body = await this.readJsonBody(req);
       const result = this.managementPlane.executeMcpAndSagaGovernance({
         action: body.action ?? "invoke_mcp_tool",
+
+
+
+
         serverName: body.serverName ? String(body.serverName) : undefined,
         toolName: body.toolName ? String(body.toolName) : undefined,
         description: body.description ? String(body.description) : undefined,
@@ -3485,6 +3496,7 @@ class AnstsLocalAndComposeServer {
       const body = await this.readJsonBody(req);
       const result = this.managementPlane.executeA2aGovernanceAction({
         action: body.action ?? "put_blackboard_cas",
+
 
 
 

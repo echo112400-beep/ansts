@@ -2498,7 +2498,11 @@ export class AnstsLocalAndComposeServer {
         res.end(JSON.stringify({ error: auth.error, message: auth.message }));
         return;
       }
-      if (typeof body.tenantId !== "string" || body.tenantId.trim().length === 0 || body.expectedVersion === undefined) {
+      if (
+        typeof body.tenantId !== "string" ||
+        body.tenantId.trim().length === 0 ||
+        (body.expectedVersion === undefined && body.action !== "delete" && body.action !== "create")
+      ) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
@@ -2509,10 +2513,13 @@ export class AnstsLocalAndComposeServer {
         return;
       }
       const result = this.managementPlane.updateTenantConfig({
+        action: body.action ? (String(body.action) as "update" | "create" | "delete") : undefined,
         tenantId: body.tenantId.trim(),
+        region: body.region ? String(body.region) : undefined,
+        tier: body.tier ? String(body.tier) : undefined,
         maxSlots: Number(body.maxSlots ?? 160),
         dailyBudgetUsd: Number(body.dailyBudgetUsd ?? 1200),
-        expectedVersion: Number(body.expectedVersion),
+        expectedVersion: Number(body.expectedVersion ?? 0),
         actor: auth.actor,
         role: auth.role,
       });
@@ -3462,7 +3469,11 @@ export class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/v1beta1/management/mcp") {
       const body = await this.readJsonBody(req);
       const result = this.managementPlane.executeMcpAndSagaGovernance({
-        action: (body.action ?? "invoke_mcp_tool") as "register_mcp_tool" | "invoke_mcp_tool" | "saga_rollback_task",
+        action: (body.action ?? "invoke_mcp_tool") as
+          | "register_mcp_tool"
+          | "unregister_mcp_tool"
+          | "invoke_mcp_tool"
+          | "saga_rollback_task",
         serverName: body.serverName ? String(body.serverName) : undefined,
         toolName: body.toolName ? String(body.toolName) : undefined,
         description: body.description ? String(body.description) : undefined,
@@ -3486,6 +3497,7 @@ export class AnstsLocalAndComposeServer {
       const result = this.managementPlane.executeA2aGovernanceAction({
         action: (body.action ?? "put_blackboard_cas") as
           | "put_blackboard_cas"
+          | "delete_blackboard_key"
           | "arbitrate_git_patches"
           | "inject_deadlock_cycle"
           | "break_deadlock"

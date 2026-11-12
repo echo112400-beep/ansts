@@ -612,3 +612,24 @@
    - 实时核查 `GATE-01`（零伪造状态与零前端打桩数据）、`GATE-02`（XSS 转义与 CSP 安全头）、`GATE-03`（HMAC-SHA256 JWT RBAC 与防篡改审计哈希链）、`GATE-04`（高危写接口 400 严格入参校验）、`GATE-05`（Nginx SPA 回退与无缓冲实时 SSE）、`GATE-06`（SQLite RPO=0 持久化）、`GATE-07`（Brain 单飞缓存并发防放大）与 `GATE-08`（256 哈希槽与核心子系统在线），并输出关键交付物 SHA-256 摘要。
    - 全量通过 **70 个测试套件（201 项端到端测试）** (`tests/m77_console_production_release_readiness.test.ts`)。
 
+---
+
+## 28. M78 Console 深度交互式系统管理 CRUD 与零静态常量 SQLite 遥测闭环 (Interactive CRUD Dialogs & Zero-Static-Constant SQLite Telemetry)
+
+进一步消除了后端管理面中的静态计算偏移量与前端无参按钮调用，实现了全模块自定义参数录入与全生命周期增删改查 (CRUD) 闭环：
+
+1. **后端零静态常量 SQLite 遥测字段持久化 (`src/dashboard/server.ts`)**：
+   - **租户 `used_slots` 持久化列**：在 `v25_mgmt_tenants` 表中新增 `used_slots` 列，移除原先 `tId === "Northstar" ? 86 : ...` 静态三元表达式，实时基于 SQLite `used_slots` + `CoreScheduler5D` 活跃任务数计算并发配额占用（新建租户初始占用精确为 `0`）。
+   - **节点 `base_leases` 持久化列与预热/排水联动**：在 `v25_mgmt_node_overrides` 表中新增 `base_leases` 列，移除原先 `+ 12` 固定偏移；执行节点排水 (`drain`) 时将 `base_leases` 置为 `0`，执行批量预热 (`prewarm`) 时真实调用 `PredictiveSandboxPrewarmer` 并在 SQLite 中下调节点 `psi_pct` 内存压力。
+
+2. **全生命周期后端系统管理 CRUD 接口与安全保护 (`src/dashboard/server.ts` & `src/server_main.ts`)**：
+   - **租户全生命周期 (`create` / `update` CAS / `delete`)**：`POST /v1beta1/management/tenants/config` 新增 `action: "delete"`，删除前自动校验 `CoreScheduler5D` 中该租户是否仍有未终止任务（若存在活跃任务则返回 `409 TENANT_HAS_ACTIVE_TASKS` 拒绝误删；无活跃任务则从 SQLite 安全移除并记录链式审计日志）。
+   - **A2A 共享黑板全生命周期 (`put_blackboard_cas` / `delete_blackboard_key`)**：`POST /v1beta1/management/a2a` 新增 `delete_blackboard_key`，支持从 SQLite `v25_mgmt_a2a_blackboard` 删除指定黑板键。
+   - **动态 MCP 工具注册表全生命周期 (`register_mcp_tool` / `invoke_mcp_tool` / `unregister_mcp_tool`)**：`POST /v1beta1/management/mcp` 新增 `unregister_mcp_tool`，支持从 SQLite `v25_mgmt_mcp_tools` 注销指定工具。
+
+3. **Console UI 交互式表单对话框与多选编排 (`docs/console-management/prototype.js` & `docs/index.html`)**：
+   - **节点多选复选框 (`node-batch-check`)**：节点列表每行支持勾选任意节点组合执行批量维护排水或批量沙箱预热，不再硬编码固定节点数组。
+   - **A2A 黑板 CAS 自定义录入弹窗 (`open-blackboard-cas-dialog`) 与行级删除 (`delete-blackboard-key`)**：支持自定义输入任意键名、期望 CAS 版本号与 JSON 载荷，并在每行提供 `编辑 CAS` 与 `删除` 按钮。
+   - **动态 MCP 工具自定义注册弹窗 (`open-register-mcp-dialog`) 与行级调用/注销 (`invoke-specific-mcp-tool` / `unregister-mcp-tool`)**：支持自定义录入工具名称、所属 MCP 服务与描述，并在每行直接触发工具调用或注销。
+   - 全量通过 **71 个测试套件（203 项端到端测试）** (`tests/m78_console_interactive_crud_and_sqlite_telemetry.test.ts`)。
+

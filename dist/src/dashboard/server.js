@@ -447,7 +447,7 @@ class PlatformManagementPlaneEngine {
   initSqlTablesAndSeed() {
     const sql = this.deps.v25Store.sql;
     sql.exec(
-    "CREATE TABLE IF NOT EXISTS v25_mgmt_tenants (tenant_id TEXT PRIMARY KEY, region TEXT, tier TEXT, max_slots INTEGER, escrow_reserved INTEGER, daily_budget_usd REAL, spent_usd REAL, model_policy TEXT, config_version INTEGER, updated_by TEXT, updated_at TEXT)");
+    "CREATE TABLE IF NOT EXISTS v25_mgmt_tenants (tenant_id TEXT PRIMARY KEY, region TEXT, tier TEXT, used_slots INTEGER, max_slots INTEGER, escrow_reserved INTEGER, daily_budget_usd REAL, spent_usd REAL, model_policy TEXT, config_version INTEGER, updated_by TEXT, updated_at TEXT)");
 
     sql.exec(
     "CREATE TABLE IF NOT EXISTS v25_mgmt_approvals (approval_id TEXT PRIMARY KEY, type TEXT, target TEXT, region TEXT, tenant TEXT, initiator TEXT, status TEXT, risk TEXT, created_at TEXT, decided_by TEXT)");
@@ -456,7 +456,7 @@ class PlatformManagementPlaneEngine {
     "CREATE TABLE IF NOT EXISTS v25_mgmt_audit_logs (audit_id TEXT PRIMARY KEY, ts TEXT, actor TEXT, role TEXT, action TEXT, scope TEXT, outcome TEXT)");
 
     sql.exec(
-    "CREATE TABLE IF NOT EXISTS v25_mgmt_node_overrides (node_id TEXT PRIMARY KEY, region TEXT, role_label TEXT, status TEXT, cpu_pct REAL, psi_pct REAL)");
+    "CREATE TABLE IF NOT EXISTS v25_mgmt_node_overrides (node_id TEXT PRIMARY KEY, region TEXT, role_label TEXT, status TEXT, cpu_pct REAL, psi_pct REAL, base_leases INTEGER)");
 
     sql.exec(
     "CREATE TABLE IF NOT EXISTS v25_mgmt_a2a_blackboard (bb_key TEXT PRIMARY KEY, value_json TEXT, version INTEGER, author_agent TEXT, updated_at_ms INTEGER)");
@@ -532,17 +532,18 @@ class PlatformManagementPlaneEngine {
   seedInitialState() {
     const sql = this.deps.v25Store.sql;
     const initialTenants = [
-    { id: "Northstar", region: "us-west-2", tier: "P0_STRATEGIC", maxSlots: 120, escrow: 16, budget: 1200, spent: 840, policy: "DeepSeek-R1 → Qwen-3.8 (80%)", ver: 14 },
-    { id: "Helios", region: "eu-central-1", tier: "P1_ENTERPRISE", maxSlots: 80, escrow: 8, budget: 800, spent: 490, policy: "DeepSeek-R1 → Qwen-3.8 (80%)", ver: 9 },
-    { id: "Vanguard", region: "ap-northeast-1", tier: "P1_ENTERPRISE", maxSlots: 60, escrow: 6, budget: 600, spent: 310, policy: "DeepSeek-R1 → Qwen-3.8 (80%)", ver: 7 },
-    { id: "Aegis", region: "us-west-2", tier: "P2_STANDARD", maxSlots: 40, escrow: 4, budget: 300, spent: 145, policy: "Qwen-3.8 Economy", ver: 5 }];
+    { id: "Northstar", region: "us-west-2", tier: "P0_STRATEGIC", usedSlots: 86, maxSlots: 120, escrow: 16, budget: 1200, spent: 840, policy: "DeepSeek-R1 → Qwen-3.8 (80%)", ver: 14 },
+    { id: "Helios", region: "eu-central-1", tier: "P1_ENTERPRISE", usedSlots: 45, maxSlots: 80, escrow: 8, budget: 800, spent: 490, policy: "DeepSeek-R1 → Qwen-3.8 (80%)", ver: 9 },
+    { id: "Vanguard", region: "ap-northeast-1", tier: "P1_ENTERPRISE", usedSlots: 34, maxSlots: 60, escrow: 6, budget: 600, spent: 310, policy: "DeepSeek-R1 → Qwen-3.8 (80%)", ver: 7 },
+    { id: "Aegis", region: "us-west-2", tier: "P2_STANDARD", usedSlots: 19, maxSlots: 40, escrow: 4, budget: 300, spent: 145, policy: "Qwen-3.8 Economy", ver: 5 }];
 
     for (const t of initialTenants) {
       sql.exec(
-      "INSERT OR REPLACE INTO v25_mgmt_tenants (tenant_id, region, tier, max_slots, escrow_reserved, daily_budget_usd, spent_usd, model_policy, config_version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO v25_mgmt_tenants (tenant_id, region, tier, used_slots, max_slots, escrow_reserved, daily_budget_usd, spent_usd, model_policy, config_version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       t.id,
       t.region,
       t.tier,
+      t.usedSlots,
       t.maxSlots,
       t.escrow,
       t.budget,
@@ -575,13 +576,14 @@ class PlatformManagementPlaneEngine {
 
     for (const n of initialNodes) {
       sql.exec(
-      "INSERT OR REPLACE INTO v25_mgmt_node_overrides (node_id, region, role_label, status, cpu_pct, psi_pct) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO v25_mgmt_node_overrides (node_id, region, role_label, status, cpu_pct, psi_pct, base_leases) VALUES (?, ?, ?, ?, ?, ?, ?)",
       n.id,
       n.region,
       n.role,
       n.status,
       n.cpu,
-      n.psi);
+      n.psi,
+      12);
 
     }
 
@@ -974,7 +976,7 @@ class PlatformManagementPlaneEngine {
       const activeTasksForTenant = Array.from(taskMap.values()).filter(
       (t) => t.tenant_id === tId && t.state !== _models.TaskState.COMPLETED && t.state !== _models.TaskState.CANCELLED).
       length;
-      const baseUsed = tId === "Northstar" ? 86 : tId === "Helios" ? 45 : tId === "Vanguard" ? 34 : 19;
+      const baseUsed = Number(r.used_slots ?? 0);
       const usedSlots =
       this.scenario === "quota" && tId === "Northstar" && maxSlots <= 120 ?
       maxSlots :
@@ -1049,7 +1051,7 @@ class PlatformManagementPlaneEngine {
         cpuPct,
         psiPct: Number(nr.psi_pct ?? 4.5),
         status: String(nr.status ?? "READY"),
-        activeLeases: assignedTasks.length + (String(nr.status) === "CORDONED" ? 0 : 12),
+        activeLeases: assignedTasks.length + (String(nr.status) === "CORDONED" ? 0 : Number(nr.base_leases ?? 12)),
         pinnedP0Tasks,
         tunnelGw: activeGw
       };
@@ -1241,6 +1243,9 @@ class PlatformManagementPlaneEngine {
 
 
 
+
+
+
   {
     this.ensureInitialized();
     if (params.role === "VIEWER") {
@@ -1253,15 +1258,56 @@ class PlatformManagementPlaneEngine {
     const row = sql.
     exec("SELECT * FROM v25_mgmt_tenants WHERE tenant_id = ?", params.tenantId).
     one();
-    if (!row && params.expectedVersion === 0) {
+    if (params.action === "delete") {
+      if (!row) {
+        return { status: 404, body: { error: "TENANT_NOT_FOUND", tenantId: params.tenantId } };
+      }
+      const activeTasksForTenant = Array.from(this.deps.scheduler.allTasks.values()).filter(
+      (t) =>
+      t.tenant_id === params.tenantId &&
+      t.state !== _models.TaskState.COMPLETED &&
+      t.state !== _models.TaskState.CANCELLED &&
+      String(t.state) !== "FENCED_TERMINATED");
+
+      if (activeTasksForTenant.length > 0) {
+        return {
+          status: 409,
+          body: {
+            error: "TENANT_HAS_ACTIVE_TASKS",
+            tenantId: params.tenantId,
+            activeTaskIds: activeTasksForTenant.map((t) => t.task_id),
+            message: `拒绝删除租户 ${params.tenantId}：仍存在 ${activeTasksForTenant.length} 个运行中任务 (${activeTasksForTenant.map((t) => t.task_id).join(", ")})，请先停止或吊销租约`
+          }
+        };
+      }
+      sql.exec("DELETE FROM v25_mgmt_tenants WHERE tenant_id = ?", params.tenantId);
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `删除无活跃任务的租户配额策略 [${params.tenantId}]`,
+      `${row.region ?? "us-west-2"} / ${params.tenantId}`,
+      "DELETED");
+
+      return {
+        status: 200,
+        body: {
+          tenantId: params.tenantId,
+          deleted: true
+        }
+      };
+    }
+
+    if (!row && (params.expectedVersion === 0 || params.action === "create")) {
       const nowUtc = `${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC`;
       const safeTenantId = (0, _console_rbac_guard.sanitizeHtmlString)(params.tenantId);
-      const region = "us-west-2";
+      const region = (0, _console_rbac_guard.sanitizeHtmlString)(params.region ?? "us-west-2");
+      const tier = (0, _console_rbac_guard.sanitizeHtmlString)(params.tier ?? "P1_ENTERPRISE");
       sql.exec(
-      "INSERT OR REPLACE INTO v25_mgmt_tenants (tenant_id, region, tier, max_slots, escrow_reserved, daily_budget_usd, spent_usd, model_policy, config_version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO v25_mgmt_tenants (tenant_id, region, tier, used_slots, max_slots, escrow_reserved, daily_budget_usd, spent_usd, model_policy, config_version, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       safeTenantId,
       region,
-      "P1_ENTERPRISE",
+      tier,
+      0,
       params.maxSlots,
       8,
       params.dailyBudgetUsd,
@@ -1415,7 +1461,26 @@ class PlatformManagementPlaneEngine {
       params.operation === "drain" || params.operation === "cordon" ?
       "CORDONED" :
       "READY";
-      sql.exec("UPDATE v25_mgmt_node_overrides SET status = ? WHERE node_id = ?", nextStatus, nodeId);
+      const nextBaseLeases = nextStatus === "CORDONED" ? 0 : 12;
+      sql.exec(
+      "UPDATE v25_mgmt_node_overrides SET status = ?, base_leases = ? WHERE node_id = ?",
+      nextStatus,
+      nextBaseLeases,
+      nodeId);
+
+      if (params.operation === "prewarm") {
+        this.deps.prewarmer.recordArrivalSampleAndPredict(18.0, 2.0);
+        const curNodeRow = sql.
+        exec("SELECT * FROM v25_mgmt_node_overrides WHERE node_id = ?", nodeId).
+        one();
+        const curPsi = Number(curNodeRow?.psi_pct ?? 5.0);
+        const nextPsi = Math.max(1.0, Number((curPsi - 1.5).toFixed(1)));
+        sql.exec(
+        "UPDATE v25_mgmt_node_overrides SET psi_pct = ? WHERE node_id = ?",
+        nextPsi,
+        nodeId);
+
+      }
 
       if (nodeId.startsWith("celld-brain-")) {
         const brainKey = nodeId.replace("celld-brain-", "brain-node-");
@@ -2051,7 +2116,7 @@ class PlatformManagementPlaneEngine {
     const activeCount = Array.from(this.deps.scheduler.allTasks.values()).filter(
     (t) => t.tenant_id === tenantId && t.state !== _models.TaskState.COMPLETED && t.state !== _models.TaskState.CANCELLED && String(t.state) !== "FENCED_TERMINATED").
     length;
-    const baseUsed = tenantId === "Northstar" ? 86 : tenantId === "Helios" ? 45 : 20;
+    const baseUsed = Number(row.used_slots ?? 0);
     const usedSlots =
     this.scenario === "quota" && tenantId === "Northstar" && maxSlots <= 120 ?
     maxSlots :
@@ -2526,6 +2591,12 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
 
 
 
+
+
+
+
+
+
   {
     this.ensureInitialized();
     if (params.role === "VIEWER") {
@@ -2535,6 +2606,32 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       };
     }
     const sql = this.deps.v25Store.sql;
+
+    if (params.action === "delete_blackboard_key") {
+      const key = String(params.key ?? "").trim();
+      if (!key) {
+        return {
+          status: 400,
+          body: { error: "MISSING_REQUIRED_PARAMETERS", message: "Required parameter: non-empty key" }
+        };
+      }
+      sql.exec("DELETE FROM v25_mgmt_a2a_blackboard WHERE bb_key = ?", key);
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `删除 A2A 共享黑板键 [${key}]`,
+      "Global / A2A-Blackboard",
+      "DELETED");
+
+      return {
+        status: 200,
+        body: {
+          deleted: true,
+          key,
+          a2aState: this.getA2aGovernanceSnapshot()
+        }
+      };
+    }
 
     if (params.action === "put_blackboard_cas") {
       const key = params.key ?? "arch/zero-trust-policy";
@@ -3127,6 +3224,32 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       };
     }
     const sql = this.deps.v25Store.sql;
+
+    if (params.action === "unregister_mcp_tool") {
+      const toolName = String(params.toolName ?? "").trim();
+      if (!toolName) {
+        return {
+          status: 400,
+          body: { error: "MISSING_REQUIRED_PARAMETERS", message: "Required parameter: non-empty toolName" }
+        };
+      }
+      sql.exec("DELETE FROM v25_mgmt_mcp_tools WHERE tool_name = ?", toolName);
+      this.appendAudit(
+      params.actor,
+      params.role,
+      `注销动态 MCP 工具 [${toolName}]`,
+      "Global / MCP-Registry",
+      "UNREGISTERED");
+
+      return {
+        status: 200,
+        body: {
+          unregistered: true,
+          toolName,
+          mcpState: this.getMcpGovernanceSnapshot()
+        }
+      };
+    }
 
     if (params.action === "register_mcp_tool") {
       const serverName = params.serverName ?? "mcp-k8s-fleet";
