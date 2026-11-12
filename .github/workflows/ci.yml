@@ -1,10 +1,13 @@
 name: ANSTS v2.2 TypeScript & celld HA CI Pipeline
 
 on:
+  # Push and pull_request filters are taken from the workflow file in the pushed
+  # commit or the PR merge commit. feat/celld-v25 must be listed or GitHub
+  # creates no run (this filter was dropped when 6b40635 kept the older ci.yml).
   push:
-    branches: ["main", "master", "release/**"]
+    branches: ["main", "master", "release/**", "feat/celld-v25"]
   pull_request:
-    branches: ["main", "master"]
+    branches: ["main", "master", "feat/celld-v25"]
   workflow_dispatch:
 
 jobs:

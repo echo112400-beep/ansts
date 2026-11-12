@@ -8,6 +8,8 @@ import * as path from "node:path";
 import * as Ansts from "../src/index.js";
 
 describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit", () => {
+  // Census was frozen at 89 in 10022739. 8e841b3 added src/cluster/celld_fleet_client.ts.
+  // This branch adds src/cloudflare/celld_worker_service.ts. The @fileoverview check is unchanged.
   it("1. Verifies all 91 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
     const walk = (dir: string): string[] => {
       let out: string[] = [];
