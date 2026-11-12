@@ -1569,7 +1569,150 @@ export class PlatformManagementPlaneEngine {
       profilerVisualization: this.buildProfilerAndStreamVisualization(),
       securityVisualization: this.buildSecurityAndReleaseVisualization(),
       dagVisualization: this.buildDagAndCognitiveSnapshot(),
+      finopsVisualization: this.buildFinOpsVisualization(),
       status: "HEALTHY",
+    };
+  }
+
+  public buildFinOpsVisualization(): Record<string, unknown> {
+    this.ensureInitialized();
+    const attrBody = this.executeDay2GovernanceOperation({
+      action: "finops_cost_attribution",
+      actor: "chen",
+      role: "SRE_ADMIN",
+    }).body as {
+      utcDayWindow: string;
+      attributions: Array<{
+        tenantId: string;
+        region: string;
+        dailyBudgetUsd: number;
+        totalSpentUsd: number;
+        llmInferenceCostUsd: number;
+        sandboxCpuMemCostUsd: number;
+        prefixCacheSavedUsd: number;
+        utilizationPct: number;
+        activeModel: string;
+        downgraded: boolean;
+        seenIdempotencyKeysCount: number;
+      }>;
+    };
+    const rows = attrBody.attributions ?? [];
+    const totalSpentUsd = Number(rows.reduce((acc, r) => acc + r.totalSpentUsd, 0).toFixed(2));
+    const totalBudgetUsd = Number(rows.reduce((acc, r) => acc + r.dailyBudgetUsd, 0).toFixed(2));
+    const totalPrefixSavedUsd = Number(rows.reduce((acc, r) => acc + r.prefixCacheSavedUsd, 0).toFixed(2));
+    return {
+      utcDayWindow: attrBody.utcDayWindow,
+      totalSpentUsd,
+      totalBudgetUsd,
+      totalPrefixSavedUsd,
+      attributions: rows.map((r) => ({
+        ...r,
+        hardBlocked: r.utilizationPct >= 100,
+      })),
+    };
+  }
+
+  public executeFinOpsAction(params: {
+    action: "simulate_spend_step" | "reset_tenant_spend";
+    tenantId: string;
+    amountUsd?: number;
+    actor: string;
+    role: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    if (params.role === "VIEWER") {
+      return {
+        status: 403,
+        body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行 FinOps 计费步进或重置预算" },
+      };
+    }
+    const tenantId = sanitizeHtmlString(String(params.tenantId ?? "Northstar").trim());
+    const sql = this.deps.v25Store.sql;
+    const row = sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_mgmt_tenants WHERE tenant_id = ?", tenantId)
+      .one();
+    if (!row) {
+      return { status: 404, body: { error: "TENANT_NOT_FOUND", tenantId } };
+    }
+
+    const dailyBudget = Number(row.daily_budget_usd ?? 1000);
+    const prevSpent = Number(row.spent_usd ?? 0);
+
+    if (params.action === "reset_tenant_spend") {
+      this.deps.finopsController.refundSpend(tenantId, prevSpent);
+      sql.exec(
+        "UPDATE v25_mgmt_tenants SET spent_usd = ?, model_policy = ? WHERE tenant_id = ?",
+        0,
+        "DeepSeek-R1 → Qwen-3.8 (80%)",
+        tenantId
+      );
+      this.appendAudit(
+        params.actor,
+        params.role,
+        `重置租户 [${tenantId}] FinOps 日累计账单 ($${prevSpent} → $0) 并恢复旗舰模型 DeepSeek-R1`,
+        `FinOps / ${tenantId}`,
+        "BUDGET_RESET ($0)"
+      );
+      return {
+        status: 200,
+        body: {
+          tenantId,
+          totalSpentUsd: 0,
+          activeModel: "DeepSeek-R1",
+          finopsVisualization: this.buildFinOpsVisualization(),
+        },
+      };
+    }
+
+    // action === "simulate_spend_step"
+    if (prevSpent >= dailyBudget) {
+      return {
+        status: 402,
+        body: {
+          error: "PAYMENT_REQUIRED_BUDGET_EXHAUSTED",
+          tenantId,
+          totalSpentUsd: prevSpent,
+          dailyBudgetUsd: dailyBudget,
+          message: `租户 ${tenantId} 日预算已耗尽 ($${prevSpent}/$${dailyBudget})，触发 HTTP 402 硬门控拦截`,
+        },
+      };
+    }
+
+    const stepUsd = Number(params.amountUsd ?? 200);
+    const nextSpent = Number(Math.min(dailyBudget, prevSpent + stepUsd).toFixed(2));
+    this.deps.finopsController.recordSpend(tenantId, stepUsd);
+    const evalRes = this.deps.finopsController.evaluateBudgetAndModel(tenantId);
+    const nextPolicy =
+      nextSpent >= dailyBudget
+        ? "BLOCKED_402 (100%)"
+        : evalRes.downgraded
+        ? "Qwen-3.8 (Soft-Downgraded)"
+        : "DeepSeek-R1 → Qwen-3.8 (80%)";
+
+    sql.exec(
+      "UPDATE v25_mgmt_tenants SET spent_usd = ?, model_policy = ? WHERE tenant_id = ?",
+      nextSpent,
+      nextPolicy,
+      tenantId
+    );
+    this.appendAudit(
+      params.actor,
+      params.role,
+      `FinOps 实时计费步进 [${tenantId}] +$${stepUsd} → $${nextSpent}/$${dailyBudget} (路由模型=${evalRes.selectedModel}, 降级=${evalRes.downgraded})`,
+      `FinOps / ${tenantId}`,
+      nextSpent >= dailyBudget ? "HARD_GATE_402" : evalRes.downgraded ? "SOFT_DOWNGRADED" : "OK"
+    );
+    return {
+      status: 200,
+      body: {
+        tenantId,
+        totalSpentUsd: nextSpent,
+        dailyBudgetUsd: dailyBudget,
+        selectedModel: evalRes.selectedModel,
+        downgraded: evalRes.downgraded,
+        hardBlocked: nextSpent >= dailyBudget,
+        finopsVisualization: this.buildFinOpsVisualization(),
+      },
     };
   }
 

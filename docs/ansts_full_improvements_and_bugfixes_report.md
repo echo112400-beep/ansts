@@ -758,3 +758,15 @@
    - 在任务运行队列新增多选复选框 (`task-batch-check`) 与一键“批量安全停止选中任务” (`dag-batch-cancel-tasks`) 交互，支持批量下发优雅停止指令并持久化审计记录。
 3. **端到端回归验证 (`tests/m86_console_dag_topology_and_batch_task_governance.test.ts`)**：
    - 全量 **89 个 `src/` 源码模块**、**79 个测试套件（共 213 项测试）100% 通过**。
+
+
+---
+
+## 37. M87: 实时 FinOps 多维成本归因、Prefix-Cache 节省计量与模型软降级 / 402 硬门控模拟器 (`GET /v1beta1/console/finops`, `POST /v1beta1/management/finops/action`, `anstsctl mgmt-finops`)
+
+1. **FinOps 多维成本归因与 Prefix-Cache 节省实时明细 (`buildFinOpsVisualization` & `GET /v1beta1/console/finops`)**：
+   - 将多维成本归因（LLM 推理费用 vs 沙箱核时费用、Prefix-Cache 节省金额、日预算利用率百分比及当前路由模型）直接嵌入控制台 **`tenants` (`租户配额与 FinOps 治理`)** 页面。
+2. **80% 模型软降级与 100% HTTP 402 硬门控模拟器 (`executeFinOpsAction` & `POST /v1beta1/management/finops/action`)**：
+   - 支持在控制台对任意租户执行 `+$200 计费模拟` (`simulate_spend_step`)，实时触发 `80%` 预算软降级（`DeepSeek-R1 → Qwen-3.8`）及 `100%` 预算耗尽时的 `HTTP 402 PAYMENT_REQUIRED_BUDGET_EXHAUSTED` 硬门控拦截，并支持一键重置日账单至 `$0` (`reset_tenant_spend`)。
+3. **端到端回归验证 (`tests/m87_console_finops_attribution_and_budget_simulator.test.ts`)**：
+   - 全量 **89 个 `src/` 源码模块**、**80 个测试套件（共 214 项测试）100% 通过**。

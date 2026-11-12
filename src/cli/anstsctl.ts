@@ -694,6 +694,28 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-finops") {
+    const action = (rest[0] ?? "inspect").trim();
+    if (action === "inspect") {
+      const resp = await fetch(`${baseUrl}/v1beta1/console/finops`);
+      const data = await resp.json();
+      return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+    }
+    const resp = await fetch(`${baseUrl}/v1beta1/management/finops/action`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action,
+        tenantId: rest[1] ? rest[1].trim() : "Northstar",
+        amountUsd: rest[2] ? Number(rest[2]) : 200,
+        actor: "chen",
+        role: "SRE_ADMIN",
+      }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-dag") {
     const action = (rest[0] ?? "inspect").trim();
     if (action === "inspect") {

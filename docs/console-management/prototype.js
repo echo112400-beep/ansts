@@ -154,6 +154,7 @@
       profilerVisualization: null,
       securityVisualization: null,
       dagVisualization: null,
+      finopsVisualization: null,
       autoRefreshPaused: false,
       darkTheme: false,
       lastBffRttMs: 0,
@@ -282,6 +283,7 @@
       if (d.profilerVisualization) state.profilerVisualization = d.profilerVisualization;
       if (d.securityVisualization) state.securityVisualization = d.securityVisualization;
       if (d.dagVisualization) state.dagVisualization = d.dagVisualization;
+      if (d.finopsVisualization) state.finopsVisualization = d.finopsVisualization;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -1026,6 +1028,51 @@
                         <button type="button" class="small" data-action="tenant-finops-step" data-tenant="${esc(t.id)}" ${!perm.ok ? 'disabled' : ''} title="累加计费流水测试 80% 软降级与 100% 熔断">+计费步进</button>
                         <button type="button" class="small" data-action="tenant-escrow-step" data-tenant="${esc(t.id)}" ${!perm.ok ? 'disabled' : ''} title="增加 DAG 子任务并发担保槽位">+DAG预留</button>
                         <button type="button" class="small danger" data-action="delete-tenant" data-tenant="${esc(t.id)}" ${!canMutateTarget('all', 'all', true).ok ? 'disabled' : ''} title="删除无活跃任务的租户配额策略">删除</button>
+                      </div>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">FinOps 多维成本归因、Prefix-Cache 节省计量与 80%/100% 预算门控模拟器 (GET /v1beta1/console/finops · POST /v1beta1/management/finops/action)</h2>
+            <p class="panel-subtitle">实时拆解各租户 LLM 推理费用 vs 沙箱核时费用与 Prefix-Cache 节省金额 (UTC 窗口: <code class="mono">${esc(state.finopsVisualization?.utcDayWindow || 'UTC')}</code> · 累计节省: <strong class="mono">$${state.finopsVisualization?.totalPrefixSavedUsd ?? 0}</strong>)。</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>租户</th>
+                <th>LLM 推理费用</th>
+                <th>沙箱核时费用</th>
+                <th>Prefix-Cache 节省</th>
+                <th>日消耗 / 预算利用率</th>
+                <th>当前路由模型</th>
+                <th>预算模拟器操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${(state.finopsVisualization?.attributions || []).map((a) => {
+                const perm = canMutateTarget(a.region, a.tenantId, false);
+                return `
+                  <tr>
+                    <td><strong>${esc(a.tenantId)}</strong> <span class="muted">(${esc(a.region)})</span></td>
+                    <td class="mono">$${a.llmInferenceCostUsd}</td>
+                    <td class="mono">$${a.sandboxCpuMemCostUsd}</td>
+                    <td class="mono"><span class="status-pill ok">-$${a.prefixCacheSavedUsd}</span></td>
+                    <td class="mono"><span class="status-pill ${a.utilizationPct >= 100 ? 'danger' : a.utilizationPct >= 80 ? 'warn' : 'ok'}">$${a.totalSpentUsd} / $${a.dailyBudgetUsd} (${a.utilizationPct}%)</span></td>
+                    <td class="mono">${esc(a.activeModel)} ${a.downgraded ? '<span class="status-pill warn">DOWNGRADED</span>' : ''}</td>
+                    <td>
+                      <div class="btn-row">
+                        <button type="button" class="small warn" data-action="finops-simulate-spend" data-tenant="${esc(a.tenantId)}" ${!perm.ok ? 'disabled' : ''}>+$200 计费模拟</button>
+                        <button type="button" class="small" data-action="finops-reset-spend" data-tenant="${esc(a.tenantId)}" ${!perm.ok ? 'disabled' : ''}>重置日账单 ($0)</button>
                       </div>
                     </td>
                   </tr>
@@ -4178,6 +4225,29 @@
       const btn = document.getElementById("auto-refresh-btn");
       if (btn) btn.textContent = state.autoRefreshPaused ? "⏸ 轮询已暂停" : "⟳ 自动轮询: 5s";
       showToast(state.autoRefreshPaused ? "已暂停 5s 自动轮询（SSE 实时推送仍保持连接）" : "已恢复 5s 后台状态同步");
+      return;
+    }
+    if (action === "finops-simulate-spend" || action === "finops-reset-spend") {
+      const tenantId = target.getAttribute("data-tenant") || "Northstar";
+      const p = getPrincipal();
+      const op = action === "finops-reset-spend" ? "reset_tenant_spend" : "simulate_spend_step";
+      const res = await callBackendApi("POST", "/v1beta1/management/finops/action", {
+        action: op,
+        tenantId,
+        amountUsd: 200,
+        actor: p.id,
+        role: p.role
+      });
+      if (!res.ok) {
+        showToast(res.data?.message || `FinOps 操作被拦截 (HTTP ${res.status})`);
+        return;
+      }
+      await fetchBackendState();
+      if (op === "reset_tenant_spend") {
+        showToast(`已重置 ${tenantId} 日累计账单为 $0 并恢复 DeepSeek-R1`);
+      } else {
+        showToast(`${tenantId} 账单更新至 $${res.data.totalSpentUsd} (模型=${res.data.selectedModel}${res.data.hardBlocked ? " · 触发 402 硬门控" : ""})`);
+      }
       return;
     }
     if (action === "dag-batch-cancel-tasks") {

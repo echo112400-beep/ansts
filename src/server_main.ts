@@ -2472,6 +2472,37 @@ export class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M87] TanStack Console BFF: FinOps Multi-Dimensional Cost Attribution & Budget Gate (`GET /v1beta1/console/finops`)
+    if (method === "GET" && pathname === "/v1beta1/console/finops") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(this.managementPlane.buildFinOpsVisualization()));
+      return;
+    }
+
+    // [M87] Interactive FinOps Spend Simulation & Budget Reset (`POST /v1beta1/management/finops/action`)
+    if (method === "POST" && pathname === "/v1beta1/management/finops/action") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      const out = this.managementPlane.executeFinOpsAction({
+        action: (body.action ?? "simulate_spend_step") as "simulate_spend_step" | "reset_tenant_spend",
+        tenantId: String(body.tenantId ?? "Northstar"),
+        amountUsd: body.amountUsd !== undefined ? Number(body.amountUsd) : undefined,
+        actor: auth.actor,
+        role: auth.role,
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M86] Interactive DAG Sub-Agent Lifecycle & Batch Task Action (`POST /v1beta1/management/tasks/dag-action`)
     if (method === "POST" && pathname === "/v1beta1/management/tasks/dag-action") {
       const body = await this.readJsonBody(req);
