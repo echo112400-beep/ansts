@@ -1,3 +1,5 @@
+> 状态校正（2026-11-13，代码基线 8eef81e）：本文保留为历史设计与目标方案，不作为当前部署或生产验证结论。当前实现、启动方式、恢复语义与已知限制以 [当前架构](current-architecture.md) 为准。下文旧版本的 APPROVED / PRODUCTION、测试数量、容量与延迟声明未在本次重新验证。
+
 # 基于 `celld.dev/docs` 构建持久化可恢复、高可靠与高可用调度系统架构规范 (ANSTS v2.2 HA Edition)
 
 - **文档版本**：v2.2 (`celld` Durable & Recoverable HA Edition)
