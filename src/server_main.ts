@@ -8,6 +8,7 @@
 import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { BodyExecutionJournal } from "./runtime/body_execution_journal.js";
 import { CoreScheduler5D } from "./scheduler.js";
 import { NodeDaemon } from "./node_daemon.js";
 import { TaskSpecValidator, TaskSpecValidationError } from "./gateway/validator.js";
@@ -1381,6 +1382,13 @@ export class AnstsLocalAndComposeServer {
     if (method === "POST" && pathname === "/internal/v1beta1/body/execute") {
       const body = await this.readJsonBody(req);
       const taskId = String(body.taskId ?? `task-${Date.now()}`);
+      const journal = body.fencingToken ? new BodyExecutionJournal(path.join(this.storageDir, "execution-journal")) : null;
+      const admission = journal?.admit(taskId);
+      if (admission && !admission.admitted) {
+        res.writeHead(admission.result ? 200 : 409, { "content-type": "application/json" });
+        res.end(JSON.stringify(admission.result ?? { error: "EXECUTION_OUTCOME_UNCERTAIN", taskId }));
+        return;
+      }
       const branchName = String(body.branchName ?? `task-${taskId}`);
       if (this.s3Endpoint) {
         await this.layerfs.pullBranchFromRemoteS3(branchName, this.s3Endpoint);
@@ -1401,6 +1409,7 @@ export class AnstsLocalAndComposeServer {
         s3Synced = await this.layerfs.pushBranchToRemoteS3(branchName, this.s3Endpoint);
       }
       this.metrics.incCounter("ansts_body_executions_total", 1);
+      journal?.complete(taskId, { executedByBodyId: this.nodeId, taskId, branchName, commitId: execResult.commitId, status: "COMPLETED", s3Synced });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({

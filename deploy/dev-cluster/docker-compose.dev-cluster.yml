@@ -211,6 +211,7 @@ services:
       <<: *ansts-common-env
       ANSTS_NODE_ID: "body-host-01"
       ANSTS_NODE_ROLE: "body"
+      ANSTS_BODY_CELL_URL: "http://celld-brain-01:8081"
       ANSTS_LISTEN_PORT: "9501"
       ANSTS_STORAGE_DIR: "/var/lib/ansts/body-host-01"
       ANSTS_PRIMARY_GATEWAY_URL: "http://ansts-gateway-01:8080"
@@ -237,6 +238,7 @@ services:
       <<: *ansts-common-env
       ANSTS_NODE_ID: "body-host-02"
       ANSTS_NODE_ROLE: "body"
+      ANSTS_BODY_CELL_URL: "http://celld-brain-01:8081"
       ANSTS_LISTEN_PORT: "9502"
       ANSTS_STORAGE_DIR: "/var/lib/ansts/body-host-02"
       ANSTS_PRIMARY_GATEWAY_URL: "http://ansts-gateway-02:8080"
@@ -250,9 +252,10 @@ services:
       - ansts_mesh_net
 
   ansts-gateway-01:
-    build:
-      context: ../..
-      dockerfile: Dockerfile.dev
+    image: ghcr.io/denoland/celld:0.6.3
+    entrypoint: ["/usr/bin/bash", "/app/deploy/dev-cluster/start-celld-gateway.sh"]
+    volumes:
+      - ../..:/app:ro
     container_name: ansts-gateway-01
     depends_on:
       celld-deploy:
@@ -267,10 +270,12 @@ services:
       <<: [*ansts-common-env, *ansts-gateway-routing-env]
       ANSTS_NODE_ID: "celld-gw-01"
       ANSTS_NODE_ROLE: "gateway"
+      ANSTS_SCHEDULER_URL: "http://celld-brain-01:8081"
+      CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
       ANSTS_LISTEN_PORT: "8080"
       ANSTS_STORAGE_DIR: "/tmp/ansts/celld-gw-01"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "/usr/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -278,9 +283,10 @@ services:
       - ansts_mesh_net
 
   ansts-gateway-02:
-    build:
-      context: ../..
-      dockerfile: Dockerfile.dev
+    image: ghcr.io/denoland/celld:0.6.3
+    entrypoint: ["/usr/bin/bash", "/app/deploy/dev-cluster/start-celld-gateway.sh"]
+    volumes:
+      - ../..:/app:ro
     container_name: ansts-gateway-02
     depends_on:
       celld-deploy:
@@ -295,10 +301,12 @@ services:
       <<: [*ansts-common-env, *ansts-gateway-routing-env]
       ANSTS_NODE_ID: "celld-gw-02"
       ANSTS_NODE_ROLE: "gateway"
+      ANSTS_SCHEDULER_URL: "http://celld-brain-01:8081"
+      CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
       ANSTS_LISTEN_PORT: "8080"
       ANSTS_STORAGE_DIR: "/tmp/ansts/celld-gw-02"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "/usr/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
       interval: 5s
       timeout: 3s
       retries: 5

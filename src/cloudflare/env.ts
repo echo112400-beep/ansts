@@ -121,6 +121,7 @@ export interface DynamicWorkerLoaderBindingLike {
 }
 
 export interface CloudflareCelldEnv {
+  ANSTS_BODY_CELL?: DurableObjectNamespaceLike;
   ANSTS_SCHEDULER_CELL: DurableObjectNamespaceLike;
   ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;
   ANSTS_HARNESS_CELL: DurableObjectNamespaceLike;

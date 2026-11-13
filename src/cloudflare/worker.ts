@@ -67,6 +67,7 @@ async function dispatchBrainSchedule(request: Request, env: CloudflareCelldEnv):
   );
 }
 
+export { AnstsBodyCell } from "./body_cell.js";
 export default {
   async fetch(request: Request, env: CloudflareCelldEnv): Promise<Response> {
     const url = new URL(request.url);
@@ -112,6 +113,10 @@ export default {
         });
       }
       return new Response(JSON.stringify(found), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.pathname.startsWith("/v1/body/") && env.ANSTS_BODY_CELL) {
+      const id = env.ANSTS_BODY_CELL.idFromName(url.searchParams.get("hostId") ?? "body-host-01");
+      return env.ANSTS_BODY_CELL.get(id).fetch(request);
     }
     if (url.pathname.startsWith("/v1/scheduler")) {
       const shardName = url.searchParams.get("shard") ?? "global-shard-0";

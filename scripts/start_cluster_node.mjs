@@ -39,3 +39,7 @@ const shutdown = () => {
 };
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
+
+if (process.env.ANSTS_BODY_CELL_URL && process.env.ANSTS_NODE_ROLE === "body") {
+  await import("./body_cell_agent.mjs");
+}
