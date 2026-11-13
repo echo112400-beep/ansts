@@ -4,6 +4,7 @@
  * and dispatches queued task messages in `queue(batch, env)` to `ANSTS_SCHEDULER_CELL` with retry-on-failure semantics.
  */
 import { CloudflareCelldEnv, QueueBatchLike } from "./env.js";
+import { authenticateBody } from "./body_auth.js";
 export { AnstsSchedulerCell } from "./scheduler_cell.js";
 export { AgentTaskHarnessCell } from "./harness_cell.js";
 export { TunnelGatewayCell } from "./tunnel_gateway_cell.js";
@@ -115,7 +116,18 @@ export default {
       return new Response(JSON.stringify(found), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (url.pathname.startsWith("/v1/body/") && env.ANSTS_BODY_CELL) {
+      const host = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
+      if (!host) return Response.json({ error: "BODY_AUTH_REQUIRED" }, { status: 401 });
       const taskId = url.searchParams.get("taskId");
+      if (url.searchParams.has("hostId") && url.searchParams.get("hostId") !== host) return Response.json({ error: "BODY_SCOPE_FORBIDDEN" }, { status: 403 });
+      if (request.method === "POST") {
+        try {
+          const raw = await request.clone().text();
+          if (raw.length > 65536) return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
+          const body = JSON.parse(raw);
+          if (body.node_id !== host || (taskId && body.task_id !== taskId)) return Response.json({ error: "BODY_SCOPE_FORBIDDEN" }, { status: 403 });
+        } catch { return Response.json({ error: "INVALID_JSON" }, { status: 400 }); }
+      }
       const id = env.ANSTS_BODY_CELL.idFromName(taskId ? `execution:${taskId}` : url.searchParams.get("hostId") ?? "body-host-01");
       return env.ANSTS_BODY_CELL.get(id).fetch(request);
     }

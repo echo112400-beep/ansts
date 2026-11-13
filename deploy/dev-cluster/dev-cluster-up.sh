@@ -12,6 +12,7 @@ elif [ ! -f "deploy/dev-cluster/docker-compose.dev-cluster.yml" ] && [ -n "${BAS
 fi
 
 COMPOSE_FILE="deploy/dev-cluster/docker-compose.dev-cluster.yml"
+python3 scripts/prepare_body_dev_credentials.py
 export RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfsadmin}"
 export RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
 

@@ -48,6 +48,15 @@ fi
 PROJECT="${CELLD_PROJECT_DIR:-$(mktemp -d)/ansts-celld-brain}"
 mkdir -p "$PROJECT"
 cp "$CONFIG" "$PROJECT/wrangler.json"
+if [[ -n "${ANSTS_BODY_AUTH_SECRET_FILE:-}" ]]; then
+  BODY_KEY="$(cat "$ANSTS_BODY_AUTH_SECRET_FILE")"
+  if [[ ! "$BODY_KEY" =~ ^[a-f0-9]{64}$ ]]; then
+    echo "[celld-deploy] invalid Body signing key" >&2
+    exit 1
+  fi
+  sed -i "s/\"ANSTS_BODY_AUTH_SECRET\": \"\"/\"ANSTS_BODY_AUTH_SECRET\": \"$BODY_KEY\"/" "$PROJECT/wrangler.json"
+  unset BODY_KEY
+fi
 cp -R "$ROOT/src" "$PROJECT/src"
 if [[ -d "$ROOT/migrations" ]]; then
   cp -R "$ROOT/migrations" "$PROJECT/migrations"

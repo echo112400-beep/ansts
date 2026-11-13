@@ -30,7 +30,7 @@
 - 本地执行日志存在但没有完成结果时返回 `EXECUTION_OUTCOME_UNCERTAIN`。共享准入没有完成结果时禁止跨宿主机自动重跑；当前没有人工核对/解除准入的管理 API。
 - HTTP 请求取消或租约续租失败不能撤销已经发生的宿主机副作用。外部工具需要自己的幂等键与 fence 校验；不承诺严格 exactly-once。
 - 续租覆盖执行 HTTP 请求等待期，结果回传失败依靠后续轮询重试。原生同步操作不能由该机制强制终止。
-- Body 内部接口依赖受信开发网络，当前不是带身份认证的生产执行协议。
+- Body Cell 路由和本地执行入口已接入开发用宿主机凭据。Scheduler 服务写接口、完整租户授权和凭据轮换仍待接入；当前不是生产执行协议。
 - Body 默认固定访问 `celld-brain-01:8081`；celld 对象可以跨节点路由，但客户端入口故障自动切换尚未实现。
 - Gateway Worker 只实现代码中显式路由的任务、健康、Gateway 状态和租约管理接口。旧 Node host 中的控制台、隧道等接口不能据此视为已经迁入 Gateway Worker。
 - 根目录 `docker-compose.yml` 仍使用 Node host 入口；开发集群必须显式选择 `deploy/dev-cluster/docker-compose.dev-cluster.yml`。
@@ -52,3 +52,5 @@ Gateway 源码更新后需重建其容器以重新暂存 Worker；Brain 源码�
 入口：控制台 `8088`；Gateway `18080/18081`；Brain `18082–18084`；Body `19501/19502`；RustFS `9000/9001`；Prometheus `9090`；Grafana `3000`。
 
 已有验证记录：TypeScript 构建通过；Body Cell/执行日志/Gateway 相关 6 项测试通过；实际提交任务达到 `COMPLETED`，Gateway 查询租约为 `RELEASED`。这些记录不等同于全套测试、长任务故障注入、生产容量或安全验证。
+
+第一阶段已开始实施，新增执行尝试状态、版本与不可变结果；旧记录缺少身份和输入证据时转为待核对。最新验证与剩余范围见 [推进记录](phase-one-progress.md)。

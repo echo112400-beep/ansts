@@ -189,9 +189,11 @@ services:
         condition: service_started
     volumes:
       - ../..:/app:ro
+      - ../../.dev-secrets/body-signing.key:/run/secrets/body-signing.key:ro
     environment:
       <<: *ansts-common-env
       CELLD_CONFIG: "/app/deploy/celld/wrangler.celld.json"
+      ANSTS_BODY_AUTH_SECRET_FILE: "/run/secrets/body-signing.key"
       CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
     restart: "no"
     networks:
@@ -207,10 +209,12 @@ services:
       - "19501:9501"
     volumes:
       - body_01_data:/var/lib/ansts/body-host-01
+      - ../../.dev-secrets/body-host-01.token:/run/secrets/body.token:ro
       - ../../scripts/body_cell_agent.mjs:/app/scripts/body_cell_agent.mjs:ro
     environment:
       <<: *ansts-common-env
       ANSTS_NODE_ID: "body-host-01"
+      ANSTS_BODY_TOKEN_FILE: "/run/secrets/body.token"
       ANSTS_NODE_ROLE: "body"
       ANSTS_BODY_CELL_URL: "http://celld-brain-01:8081"
       ANSTS_LISTEN_PORT: "9501"
@@ -235,10 +239,12 @@ services:
       - "19502:9502"
     volumes:
       - body_02_data:/var/lib/ansts/body-host-02
+      - ../../.dev-secrets/body-host-02.token:/run/secrets/body.token:ro
       - ../../scripts/body_cell_agent.mjs:/app/scripts/body_cell_agent.mjs:ro
     environment:
       <<: *ansts-common-env
       ANSTS_NODE_ID: "body-host-02"
+      ANSTS_BODY_TOKEN_FILE: "/run/secrets/body.token"
       ANSTS_NODE_ROLE: "body"
       ANSTS_BODY_CELL_URL: "http://celld-brain-01:8081"
       ANSTS_LISTEN_PORT: "9502"

@@ -9,6 +9,8 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { BodyExecutionJournal } from "./runtime/body_execution_journal.js";
+import { equalBodyToken } from "./cloudflare/body_auth.js";
+import { executionDigest } from "./cloudflare/execution_attempt.js";
 import { CoreScheduler5D } from "./scheduler.js";
 import { NodeDaemon } from "./node_daemon.js";
 import { TaskSpecValidator, TaskSpecValidationError } from "./gateway/validator.js";
@@ -1384,6 +1386,23 @@ export class AnstsLocalAndComposeServer {
       const taskId = String(body.taskId ?? `task-${Date.now()}`);
       const journal = body.fencingToken ? new BodyExecutionJournal(path.join(this.storageDir, "execution-journal")) : null;
       if (process.env.ANSTS_BODY_CELL_URL) {
+        const tokenFile = process.env.ANSTS_BODY_TOKEN_FILE;
+        const token = tokenFile ? fs.readFileSync(tokenFile, "utf8").trim() : "";
+        if (!token || !equalBodyToken(String(req.headers.authorization ?? ""), `Body ${token}`) || req.headers["x-ansts-body-id"] !== this.nodeId) {
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "BODY_AUTH_REQUIRED" }));
+          return;
+        }
+        const control = await fetch(`${process.env.ANSTS_BODY_CELL_URL}/v1/body/state?taskId=${encodeURIComponent(taskId)}`, {
+          headers: { authorization: `Body ${token}`, "x-ansts-body-id": this.nodeId }, signal: AbortSignal.timeout(10000),
+        });
+        const attempt = control.ok ? (await control.json() as { execution?: Record<string, unknown> }).execution : null;
+        const inputDigest = executionDigest({ tenant_id: body.tenantId, task_id: taskId, prompt: body.promptText });
+        if (!attempt || attempt.phase !== "RUNNING" || attempt.node_id !== this.nodeId || attempt.fencing_token !== body.fencingToken || attempt.attempt_id !== body.attemptId || attempt.input_digest !== inputDigest) {
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "EXECUTION_ADMISSION_REQUIRED" }));
+          return;
+        }
         const leaseResponse = await fetch(`${process.env.ANSTS_BODY_CELL_URL}/v1/scheduler/lease-renew`, {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ task_id: taskId, node_id: this.nodeId, fencing_token: body.fencingToken }),
