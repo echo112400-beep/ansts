@@ -122,8 +122,11 @@ export interface DynamicWorkerLoaderBindingLike {
 
 export interface CloudflareCelldEnv {
   ANSTS_SCHEDULER_CELL: DurableObjectNamespaceLike;
+  ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;
   ANSTS_HARNESS_CELL: DurableObjectNamespaceLike;
   ANSTS_TUNNEL_CELL?: DurableObjectNamespaceLike;
+  /** Operator write secret. Empty or unset fail-closes gateway lease release. Never a default. */
+  ANSTS_CONSOLE_RBAC_SECRET?: string;
   ANSTS_IDEMPOTENCY_KV: KvNamespaceLike;
   ANSTS_CHECKPOINT_BUCKET: R2BucketLike;
   ANSTS_TASK_DISPATCH_QUEUE: QueueProducerLike;

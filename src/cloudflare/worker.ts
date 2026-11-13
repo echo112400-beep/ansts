@@ -70,12 +70,18 @@ async function dispatchBrainSchedule(request: Request, env: CloudflareCelldEnv):
 export default {
   async fetch(request: Request, env: CloudflareCelldEnv): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/healthz") {
+    if (
+      request.method === "GET" &&
+      (url.pathname === "/health" || url.pathname === "/healthz" || url.pathname === "/readyz")
+    ) {
       return new Response(
         JSON.stringify({
           status: "ok",
+          healthy: true,
           runtime: "denoland/celld-cloudflare-workers",
           region: env.CELLD_REGION ?? "local",
+          controlPlane: "celld-scheduler",
+          planes: { scheduler: "durable-object" },
         }),
         { status: 200, headers: { "content-type": "application/json" } }
       );
