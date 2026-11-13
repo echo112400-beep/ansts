@@ -17,7 +17,8 @@
     "dev:cluster:up": "cat deploy/dev-cluster/dev-cluster-up.sh | bash",
     "dev:cluster:down": "cat deploy/dev-cluster/dev-cluster-down.sh | bash",
     "start:local": "cat scripts/run-local.sh | bash",
-    "start:celld-worker": "bash scripts/celld_worker_up.sh"
+    "start:celld-scheduler": "bash scripts/celld_scheduler_up.sh",
+    "start:celld-gateway": "bash scripts/celld_gateway_up.sh"
   },
   "engines": {
     "node": ">=18.0.0"

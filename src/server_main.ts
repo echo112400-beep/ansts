@@ -221,7 +221,8 @@ export class AnstsLocalAndComposeServer {
       (process.env.ANSTS_CELLD_FLEET_URLS || process.env.ANSTS_CELLD_INTERNAL_URLS
         ? CelldFleetClient.fromEnv(process.env)
         : null);
-    const configuredWorkerUrl = options.celldWorkerUrl ?? process.env.ANSTS_CELLD_WORKER_URL ?? "";
+    const configuredWorkerUrl =
+      options.celldWorkerUrl ?? process.env.ANSTS_GATEWAY_URL ?? process.env.ANSTS_CELLD_WORKER_URL ?? "";
     this.celldWorkerUrl = configuredWorkerUrl.trim().replace(/\/+$/, "") || null;
 
     this.tickIntervalMs = options.tickIntervalMs ?? Number(process.env.ANSTS_TICK_INTERVAL_MS ?? 1000);
@@ -464,7 +465,7 @@ export class AnstsLocalAndComposeServer {
         const addr = this.apiServer!.address();
         const bound = typeof addr === "object" && addr ? addr.port : targetApiPort;
         console.log(
-          `[ANSTS] host process role=${this.nodeRole} api=:${bound}. Primary control plane is the celld worker (npm run start:celld-worker). Body execution, LayerFS, and the dashboard stay in this process.`
+          `[ANSTS] host process role=${this.nodeRole} api=:${bound}. Gateway and scheduler are separate celld workers (npm run start:celld-gateway, npm run start:celld-scheduler). Body execution, LayerFS, and the dashboard stay in this process.`
         );
         if (this.celldWorkerUrl) {
           console.log(`[ANSTS] proxying control-plane routes to ${this.celldWorkerUrl}`);

@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# Start the unified ANSTS control plane as a worker loaded by denoland/celld.
-#
-# The celld process bundles and runs src/cloudflare/worker.ts. Gateway dispatch, lease, and
-# session rows live in AnstsGatewayCell. Scheduler rows live in AnstsSchedulerCell. Both are
-# SQLite Durable Objects under the staged project's .celld/dev directory.
-# Body execution, LayerFS, and the dashboard stay in the Node host process.
-#
-#   bash scripts/celld_worker_up.sh
+# Shared launcher for one celld worker. Callers set CELLD_ROLE.
+# Prefer scripts/celld_scheduler_up.sh and scripts/celld_gateway_up.sh.
 #
 # Environment:
+#   CELLD_ROLE         scheduler or gateway (required)
 #   CELLD_BIN          celld executable (default: `celld` on PATH). Verified with 0.6.3.
 #   CELLD_ESBUILD      esbuild executable (default: the platform binary in node_modules)
 #   CELLD_HOST         Worker listener host (default: 127.0.0.1)
-#   CELLD_PORT         Worker listener port (default: 9876)
-#   CELLD_PROJECT_DIR  Staged project directory (default: .celld/worker-service)
+#   CELLD_PORT         Worker listener port (scheduler default 9876, gateway default 9877)
+#   CELLD_PROJECT_DIR  Staged project directory
+#   ANSTS_SCHEDULER_URL  Gateway only. Base URL of the scheduler worker.
 #   CELLD_CLEAN=1      Delete that project's .celld/dev before start
 #   CELLD_LOGS=0       Hide celld node logs
 set -euo pipefail
+
+if [[ "${CELLD_ROLE:-}" != "scheduler" && "${CELLD_ROLE:-}" != "gateway" ]]; then
+  echo "[celld-worker] ERROR: set CELLD_ROLE=scheduler or CELLD_ROLE=gateway, or run scripts/celld_scheduler_up.sh / scripts/celld_gateway_up.sh" >&2
+  exit 2
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"

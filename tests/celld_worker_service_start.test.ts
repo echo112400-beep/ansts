@@ -27,7 +27,7 @@ describe("celld-loaded worker service start", () => {
     fs.mkdirSync(markerDir, { recursive: true });
     fs.writeFileSync(path.join(markerDir, "keep.txt"), "durable-state");
 
-    const staged = prepareCelldWorkerProject({ rootDir: ROOT, projectDir });
+    const staged = prepareCelldWorkerProject({ rootDir: ROOT, projectDir, role: "scheduler" });
     assert.equal(staged.projectDir, projectDir);
     assert.equal(fs.readFileSync(path.join(markerDir, "keep.txt"), "utf8"), "durable-state");
 
@@ -41,23 +41,27 @@ describe("celld-loaded worker service start", () => {
         ["ANSTS_SCHEDULER_CELL", "AnstsSchedulerCell"],
         ["ANSTS_HARNESS_CELL", "AgentTaskHarnessCell"],
         ["ANSTS_TUNNEL_CELL", "TunnelGatewayCell"],
-        ["ANSTS_GATEWAY_CELL", "AnstsGatewayCell"],
       ]
     );
-    const sqliteClasses = (config.migrations as Array<{ new_sqlite_classes?: string[] }>).flatMap(
-      (migration) => migration.new_sqlite_classes ?? []
-    );
-    assert.deepEqual(sqliteClasses, [
-      "AnstsSchedulerCell",
-      "AgentTaskHarnessCell",
-      "TunnelGatewayCell",
-      "AnstsGatewayCell",
-    ]);
+    assert.equal(bindings.some((binding) => binding.class_name === "AnstsGatewayCell"), false);
 
-    const stagedWorker = fs.readFileSync(path.join(projectDir, "src/cloudflare/worker.ts"));
-    const sourceWorker = fs.readFileSync(path.join(ROOT, "src/cloudflare/worker.ts"));
-    assert.deepEqual(stagedWorker, sourceWorker);
-    assert.ok(fs.existsSync(path.join(projectDir, "migrations")));
+    const gatewayDir = fs.mkdtempSync(path.join(os.tmpdir(), "ansts-celld-gateway-stage-"));
+    const gateway = prepareCelldWorkerProject({
+      rootDir: ROOT,
+      projectDir: gatewayDir,
+      role: "gateway",
+      schedulerUrl: "http://127.0.0.1:9876",
+    });
+    const gatewayConfig = readJson(gateway.wranglerPath);
+    assert.equal(gatewayConfig.main, "src/cloudflare/gateway_worker.ts");
+    assert.equal(gatewayConfig.name, "ansts-celld-gateway");
+    const gatewayBindings = (gatewayConfig.durable_objects as { bindings: Array<{ name: string; class_name: string }> }).bindings;
+    assert.deepEqual(
+      gatewayBindings.map((binding) => [binding.name, binding.class_name]),
+      [["ANSTS_GATEWAY_CELL", "AnstsGatewayCell"]]
+    );
+    assert.equal(fs.readFileSync(path.join(gatewayDir, ".dev.vars"), "utf8").includes("ANSTS_SCHEDULER_URL=http://127.0.0.1:9876"), true);
+    assert.equal(fs.readFileSync(path.join(gatewayDir, ".dev.vars"), "utf8").includes("ANSTS_CONSOLE_RBAC_SECRET"), false);
   });
 
   it("builds a celld dev command and refuses to point it at the in-process gateway", () => {
@@ -84,6 +88,13 @@ describe("celld-loaded worker service start", () => {
     assert.match(script, /print-exec/);
     assert.match(script, /exec\s+"\$CELLD_BIN"/);
     assert.equal(script.includes("server_main"), false);
+    const schedulerScript = fs.readFileSync(path.join(ROOT, "scripts/celld_scheduler_up.sh"), "utf8");
+    const gatewayScript = fs.readFileSync(path.join(ROOT, "scripts/celld_gateway_up.sh"), "utf8");
+    assert.match(schedulerScript, /CELLD_ROLE=scheduler/);
+    assert.match(gatewayScript, /CELLD_ROLE=gateway/);
+    assert.match(gatewayScript, /ANSTS_SCHEDULER_URL/);
+    assert.equal(schedulerScript.includes("server_main"), false);
+    assert.equal(gatewayScript.includes("server_main"), false);
     const resolved = resolveCelldWorkerStart({
       rootDir: ROOT,
       projectDir: path.join(os.tmpdir(), "ansts-celld-resolve-unused"),
@@ -97,7 +108,7 @@ describe("celld-loaded worker service start", () => {
     assert.equal(fs.existsSync(path.join(resolved.projectDir, "src/cloudflare/worker.ts")), true);
   });
 
-  it("celld loads the worker and the scheduler Durable Object survives a process restart", async (t) => {
+  it("gateway and scheduler are separate celld processes and survive each other's restart", async (t) => {
     const celldBin = process.env.CELLD_BIN || "";
     const esbuildBin = process.env.CELLD_ESBUILD || "";
     if (!celldBin || !esbuildBin || !fs.existsSync(celldBin) || !fs.existsSync(esbuildBin)) {
@@ -105,157 +116,152 @@ describe("celld-loaded worker service start", () => {
       return;
     }
 
-    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "ansts-celld-live-"));
-    const staged = prepareCelldWorkerProject({ rootDir: ROOT, projectDir });
-    const port = 18976;
-    const taskId = `celld-do-live-${Date.now()}`;
+    const schedulerDir = fs.mkdtempSync(path.join(os.tmpdir(), "ansts-celld-sched-"));
+    const gatewayDir = fs.mkdtempSync(path.join(os.tmpdir(), "ansts-celld-gw-"));
+    const schedulerPort = 18976;
+    const gatewayPort = 18977;
+    const schedulerUrl = `http://127.0.0.1:${schedulerPort}`;
+    const gatewayUrl = `http://127.0.0.1:${gatewayPort}`;
+    prepareCelldWorkerProject({ rootDir: ROOT, projectDir: schedulerDir, role: "scheduler" });
+    prepareCelldWorkerProject({
+      rootDir: ROOT,
+      projectDir: gatewayDir,
+      role: "gateway",
+      schedulerUrl,
+    });
+    const taskId = `split-live-${Date.now()}`;
     const childEnv = { ...process.env, CELLD_ESBUILD: esbuildBin };
-    let child: ChildProcess | null = null;
+    const children = new Map<string, ChildProcess>();
 
-    const stop = async (): Promise<void> => {
-      if (!child || child.exitCode !== null || child.killed) {
-        child = null;
+    const stopNamed = async (name: string): Promise<void> => {
+      const proc = children.get(name);
+      if (!proc || proc.exitCode !== null) {
+        children.delete(name);
         return;
       }
-      const proc = child;
-      child = null;
       const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
       proc.kill("SIGTERM");
       const timer = setTimeout(() => proc.kill("SIGKILL"), 3000);
       await exited;
       clearTimeout(timer);
+      children.delete(name);
     };
 
-    const start = async (clean: boolean): Promise<string> => {
-      const args = celldWorkerDevArgs({
-        projectDir: staged.projectDir,
-        host: "127.0.0.1",
-        port,
-        clean,
-        logs: true,
-      });
-      const stderr: string[] = [];
-      child = spawn(celldBin, args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
-      child.stdout?.on("data", (chunk: Buffer) => stderr.push(chunk.toString("utf8")));
-      child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk.toString("utf8")));
+    const startNamed = async (name: string, projectDir: string, port: number, clean: boolean): Promise<void> => {
+      const args = celldWorkerDevArgs({ projectDir, host: "127.0.0.1", port, clean, logs: true });
+      const logs: string[] = [];
+      const proc = spawn(celldBin, args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
+      children.set(name, proc);
+      proc.stdout?.on("data", (chunk: Buffer) => logs.push(chunk.toString("utf8")));
+      proc.stderr?.on("data", (chunk: Buffer) => logs.push(chunk.toString("utf8")));
       const deadline = Date.now() + 30_000;
       let lastError = "";
-      let workerReady = false;
-      let runtimeReady = false;
       while (Date.now() < deadline) {
-        if (child.exitCode !== null) {
-          throw new Error(`celld exited ${child.exitCode}: ${stderr.join("").slice(-2000)}`);
+        if (proc.exitCode !== null) {
+          throw new Error(`${name} exited ${proc.exitCode}: ${logs.join("").slice(-2000)}`);
         }
         try {
           const health = await fetch(`http://127.0.0.1:${port}/healthz`);
-          workerReady = health.ok;
           const runtime = await fetch(`http://127.0.0.1:${port}/.well-known/celld/health`);
-          runtimeReady = runtime.status === 200;
-          if (workerReady && runtimeReady) break;
-          lastError = `healthz ${health.status} celld ${runtime.status} ${await runtime.text()}`;
+          if (health.ok && runtime.status === 200) return;
+          lastError = `healthz ${health.status} celld ${runtime.status}`;
         } catch (err) {
           lastError = (err as Error).message;
         }
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
-      if (!workerReady || !runtimeReady) {
-        throw new Error(`celld did not become ready: ${lastError}; ${stderr.join("").slice(-2000)}`);
-      }
-      const internal = stderr.join("").match(/internal listening on (\S+)/);
-      return internal ? internal[1] : "";
+      throw new Error(`${name} did not become ready: ${lastError}; ${logs.join("").slice(-2000)}`);
     };
 
     try {
-      await start(true);
-      const workerHealth = (await (await fetch(`http://127.0.0.1:${port}/healthz`)).json()) as {
-        status?: string;
-        runtime?: string;
+      await startNamed("scheduler", schedulerDir, schedulerPort, true);
+      await startNamed("gateway", gatewayDir, gatewayPort, true);
+      const schedulerHealth = (await (await fetch(`${schedulerUrl}/healthz`)).json()) as { controlPlane?: string };
+      const gatewayHealth = (await (await fetch(`${gatewayUrl}/health`)).json()) as {
         controlPlane?: string;
-        planes?: { gateway?: string; scheduler?: string; bodyExecution?: string };
+        planes?: { scheduler?: string };
+        scheduler?: { reachable?: boolean };
       };
-      assert.equal(workerHealth.status, "ok");
-      assert.equal(workerHealth.runtime, "denoland/celld-cloudflare-workers");
-      assert.equal(workerHealth.controlPlane, "celld-worker");
-      assert.equal(workerHealth.planes?.gateway, "durable-object");
-      assert.equal(workerHealth.planes?.scheduler, "durable-object");
-      assert.equal(workerHealth.planes?.bodyExecution, "external-node-process");
-      const celldHealth = await fetch(`http://127.0.0.1:${port}/.well-known/celld/health`);
-      assert.equal(celldHealth.status, 200);
+      assert.equal(schedulerHealth.controlPlane, "celld-scheduler");
+      assert.equal(gatewayHealth.controlPlane, "celld-gateway");
+      assert.equal(gatewayHealth.planes?.scheduler, "remote-http");
+      assert.equal(gatewayHealth.scheduler?.reachable, true);
+      assert.equal((await fetch(`${schedulerUrl}/v1/tasks`)).status, 404);
+      assert.equal((await fetch(`${gatewayUrl}/v1/scheduler/tasks`)).status, 404);
 
-      const submit = await fetch(`http://127.0.0.1:${port}/v1/scheduler/submit`, {
+      const registered = await fetch(`${schedulerUrl}/v1/scheduler/register-node`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ task_id: taskId, tenant_id: "probe", priority: 1, prompt: "durable object" }),
+        body: JSON.stringify({ node_id: "body-host-01", total_cpu_cores: 8, free_cpu_cores: 8 }),
+      });
+      assert.equal(registered.status, 200);
+      const submit = await fetch(`${gatewayUrl}/v1/tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ task_id: taskId, tenant_id: "probe", priority: 1, prompt: "cross worker" }),
       });
       assert.equal(submit.status, 202);
-      const gatewayTaskId = `gw-${taskId}`.slice(0, 64);
-      const gatewaySubmit = await fetch(`http://127.0.0.1:${port}/v1/tasks`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ task_id: gatewayTaskId, tenant_id: "probe", priority: 1, prompt: "gateway durable" }),
-      });
-      assert.equal(gatewaySubmit.status, 202);
-      const gatewaySubmitBody = (await gatewaySubmit.json()) as { controlPlane?: string; executionPlane?: string; bodyExecution?: unknown };
-      assert.equal(gatewaySubmitBody.controlPlane, "celld-worker");
-      assert.equal(gatewaySubmitBody.executionPlane, "external-body");
-      assert.equal(gatewaySubmitBody.bodyExecution, null);
-      const dispatch = await fetch(`http://127.0.0.1:${port}/v1beta1/tasks/dispatch`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ taskId: `dp-${taskId}`.slice(0, 64), tenantId: "probe", priority: 1, promptText: "dispatched" }),
-      });
-      assert.equal(dispatch.status, 202);
-      const release = await fetch(`http://127.0.0.1:${port}/v1beta1/gateway/leases/release`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ task_id: gatewayTaskId, confirm: true }),
-      });
-      assert.equal(release.status, 503);
-      const before = (await (await fetch(`http://127.0.0.1:${port}/v1/scheduler/tasks`)).json()) as {
+      const submitBody = (await submit.json()) as { controlPlane?: string; state?: string; bodyExecution?: unknown };
+      assert.equal(submitBody.controlPlane, "celld-gateway");
+      assert.equal(submitBody.state, "LEASED");
+      assert.equal(submitBody.bodyExecution, null);
+      const onScheduler = (await (await fetch(`${schedulerUrl}/v1/scheduler/tasks`)).json()) as {
         cellId?: string;
-        tasks?: Array<{ task_id?: string; state?: string }>;
+        tasks?: Array<{ task_id?: string }>;
       };
-      assert.match(String(before.cellId), /^[0-9a-f]{64}$/);
-      assert.equal(before.tasks?.some((task) => task.task_id === taskId && task.state === "QUEUED"), true);
-      const cellId = String(before.cellId);
-      const gatewayBefore = (await (await fetch(`http://127.0.0.1:${port}/v1beta1/gateway/state`)).json()) as {
-        cellId?: string;
-        dispatches?: Array<{ task_id?: string }>;
-      };
-      assert.match(String(gatewayBefore.cellId), /^[0-9a-f]{64}$/);
-      assert.equal(gatewayBefore.dispatches?.some((row) => row.task_id === gatewayTaskId), true);
-      const gatewayCellId = String(gatewayBefore.cellId);
-
-      await stop();
-      const internal = await start(false);
-      const after = (await (await fetch(`http://127.0.0.1:${port}/v1/scheduler/tasks`)).json()) as {
-        cellId?: string;
-        tasks?: Array<{ task_id?: string; prompt?: string; state?: string }>;
-      };
-      assert.equal(after.cellId, cellId);
-      const restored = after.tasks?.find((task) => task.task_id === taskId);
-      assert.equal(restored?.state, "QUEUED");
-      assert.equal(restored?.prompt, "durable object");
-      const gatewayAfter = (await (await fetch(`http://127.0.0.1:${port}/v1beta1/gateway/state`)).json()) as {
+      assert.equal(onScheduler.tasks?.some((task) => task.task_id === taskId), true);
+      const gatewayState = (await (await fetch(`${gatewayUrl}/v1beta1/gateway/state`)).json()) as {
         cellId?: string;
         dispatches?: Array<{ task_id?: string; prompt?: string }>;
       };
-      assert.equal(gatewayAfter.cellId, gatewayCellId);
+      const gatewayCellId = String(gatewayState.cellId);
+      const schedulerCellId = String(onScheduler.cellId);
+
+      const schedulerPid = children.get("scheduler")?.pid;
+      await stopNamed("gateway");
+      assert.equal(children.get("scheduler")?.exitCode ?? null, null);
+      assert.equal(children.get("scheduler")?.pid, schedulerPid);
+      const stillThere = (await (await fetch(`${schedulerUrl}/v1/scheduler/tasks`)).json()) as {
+        tasks?: Array<{ task_id?: string }>;
+      };
+      assert.equal(stillThere.tasks?.some((task) => task.task_id === taskId), true);
+
+      await startNamed("gateway", gatewayDir, gatewayPort, false);
+      const restoredGateway = (await (await fetch(`${gatewayUrl}/v1beta1/gateway/state`)).json()) as {
+        cellId?: string;
+        dispatches?: Array<{ task_id?: string; prompt?: string }>;
+      };
+      assert.equal(restoredGateway.cellId, gatewayCellId);
       assert.equal(
-        gatewayAfter.dispatches?.some((row) => row.task_id === gatewayTaskId && row.prompt === "gateway durable"),
+        restoredGateway.dispatches?.some((row) => row.task_id === taskId && row.prompt === "cross worker"),
         true
       );
+      assert.equal(children.get("scheduler")?.pid, schedulerPid);
 
-      assert.match(internal, /^127\.0\.0\.1:\d+$/);
-      const stateResp = await fetch(`http://${internal}/state`);
-      assert.equal(stateResp.status, 200);
-      const state = (await stateResp.json()) as { owned_cells?: number; published?: string[] };
-      assert.ok((state.owned_cells ?? 0) >= 2);
-      assert.equal(state.published?.includes(`AnstsSchedulerCell:${cellId}`), true);
-      assert.equal(state.published?.includes(`AnstsGatewayCell:${gatewayCellId}`), true);
+      await stopNamed("scheduler");
+      const down = await fetch(`${gatewayUrl}/v1/tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ task_id: "split-while-down", tenant_id: "probe", priority: 1, prompt: "no" }),
+      });
+      assert.equal(down.status, 503);
+      const downBody = (await down.json()) as { error?: string };
+      assert.equal(downBody.error, "SCHEDULER_UNREACHABLE");
+      assert.equal(children.get("gateway")?.exitCode ?? null, null);
+
+      await startNamed("scheduler", schedulerDir, schedulerPort, false);
+      const after = (await (await fetch(`${schedulerUrl}/v1/scheduler/tasks`)).json()) as {
+        cellId?: string;
+        tasks?: Array<{ task_id?: string; prompt?: string }>;
+      };
+      assert.equal(after.cellId, schedulerCellId);
+      assert.equal(after.tasks?.some((task) => task.task_id === taskId && task.prompt === "cross worker"), true);
+      assert.notEqual(children.get("scheduler")?.pid, schedulerPid);
     } finally {
-      await stop();
-      fs.rmSync(projectDir, { recursive: true, force: true });
+      await stopNamed("gateway");
+      await stopNamed("scheduler");
+      fs.rmSync(schedulerDir, { recursive: true, force: true });
+      fs.rmSync(gatewayDir, { recursive: true, force: true });
     }
   });
 });

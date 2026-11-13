@@ -8,9 +8,9 @@ import * as path from "node:path";
 import * as Ansts from "../src/index.js";
 
 describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit", () => {
-  // 8e841b3 added celld_fleet_client.ts, this branch adds celld_worker_service.ts and gateway_cell.ts.
-  // The @fileoverview check is unchanged.
-  it("1. Verifies all 92 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
+  // 8e841b3 added celld_fleet_client.ts. This branch adds celld_worker_service.ts, gateway_cell.ts,
+  // and gateway_worker.ts. The @fileoverview check is unchanged.
+  it("1. Verifies all 93 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
     const walk = (dir: string): string[] => {
       let out: string[] = [];
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -21,7 +21,7 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
       return out;
     };
     const srcFiles = walk(path.join(process.cwd(), "src"));
-    assert.equal(srcFiles.length, 92);
+    assert.equal(srcFiles.length, 93);
     for (const f of srcFiles) {
       const content = fs.readFileSync(f, "utf-8");
       assert.ok(content.includes("@fileoverview"), `Missing @fileoverview in ${f}`);
@@ -86,15 +86,7 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
   it("4. Behavioral E2E M7-M9: Cloudflare Worker Entrypoint -> AnstsSchedulerCell -> RpoZeroDurabilityEngine", async () => {
     const state = new Ansts.MockDurableObjectState("cell-0");
     const cell = new Ansts.AnstsSchedulerCell(state);
-    const gateway = new Ansts.AnstsGatewayCell(new Ansts.MockDurableObjectState("gateway-control-plane"));
     const env: Ansts.CloudflareCelldEnv = {
-      ANSTS_GATEWAY_CELL: {
-        idFromName: (name) => ({ toString: () => name }),
-        get: () => ({
-          id: { toString: () => "gateway-control-plane" },
-          fetch: (input, init) => gateway.fetch(input instanceof Request ? input : new Request(String(input), init)),
-        }),
-      },
       ANSTS_SCHEDULER_CELL: {
         idFromName: (name) => ({ toString: () => name }),
         get: () => ({
@@ -116,7 +108,7 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
     assert.equal(healthResp.status, 200);
     const healthBody = (await healthResp.json()) as { region: string; controlPlane: string };
     assert.equal(healthBody.region, "us-west-1");
-    assert.equal(healthBody.controlPlane, "celld-worker");
+    assert.equal(healthBody.controlPlane, "celld-scheduler");
   });
 
   it("5. Behavioral E2E M10-M11: ModelPoolClientAdapter -> SlidingWindowTokenBucket -> ThreeStateCircuitBreaker", () => {

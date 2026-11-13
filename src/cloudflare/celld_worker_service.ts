@@ -1,8 +1,7 @@
 /**
- * @fileoverview Start path for the unified ANSTS control plane as a denoland/celld-loaded worker.
- * `celld dev` bundles `src/cloudflare/worker.ts` and serves both the gateway HTTP API and the
- * scheduler. Gateway and scheduler state stay in SQLite Durable Objects under `.celld/dev`.
- * Body execution remains a separate Node or Body process.
+ * @fileoverview Start paths for the two celld workers. The scheduler and the gateway each get
+ * their own project directory, wrangler config, listen port, and `.celld/dev` store.
+ * Body execution remains a separate Node process.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -20,13 +19,37 @@ export interface CelldWorkerDevOptions {
   logs?: boolean;
 }
 
+export type CelldWorkerRole = "scheduler" | "gateway";
+
 export interface CelldWorkerStartOptions {
   rootDir?: string;
+  role?: CelldWorkerRole;
   projectDir?: string;
   host?: string;
   port?: number;
   clean?: boolean;
   logs?: boolean;
+  /** Gateway only. Written into the staged project's `.dev.vars` so celld injects it. */
+  schedulerUrl?: string;
+}
+
+const ROLE_DEFAULTS: Record<CelldWorkerRole, { config: string; entry: string; dirName: string; port: number }> = {
+  scheduler: {
+    config: "deploy/celld/wrangler.celld.json",
+    entry: "src/cloudflare/worker.ts",
+    dirName: "scheduler-worker",
+    port: 9876,
+  },
+  gateway: {
+    config: "deploy/celld/wrangler.gateway.json",
+    entry: "src/cloudflare/gateway_worker.ts",
+    dirName: "gateway-worker",
+    port: 9877,
+  },
+};
+
+export function celldWorkerRoleDefaults(role: CelldWorkerRole): { config: string; entry: string; port: number; dirName: string } {
+  return ROLE_DEFAULTS[role];
 }
 
 function resolveRoot(rootDir?: string): string {
@@ -37,9 +60,13 @@ function resolveRoot(rootDir?: string): string {
  * Copies the celld Wrangler config, worker sources, and migrations into a directory `celld dev` can load.
  * An existing `.celld/` directory inside the project is left in place so a restart keeps Durable Object state.
  */
-export function prepareCelldWorkerProject(options: { rootDir?: string; projectDir?: string } = {}): CelldWorkerProject {
+export function prepareCelldWorkerProject(
+  options: { rootDir?: string; projectDir?: string; role?: CelldWorkerRole; schedulerUrl?: string } = {}
+): CelldWorkerProject {
+  const role = options.role ?? "scheduler";
+  const defaults = ROLE_DEFAULTS[role];
   const rootDir = resolveRoot(options.rootDir);
-  const projectDir = path.resolve(options.projectDir ?? path.join(rootDir, ".celld", "worker-service"));
+  const projectDir = path.resolve(options.projectDir ?? path.join(rootDir, ".celld", defaults.dirName));
   const srcDir = path.join(rootDir, "src");
   if (projectDir === rootDir || projectDir === srcDir || projectDir.startsWith(srcDir + path.sep)) {
     throw new Error(
@@ -47,8 +74,8 @@ export function prepareCelldWorkerProject(options: { rootDir?: string; projectDi
     );
   }
 
-  const configSource = path.join(rootDir, "deploy", "celld", "wrangler.celld.json");
-  const workerSource = path.join(rootDir, "src", "cloudflare", "worker.ts");
+  const configSource = path.join(rootDir, defaults.config);
+  const workerSource = path.join(rootDir, defaults.entry);
   if (!fs.existsSync(configSource)) {
     throw new Error(`celld wrangler config not found: ${configSource}`);
   }
@@ -65,6 +92,12 @@ export function prepareCelldWorkerProject(options: { rootDir?: string; projectDi
   if (fs.existsSync(migrations)) {
     fs.rmSync(path.join(projectDir, "migrations"), { recursive: true, force: true });
     fs.cpSync(migrations, path.join(projectDir, "migrations"), { recursive: true });
+  }
+  if (role === "gateway") {
+    const lines = [`ANSTS_SCHEDULER_URL=${options.schedulerUrl?.trim() || process.env.ANSTS_SCHEDULER_URL?.trim() || ""}`];
+    const secret = process.env.ANSTS_CONSOLE_RBAC_SECRET?.trim() ?? "";
+    if (secret) lines.push(`ANSTS_CONSOLE_RBAC_SECRET=${secret}`);
+    fs.writeFileSync(path.join(projectDir, ".dev.vars"), `${lines.join("\n")}\n`);
   }
   return { projectDir, wranglerPath };
 }
@@ -86,29 +119,49 @@ export function celldWorkerDevArgs(options: CelldWorkerDevOptions): string[] {
 }
 
 /** Stages the project and returns the `celld dev` arguments that serve it. */
-export function resolveCelldWorkerStart(options: CelldWorkerStartOptions = {}): { projectDir: string; args: string[] } {
-  const prepared = prepareCelldWorkerProject({ rootDir: options.rootDir, projectDir: options.projectDir });
+export function resolveCelldWorkerStart(options: CelldWorkerStartOptions = {}): { projectDir: string; args: string[]; role: CelldWorkerRole } {
+  const role = options.role ?? "scheduler";
+  const defaults = ROLE_DEFAULTS[role];
+  const prepared = prepareCelldWorkerProject({
+    rootDir: options.rootDir,
+    projectDir: options.projectDir,
+    role,
+    schedulerUrl: options.schedulerUrl,
+  });
   return {
+    role,
     projectDir: prepared.projectDir,
     args: celldWorkerDevArgs({
       projectDir: prepared.projectDir,
       host: options.host,
-      port: options.port,
+      port: options.port ?? defaults.port,
       clean: options.clean,
       logs: options.logs,
     }),
   };
 }
 
+function roleFromEnv(): CelldWorkerRole {
+  const raw = (process.env.CELLD_ROLE ?? "scheduler").trim();
+  if (raw !== "scheduler" && raw !== "gateway") {
+    throw new Error(`CELLD_ROLE must be scheduler or gateway, got '${raw}'`);
+  }
+  return raw;
+}
+
 function startFromProcessEnv(): { projectDir: string; args: string[] } {
-  const port = process.env.CELLD_PORT === undefined || process.env.CELLD_PORT === "" ? 9876 : Number(process.env.CELLD_PORT);
+  const role = roleFromEnv();
+  const defaults = ROLE_DEFAULTS[role];
+  const port = process.env.CELLD_PORT === undefined || process.env.CELLD_PORT === "" ? defaults.port : Number(process.env.CELLD_PORT);
   return resolveCelldWorkerStart({
     rootDir: process.cwd(),
+    role,
     projectDir: process.env.CELLD_PROJECT_DIR,
     host: process.env.CELLD_HOST,
     port,
     clean: process.env.CELLD_CLEAN === "1",
     logs: process.env.CELLD_LOGS !== "0",
+    schedulerUrl: process.env.ANSTS_SCHEDULER_URL,
   });
 }
 

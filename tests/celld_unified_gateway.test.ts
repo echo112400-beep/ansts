@@ -10,22 +10,20 @@ import { handleUnifiedGatewayRequest } from "../src/cloudflare/gateway_cell.js";
 import { MockDurableObjectState } from "../src/cloudflare/env.js";
 import { AnstsSchedulerCell } from "../src/cloudflare/scheduler_cell.js";
 import { ConsoleRbacAuthGuard } from "../src/dashboard/console_rbac_guard.js";
-import workerDefault from "../src/cloudflare/worker.js";
+import schedulerWorker from "../src/cloudflare/worker.js";
+import gatewayWorker from "../src/cloudflare/gateway_worker.js";
 import { AnstsLocalAndComposeServer } from "../src/server_main.js";
 
 const SECRET = "unified-gateway-test-secret-32b";
 
-function gatewayEnv(gateway: AnstsGatewayCell, scheduler: AnstsSchedulerCell, secret?: string) {
+function gatewayEnv(gateway: AnstsGatewayCell, schedulerUrl?: string, secret?: string) {
   return {
-    CELLD_REGION: "celld-brain",
+    CELLD_REGION: "celld-gateway",
     ANSTS_CONSOLE_RBAC_SECRET: secret,
+    ANSTS_SCHEDULER_URL: schedulerUrl,
     ANSTS_GATEWAY_CELL: {
       idFromName: (name: string) => ({ toString: () => name, name }),
       get: () => ({ id: { toString: () => "gateway-control-plane" }, fetch: (req: Request) => gateway.fetch(req) }),
-    },
-    ANSTS_SCHEDULER_CELL: {
-      idFromName: (name: string) => ({ toString: () => name, name }),
-      get: () => ({ id: { toString: () => "global-shard-0" }, fetch: (req: Request) => scheduler.fetch(req) }),
     },
   };
 }
@@ -98,26 +96,53 @@ describe("unified celld gateway and scheduler", () => {
   it("serves gateway submit, dispatch, and health on the worker and fail-closes lease release", async () => {
     const gateway = new AnstsGatewayCell(new MockDurableObjectState("gateway-control-plane"));
     const scheduler = new AnstsSchedulerCell(new MockDurableObjectState("global-shard-0"));
-    await scheduler.fetch(
-      new Request("https://cell.internal/v1/scheduler/register-node", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ node_id: "body-host-01", total_cpu_cores: 4, free_cpu_cores: 4 }),
-      })
-    );
-    const env = gatewayEnv(gateway, scheduler, SECRET);
-    const health = await workerDefault.fetch(new Request("https://edge.ansts.io/health"), env as never);
+    const schedulerEnv = {
+      CELLD_REGION: "celld-scheduler",
+      ANSTS_SCHEDULER_CELL: {
+        idFromName: (name: string) => ({ toString: () => name, name }),
+        get: () => ({ id: { toString: () => "global-shard-0" }, fetch: (req: Request) => scheduler.fetch(req) }),
+      },
+    };
+    const schedulerServer = http.createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const body = Buffer.concat(chunks);
+      const upstream = await schedulerWorker.fetch(
+        new Request(`http://scheduler.local${req.url}`, {
+          method: req.method,
+          headers: { "content-type": "application/json" },
+          body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
+        }),
+        schedulerEnv as never
+      );
+      const payload = Buffer.from(await upstream.arrayBuffer());
+      res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+      res.end(payload);
+    });
+    await new Promise<void>((resolve) => schedulerServer.listen(0, "127.0.0.1", () => resolve()));
+    const schedulerAddress = schedulerServer.address();
+    const schedulerPort = typeof schedulerAddress === "object" && schedulerAddress ? schedulerAddress.port : 0;
+    const schedulerUrl = `http://127.0.0.1:${schedulerPort}`;
+    const registered = await fetch(`${schedulerUrl}/v1/scheduler/register-node`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ node_id: "body-host-01", total_cpu_cores: 4, free_cpu_cores: 4 }),
+    });
+    assert.equal(registered.status, 200);
+    const env = gatewayEnv(gateway, schedulerUrl, SECRET);
+    try {
+    const health = await gatewayWorker.fetch(new Request("https://edge.ansts.io/health"), env as never);
     assert.equal(health.status, 200);
     const healthBody = (await health.json()) as {
       controlPlane: string;
       planes: { gateway: string; scheduler: string; bodyExecution: string };
     };
-    assert.equal(healthBody.controlPlane, "celld-worker");
+    assert.equal(healthBody.controlPlane, "celld-gateway");
     assert.equal(healthBody.planes.gateway, "durable-object");
-    assert.equal(healthBody.planes.scheduler, "durable-object");
+    assert.equal(healthBody.planes.scheduler, "remote-http");
     assert.equal(healthBody.planes.bodyExecution, "external-node-process");
 
-    const submit = await workerDefault.fetch(
+    const submit = await gatewayWorker.fetch(
       new Request("https://edge.ansts.io/v1/tasks", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -134,15 +159,15 @@ describe("unified celld gateway and scheduler", () => {
       state: string;
     };
     assert.equal(submitBody.task_id, "task-gw-submit");
-    assert.equal(submitBody.controlPlane, "celld-worker");
+    assert.equal(submitBody.controlPlane, "celld-gateway");
     assert.equal(submitBody.executionPlane, "external-body");
     assert.equal(submitBody.bodyExecution, null);
     assert.equal(submitBody.state, "LEASED");
 
-    const listed = await workerDefault.fetch(new Request("https://edge.ansts.io/v1/tasks/task-gw-submit"), env as never);
+    const listed = await gatewayWorker.fetch(new Request("https://edge.ansts.io/v1/tasks/task-gw-submit"), env as never);
     assert.equal(listed.status, 200);
 
-    const dispatch = await workerDefault.fetch(
+    const dispatch = await gatewayWorker.fetch(
       new Request("https://edge.ansts.io/v1beta1/tasks/dispatch", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -156,13 +181,13 @@ describe("unified celld gateway and scheduler", () => {
     assert.equal(dispatchBody.bodyExecution, null);
     assert.equal(dispatchBody.deferred, "BODY_EXECUTION_IS_EXTERNAL");
 
-    const overview = await workerDefault.fetch(new Request("https://edge.ansts.io/v1beta1/console/gateway"), env as never);
+    const overview = await gatewayWorker.fetch(new Request("https://edge.ansts.io/v1beta1/console/gateway"), env as never);
     assert.equal(overview.status, 200);
     const overviewBody = (await overview.json()) as { totalTasks: number; controlPlane: string };
-    assert.equal(overviewBody.controlPlane, "celld-worker");
+    assert.equal(overviewBody.controlPlane, "celld-gateway");
     assert.ok(overviewBody.totalTasks >= 2);
 
-    const missingAuth = await workerDefault.fetch(
+    const missingAuth = await gatewayWorker.fetch(
       new Request("https://edge.ansts.io/v1beta1/gateway/leases/release", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -172,7 +197,7 @@ describe("unified celld gateway and scheduler", () => {
     );
     assert.equal(missingAuth.status, 401);
 
-    const unconfirmed = await workerDefault.fetch(
+    const unconfirmed = await gatewayWorker.fetch(
       new Request("https://edge.ansts.io/v1beta1/gateway/leases/release", {
         method: "POST",
         headers: {
@@ -185,7 +210,7 @@ describe("unified celld gateway and scheduler", () => {
     );
     assert.equal(unconfirmed.status, 400);
 
-    const viewer = await workerDefault.fetch(
+    const viewer = await gatewayWorker.fetch(
       new Request("https://edge.ansts.io/v1beta1/gateway/leases/release", {
         method: "POST",
         headers: {
@@ -198,7 +223,7 @@ describe("unified celld gateway and scheduler", () => {
     );
     assert.equal(viewer.status, 403);
 
-    const unbound = await workerDefault.fetch(
+    const unbound = await gatewayWorker.fetch(
       new Request("https://edge.ansts.io/v1beta1/gateway/leases/release", {
         method: "POST",
         headers: {
@@ -207,11 +232,11 @@ describe("unified celld gateway and scheduler", () => {
         },
         body: JSON.stringify({ task_id: "task-gw-submit", confirm: true }),
       }),
-      gatewayEnv(gateway, scheduler, undefined) as never
+      gatewayEnv(gateway, schedulerUrl, undefined) as never
     );
     assert.equal(unbound.status, 503);
 
-    const released = await workerDefault.fetch(
+    const released = await gatewayWorker.fetch(
       new Request("https://edge.ansts.io/v1beta1/gateway/leases/release", {
         method: "POST",
         headers: {
@@ -230,6 +255,32 @@ describe("unified celld gateway and scheduler", () => {
     assert.equal(state.sessions.some((row) => row.subject === "lin"), true);
     assert.equal(state.leases.find((row) => row.task_id === "task-gw-submit")?.status, "RELEASED");
     assert.equal(await handleUnifiedGatewayRequest(new Request("https://edge.ansts.io/v1/scheduler/tasks"), env as never), null);
+    const schedulerOnly = (await (await fetch(`${schedulerUrl}/healthz`)).json()) as { controlPlane?: string };
+    assert.equal(schedulerOnly.controlPlane, "celld-scheduler");
+    assert.equal((await fetch(`${schedulerUrl}/v1/tasks`)).status, 404);
+    const missingUrl = await gatewayWorker.fetch(
+      new Request("https://edge.ansts.io/v1/tasks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ task_id: "task-no-url", tenant_id: "probe", priority: 1, prompt: "x" }),
+      }),
+      gatewayEnv(gateway, "", SECRET) as never
+    );
+    assert.equal(missingUrl.status, 503);
+    assert.equal(((await missingUrl.json()) as { error?: string }).error, "SCHEDULER_URL_UNCONFIGURED");
+    } finally {
+      await new Promise<void>((resolve) => schedulerServer.close(() => resolve()));
+    }
+    const unreachable = await gatewayWorker.fetch(
+      new Request("https://edge.ansts.io/v1/tasks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ task_id: "task-down", tenant_id: "probe", priority: 1, prompt: "x" }),
+      }),
+      env as never
+    );
+    assert.equal(unreachable.status, 503);
+    assert.equal(((await unreachable.json()) as { error?: string }).error, "SCHEDULER_UNREACHABLE");
   });
 
   it("proxies control-plane routes from the host process to the celld worker and does not schedule them locally", async () => {
@@ -237,7 +288,7 @@ describe("unified celld gateway and scheduler", () => {
       const url = req.url ?? "/";
       if (req.method === "POST" && url === "/v1/tasks") {
         res.writeHead(202, { "content-type": "application/json" });
-        res.end(JSON.stringify({ task_id: "proxied-task", state: "QUEUED", controlPlane: "celld-worker" }));
+        res.end(JSON.stringify({ task_id: "proxied-task", state: "QUEUED", controlPlane: "celld-gateway" }));
         return;
       }
       res.writeHead(404, { "content-type": "application/json" });
@@ -261,7 +312,7 @@ describe("unified celld gateway and scheduler", () => {
       });
       assert.equal(submit.status, 202);
       const body = (await submit.json()) as { controlPlane: string; task_id: string };
-      assert.equal(body.controlPlane, "celld-worker");
+      assert.equal(body.controlPlane, "celld-gateway");
       assert.equal(body.task_id, "proxied-task");
       assert.equal(host.scheduler.allTasks.has("proxied-task"), false);
       const health = (await (await fetch(`http://127.0.0.1:${started.apiPort}/healthz`)).json()) as {

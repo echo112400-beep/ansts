@@ -50,6 +50,7 @@ export * from "./cloudflare/federation_router.js";
 export * from "./cloudflare/celld_native_optimizations.js";
 export { default as cloudflareCelldWorker } from "./cloudflare/worker.js";
 export * from "./cloudflare/gateway_cell.js";
+export { default as cloudflareGatewayWorker } from "./cloudflare/gateway_worker.js";
 export * from "./cloudflare/celld_worker_service.js";
 export * from "./finops/budget_controller.js";
 export * from "./cli/anstsctl.js";

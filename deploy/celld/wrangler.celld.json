@@ -19,10 +19,6 @@
       {
         "name": "ANSTS_TUNNEL_CELL",
         "class_name": "TunnelGatewayCell"
-      },
-      {
-        "name": "ANSTS_GATEWAY_CELL",
-        "class_name": "AnstsGatewayCell"
       }
     ]
   },
@@ -33,12 +29,6 @@
         "AnstsSchedulerCell",
         "AgentTaskHarnessCell",
         "TunnelGatewayCell"
-      ]
-    },
-    {
-      "tag": "v2",
-      "new_sqlite_classes": [
-        "AnstsGatewayCell"
       ]
     }
   ],
@@ -78,8 +68,7 @@
     ]
   },
   "vars": {
-    "CELLD_REGION": "celld-brain",
-    "CELLD_REBALANCE_INTERVAL_MS": "5000",
-    "ANSTS_CONSOLE_RBAC_SECRET": ""
+    "CELLD_REGION": "celld-scheduler",
+    "CELLD_REBALANCE_INTERVAL_MS": "5000"
   }
 }

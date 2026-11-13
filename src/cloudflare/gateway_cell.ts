@@ -1,8 +1,8 @@
 /**
  * @fileoverview Unified control-plane gateway on denoland/celld.
  * AnstsGatewayCell stores dispatch, lease, and operator-session rows in its SQLite Durable Object.
- * The worker HTTP routes in this module submit work to AnstsSchedulerCell in the same isolate
- * and leave sandbox execution on an external Body process.
+ * Gateway HTTP routes in this module record session and lease state in this cell, then call the
+ * scheduler worker over HTTP at ANSTS_SCHEDULER_URL. Sandbox execution stays on a Body process.
  */
 import { ConsoleRbacAuthGuard, ConsoleRole } from "../dashboard/console_rbac_guard.js";
 import { TaskSpecValidationError, TaskSpecValidator } from "../gateway/validator.js";
@@ -10,7 +10,8 @@ import { DurableObjectNamespaceLike, DurableObjectStateLike } from "./env.js";
 
 export interface UnifiedGatewayEnv {
   ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;
-  ANSTS_SCHEDULER_CELL?: DurableObjectNamespaceLike;
+  /** Base URL of the separate scheduler celld worker. Empty or unset fail-closes cross-worker calls. */
+  ANSTS_SCHEDULER_URL?: string;
   ANSTS_CONSOLE_RBAC_SECRET?: string;
   CELLD_REGION?: string;
 }
@@ -61,7 +62,7 @@ export class AnstsGatewayCell {
       this.ctx.storage.sql.exec(
         "INSERT OR REPLACE INTO gateway_leases (task_id, holder_id, node_id, fencing_token, status, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
         taskId,
-        String(body.holder_id ?? "celld-worker"),
+        String(body.holder_id ?? "celld-gateway"),
         assigned,
         fencing,
         assigned ? "HELD" : "PENDING",
@@ -136,10 +137,49 @@ function gatewayStub(env: UnifiedGatewayEnv) {
   return ns.get(ns.idFromName("gateway-control-plane"));
 }
 
-function schedulerStub(env: UnifiedGatewayEnv) {
-  const ns = env.ANSTS_SCHEDULER_CELL;
-  if (!ns) return null;
-  return ns.get(ns.idFromName("global-shard-0"));
+function schedulerBase(env: UnifiedGatewayEnv): string | null {
+  const raw = env.ANSTS_SCHEDULER_URL?.trim() ?? "";
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  } catch {
+    return null;
+  }
+  return raw.replace(/\/+$/, "");
+}
+
+function schedulerClientError(body: Record<string, unknown>, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...JSON_HEADERS, "x-ansts-scheduler-client": "gateway" },
+  });
+}
+
+/** Calls the scheduler worker. A missing URL or a refused connection is a local 503, not an in-process fallback. */
+async function schedulerFetch(env: UnifiedGatewayEnv, path: string, init?: RequestInit): Promise<Response> {
+  const base = schedulerBase(env);
+  if (!base) {
+    return schedulerClientError(
+      {
+        error: "SCHEDULER_URL_UNCONFIGURED",
+        message: "Set ANSTS_SCHEDULER_URL to the scheduler worker. The gateway process does not embed the scheduler.",
+      },
+      503
+    );
+  }
+  try {
+    return await fetch(`${base}${path}`, init);
+  } catch (err) {
+    return schedulerClientError(
+      {
+        error: "SCHEDULER_UNREACHABLE",
+        schedulerUrl: base,
+        message: (err as Error).message,
+      },
+      503
+    );
+  }
 }
 
 async function readGatewayState(env: UnifiedGatewayEnv): Promise<Record<string, unknown> | null> {
@@ -150,13 +190,13 @@ async function readGatewayState(env: UnifiedGatewayEnv): Promise<Record<string, 
   return (await resp.json()) as Record<string, unknown>;
 }
 
-async function listSchedulerTasks(env: UnifiedGatewayEnv): Promise<Record<string, unknown>[]> {
-  const stub = schedulerStub(env);
-  if (!stub) return [];
-  const resp = await stub.fetch(new Request("https://cell.internal/v1/scheduler/tasks"));
-  if (!resp.ok) return [];
+async function listSchedulerTasks(env: UnifiedGatewayEnv): Promise<{ tasks: Record<string, unknown>[]; failure: Response | null }> {
+  const resp = await schedulerFetch(env, "/v1/scheduler/tasks");
+  if (resp.headers.get("x-ansts-scheduler-client") === "gateway" || !resp.ok) {
+    return { tasks: [], failure: resp };
+  }
   const body = (await resp.json()) as { tasks?: Record<string, unknown>[] };
-  return Array.isArray(body.tasks) ? body.tasks : [];
+  return { tasks: Array.isArray(body.tasks) ? body.tasks : [], failure: null };
 }
 
 function isGatewayPath(method: string, pathname: string): boolean {
@@ -176,22 +216,28 @@ function isGatewayPath(method: string, pathname: string): boolean {
 export async function handleUnifiedGatewayRequest(request: Request, env: UnifiedGatewayEnv): Promise<Response | null> {
   const url = new URL(request.url);
   if (!isGatewayPath(request.method, url.pathname)) return null;
-  if (!env.ANSTS_GATEWAY_CELL || !env.ANSTS_SCHEDULER_CELL) {
-    return json({ error: "GATEWAY_CELL_UNBOUND", controlPlane: "celld-worker" }, 503);
+  if (!env.ANSTS_GATEWAY_CELL) {
+    return json({ error: "GATEWAY_CELL_UNBOUND", controlPlane: "celld-gateway" }, 503);
   }
   if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz" || url.pathname === "/readyz")) {
     const gateway = await readGatewayState(env);
-    const tasks = await listSchedulerTasks(env);
+    const peer = await schedulerFetch(env, "/healthz");
+    const peerIsLocal = peer.headers.get("x-ansts-scheduler-client") === "gateway";
+    let peerPlane: string | null = null;
+    if (!peerIsLocal && peer.ok) {
+      const peerBody = (await peer.json().catch(() => ({}))) as { controlPlane?: string };
+      peerPlane = peerBody.controlPlane ?? null;
+    }
     return json(
       {
         status: "ok",
         healthy: true,
         runtime: "denoland/celld-cloudflare-workers",
         region: env.CELLD_REGION ?? "local",
-        controlPlane: "celld-worker",
+        controlPlane: "celld-gateway",
         planes: {
           gateway: "durable-object",
-          scheduler: "durable-object",
+          scheduler: "remote-http",
           bodyExecution: "external-node-process",
         },
         gateway: {
@@ -199,7 +245,10 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
           dispatches: Array.isArray(gateway?.dispatches) ? gateway.dispatches.length : 0,
           activeLeases: Number(gateway?.activeLeases ?? 0),
         },
-        scheduler: { totalTasks: tasks.length },
+        scheduler: {
+          url: schedulerBase(env),
+          reachable: !peerIsLocal && peer.ok && peerPlane === "celld-scheduler",
+        },
       },
       200
     );
@@ -210,10 +259,12 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
   }
   if (request.method === "GET" && url.pathname === "/v1beta1/console/gateway") {
     const gateway = await readGatewayState(env);
-    const tasks = await listSchedulerTasks(env);
+    const listed = await listSchedulerTasks(env);
+    if (listed.failure) return listed.failure;
+    const tasks = listed.tasks;
     return json(
       {
-        controlPlane: "celld-worker",
+        controlPlane: "celld-gateway",
         totalTasks: tasks.length,
         gatewayDispatches: Array.isArray(gateway?.dispatches) ? gateway.dispatches.length : 0,
         activeLeases: Number(gateway?.activeLeases ?? 0),
@@ -225,13 +276,14 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
   }
   if (request.method === "GET" && url.pathname.startsWith("/v1/tasks/")) {
     const taskId = decodeURIComponent(url.pathname.slice("/v1/tasks/".length));
-    const tasks = await listSchedulerTasks(env);
-    const found = tasks.find((task) => String(task.task_id ?? task.taskId ?? "") === taskId);
+    const listed = await listSchedulerTasks(env);
+    if (listed.failure) return listed.failure;
+    const found = listed.tasks.find((task) => String(task.task_id ?? task.taskId ?? "") === taskId);
     if (!found) return json({ error: "TASK_NOT_FOUND", task_id: taskId }, 404);
     const gateway = await readGatewayState(env);
     const leases = Array.isArray(gateway?.leases) ? (gateway.leases as Array<Record<string, unknown>>) : [];
     const lease = leases.find((row) => String(row.task_id) === taskId) ?? null;
-    return json({ ...found, controlPlane: "celld-worker", gatewayLease: lease }, 200);
+    return json({ ...found, controlPlane: "celld-gateway", gatewayLease: lease }, 200);
   }
   if (request.method === "POST" && (url.pathname === "/v1/tasks" || url.pathname === "/v1beta1/tasks/dispatch")) {
     return submitThroughCells(request, env, url.pathname === "/v1beta1/tasks/dispatch");
@@ -267,31 +319,28 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
     }
     throw err;
   }
-  const scheduler = schedulerStub(env);
   const gateway = gatewayStub(env);
-  if (!scheduler || !gateway) return json({ error: "GATEWAY_CELL_UNBOUND" }, 503);
-  const submitResp = await scheduler.fetch(
-    new Request("https://cell.internal/v1/scheduler/submit", {
-      method: "POST",
-      headers: JSON_HEADERS,
-      body: JSON.stringify({
-        task_id: spec.task_id,
-        tenant_id: spec.tenant_id,
-        priority: spec.priority,
-        prompt: spec.prompt,
-        max_turns: spec.max_turns,
-        timeout_seconds: spec.timeout_seconds,
-        resource_profile: spec.resource_profile,
-      }),
-    })
-  );
+  if (!gateway) return json({ error: "GATEWAY_CELL_UNBOUND" }, 503);
+  const submitResp = await schedulerFetch(env, "/v1/scheduler/submit", {
+    method: "POST",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      task_id: spec.task_id,
+      tenant_id: spec.tenant_id,
+      priority: spec.priority,
+      prompt: spec.prompt,
+      max_turns: spec.max_turns,
+      timeout_seconds: spec.timeout_seconds,
+      resource_profile: spec.resource_profile,
+    }),
+  });
+  if (submitResp.headers.get("x-ansts-scheduler-client") === "gateway") return submitResp;
   if (!submitResp.ok) {
     return json({ error: "SCHEDULER_REJECTED", status: submitResp.status }, submitResp.status);
   }
   const submitted = (await submitResp.json()) as Record<string, unknown>;
-  const tickResp = await scheduler.fetch(
-    new Request("https://cell.internal/v1/scheduler/schedule-tick", { method: "POST", headers: JSON_HEADERS })
-  );
+  const tickResp = await schedulerFetch(env, "/v1/scheduler/schedule-tick", { method: "POST", headers: JSON_HEADERS });
+  if (tickResp.headers.get("x-ansts-scheduler-client") === "gateway") return tickResp;
   const tick = tickResp.ok
     ? ((await tickResp.json()) as { placements?: Array<[string, string, number]> })
     : { placements: [] };
@@ -311,7 +360,7 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
         state,
         assigned_node_id: assigned,
         fencing_token: fencing,
-        holder_id: "celld-worker",
+        holder_id: "celld-gateway",
       }),
     })
   );
@@ -321,8 +370,8 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
     return json(
       {
         dispatched: true,
-        controlPlane: "celld-worker",
-        gatewayNodeId: env.CELLD_REGION ?? "celld-worker",
+        controlPlane: "celld-gateway",
+        gatewayNodeId: env.CELLD_REGION ?? "celld-gateway",
         gatewayCellId: recorded.cellId ?? null,
         taskId: spec.task_id,
         tenantId: spec.tenant_id,
@@ -343,7 +392,7 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
       state,
       assigned_node_id: assigned || null,
       lease_fencing_token: fencing,
-      controlPlane: "celld-worker",
+      controlPlane: "celld-gateway",
       gatewayCellId: recorded.cellId ?? null,
       executionPlane: "external-body",
       bodyExecution: null,
@@ -404,15 +453,13 @@ async function releaseLease(request: Request, env: UnifiedGatewayEnv): Promise<R
   const fencing = Number(lease?.fencing_token ?? 0);
   const nodeId = String(lease?.node_id ?? "");
   if (fencing > 0 && nodeId) {
-    const scheduler = schedulerStub(env);
-    const completeResp = await scheduler?.fetch(
-      new Request("https://cell.internal/v1/scheduler/complete", {
-        method: "POST",
-        headers: JSON_HEADERS,
-        body: JSON.stringify({ task_id: taskId, node_id: nodeId, fencing_token: fencing }),
-      })
-    );
-    if (!completeResp || !completeResp.ok) {
+    const completeResp = await schedulerFetch(env, "/v1/scheduler/complete", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ task_id: taskId, node_id: nodeId, fencing_token: fencing }),
+    });
+    if (completeResp.headers.get("x-ansts-scheduler-client") === "gateway") return completeResp;
+    if (!completeResp.ok) {
       const detail = completeResp ? await completeResp.text() : "scheduler missing";
       return json({ error: "SCHEDULER_COMPLETE_REJECTED", message: detail }, completeResp?.status ?? 503);
     }
