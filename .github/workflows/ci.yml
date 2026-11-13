@@ -15,10 +15,12 @@ jobs:
     name: "Verify TypeScript AST, Build & 55 Integration/Chaos Tests (Node ${{ matrix.node-version }})"
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      CELLD_VERSION: "0.6.3"
     strategy:
       fail-fast: false
       matrix:
-        node-version: ["18.x", "20.x", "22.x"]
+        node-version: ["22.x"]
 
     steps:
       - name: Checkout repository
@@ -32,6 +34,54 @@ jobs:
       - name: Install dependencies (tolerant of missing lockfile)
         run: npm install --no-audit --no-fund || true
 
+      - name: Install denoland/celld ${{ env.CELLD_VERSION }}
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)
+              asset="celld-x86_64-unknown-linux-gnu.gz"
+              sha256="5084a083472cf036551a7eac63fa24d22bb9a56323c517f63205724c12783047"
+              ;;
+            aarch64|arm64)
+              asset="celld-aarch64-unknown-linux-gnu.gz"
+              sha256="6d617cdf9f049e43ca6a4e37c4cce5d8e35395c8e86b371c984d32ba7d803bf5"
+              ;;
+            *)
+              echo "unsupported architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          dest="${RUNNER_TEMP}/celld-${CELLD_VERSION}"
+          mkdir -p "$dest"
+          archive="${dest}/${asset}"
+          curl -fsSL "https://github.com/denoland/celld/releases/download/v${CELLD_VERSION}/${asset}" -o "$archive"
+          echo "${sha256}  ${archive}" | sha256sum -c -
+          gzip -dc "$archive" > "${dest}/celld"
+          chmod +x "${dest}/celld"
+          version_out="$("${dest}/celld" --version)"
+          printf '%s\n' "$version_out"
+          printf '%s\n' "$version_out" | grep -qx "celld ${CELLD_VERSION}"
+          echo "CELLD_BIN=${dest}/celld" >> "$GITHUB_ENV"
+
+      - name: Point CELLD_ESBUILD at the installed esbuild binary
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) platform="linux-x64" ;;
+            aarch64|arm64) platform="linux-arm64" ;;
+            *)
+              echo "unsupported architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          esbuild="${GITHUB_WORKSPACE}/node_modules/@esbuild/${platform}/bin/esbuild"
+          if [[ ! -x "$esbuild" ]]; then
+            esbuild="${GITHUB_WORKSPACE}/node_modules/esbuild/bin/esbuild"
+          fi
+          test -x "$esbuild"
+          "$esbuild" --version
+          echo "CELLD_ESBUILD=${esbuild}" >> "$GITHUB_ENV"
+
       - name: Stage 1 — TypeScript AST, Google Style & Schema Lint
         run: npm run lint
 
@@ -39,4 +89,15 @@ jobs:
         run: npm run build
 
       - name: Stage 3 — Execute Full 55-Test Integration, Chaos & celld HA Suite
-        run: npm test
+        run: |
+          set -euo pipefail
+          test -x "${CELLD_BIN}"
+          test -x "${CELLD_ESBUILD}"
+          log="${RUNNER_TEMP}/npm-test.log"
+          set -o pipefail
+          npm test 2>&1 | tee "$log"
+          if grep -F "CELLD_BIN and CELLD_ESBUILD are required for the live celld process check" "$log"; then
+            echo "live celld process check was skipped" >&2
+            exit 1
+          fi
+          grep -E '^# skipped 0$' "$log"
