@@ -23,6 +23,7 @@
     }
   ],
   "vars": {
+    "ANSTS_SCHEDULER_SERVICE_TOKEN": "",
     "CELLD_REGION": "celld-gateway",
     "ANSTS_SCHEDULER_URL": "",
     "ANSTS_CONSOLE_RBAC_SECRET": ""

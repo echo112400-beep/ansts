@@ -22,7 +22,7 @@ for (let i = 0; i < 30; i++) {
 assert.equal(task.state, 'COMPLETED');
 const host = task.assigned_node_id;
 const token = readFileSync(new URL(`../.dev-secrets/${host}.token`, import.meta.url), 'utf8').trim();
-const result = await fetch(`${brain}/v1/body/state?taskId=${encodeURIComponent(taskId)}`, {
+const result = await fetch(`${brain}/v1/body/state?taskId=${encodeURIComponent(task.executionTaskId ?? taskId)}`, {
   headers: { authorization: `Body ${token}`, 'x-ansts-body-id': host },
 });
 assert.equal(result.status, 200);

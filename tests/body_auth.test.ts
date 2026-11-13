@@ -27,4 +27,6 @@ it("rejects forged host payloads before reading a Durable Object", async () => {
   assert.equal((await worker.fetch(new Request("https://cell/v1/body/state?hostId=host-b", { headers }), env)).status, 403);
   assert.equal((await worker.fetch(new Request("https://cell/v1/body/acquire?taskId=task", { method: "POST", headers, body: JSON.stringify({ node_id: "host-b", task_id: "task" }) }), env)).status, 403);
   assert.equal(calls, 0);
+  assert.equal((await worker.fetch(new Request("https://cell/v1/scheduler/complete", { method: "POST", body: "{}" }), env)).status, 401);
+  assert.equal((await worker.fetch(new Request("https://cell/v1/scheduler/register-node", { method: "POST", headers, body: JSON.stringify({ node_id: "host-b" }) }), env)).status, 403);
 });

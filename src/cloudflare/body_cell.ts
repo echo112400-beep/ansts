@@ -9,7 +9,7 @@ export class AnstsBodyCell {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     const route = path.slice("/v1/body/".length);
-    const allowed = ["acquire", "start", "finish", "acknowledge", "uncertain", "reconcile", "heartbeat", "receipt", "state"];
+    const allowed = ["acquire", "start", "finish", "acknowledge", "uncertain", "reconcile", "heartbeat", "receipt", "state", "consume-grant"];
     if (!path.startsWith("/v1/body/") || !allowed.includes(route)) return Response.json({ error: "NOT_FOUND" }, { status: 404 });
     if ((route === "state" && request.method !== "GET") || (route !== "state" && request.method !== "POST")) {
       return Response.json({ error: "METHOD_NOT_ALLOWED" }, { status: 405 });
@@ -22,6 +22,14 @@ export class AnstsBodyCell {
         body = JSON.parse(raw);
         if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("object required");
       } catch { return Response.json({ error: "INVALID_JSON" }, { status: 400 }); }
+      if (route === "consume-grant") {
+        const execution = this.loadAttempt();
+        if (request.headers.get("x-ansts-verified-grant") !== "true" || !execution || execution.phase !== "RUNNING" || !sameOwner(execution, body) || typeof body.nonce !== "string") return Response.json({ error: "EXECUTION_GRANT_REQUIRED" }, { status: 403 });
+        const id = `grant:${body.nonce}`;
+        if (this.ctx.storage.sql.exec("SELECT * FROM body_state WHERE id = ?", id).toArray().length) return Response.json({ error: "EXECUTION_GRANT_REPLAY" }, { status: 409 });
+        this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", id, JSON.stringify({ consumed_at: Date.now() }));
+        return Response.json({ authorized: true });
+      }
       if (route === "reconcile") return this.reconcile(body, request.headers.get("x-ansts-verified-operator"));
       if (["acquire", "start", "finish", "acknowledge", "uncertain"].includes(route)) return this.transition(route, body);
       const id = path.endsWith("/heartbeat") ? "heartbeat" : `receipt:${String(body.task_id)}:${Number(body.fencing_token)}`;

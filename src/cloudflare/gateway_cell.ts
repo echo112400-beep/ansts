@@ -7,11 +7,13 @@
 import { ConsoleRbacAuthGuard, ConsoleRole } from "../dashboard/console_rbac_guard.js";
 import { TaskSpecValidationError, TaskSpecValidator } from "../gateway/validator.js";
 import { DurableObjectNamespaceLike, DurableObjectStateLike } from "./env.js";
+import { publicTaskId, taskStorageId } from "./task_identity.js";
 
 export interface UnifiedGatewayEnv {
   ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;
   /** Base URL of the separate scheduler celld worker. Empty or unset fail-closes cross-worker calls. */
   ANSTS_SCHEDULER_URL?: string;
+  ANSTS_SCHEDULER_SERVICE_TOKEN?: string;
   ANSTS_CONSOLE_RBAC_SECRET?: string;
   CELLD_REGION?: string;
 }
@@ -169,7 +171,9 @@ async function schedulerFetch(env: UnifiedGatewayEnv, path: string, init?: Reque
     );
   }
   try {
-    return await fetch(`${base}${path}`, init);
+    const headers = new Headers(init?.headers);
+    if (env.ANSTS_SCHEDULER_SERVICE_TOKEN) headers.set("authorization", `Gateway ${env.ANSTS_SCHEDULER_SERVICE_TOKEN}`);
+    return await fetch(`${base}${path}`, { ...init, headers });
   } catch (err) {
     return schedulerClientError(
       {
@@ -264,6 +268,11 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
   }
   if (request.method === "GET" && url.pathname === "/v1beta1/gateway/state") {
     const gateway = await readGatewayState(env);
+    if (gateway) {
+      for (const key of ["leases", "dispatches"]) {
+        if (Array.isArray(gateway[key])) gateway[key] = (gateway[key] as Record<string, unknown>[]).map(row => ({ ...row, executionTaskId: row.task_id, task_id: publicTaskId(String(row.task_id))?.taskId ?? row.task_id }));
+      }
+    }
     return json(gateway ?? { error: "GATEWAY_STATE_UNAVAILABLE" }, gateway ? 200 : 503);
   }
   if (request.method === "GET" && url.pathname === "/v1beta1/console/gateway") {
@@ -287,12 +296,18 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
     const taskId = decodeURIComponent(url.pathname.slice("/v1/tasks/".length));
     const listed = await listSchedulerTasks(env);
     if (listed.failure) return listed.failure;
-    const found = listed.tasks.find((task) => String(task.task_id ?? task.taskId ?? "") === taskId);
+    const tenantId = url.searchParams.get("tenantId");
+    const candidates = listed.tasks.filter(task => {
+      const identity = publicTaskId(String(task.task_id ?? task.taskId ?? ""));
+      return (identity?.taskId ?? String(task.task_id ?? task.taskId ?? "")) === taskId && (!tenantId || (identity?.tenantId ?? task.tenant_id) === tenantId);
+    });
+    if (candidates.length > 1) return json({ error: "TENANT_REQUIRED" }, 400);
+    const found = candidates[0];
     if (!found) return json({ error: "TASK_NOT_FOUND", task_id: taskId }, 404);
     const gateway = await readGatewayState(env);
     const leases = Array.isArray(gateway?.leases) ? (gateway.leases as Array<Record<string, unknown>>) : [];
-    const lease = leases.find((row) => String(row.task_id) === taskId) ?? null;
-    return json({ ...found, controlPlane: "celld-gateway", gatewayLease: lease }, 200);
+    const lease = leases.find((row) => row.task_id === found.task_id) ?? null;
+    return json({ ...found, executionTaskId: found.task_id, task_id: publicTaskId(String(found.task_id))?.taskId ?? found.task_id, controlPlane: "celld-gateway", gatewayLease: lease }, 200);
   }
   if (request.method === "POST" && (url.pathname === "/v1/tasks" || url.pathname === "/v1beta1/tasks/dispatch")) {
     return submitThroughCells(request, env, url.pathname === "/v1beta1/tasks/dispatch");
@@ -328,6 +343,11 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
     }
     throw err;
   }
+  spec.task_id = taskStorageId(tenantId, taskId);
+  const existing = await listSchedulerTasks(env);
+  if (existing.failure) return existing.failure;
+  const legacy = existing.tasks.find(task => task.task_id === taskId && task.tenant_id === tenantId);
+  if (legacy) spec.task_id = String(legacy.task_id);
   const gateway = gatewayStub(env);
   if (!gateway) return json({ error: "GATEWAY_CELL_UNBOUND" }, 503);
   const submitResp = await schedulerFetch(env, "/v1/scheduler/submit", {
@@ -382,7 +402,8 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
         controlPlane: "celld-gateway",
         gatewayNodeId: env.CELLD_REGION ?? "celld-gateway",
         gatewayCellId: recorded.cellId ?? null,
-        taskId: spec.task_id,
+        taskId,
+        executionTaskId: spec.task_id,
         tenantId: spec.tenant_id,
         state,
         fencingToken: fencing,
@@ -397,7 +418,8 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
   }
   return json(
     {
-      task_id: spec.task_id,
+      task_id: taskId,
+      executionTaskId: spec.task_id,
       state,
       assigned_node_id: assigned || null,
       lease_fencing_token: fencing,
@@ -458,14 +480,24 @@ async function releaseLease(request: Request, env: UnifiedGatewayEnv): Promise<R
   const taskId = String(body.task_id ?? body.taskId ?? "");
   const state = await readGatewayState(env);
   const leases = Array.isArray(state?.leases) ? (state.leases as Array<Record<string, unknown>>) : [];
-  const lease = leases.find((row) => String(row.task_id) === taskId);
+  const tenantId = String(body.tenant_id ?? body.tenantId ?? (verified.claims.scopeTenant === "all" ? "" : verified.claims.scopeTenant));
+  const matches = leases.filter(row => {
+    const identity = publicTaskId(String(row.task_id));
+    return (identity?.taskId ?? row.task_id) === taskId && (!tenantId || identity?.tenantId === tenantId);
+  });
+  if (matches.length > 1) return json({ error: "TENANT_REQUIRED" }, 400);
+  const lease = matches[0];
+  if (!lease) return json({ error: "LEASE_NOT_FOUND" }, 404);
+  const identity = publicTaskId(String(lease.task_id));
+  if (identity && verified.claims.scopeTenant !== "all" && verified.claims.scopeTenant !== identity.tenantId) return json({ error: "TENANT_FORBIDDEN" }, 403);
+  const storageTaskId = String(lease.task_id);
   const fencing = Number(lease?.fencing_token ?? 0);
   const nodeId = String(lease?.node_id ?? "");
   if (fencing > 0 && nodeId) {
     const completeResp = await schedulerFetch(env, "/v1/scheduler/complete", {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ task_id: taskId, node_id: nodeId, fencing_token: fencing }),
+      body: JSON.stringify({ task_id: storageTaskId, node_id: nodeId, fencing_token: fencing }),
     });
     if (completeResp.headers.get("x-ansts-scheduler-client") === "gateway") return completeResp;
     if (!completeResp.ok) {
@@ -477,7 +509,7 @@ async function releaseLease(request: Request, env: UnifiedGatewayEnv): Promise<R
     new Request("https://cell.internal/v1/gateway/release", {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ task_id: taskId, confirm: true }),
+      body: JSON.stringify({ task_id: storageTaskId, confirm: true }),
     })
   );
   const releaseBody = (await releaseResp.json()) as Record<string, unknown>;

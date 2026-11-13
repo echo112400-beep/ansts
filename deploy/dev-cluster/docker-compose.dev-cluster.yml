@@ -277,6 +277,7 @@ services:
     environment:
       <<: [*ansts-common-env, *ansts-gateway-routing-env]
       ANSTS_NODE_ID: "celld-gw-01"
+      ANSTS_GATEWAY_TOKEN_FILE: "/app/.dev-secrets/gateway-control.token"
       ANSTS_NODE_ROLE: "gateway"
       ANSTS_SCHEDULER_URL: "http://celld-brain-01:8081"
       CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
@@ -308,6 +309,7 @@ services:
     environment:
       <<: [*ansts-common-env, *ansts-gateway-routing-env]
       ANSTS_NODE_ID: "celld-gw-02"
+      ANSTS_GATEWAY_TOKEN_FILE: "/app/.dev-secrets/gateway-control.token"
       ANSTS_NODE_ROLE: "gateway"
       ANSTS_SCHEDULER_URL: "http://celld-brain-01:8081"
       CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"

@@ -4,7 +4,10 @@
  * and dispatches queued task messages in `queue(batch, env)` to `ANSTS_SCHEDULER_CELL` with retry-on-failure semantics.
  */
 import { CloudflareCelldEnv, QueueBatchLike } from "./env.js";
-import { authenticateBody, authenticateBodyOperator } from "./body_auth.js";
+import { authenticateBody, authenticateBodyOperator, authenticateGatewayService } from "./body_auth.js";
+import { issueExecutionGrant, verifyExecutionGrant } from "./execution_token.js";
+import { ExecutionAttempt, sameOwner } from "./execution_attempt.js";
+import { normalizeTaskStorageId } from "./task_identity.js";
 export { AnstsSchedulerCell } from "./scheduler_cell.js";
 export { AgentTaskHarnessCell } from "./harness_cell.js";
 export { TunnelGatewayCell } from "./tunnel_gateway_cell.js";
@@ -116,6 +119,7 @@ export default {
       return new Response(JSON.stringify(found), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (url.pathname.startsWith("/v1/body/") && env.ANSTS_BODY_CELL) {
+      if (url.pathname === "/v1/body/consume-grant") return Response.json({ error: "INTERNAL_ROUTE" }, { status: 403 });
       if (url.pathname === "/v1/body/reconcile") {
         if (!authenticateBodyOperator(request, env.ANSTS_BODY_AUTH_SECRET)) return Response.json({ error: "OPERATOR_AUTH_REQUIRED" }, { status: 401 });
         const taskId = url.searchParams.get("taskId");
@@ -163,9 +167,39 @@ export default {
         } catch { return Response.json({ error: "INVALID_JSON" }, { status: 400 }); }
       }
       const id = env.ANSTS_BODY_CELL.idFromName(taskId ? `execution:${taskId}` : url.searchParams.get("hostId") ?? "body-host-01");
-      return env.ANSTS_BODY_CELL.get(id).fetch(request);
+      const cell = env.ANSTS_BODY_CELL.get(id);
+      if (url.pathname === "/v1/body/verify-execution-token" && request.method === "POST") {
+        const body = await request.json() as Record<string, unknown>;
+        const snapshot = await cell.fetch(new Request("https://cell/v1/body/state"));
+        const execution = (await snapshot.json() as { execution: ExecutionAttempt }).execution;
+        if (!execution || execution.phase !== "RUNNING" || !sameOwner(execution, body)) return Response.json({ error: "EXECUTION_ADMISSION_REQUIRED" }, { status: 409 });
+        const grant = verifyExecutionGrant(env.ANSTS_BODY_AUTH_SECRET ?? "", String(body.execution_token ?? ""), execution);
+        if (!grant) return Response.json({ error: "INVALID_EXECUTION_GRANT" }, { status: 403 });
+        return cell.fetch(new Request("https://cell/v1/body/consume-grant", { method: "POST", headers: { "x-ansts-verified-grant": "true" }, body: JSON.stringify({ ...body, nonce: grant.nonce }) }));
+      }
+      const response = await cell.fetch(request);
+      if (url.pathname === "/v1/body/start" && response.ok) {
+        const body = await response.json() as { execution: ExecutionAttempt };
+        return Response.json({ ...body, execution_token: issueExecutionGrant(env.ANSTS_BODY_AUTH_SECRET ?? "", body.execution) });
+      }
+      return response;
     }
     if (url.pathname.startsWith("/v1/scheduler")) {
+      if (request.method === "POST" && ["/v1/scheduler/register-node", "/v1/scheduler/lease-renew", "/v1/scheduler/complete", "/v1/scheduler/schedule-tick"].includes(url.pathname)) {
+        const host = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
+        const gateway = authenticateGatewayService(request, env.ANSTS_BODY_AUTH_SECRET);
+        if (!host && !gateway) return Response.json({ error: "SERVICE_AUTH_REQUIRED" }, { status: 401 });
+        if (host && url.pathname !== "/v1/scheduler/schedule-tick") {
+          const body = await request.clone().json() as Record<string, unknown>;
+          if (body.node_id !== host) return Response.json({ error: "BODY_SCOPE_FORBIDDEN" }, { status: 403 });
+          if (url.pathname !== "/v1/scheduler/register-node") {
+            const scheduler = env.ANSTS_SCHEDULER_CELL.get(env.ANSTS_SCHEDULER_CELL.idFromName(url.searchParams.get("shard") ?? "global-shard-0"));
+            const tasks = (await (await scheduler.fetch(new Request("https://cell/v1/scheduler/tasks"))).json() as { tasks: Record<string, unknown>[] }).tasks;
+            const task = tasks.find(task => task.task_id === body.task_id);
+            if (!task || task.assigned_node_id !== host || (body.tenant_id && task.tenant_id !== body.tenant_id)) return Response.json({ error: "BODY_SCOPE_FORBIDDEN" }, { status: 403 });
+          }
+        }
+      }
       if (url.pathname === "/v1/scheduler/resolve-uncertain") return Response.json({ error: "OPERATOR_ROUTE_REQUIRED" }, { status: 403 });
       if (url.pathname === "/v1/scheduler/suspend-uncertain") {
         const host = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
@@ -179,6 +213,13 @@ export default {
       const shardName = url.searchParams.get("shard") ?? "global-shard-0";
       const id = env.ANSTS_SCHEDULER_CELL.idFromName(shardName);
       const stub = env.ANSTS_SCHEDULER_CELL.get(id);
+      if (url.pathname === "/v1/scheduler/submit" && request.method === "POST") {
+        const body = await request.json() as Record<string, unknown>;
+        const tasks = (await (await stub.fetch(new Request("https://cell/v1/scheduler/tasks"))).json() as { tasks: Record<string, unknown>[] }).tasks;
+        const legacy = tasks.find(task => task.task_id === body.task_id && task.tenant_id === body.tenant_id);
+        if (!legacy) body.task_id = normalizeTaskStorageId(String(body.tenant_id ?? ""), String(body.task_id ?? ""));
+        return stub.fetch(new Request(request.url, { method: "POST", headers: request.headers, body: JSON.stringify(body) }));
+      }
       return stub.fetch(request);
     }
     if (url.pathname.startsWith("/v1/harness") && env.ANSTS_HARNESS_CELL) {
@@ -208,7 +249,7 @@ export default {
             new Request("https://cell.internal/v1/scheduler/submit", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify(body),
+              body: JSON.stringify({ ...body, task_id: normalizeTaskStorageId(String(body.tenant_id ?? ""), String(body.task_id ?? "")) }),
             })
           );
           if (!resp.ok && resp.status >= 500) {

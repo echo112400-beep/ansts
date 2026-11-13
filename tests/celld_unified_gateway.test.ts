@@ -13,14 +13,17 @@ import { ConsoleRbacAuthGuard } from "../src/dashboard/console_rbac_guard.js";
 import schedulerWorker from "../src/cloudflare/worker.js";
 import gatewayWorker from "../src/cloudflare/gateway_worker.js";
 import { AnstsLocalAndComposeServer } from "../src/server_main.js";
+import { bodyServiceToken } from "../src/cloudflare/body_auth.js";
 
 const SECRET = "unified-gateway-test-secret-32b";
+const SERVICE_SECRET = "e".repeat(64);
 
 function gatewayEnv(gateway: AnstsGatewayCell, schedulerUrl?: string, secret?: string) {
   return {
     CELLD_REGION: "celld-gateway",
     ANSTS_CONSOLE_RBAC_SECRET: secret,
     ANSTS_SCHEDULER_URL: schedulerUrl,
+    ANSTS_SCHEDULER_SERVICE_TOKEN: bodyServiceToken(SERVICE_SECRET, "gateway:control"),
     ANSTS_GATEWAY_CELL: {
       idFromName: (name: string) => ({ toString: () => name, name }),
       get: () => ({ id: { toString: () => "gateway-control-plane" }, fetch: (req: Request) => gateway.fetch(req) }),
@@ -97,6 +100,7 @@ describe("unified celld gateway and scheduler", () => {
     const gateway = new AnstsGatewayCell(new MockDurableObjectState("gateway-control-plane"));
     const scheduler = new AnstsSchedulerCell(new MockDurableObjectState("global-shard-0"));
     const schedulerEnv = {
+      ANSTS_BODY_AUTH_SECRET: SERVICE_SECRET,
       CELLD_REGION: "celld-scheduler",
       ANSTS_SCHEDULER_CELL: {
         idFromName: (name: string) => ({ toString: () => name, name }),
@@ -110,7 +114,7 @@ describe("unified celld gateway and scheduler", () => {
       const upstream = await schedulerWorker.fetch(
         new Request(`http://scheduler.local${req.url}`, {
           method: req.method,
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}), ...(req.headers["x-ansts-body-id"] ? { "x-ansts-body-id": String(req.headers["x-ansts-body-id"]) } : {}) },
           body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
         }),
         schedulerEnv as never
@@ -125,7 +129,7 @@ describe("unified celld gateway and scheduler", () => {
     const schedulerUrl = `http://127.0.0.1:${schedulerPort}`;
     const registered = await fetch(`${schedulerUrl}/v1/scheduler/register-node`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: `Body ${bodyServiceToken(SERVICE_SECRET, "body-host-01")}`, "x-ansts-body-id": "body-host-01" },
       body: JSON.stringify({ node_id: "body-host-01", total_cpu_cores: 4, free_cpu_cores: 4 }),
     });
     assert.equal(registered.status, 200);
@@ -253,7 +257,7 @@ describe("unified celld gateway and scheduler", () => {
       leases: Array<{ task_id: string; status: string }>;
     };
     assert.equal(state.sessions.some((row) => row.subject === "lin"), true);
-    assert.equal(state.leases.find((row) => row.task_id === "task-gw-submit")?.status, "RELEASED");
+    assert.equal(state.leases.find((row) => row.task_id === "ansts:v1:" + Buffer.from(JSON.stringify(["probe", "task-gw-submit"])).toString("base64url"))?.status, "RELEASED");
     assert.equal(await handleUnifiedGatewayRequest(new Request("https://edge.ansts.io/v1/scheduler/tasks"), env as never), null);
     const schedulerOnly = (await (await fetch(`${schedulerUrl}/healthz`)).json()) as { controlPlane?: string };
     assert.equal(schedulerOnly.controlPlane, "celld-scheduler");

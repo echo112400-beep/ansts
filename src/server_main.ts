@@ -1405,8 +1405,17 @@ export class AnstsLocalAndComposeServer {
           res.end(JSON.stringify({ error: "EXECUTION_ADMISSION_REQUIRED" }));
           return;
         }
+        const grant = await fetch(`${process.env.ANSTS_BODY_CELL_URL}/v1/body/verify-execution-token?taskId=${encodeURIComponent(taskId)}`, {
+          method: "POST", headers: { authorization: `Body ${token}`, "x-ansts-body-id": this.nodeId, "content-type": "application/json" },
+          body: JSON.stringify({ tenant_id: body.tenantId, task_id: taskId, attempt_id: body.attemptId, node_id: this.nodeId, fencing_token: body.fencingToken, input_digest: inputDigest, execution_token: body.executionToken }), signal: AbortSignal.timeout(10000),
+        });
+        if (!grant.ok) {
+          res.writeHead(grant.status, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "EXECUTION_GRANT_REJECTED" }));
+          return;
+        }
         const leaseResponse = await fetch(`${process.env.ANSTS_BODY_CELL_URL}/v1/scheduler/lease-renew`, {
-          method: "POST", headers: { "content-type": "application/json" },
+          method: "POST", headers: { "content-type": "application/json", authorization: `Body ${token}`, "x-ansts-body-id": this.nodeId },
           body: JSON.stringify({ task_id: taskId, node_id: this.nodeId, fencing_token: body.fencingToken }),
           signal: AbortSignal.timeout(10000),
         });
@@ -1442,7 +1451,7 @@ export class AnstsLocalAndComposeServer {
         renewing = true;
         try {
           const response = await fetch(`${process.env.ANSTS_BODY_CELL_URL}/v1/scheduler/lease-renew`, {
-            method: "POST", headers: { "content-type": "application/json" },
+            method: "POST", headers: { "content-type": "application/json", authorization: `Body ${fs.readFileSync(process.env.ANSTS_BODY_TOKEN_FILE!, "utf8").trim()}`, "x-ansts-body-id": this.nodeId },
             body: JSON.stringify({ task_id: taskId, node_id: this.nodeId, fencing_token: body.fencingToken }), signal: AbortSignal.timeout(5000),
           });
           if (!response.ok) executionController.abort();

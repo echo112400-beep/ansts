@@ -97,7 +97,10 @@ export function prepareCelldWorkerProject(
     const lines = [`ANSTS_SCHEDULER_URL=${options.schedulerUrl?.trim() || process.env.ANSTS_SCHEDULER_URL?.trim() || ""}`];
     const secret = process.env.ANSTS_CONSOLE_RBAC_SECRET?.trim() ?? "";
     if (secret) lines.push(`ANSTS_CONSOLE_RBAC_SECRET=${secret}`);
+    if (process.env.ANSTS_SCHEDULER_SERVICE_TOKEN) lines.push(`ANSTS_SCHEDULER_SERVICE_TOKEN=${process.env.ANSTS_SCHEDULER_SERVICE_TOKEN}`);
     fs.writeFileSync(path.join(projectDir, ".dev.vars"), `${lines.join("\n")}\n`);
+  } else if (process.env.ANSTS_BODY_AUTH_SECRET) {
+    fs.writeFileSync(path.join(projectDir, ".dev.vars"), `ANSTS_BODY_AUTH_SECRET=${process.env.ANSTS_BODY_AUTH_SECRET}\n`);
   }
   return { projectDir, wranglerPath };
 }

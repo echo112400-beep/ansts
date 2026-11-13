@@ -41,6 +41,7 @@ describe("celld-loaded worker service start", () => {
         ["ANSTS_SCHEDULER_CELL", "AnstsSchedulerCell"],
         ["ANSTS_HARNESS_CELL", "AgentTaskHarnessCell"],
         ["ANSTS_TUNNEL_CELL", "TunnelGatewayCell"],
+        ["ANSTS_BODY_CELL", "AnstsBodyCell"],
       ]
     );
     assert.equal(bindings.some((binding) => binding.class_name === "AnstsGatewayCell"), false);

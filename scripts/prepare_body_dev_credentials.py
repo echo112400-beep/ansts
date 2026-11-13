@@ -24,3 +24,6 @@ print('Prepared host-scoped development credentials (values hidden).')
 operator = root / 'body-operator.token'
 operator.write_text(hmac.new(key.encode(), b'ansts-body-v1:operator:reconcile', hashlib.sha256).hexdigest())
 operator.chmod(0o600)
+gateway = root / 'gateway-control.token'
+gateway.write_text(hmac.new(key.encode(), b'ansts-body-v1:gateway:control', hashlib.sha256).hexdigest())
+gateway.chmod(0o600)

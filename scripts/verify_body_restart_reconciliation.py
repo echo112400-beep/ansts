@@ -58,24 +58,25 @@ def main():
         status, submitted = http('/v1beta1/tasks/dispatch', {'tenantId': 'fault-test', 'taskId': task_id, 'promptText': 'must not automatically replay after restart'}, base='http://127.0.0.1:18080')
         assert status == 202, submitted
         host = submitted['targetBodyHostId']
+        execution_task_id = submitted.get('executionTaskId', task_id)
         assert host in HOSTS, submitted
         def state():
-            return http(f'/v1/body/state?taskId={task_id}', host=host)[1].get('execution')
+            return http(f'/v1/body/state?taskId={execution_task_id}', host=host)[1].get('execution')
         wait_for(lambda: (value if value and value['phase'] == 'RUNNING' else None) if (value := state()) else None)
         # Allow the local journal to be admitted before restarting the container.
         time.sleep(1)
         subprocess.run(['docker', 'restart', 'ansts-body-daemon-' + host[-2:]], check=True, stdout=subprocess.DEVNULL)
         uncertain = wait_for(lambda: (value if value and value['phase'] == 'UNCERTAIN' else None) if (value := state()) else None)
         wait_for(lambda: http(f'/v1/tasks/{task_id}', base='http://127.0.0.1:18080')[1].get('state') == 'SUSPENDED_RECONCILIATION')
-        review = {'tenant_id': uncertain['tenant_id'], 'task_id': task_id, 'expected_version': uncertain['version'], 'action': 'retain_block', 'evidence': 'development restart during delayed execution; no completed result', 'reason': 'Fault verification must retain uncertainty'}
-        assert http(f'/v1/body/reconcile?taskId={task_id}', review, host=host)[0] == 401
-        assert http(f'/v1/body/reconcile?taskId={task_id}', {**review, 'expected_version': 0}, operator=True)[0] == 409
-        status, result = http(f'/v1/body/reconcile?taskId={task_id}', review, operator=True)
+        review = {'tenant_id': uncertain['tenant_id'], 'task_id': execution_task_id, 'expected_version': uncertain['version'], 'action': 'retain_block', 'evidence': 'development restart during delayed execution; no completed result', 'reason': 'Fault verification must retain uncertainty'}
+        assert http(f'/v1/body/reconcile?taskId={execution_task_id}', review, host=host)[0] == 401
+        assert http(f'/v1/body/reconcile?taskId={execution_task_id}', {**review, 'expected_version': 0}, operator=True)[0] == 409
+        status, result = http(f'/v1/body/reconcile?taskId={execution_task_id}', review, operator=True)
         assert status == 200, result
         assert result['execution']['phase'] == 'UNCERTAIN'
         assert result['execution']['audit'][-1]['action'] == 'retain_block'
-        assert http(f'/v1/body/reconcile?taskId={task_id}', review, operator=True)[0] == 200
-        assert http(f'/v1/body/reconcile?taskId={task_id}', {**review, 'reason': 'changed stale review'}, operator=True)[0] == 409
+        assert http(f'/v1/body/reconcile?taskId={execution_task_id}', review, operator=True)[0] == 200
+        assert http(f'/v1/body/reconcile?taskId={execution_task_id}', {**review, 'reason': 'changed stale review'}, operator=True)[0] == 409
         time.sleep(3)
         assert state()['phase'] == 'UNCERTAIN'
         print(json.dumps({'taskId': task_id, 'host': host, 'restart': 'verified', 'automaticReplay': 'blocked', 'hostPrivilegeEscalation': 'rejected', 'staleReview': 'rejected', 'audit': 'persisted'}))

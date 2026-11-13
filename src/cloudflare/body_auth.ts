@@ -20,3 +20,6 @@ export function authenticateBodyOperator(request: Request, secret?: string): boo
     request.headers.get("authorization") ?? "", `Operator ${bodyServiceToken(secret, "operator:reconcile")}`
   );
 }
+export function authenticateGatewayService(request: Request, secret?: string): boolean {
+  return !!secret && /^[a-f0-9]{64}$/.test(secret) && equalBodyToken(request.headers.get("authorization") ?? "", `Gateway ${bodyServiceToken(secret, "gateway:control")}`);
+}
