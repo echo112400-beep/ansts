@@ -217,6 +217,8 @@ async function listSchedulerTasks(env: UnifiedGatewayEnv): Promise<{ tasks: Reco
 }
 
 function isGatewayPath(method: string, pathname: string): boolean {
+  if (method === "GET" && pathname === "/v1/auth/me") return true;
+  if (method === "GET" && pathname === "/v1/console/tasks") return true;
   if (method === "GET" && (pathname === "/health" || pathname === "/healthz" || pathname === "/readyz")) return true;
   if (method === "POST" && pathname === "/v1/tasks") return true;
   if (method === "GET" && pathname.startsWith("/v1/tasks/") && pathname.length > "/v1/tasks/".length) return true;
@@ -250,6 +252,17 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
       const tenantDenied = gatewayAuthorizationError(request, principal, body.tenant_id ?? body.tenantId);
       if (tenantDenied) return tenantDenied;
     }
+  }
+  if (request.method === "GET" && url.pathname === "/v1/auth/me" && principal) {
+    return Response.json({ authenticated: true, user: { sub: principal.sub, role: principal.role, scopeTenant: principal.scopeTenant, scopeRegion: principal.scopeRegion, canWrite: !principal.readOnly }, expiresAt: principal.exp * 1000 }, { headers: { "cache-control": "no-store" } });
+  }
+  if (request.method === "GET" && url.pathname === "/v1/console/tasks" && principal) {
+    const tenant = url.searchParams.get("tenantId");
+    if (tenant && !tenantAllowed(principal, tenant)) return json({ error: "TENANT_FORBIDDEN" }, 403);
+    const listed = await listSchedulerTasks(env);
+    if (listed.failure) return listed.failure;
+    const tasks = listed.tasks.filter(task => tenantAllowed(principal, task.tenant_id) && (!tenant || task.tenant_id === tenant)).sort((a, b) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0));
+    return Response.json({ total: tasks.length, tasks: tasks.slice(0, 50).map(task => ({ task_id: publicTaskId(String(task.task_id))?.taskId ?? task.task_id, tenant_id: task.tenant_id, state: task.state, assigned_node_id: task.assigned_node_id ?? null, created_at: task.created_at ?? null })), refreshedAt: Date.now() }, { headers: { "cache-control": "no-store" } });
   }
   if (!env.ANSTS_GATEWAY_CELL) {
     return json({ error: "GATEWAY_CELL_UNBOUND", controlPlane: "celld-gateway" }, 503);

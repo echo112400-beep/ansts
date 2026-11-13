@@ -6,7 +6,7 @@ JWT 使用独立用户签名密钥验证 HS256，要求有效的 sub、role、sc
 
 任务查询根据已认证租户过滤；越权显式 tenantId 返回 403。Gateway 状态与总览只返回授权租户的任务、提交和租约；租户用户不能读取其他用户会话。租约写操作仍需现有确认字段与操作权限。后台 Brain 的 Scheduler/Harness/Tunnel/旧 Brain 数据路径要求服务身份，用户 JWT 不能用于绕过 Gateway。
 
-开发凭据准备脚本生成 `.dev-secrets/user-signing.key`，Gateway 启动时注入独立签名配置。`scripts/gateway_dev_identity.mjs` 为本地测试生成 15 分钟有效凭据，不提供公共登录或发证端点，也不把凭据输出到日志。控制台的用户登录/安全会话交互尚未接入；旧页面不能依赖匿名 API 或固定演示 token。
+开发凭据准备脚本生成 `.dev-secrets/user-signing.key`，Gateway 启动时注入独立签名配置。`scripts/gateway_dev_identity.mjs` 为本地测试生成 15 分钟有效凭据，不提供公共发证端点，也不把凭据输出到日志。[控制台登录](console-session.md) 已接入短期凭据验证、只读能力、内存会话、退出和过期处理；生产身份提供方尚待配置。
 
 ## 开发用户密钥轮换
 

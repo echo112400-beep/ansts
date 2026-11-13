@@ -37,6 +37,16 @@ it("rejects anonymous, expired, viewer writes and cross-tenant operations; filte
     assert.equal((await request("/v1/tasks", token("a", "VIEWER"), body("a"))).status, 403);
     assert.equal((await request("/v1/tasks", token("a", "OPERATOR"), body("b"))).status, 403);
     for (const tenant of ["a", "b"]) assert.equal((await request("/v1/tasks", token(tenant, "OPERATOR"), body(tenant))).status, 202);
+    const me = await request("/v1/auth/me", token("a", "VIEWER"));
+    assert.equal(me.status, 200);
+    assert.equal(me.headers.get("cache-control"), "no-store");
+    const identity = await me.json();
+    assert.equal(identity.user.scopeTenant, "a");
+    assert.equal(identity.token, undefined);
+    const consoleTasks = await (await request("/v1/console/tasks", token("a", "VIEWER"))).json();
+    assert.equal(consoleTasks.total, 1);
+    assert.equal(consoleTasks.tasks[0].tenant_id, "a");
+    assert.equal((await request("/v1/console/tasks?tenantId=b", token("a", "VIEWER"))).status, 403);
     assert.equal((await request("/v1/tasks/same-name?tenantId=b", token("a", "VIEWER"))).status, 403);
     const task = await (await request("/v1/tasks/same-name", token("a", "VIEWER"))).json();
     assert.equal(task.tenant_id, "a");
