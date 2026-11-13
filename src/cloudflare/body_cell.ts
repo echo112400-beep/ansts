@@ -9,6 +9,30 @@ export class AnstsBodyCell {
     const path = new URL(request.url).pathname;
     if (request.method === "POST") {
       const body = await request.json() as Record<string, unknown>;
+      if (path.endsWith("/acquire")) {
+        if (!body.task_id || !body.node_id || !Number.isInteger(body.fencing_token) || Number(body.fencing_token) < 1) {
+          return Response.json({ error: "INVALID_EXECUTION_LEASE" }, { status: 400 });
+        }
+        const previous = this.ctx.storage.sql.exec<{ payload: string }>("SELECT * FROM body_state WHERE id = ?", "execution").toArray()[0];
+        if (previous) {
+          const saved = JSON.parse(previous.payload);
+          if (!saved.result && saved.node_id === body.node_id && saved.fencing_token === body.fencing_token) {
+            return Response.json({ acquired: true });
+          }
+          return Response.json({ acquired: false, ...saved }, { status: saved.result ? 200 : 409 });
+        }
+        this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", "execution", JSON.stringify(body));
+        return Response.json({ acquired: true });
+      }
+      if (path.endsWith("/finish")) {
+        const previous = this.ctx.storage.sql.exec<{ payload: string }>("SELECT * FROM body_state WHERE id = ?", "execution").toArray()[0];
+        const saved = previous ? JSON.parse(previous.payload) : null;
+        if (!saved || saved.node_id !== body.node_id || saved.fencing_token !== body.fencing_token || !body.result) {
+          return Response.json({ error: "STALE_EXECUTION_OWNER" }, { status: 409 });
+        }
+        this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", "execution", JSON.stringify({ ...saved, result: body.result }));
+        return Response.json({ recorded: true });
+      }
       const id = path.endsWith("/heartbeat") ? "heartbeat" : `receipt:${String(body.task_id)}:${Number(body.fencing_token)}`;
       if (id !== "heartbeat" && (!body.task_id || !Number.isInteger(body.fencing_token))) {
         return Response.json({ error: "INVALID_RECEIPT" }, { status: 400 });

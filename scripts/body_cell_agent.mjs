@@ -22,6 +22,7 @@ while (!stopping) {
     const { tasks } = await rpc('/v1/scheduler/tasks');
     for (const task of tasks) {
       if (task.assigned_node_id !== nodeId || task.state !== 'LEASED') continue;
+      try {
       const lease = { task_id: task.task_id, node_id: nodeId, fencing_token: task.lease_fencing_token };
       await rpc('/v1/scheduler/lease-renew', lease);
       const state = await rpc(`/v1/body/state?hostId=${encodeURIComponent(nodeId)}`);
@@ -30,6 +31,12 @@ while (!stopping) {
         continue;
       }
       const controller = new AbortController();
+      const executionPath = `/v1/body/acquire?taskId=${encodeURIComponent(task.task_id)}`;
+      const admission = await rpc(executionPath, lease);
+      if (!admission.acquired && admission.result) {
+        await rpc('/v1/scheduler/complete', lease);
+        continue;
+      }
       let renewing = false;
       const renewal = setInterval(async () => {
         if (renewing) return;
@@ -48,9 +55,13 @@ while (!stopping) {
       } finally { clearInterval(renewal); }
       if (!response.ok) throw new Error(`execute: ${response.status}`);
       const result = await response.json();
+      await rpc(`/v1/body/finish?taskId=${encodeURIComponent(task.task_id)}`, { ...lease, result });
       await rpc(`/v1/body/receipt?hostId=${encodeURIComponent(nodeId)}`, { ...lease, result });
       await rpc('/v1/scheduler/complete', lease);
       console.log(JSON.stringify({ event: 'body-completed', ...lease }));
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'body-task-blocked', taskId: task.task_id, error: String(error) }));
+      }
     }
   } catch (error) { console.error(String(error)); }
   await new Promise(resolve => setTimeout(resolve, 2000));

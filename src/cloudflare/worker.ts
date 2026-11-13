@@ -115,7 +115,8 @@ export default {
       return new Response(JSON.stringify(found), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (url.pathname.startsWith("/v1/body/") && env.ANSTS_BODY_CELL) {
-      const id = env.ANSTS_BODY_CELL.idFromName(url.searchParams.get("hostId") ?? "body-host-01");
+      const taskId = url.searchParams.get("taskId");
+      const id = env.ANSTS_BODY_CELL.idFromName(taskId ? `execution:${taskId}` : url.searchParams.get("hostId") ?? "body-host-01");
       return env.ANSTS_BODY_CELL.get(id).fetch(request);
     }
     if (url.pathname.startsWith("/v1/scheduler")) {

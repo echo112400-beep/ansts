@@ -29,3 +29,5 @@ side effects over automatic progress. Cross-host exactly-once side effects are
 not guaranteed: external tools still require idempotency keys and fence validation.
 Scheduler node expiration remains the authority for recovery.
 The two development Gateway workers retain separate local cell stores.
+
+Per-task shared admission now blocks cross-host replay of unresolved attempts and reuses completed results. Unresolved attempts require operator reconciliation. Body execution validates the scheduler lease before native work. Gateway lease views reflect scheduler terminal states.

@@ -1383,6 +1383,18 @@ export class AnstsLocalAndComposeServer {
       const body = await this.readJsonBody(req);
       const taskId = String(body.taskId ?? `task-${Date.now()}`);
       const journal = body.fencingToken ? new BodyExecutionJournal(path.join(this.storageDir, "execution-journal")) : null;
+      if (process.env.ANSTS_BODY_CELL_URL) {
+        const leaseResponse = await fetch(`${process.env.ANSTS_BODY_CELL_URL}/v1/scheduler/lease-renew`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ task_id: taskId, node_id: this.nodeId, fencing_token: body.fencingToken }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!leaseResponse.ok) {
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "STALE_EXECUTION_LEASE", taskId }));
+          return;
+        }
+      }
       const admission = journal?.admit(taskId);
       if (admission && !admission.admitted) {
         res.writeHead(admission.result ? 200 : 409, { "content-type": "application/json" });

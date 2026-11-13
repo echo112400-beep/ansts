@@ -5,6 +5,18 @@ import { AnstsBodyCell } from "../src/cloudflare/body_cell.js";
 import { MockDurableObjectState } from "../src/cloudflare/env.js";
 
 describe("Body Cell", () => {
+  it("prevents another host from replaying an uncertain execution and rejects stale completion", async () => {
+    const cell = new AnstsBodyCell(new MockDurableObjectState("execution:task"));
+    const post = (path: string, body: unknown) => cell.fetch(new Request(`https://cell/v1/body/${path}`, { method: "POST", body: JSON.stringify(body) }));
+    const owner = { task_id: "task", node_id: "host-a", fencing_token: 1 };
+    assert.equal((await post("acquire", owner)).status, 200);
+    assert.equal((await post("acquire", { ...owner, node_id: "host-b", fencing_token: 2 })).status, 409);
+    assert.equal((await post("finish", { ...owner, fencing_token: 2, result: {} })).status, 409);
+    await post("finish", { ...owner, result: { status: "COMPLETED" } });
+    const recovered = await (await post("acquire", { ...owner, node_id: "host-b", fencing_token: 2 })).json();
+    assert.equal(recovered.acquired, false);
+    assert.equal(recovered.result.status, "COMPLETED");
+  });
   it("keeps heartbeat and fenced receipts across cell reconstruction", async () => {
     const state = new MockDurableObjectState("body-01");
     const cell = new AnstsBodyCell(state);

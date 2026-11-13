@@ -187,7 +187,16 @@ async function readGatewayState(env: UnifiedGatewayEnv): Promise<Record<string, 
   if (!stub) return null;
   const resp = await stub.fetch(new Request("https://cell.internal/v1/gateway/state"));
   if (!resp.ok) return null;
-  return (await resp.json()) as Record<string, unknown>;
+  const state = (await resp.json()) as Record<string, unknown>;
+  const listed = await listSchedulerTasks(env);
+  if (!listed.failure && Array.isArray(state.leases)) {
+    for (const lease of state.leases as Record<string, unknown>[]) {
+      const task = listed.tasks.find(task => task.task_id === lease.task_id);
+      if (task && ["COMPLETED", "SUCCEEDED", "FAILED", "CANCELLED", "DEAD_LETTER"].includes(String(task.state))) lease.status = "RELEASED";
+    }
+    state.activeLeases = (state.leases as Record<string, unknown>[]).filter(lease => lease.status === "HELD").length;
+  }
+  return state;
 }
 
 async function listSchedulerTasks(env: UnifiedGatewayEnv): Promise<{ tasks: Record<string, unknown>[]; failure: Response | null }> {

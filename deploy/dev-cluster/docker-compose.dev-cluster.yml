@@ -207,6 +207,7 @@ services:
       - "19501:9501"
     volumes:
       - body_01_data:/var/lib/ansts/body-host-01
+      - ../../scripts/body_cell_agent.mjs:/app/scripts/body_cell_agent.mjs:ro
     environment:
       <<: *ansts-common-env
       ANSTS_NODE_ID: "body-host-01"
@@ -234,6 +235,7 @@ services:
       - "19502:9502"
     volumes:
       - body_02_data:/var/lib/ansts/body-host-02
+      - ../../scripts/body_cell_agent.mjs:/app/scripts/body_cell_agent.mjs:ro
     environment:
       <<: *ansts-common-env
       ANSTS_NODE_ID: "body-host-02"
