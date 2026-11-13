@@ -21,7 +21,7 @@
     "start:celld-gateway": "bash scripts/celld_gateway_up.sh"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0 <23.0.0"
   },
   "devDependencies": {
     "@babel/core": "^7.20.0",
