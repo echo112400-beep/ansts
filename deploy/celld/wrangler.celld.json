@@ -68,7 +68,7 @@
     ]
   },
   "vars": {
-    "CELLD_REGION": "celld-brain",
+    "CELLD_REGION": "celld-scheduler",
     "CELLD_REBALANCE_INTERVAL_MS": "5000"
   }
 }

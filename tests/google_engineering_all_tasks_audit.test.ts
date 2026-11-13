@@ -8,10 +8,9 @@ import * as path from "node:path";
 import * as Ansts from "../src/index.js";
 
 describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit", () => {
-  // Census was frozen at 89 in 10022739. 8e841b3 added src/cluster/celld_fleet_client.ts
-  // (exported from src/index.ts, covered by tests/celld_fleet_client.test.ts). It carries
-  // @fileoverview, so the header check stays; only the module count moves to 90.
-  it("1. Verifies all 90 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
+  // 8e841b3 added celld_fleet_client.ts. This branch adds celld_worker_service.ts, gateway_cell.ts,
+  // and gateway_worker.ts. The @fileoverview check is unchanged.
+  it("1. Verifies all 93 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
     const walk = (dir: string): string[] => {
       let out: string[] = [];
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -22,7 +21,7 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
       return out;
     };
     const srcFiles = walk(path.join(process.cwd(), "src"));
-    assert.equal(srcFiles.length, 90);
+    assert.equal(srcFiles.length, 93);
     for (const f of srcFiles) {
       const content = fs.readFileSync(f, "utf-8");
       assert.ok(content.includes("@fileoverview"), `Missing @fileoverview in ${f}`);
@@ -107,8 +106,9 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
     };
     const healthResp = await Ansts.cloudflareCelldWorker.fetch(new Request("https://ansts.internal/healthz"), env);
     assert.equal(healthResp.status, 200);
-    const healthBody = (await healthResp.json()) as { region: string };
+    const healthBody = (await healthResp.json()) as { region: string; controlPlane: string };
     assert.equal(healthBody.region, "us-west-1");
+    assert.equal(healthBody.controlPlane, "celld-scheduler");
   });
 
   it("5. Behavioral E2E M10-M11: ModelPoolClientAdapter -> SlidingWindowTokenBucket -> ThreeStateCircuitBreaker", () => {

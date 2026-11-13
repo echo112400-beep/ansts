@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ansts-celld-gateway",
+  "main": "src/cloudflare/gateway_worker.ts",
+  "compatibility_date": "2025-08-15",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ANSTS_GATEWAY_CELL",
+        "class_name": "AnstsGatewayCell"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "AnstsGatewayCell"
+      ]
+    }
+  ],
+  "vars": {
+    "CELLD_REGION": "celld-gateway",
+    "ANSTS_SCHEDULER_URL": "",
+    "ANSTS_CONSOLE_RBAC_SECRET": ""
+  }
+}
