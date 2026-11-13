@@ -4,7 +4,7 @@
 
 公开提交仍接受原 `taskId`/`task_id`，响应同时返回 `executionTaskId`。读取使用 `GET /v1/tasks/<公开ID>?tenantId=<租户>`；同名记录超过一条而未指定租户时返回 `TENANT_REQUIRED`。Body 管理和核对接口使用 executionTaskId。已有未编码记录按同一租户的原始 ID 保守复用，避免重新提交时重复创建。
 
-这些规则隔离存储命名空间，不构成用户权限控制。完整的租户用户身份与读授权尚未接入；不能把开发 Gateway 直接暴露为生产多租户 API。
+这些规则隔离存储命名空间。用户权限另外由 [Gateway 用户授权](gateway-user-authorization.md) 校验；生产身份提供方与控制台登录尚未接入，不能把开发部署视为生产身份系统。
 
 执行开始后控制面签发 30 秒凭证，绑定租户、任务、尝试、宿主机、fence 和输入摘要。Body 的固定服务凭据只用于身份认证，不能替代这张执行凭证。执行入口调用控制面验证签名、时间和共享 RUNNING 状态，并在 Durable Object 中消费单次 nonce；过期、篡改、身份不符或重放均被拒绝。
 

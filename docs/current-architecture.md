@@ -30,7 +30,7 @@
 - 本地执行日志存在但没有完成结果时返回 `EXECUTION_OUTCOME_UNCERTAIN`。共享准入没有完成结果时禁止跨宿主机自动重跑；任务进入 `SUSPENDED_RECONCILIATION`，等待管理员带证据核对。
 - 原生工作在独立进程组中运行；超时、客户端断开或失租会终止进程组并等待退出。已经发生的宿主机副作用仍不能撤销，外部工具需要幂等键与 fence 校验，不承诺严格 exactly-once。
 - 结果先写 Body 持久 outbox，再依次重试共享结果、回执、Scheduler 完成和确认。队列包含持久退避时间，重启后继续回报。
-- Body Cell 路由和本地执行入口已接入开发用宿主机凭据。Scheduler 服务写接口、完整租户授权和凭据轮换仍待接入；当前不是生产执行协议。
+- Body Cell 和本地执行使用宿主机凭据及单次执行凭证；后台数据路径要求服务身份。Gateway 用户接口校验 JWT、角色及租户范围，开发用户密钥支持只读宽限轮换。生产 IdP 和服务根密钥滚动轮换尚未接入。
 - Body 默认固定访问 `celld-brain-01:8081`；celld 对象可以跨节点路由，但客户端入口故障自动切换尚未实现。
 - Gateway Worker 只实现代码中显式路由的任务、健康、Gateway 状态和租约管理接口。旧 Node host 中的控制台、隧道等接口不能据此视为已经迁入 Gateway Worker。
 - 根目录 `docker-compose.yml` 仍使用 Node host 入口；开发集群必须显式选择 `deploy/dev-cluster/docker-compose.dev-cluster.yml`。

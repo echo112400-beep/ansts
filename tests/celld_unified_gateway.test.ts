@@ -11,16 +11,27 @@ import { MockDurableObjectState } from "../src/cloudflare/env.js";
 import { AnstsSchedulerCell } from "../src/cloudflare/scheduler_cell.js";
 import { ConsoleRbacAuthGuard } from "../src/dashboard/console_rbac_guard.js";
 import schedulerWorker from "../src/cloudflare/worker.js";
-import gatewayWorker from "../src/cloudflare/gateway_worker.js";
+import actualGatewayWorker from "../src/cloudflare/gateway_worker.js";
 import { AnstsLocalAndComposeServer } from "../src/server_main.js";
 import { bodyServiceToken } from "../src/cloudflare/body_auth.js";
 
-const SECRET = "unified-gateway-test-secret-32b";
+const SECRET = "unified-gateway-test-secret-32b-safe";
+const gatewayWorker = {
+  fetch: (request: Request, env: Parameters<typeof actualGatewayWorker.fetch>[1]) => {
+    if (!request.headers.has("authorization") && !new URL(request.url).pathname.includes("/leases/release")) {
+      const headers = new Headers(request.headers);
+      headers.set("authorization", `Bearer ${new ConsoleRbacAuthGuard(SECRET).issueToken({ sub: "test-admin", role: "SRE_ADMIN", ttlSec: 900 })}`);
+      request = new Request(request, { headers });
+    }
+    return actualGatewayWorker.fetch(request, env);
+  },
+};
 const SERVICE_SECRET = "e".repeat(64);
 
 function gatewayEnv(gateway: AnstsGatewayCell, schedulerUrl?: string, secret?: string) {
   return {
     CELLD_REGION: "celld-gateway",
+    ANSTS_USER_AUTH_SECRET: SECRET,
     ANSTS_CONSOLE_RBAC_SECRET: secret,
     ANSTS_SCHEDULER_URL: schedulerUrl,
     ANSTS_SCHEDULER_SERVICE_TOKEN: bodyServiceToken(SERVICE_SECRET, "gateway:control"),

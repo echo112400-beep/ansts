@@ -27,3 +27,8 @@ operator.chmod(0o600)
 gateway = root / 'gateway-control.token'
 gateway.write_text(hmac.new(key.encode(), b'ansts-body-v1:gateway:control', hashlib.sha256).hexdigest())
 gateway.chmod(0o600)
+user_key = root / 'user-signing.key'
+if not user_key.exists():
+    fd = os.open(user_key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as output:
+        output.write(secrets.token_hex(32))

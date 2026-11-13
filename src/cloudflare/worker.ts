@@ -91,6 +91,12 @@ export default {
         { status: 200, headers: { "content-type": "application/json" } }
       );
     }
+    if (["/v1/scheduler", "/v1/harness", "/v1/tunnel", "/internal/v1beta1/brain/"].some(prefix => url.pathname.startsWith(prefix))) {
+      const bodyHost = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
+      const gatewayService = authenticateGatewayService(request, env.ANSTS_BODY_AUTH_SECRET);
+      if (!bodyHost && !gatewayService) return Response.json({ error: "SERVICE_AUTH_REQUIRED" }, { status: 401 });
+      if (bodyHost && (url.pathname === "/v1/scheduler/submit" || url.pathname === "/internal/v1beta1/brain/schedule")) return Response.json({ error: "GATEWAY_SERVICE_REQUIRED" }, { status: 403 });
+    }
     if (url.pathname === "/internal/v1beta1/brain/schedule" && request.method === "POST") {
       return dispatchBrainSchedule(request, env);
     }

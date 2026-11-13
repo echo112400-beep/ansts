@@ -4,6 +4,9 @@ The temporary Compose override is removed and normal Body settings restored in f
 Credentials are read from ignored local files and never printed.
 """
 import json
+import base64
+import hashlib
+import hmac
 from pathlib import Path
 import subprocess
 import tempfile
@@ -22,6 +25,14 @@ def http(path, body=None, host=None, operator=False, base='http://127.0.0.1:1808
     elif host:
         headers['Authorization'] = 'Body ' + (ROOT / f'.dev-secrets/{host}.token').read_text().strip()
         headers['x-ansts-body-id'] = host
+    elif base.endswith(':18080'):
+        encode = lambda value: base64.urlsafe_b64encode(json.dumps(value, separators=(',', ':')).encode()).decode().rstrip('=')
+        now = int(time.time())
+        header = encode({'alg': 'HS256', 'typ': 'JWT'})
+        payload = encode({'sub': 'development-fault-test', 'role': 'SRE_ADMIN', 'scopeTenant': 'all', 'scopeRegion': 'all', 'iat': now, 'exp': now + 900})
+        signing = f'{header}.{payload}'
+        signature = base64.urlsafe_b64encode(hmac.new((ROOT / '.dev-secrets/user-signing.key').read_text().strip().encode(), signing.encode(), hashlib.sha256).digest()).decode().rstrip('=')
+        headers['Authorization'] = f'Bearer {signing}.{signature}'
     request = urllib.request.Request(base + path, data=json.dumps(body).encode() if body is not None else None, headers=headers)
     try:
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=10) as response:

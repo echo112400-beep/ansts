@@ -5,6 +5,7 @@ import { taskStorageId, publicTaskId } from "../src/cloudflare/task_identity.js"
 import { AnstsSchedulerCell } from "../src/cloudflare/scheduler_cell.js";
 import { AnstsGatewayCell, handleUnifiedGatewayRequest } from "../src/cloudflare/gateway_cell.js";
 import { MockDurableObjectState } from "../src/cloudflare/env.js";
+import { ConsoleRbacAuthGuard } from "../src/dashboard/console_rbac_guard.js";
 
 it("uses unambiguous tenant identities and requires tenant selection for ambiguous public IDs", async () => {
   assert.notEqual(taskStorageId("a:b", "c"), taskStorageId("a", "b:c"));
@@ -14,14 +15,16 @@ it("uses unambiguous tenant identities and requires tenant selection for ambiguo
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => scheduler.fetch(new Request(input, init));
   try {
-    const env = { ANSTS_SCHEDULER_URL: "https://scheduler", ANSTS_GATEWAY_CELL: { idFromName: (name: string) => ({ toString: () => name }), get: () => gateway } } as never;
+    const secret = "tenant-test-user-secret-32-characters";
+    const headers = { authorization: `Bearer ${new ConsoleRbacAuthGuard(secret).issueToken({ sub: "admin", role: "SRE_ADMIN" })}` };
+    const env = { ANSTS_USER_AUTH_SECRET: secret, ANSTS_SCHEDULER_URL: "https://scheduler", ANSTS_GATEWAY_CELL: { idFromName: (name: string) => ({ toString: () => name }), get: () => gateway } } as never;
     for (const tenant of ["tenant-a", "tenant-b"]) {
-      const response = await handleUnifiedGatewayRequest(new Request("https://gateway/v1/tasks", { method: "POST", body: JSON.stringify({ task_id: "same-name", tenant_id: tenant, prompt: `work for ${tenant}` }) }), env);
+      const response = await handleUnifiedGatewayRequest(new Request("https://gateway/v1/tasks", { method: "POST", headers, body: JSON.stringify({ task_id: "same-name", tenant_id: tenant, prompt: `work for ${tenant}` }) }), env);
       assert.equal(response?.status, 202);
     }
-    assert.equal((await handleUnifiedGatewayRequest(new Request("https://gateway/v1/tasks/same-name"), env))?.status, 400);
+    assert.equal((await handleUnifiedGatewayRequest(new Request("https://gateway/v1/tasks/same-name", { headers }), env))?.status, 400);
     for (const tenant of ["tenant-a", "tenant-b"]) {
-      const response = await handleUnifiedGatewayRequest(new Request(`https://gateway/v1/tasks/same-name?tenantId=${tenant}`), env);
+      const response = await handleUnifiedGatewayRequest(new Request(`https://gateway/v1/tasks/same-name?tenantId=${tenant}`, { headers }), env);
       assert.equal(response?.status, 200);
       const task = await response!.json();
       assert.equal(task.tenant_id, tenant);

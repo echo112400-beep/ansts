@@ -23,6 +23,9 @@
     }
   ],
   "vars": {
+    "ANSTS_USER_AUTH_SECRET": "",
+    "ANSTS_USER_AUTH_PREVIOUS_SECRET": "",
+    "ANSTS_USER_AUTH_PREVIOUS_UNTIL": "",
     "ANSTS_SCHEDULER_SERVICE_TOKEN": "",
     "CELLD_REGION": "celld-gateway",
     "ANSTS_SCHEDULER_URL": "",

@@ -8,12 +8,16 @@ import { ConsoleRbacAuthGuard, ConsoleRole } from "../dashboard/console_rbac_gua
 import { TaskSpecValidationError, TaskSpecValidator } from "../gateway/validator.js";
 import { DurableObjectNamespaceLike, DurableObjectStateLike } from "./env.js";
 import { publicTaskId, taskStorageId } from "./task_identity.js";
+import { gatewayPrincipal, gatewayAuthorizationError, tenantAllowed } from "./gateway_authorization.js";
 
 export interface UnifiedGatewayEnv {
   ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;
   /** Base URL of the separate scheduler celld worker. Empty or unset fail-closes cross-worker calls. */
   ANSTS_SCHEDULER_URL?: string;
   ANSTS_SCHEDULER_SERVICE_TOKEN?: string;
+  ANSTS_USER_AUTH_SECRET?: string;
+  ANSTS_USER_AUTH_PREVIOUS_SECRET?: string;
+  ANSTS_USER_AUTH_PREVIOUS_UNTIL?: string;
   ANSTS_CONSOLE_RBAC_SECRET?: string;
   CELLD_REGION?: string;
 }
@@ -229,6 +233,24 @@ function isGatewayPath(method: string, pathname: string): boolean {
 export async function handleUnifiedGatewayRequest(request: Request, env: UnifiedGatewayEnv): Promise<Response | null> {
   const url = new URL(request.url);
   if (!isGatewayPath(request.method, url.pathname)) return null;
+  const publicHealth = request.method === "GET" && ["/health", "/healthz", "/readyz"].includes(url.pathname);
+  const principal = publicHealth ? null : gatewayPrincipal(request, env.ANSTS_USER_AUTH_SECRET, env.ANSTS_USER_AUTH_PREVIOUS_SECRET, Number(env.ANSTS_USER_AUTH_PREVIOUS_UNTIL));
+  if (!publicHealth) {
+    if (!principal) return json({ error: "USER_AUTH_REQUIRED" }, 401);
+    const denied = gatewayAuthorizationError(request, principal);
+    if (denied) return denied;
+    if (request.method === "POST" && url.pathname !== "/v1beta1/gateway/leases/release") {
+      let body: Record<string, unknown>;
+      try {
+        const raw = await request.clone().text();
+        if (raw.length > 65536) return json({ error: "PAYLOAD_TOO_LARGE" }, 413);
+        body = JSON.parse(raw) as Record<string, unknown>;
+      }
+      catch { return json({ error: "INVALID_JSON" }, 400); }
+      const tenantDenied = gatewayAuthorizationError(request, principal, body.tenant_id ?? body.tenantId);
+      if (tenantDenied) return tenantDenied;
+    }
+  }
   if (!env.ANSTS_GATEWAY_CELL) {
     return json({ error: "GATEWAY_CELL_UNBOUND", controlPlane: "celld-gateway" }, 503);
   }
@@ -269,6 +291,11 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
   if (request.method === "GET" && url.pathname === "/v1beta1/gateway/state") {
     const gateway = await readGatewayState(env);
     if (gateway) {
+      if (principal?.scopeTenant !== "all") {
+        for (const key of ["leases", "dispatches"]) if (Array.isArray(gateway[key])) gateway[key] = (gateway[key] as Record<string, unknown>[]).filter(row => tenantAllowed(principal!, row.tenant_id ?? publicTaskId(String(row.task_id))?.tenantId));
+        gateway.sessions = [];
+        gateway.activeLeases = (gateway.leases as Record<string, unknown>[] ?? []).filter(row => row.status === "HELD").length;
+      }
       for (const key of ["leases", "dispatches"]) {
         if (Array.isArray(gateway[key])) gateway[key] = (gateway[key] as Record<string, unknown>[]).map(row => ({ ...row, executionTaskId: row.task_id, task_id: publicTaskId(String(row.task_id))?.taskId ?? row.task_id }));
       }
@@ -279,13 +306,13 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
     const gateway = await readGatewayState(env);
     const listed = await listSchedulerTasks(env);
     if (listed.failure) return listed.failure;
-    const tasks = listed.tasks;
+    const tasks = listed.tasks.filter(task => tenantAllowed(principal!, task.tenant_id));
     return json(
       {
         controlPlane: "celld-gateway",
         totalTasks: tasks.length,
-        gatewayDispatches: Array.isArray(gateway?.dispatches) ? gateway.dispatches.length : 0,
-        activeLeases: Number(gateway?.activeLeases ?? 0),
+        gatewayDispatches: Array.isArray(gateway?.dispatches) ? (gateway.dispatches as Record<string, unknown>[]).filter(row => tenantAllowed(principal!, row.tenant_id)).length : 0,
+        activeLeases: Array.isArray(gateway?.leases) ? (gateway.leases as Record<string, unknown>[]).filter(row => row.status === "HELD" && tenantAllowed(principal!, row.tenant_id ?? publicTaskId(String(row.task_id))?.tenantId)).length : 0,
         bodyExecution: "external-node-process",
         gatewayCellId: gateway?.cellId ?? null,
       },
@@ -297,9 +324,10 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
     const listed = await listSchedulerTasks(env);
     if (listed.failure) return listed.failure;
     const tenantId = url.searchParams.get("tenantId");
+    if (tenantId && !tenantAllowed(principal!, tenantId)) return json({ error: "TENANT_FORBIDDEN" }, 403);
     const candidates = listed.tasks.filter(task => {
       const identity = publicTaskId(String(task.task_id ?? task.taskId ?? ""));
-      return (identity?.taskId ?? String(task.task_id ?? task.taskId ?? "")) === taskId && (!tenantId || (identity?.tenantId ?? task.tenant_id) === tenantId);
+      return (identity?.taskId ?? String(task.task_id ?? task.taskId ?? "")) === taskId && tenantAllowed(principal!, identity?.tenantId ?? task.tenant_id) && (!tenantId || (identity?.tenantId ?? task.tenant_id) === tenantId);
     });
     if (candidates.length > 1) return json({ error: "TENANT_REQUIRED" }, 400);
     const found = candidates[0];
