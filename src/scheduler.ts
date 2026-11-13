@@ -452,6 +452,46 @@ export class CoreScheduler5D {
     return true;
   }
 
+  public resolveReconciliation(taskId: string, tenantId: string, fencingToken: number, retry: boolean): boolean {
+    const task = this.allTasks.get(taskId);
+    if (!task || task.tenant_id !== tenantId || task.lease_fencing_token !== fencingToken) return false;
+    if ((!retry && task.state === TaskState.COMPLETED) || (retry && task.state === TaskState.QUEUED)) return true;
+    if (task.state !== TaskState.SUSPENDED_RECONCILIATION) return false;
+    if (retry) {
+      task.state = TaskState.QUEUED;
+      task.assigned_node_id = undefined;
+      this.queueManager.enqueue(task);
+    } else {
+      task.state = TaskState.COMPLETED;
+      this.completedIds.add(taskId);
+      this.releaseContentFingerprintIfOwned(task);
+      for (const candidate of this.allTasks.values()) {
+        if (candidate.state === TaskState.SUBMITTED && this.dependenciesSatisfied(candidate)) {
+          candidate.state = TaskState.QUEUED;
+          this.queueManager.enqueue(candidate);
+        }
+      }
+    }
+    return true;
+  }
+
+  public suspendForReconciliation(taskId: string, nodeId: string, fencingToken: number): boolean {
+    const task = this.allTasks.get(taskId);
+    if (!task || task.assigned_node_id !== nodeId || task.lease_fencing_token !== fencingToken) return false;
+    if (task.state === TaskState.SUSPENDED_RECONCILIATION) return true;
+    if (!this.leaseCoordinator.validateFencingToken(taskId, fencingToken)) return false;
+    this.leaseCoordinator.revokeLease(taskId);
+    this.queueManager.completeTask(task);
+    const node = this.nodes.get(nodeId);
+    if (node) {
+      node.free_cpu_cores = Math.min(node.total_cpu_cores, node.free_cpu_cores + task.resource_profile.think_cpu_cores);
+      node.free_memory_mb = Math.min(node.total_memory_mb, node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25));
+      node.running_tasks = Math.max(0, node.running_tasks - 1);
+    }
+    task.state = TaskState.SUSPENDED_RECONCILIATION;
+    return true;
+  }
+
   public completeTaskExecution(
     taskId: string,
     nodeId: string,

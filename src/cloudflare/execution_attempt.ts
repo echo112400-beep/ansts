@@ -16,6 +16,8 @@ export interface ExecutionAttempt {
   result?: Record<string, unknown>;
   result_digest?: string;
   reason?: string;
+  reconciliation_digest?: string;
+  audit?: Array<{ version: number; actor: string; action: string; evidence: string; reason: string; timestamp: number; previous_hash: string; hash: string }>;
 }
 
 function canonical(value: unknown): string {

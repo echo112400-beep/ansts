@@ -11,6 +11,7 @@ import * as path from "node:path";
 import { BodyExecutionJournal } from "./runtime/body_execution_journal.js";
 import { equalBodyToken } from "./cloudflare/body_auth.js";
 import { executionDigest } from "./cloudflare/execution_attempt.js";
+import { runBodyExecution } from "./runtime/body_execution_process.js";
 import { CoreScheduler5D } from "./scheduler.js";
 import { NodeDaemon } from "./node_daemon.js";
 import { TaskSpecValidator, TaskSpecValidationError } from "./gateway/validator.js";
@@ -114,6 +115,7 @@ export class AnstsLocalAndComposeServer {
   public readonly nodeId: string;
   public readonly nodeRole: "brain" | "body" | "gateway";
   public readonly storageDir: string;
+  private readonly activeBodyExecutions = new Set<AbortController>();
   public readonly s3Endpoint: string | null;
   public readonly primaryGatewayUrl: string | null;
   public readonly secondaryGatewayUrl: string | null;
@@ -1414,7 +1416,8 @@ export class AnstsLocalAndComposeServer {
           return;
         }
       }
-      const admission = journal?.admit(taskId);
+      const journalKey = body.attemptId ? JSON.stringify([body.tenantId, taskId, body.attemptId]) : taskId;
+      const admission = journal?.admit(journalKey);
       if (admission && !admission.admitted) {
         res.writeHead(admission.result ? 200 : 409, { "content-type": "application/json" });
         res.end(JSON.stringify(admission.result ?? { error: "EXECUTION_OUTCOME_UNCERTAIN", taskId }));
@@ -1429,18 +1432,47 @@ export class AnstsLocalAndComposeServer {
       } catch {
         this.layerfs.forkBranch("main", branchName);
       }
-      const execResult = this.layerfs.executeEphemeralBashWorkspace({
-        branchName,
-        agentId: String(body.tenantId ?? "distributed-agent"),
-        stepId: `exec-${taskId}`,
-        command: `printf '%s\\n' ${JSON.stringify(String(body.promptText ?? "ok"))} > .ansts_task_trace.txt`,
-      });
+      const executionController = new AbortController();
+      this.activeBodyExecutions.add(executionController);
+      const disconnect = () => { if (!res.writableEnded) executionController.abort(); };
+      res.once("close", disconnect);
+      let renewing = false;
+      const renewal = process.env.ANSTS_BODY_CELL_URL ? setInterval(async () => {
+        if (renewing) return;
+        renewing = true;
+        try {
+          const response = await fetch(`${process.env.ANSTS_BODY_CELL_URL}/v1/scheduler/lease-renew`, {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ task_id: taskId, node_id: this.nodeId, fencing_token: body.fencingToken }), signal: AbortSignal.timeout(5000),
+          });
+          if (!response.ok) executionController.abort();
+        } catch { executionController.abort(); }
+        finally { renewing = false; }
+      }, 3000) : null;
+      const timeout = setTimeout(() => executionController.abort(), Math.min(2147483647, Math.max(1000, Number(body.timeoutSeconds ?? 1800) * 1000)));
+      let execResult;
+      try {
+        const output = await runBodyExecution({
+          bundle: this.layerfs.exportBranchBundle(branchName), branchName,
+          tenantId: String(body.tenantId ?? "distributed-agent"), stepId: `exec-${taskId}`,
+          prompt: String(body.promptText ?? "ok"), delayMs: Number(process.env.ANSTS_BODY_EXECUTION_DELAY_MS ?? 0),
+        }, executionController.signal);
+        if (executionController.signal.aborted) throw new Error("BODY_EXECUTION_CANCELLED");
+        this.layerfs.importBranchBundle(output.bundle);
+        execResult = output.result;
+      } finally {
+        if (renewal) clearInterval(renewal);
+        clearTimeout(timeout);
+        res.removeListener("close", disconnect);
+        this.activeBodyExecutions.delete(executionController);
+      }
       let s3Synced = false;
       if (this.s3Endpoint) {
         s3Synced = await this.layerfs.pushBranchToRemoteS3(branchName, this.s3Endpoint);
       }
       this.metrics.incCounter("ansts_body_executions_total", 1);
-      journal?.complete(taskId, { executedByBodyId: this.nodeId, taskId, branchName, commitId: execResult.commitId, status: "COMPLETED", s3Synced });
+      const executionResult = { executedByBodyId: this.nodeId, taskId, branchName, commitHash: execResult.commitId, commitId: execResult.commitId, committedNewSnapshot: execResult.committedNewSnapshot, mountLatencyMs: execResult.mountLatencyMs, s3Synced, status: "COMPLETED" };
+      journal?.complete(journalKey, executionResult);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
@@ -4718,6 +4750,7 @@ export class AnstsLocalAndComposeServer {
   }
 
   public async stop(): Promise<void> {
+    for (const execution of this.activeBodyExecutions) execution.abort();
     this.draining = true;
     if (this.tickTimer) {
       clearInterval(this.tickTimer);

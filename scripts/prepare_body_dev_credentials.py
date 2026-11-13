@@ -21,3 +21,6 @@ for host in ('body-host-01', 'body-host-02'):
     target.write_text(token)
     target.chmod(0o600)
 print('Prepared host-scoped development credentials (values hidden).')
+operator = root / 'body-operator.token'
+operator.write_text(hmac.new(key.encode(), b'ansts-body-v1:operator:reconcile', hashlib.sha256).hexdigest())
+operator.chmod(0o600)

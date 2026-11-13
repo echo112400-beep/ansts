@@ -398,6 +398,21 @@ export class AnstsSchedulerCell {
       });
     }
 
+    if (request.method === "POST" && normalizedPath === "/resolve-uncertain") {
+      const body = await request.json() as Record<string, unknown>;
+      const resolved = this.scheduler.resolveReconciliation(String(body.task_id), String(body.tenant_id), Number(body.fencing_token), body.retry === true);
+      const task = this.scheduler.allTasks.get(String(body.task_id));
+      if (resolved && task) this.persistTask(task);
+      return Response.json({ resolved }, { status: resolved ? 200 : 409 });
+    }
+    if (request.method === "POST" && normalizedPath === "/suspend-uncertain") {
+      const body = await request.json() as Record<string, unknown>;
+      const taskId = String(body.task_id ?? "");
+      const suspended = this.scheduler.suspendForReconciliation(taskId, String(body.node_id ?? ""), Number(body.fencing_token));
+      const task = this.scheduler.allTasks.get(taskId);
+      if (suspended && task) this.persistTask(task);
+      return Response.json({ suspended, task_id: taskId }, { status: suspended ? 200 : 409 });
+    }
     if (request.method === "POST" && normalizedPath === "/complete") {
       const body = (await request.json()) as Record<string, unknown>;
       const taskId = String(body.task_id ?? "");

@@ -15,3 +15,8 @@ export function authenticateBody(request: Request, secret?: string): string | nu
   if (!/^[a-zA-Z0-9_-]{1,128}$/.test(host)) return null;
   return equalBodyToken(request.headers.get("authorization") ?? "", `Body ${bodyServiceToken(secret, host)}`) ? host : null;
 }
+export function authenticateBodyOperator(request: Request, secret?: string): boolean {
+  return !!secret && /^[a-f0-9]{64}$/.test(secret) && equalBodyToken(
+    request.headers.get("authorization") ?? "", `Operator ${bodyServiceToken(secret, "operator:reconcile")}`
+  );
+}

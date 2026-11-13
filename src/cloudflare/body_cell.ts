@@ -9,7 +9,7 @@ export class AnstsBodyCell {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     const route = path.slice("/v1/body/".length);
-    const allowed = ["acquire", "start", "finish", "acknowledge", "uncertain", "heartbeat", "receipt", "state"];
+    const allowed = ["acquire", "start", "finish", "acknowledge", "uncertain", "reconcile", "heartbeat", "receipt", "state"];
     if (!path.startsWith("/v1/body/") || !allowed.includes(route)) return Response.json({ error: "NOT_FOUND" }, { status: 404 });
     if ((route === "state" && request.method !== "GET") || (route !== "state" && request.method !== "POST")) {
       return Response.json({ error: "METHOD_NOT_ALLOWED" }, { status: 405 });
@@ -22,6 +22,7 @@ export class AnstsBodyCell {
         body = JSON.parse(raw);
         if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("object required");
       } catch { return Response.json({ error: "INVALID_JSON" }, { status: 400 }); }
+      if (route === "reconcile") return this.reconcile(body, request.headers.get("x-ansts-verified-operator"));
       if (["acquire", "start", "finish", "acknowledge", "uncertain"].includes(route)) return this.transition(route, body);
       const id = path.endsWith("/heartbeat") ? "heartbeat" : `receipt:${String(body.task_id)}:${Number(body.fencing_token)}`;
       if (id !== "heartbeat" && (!body.task_id || !Number.isInteger(body.fencing_token))) {
@@ -38,6 +39,38 @@ export class AnstsBodyCell {
   }
   private saveAttempt(attempt: ExecutionAttempt): void {
     this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", "execution", JSON.stringify(attempt));
+  }
+  private reconcile(body: Record<string, unknown>, actor: string | null): Response {
+    if (!actor) return Response.json({ error: "OPERATOR_AUTH_REQUIRED" }, { status: 401 });
+    const saved = this.loadAttempt();
+    if (saved?.reconciliation_digest === executionDigest(body)) return Response.json({ reconciled: true, execution: saved });
+    if (!saved || saved.task_id !== body.task_id || saved.tenant_id !== body.tenant_id || saved.version !== body.expected_version) {
+      return Response.json({ error: "RECONCILIATION_VERSION_CONFLICT" }, { status: 409 });
+    }
+    if (typeof body.evidence !== "string" || !body.evidence.trim() || body.evidence.length > 4096 || typeof body.reason !== "string" || !body.reason.trim() || body.reason.length > 512) {
+      return Response.json({ error: "RECONCILIATION_EVIDENCE_REQUIRED" }, { status: 400 });
+    }
+    if (saved.phase !== "UNCERTAIN") return Response.json({ error: "EXECUTION_NOT_UNCERTAIN" }, { status: 409 });
+    if (body.action !== "retain_block" && (body.fencing_token !== saved.fencing_token || body.node_id !== saved.node_id)) return Response.json({ error: "RECONCILIATION_OWNER_CONFLICT" }, { status: 409 });
+    let next = { ...saved, version: saved.version + 1, updated_at: Date.now() };
+    if (body.action === "confirm_completed") {
+      if (!body.result || typeof body.result !== "object" || Array.isArray(body.result)) return Response.json({ error: "RESULT_REQUIRED" }, { status: 400 });
+      const digest = executionDigest(body.result);
+      if (saved.result_digest && saved.result_digest !== digest) return Response.json({ error: "RESULT_CONFLICT" }, { status: 409 });
+      next = { ...next, phase: "RESULT_PENDING", result: body.result as Record<string, unknown>, result_digest: digest };
+    } else if (body.action === "confirm_not_started") {
+      const replacement = body.replacement && typeof body.replacement === "object" ? newAttempt(body.replacement as Record<string, unknown>) : null;
+      if (!replacement || !sameExecution(saved, replacement as unknown as Record<string, unknown>) || replacement.attempt_id === saved.attempt_id || replacement.fencing_token <= saved.fencing_token) {
+        return Response.json({ error: "INVALID_REPLACEMENT_ATTEMPT" }, { status: 400 });
+      }
+      next = { ...replacement, version: saved.version + 1, reason: "RECONCILED_NOT_STARTED" };
+    } else if (body.action !== "retain_block") return Response.json({ error: "INVALID_RECONCILIATION_ACTION" }, { status: 400 });
+    const audit = saved.audit ?? [];
+    const entry = { version: next.version, actor, action: String(body.action), evidence: body.evidence, reason: body.reason, timestamp: Date.now(), previous_hash: audit.at(-1)?.hash ?? "" };
+    next.audit = [...audit, { ...entry, hash: executionDigest(entry) }];
+    next.reconciliation_digest = executionDigest(body);
+    this.saveAttempt(next);
+    return Response.json({ reconciled: true, execution: next });
   }
   private loadAttempt(): ExecutionAttempt | null {
     const row = this.ctx.storage.sql.exec<{ payload: string }>("SELECT * FROM body_state WHERE id = ?", "execution").toArray()[0];
@@ -57,6 +90,11 @@ export class AnstsBodyCell {
     }
     if (!saved || !sameExecution(saved, body)) return Response.json({ error: "EXECUTION_IDENTITY_CONFLICT", execution: saved }, { status: 409 });
     if (route === "acquire") {
+      if (saved.phase === "ADMITTED" && saved.reason === "RECONCILED_NOT_STARTED" && proposed.fencing_token >= saved.fencing_token) {
+        const bound = { ...proposed, version: saved.version + 1, audit: saved.audit };
+        this.saveAttempt(bound);
+        return Response.json({ acquired: true, execution: bound });
+      }
       const completed = saved.phase === "RESULT_PENDING" || saved.phase === "COMPLETED";
       const acquired = sameOwner(saved, body) && ["ADMITTED", "RUNNING"].includes(saved.phase);
       return Response.json({ acquired, execution: saved, ...(completed ? { result: saved.result } : {}) }, { status: acquired || completed ? 200 : 409 });

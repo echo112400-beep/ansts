@@ -4,7 +4,7 @@
  * and dispatches queued task messages in `queue(batch, env)` to `ANSTS_SCHEDULER_CELL` with retry-on-failure semantics.
  */
 import { CloudflareCelldEnv, QueueBatchLike } from "./env.js";
-import { authenticateBody } from "./body_auth.js";
+import { authenticateBody, authenticateBodyOperator } from "./body_auth.js";
 export { AnstsSchedulerCell } from "./scheduler_cell.js";
 export { AgentTaskHarnessCell } from "./harness_cell.js";
 export { TunnelGatewayCell } from "./tunnel_gateway_cell.js";
@@ -116,6 +116,40 @@ export default {
       return new Response(JSON.stringify(found), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (url.pathname.startsWith("/v1/body/") && env.ANSTS_BODY_CELL) {
+      if (url.pathname === "/v1/body/reconcile") {
+        if (!authenticateBodyOperator(request, env.ANSTS_BODY_AUTH_SECRET)) return Response.json({ error: "OPERATOR_AUTH_REQUIRED" }, { status: 401 });
+        const taskId = url.searchParams.get("taskId");
+        if (!taskId || request.method !== "POST") return Response.json({ error: "INVALID_RECONCILIATION_ROUTE" }, { status: 400 });
+        const headers = new Headers(request.headers);
+        headers.set("x-ansts-verified-operator", "development-operator");
+        const id = env.ANSTS_BODY_CELL.idFromName(`execution:${taskId}`);
+        let review: Record<string, unknown>;
+        try { review = await request.clone().json() as Record<string, unknown>; }
+        catch { return Response.json({ error: "INVALID_JSON" }, { status: 400 }); }
+        const reconciled = await env.ANSTS_BODY_CELL.get(id).fetch(new Request(request, { headers }));
+        if (!reconciled.ok || review.action === "retain_block") return reconciled;
+        const scheduler = env.ANSTS_SCHEDULER_CELL.get(env.ANSTS_SCHEDULER_CELL.idFromName("global-shard-0"));
+        // State transitions across cells are retried with the same reconciliation request digest.
+        const listed = await scheduler.fetch(new Request("https://cell/v1/scheduler/tasks"));
+        const tasks = (await listed.json() as { tasks?: Record<string, unknown>[] }).tasks ?? [];
+        const task = tasks.find(task => task.task_id === review.task_id && task.tenant_id === review.tenant_id);
+        if (!task) return Response.json({ error: "SCHEDULER_RECONCILIATION_PENDING", retry_same_request: true }, { status: 503 });
+        const current = { ...review, node_id: task.assigned_node_id, fencing_token: task.lease_fencing_token };
+        await scheduler.fetch(new Request("https://cell/v1/scheduler/suspend-uncertain", { method: "POST", body: JSON.stringify(current) }));
+        const resolved = await scheduler.fetch(new Request("https://cell/v1/scheduler/resolve-uncertain", {
+          method: "POST", body: JSON.stringify({ ...current, retry: review.action === "confirm_not_started" }),
+        }));
+        if (!resolved.ok) return Response.json({ error: "SCHEDULER_RECONCILIATION_PENDING", retry_same_request: true }, { status: 503 });
+        if (review.action === "confirm_completed") {
+          const decision = await reconciled.clone().json() as { execution: Record<string, unknown> };
+          const acknowledged = await env.ANSTS_BODY_CELL.get(id).fetch(new Request("https://cell/v1/body/acknowledge", {
+            method: "POST", body: JSON.stringify({ ...decision.execution, expected_version: decision.execution.version }),
+          }));
+          if (!acknowledged.ok) return Response.json({ error: "SCHEDULER_RECONCILIATION_PENDING", retry_same_request: true }, { status: 503 });
+          return Response.json({ reconciled: true, ...(await acknowledged.json() as Record<string, unknown>) });
+        }
+        return reconciled;
+      }
       const host = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
       if (!host) return Response.json({ error: "BODY_AUTH_REQUIRED" }, { status: 401 });
       const taskId = url.searchParams.get("taskId");
@@ -132,6 +166,16 @@ export default {
       return env.ANSTS_BODY_CELL.get(id).fetch(request);
     }
     if (url.pathname.startsWith("/v1/scheduler")) {
+      if (url.pathname === "/v1/scheduler/resolve-uncertain") return Response.json({ error: "OPERATOR_ROUTE_REQUIRED" }, { status: 403 });
+      if (url.pathname === "/v1/scheduler/suspend-uncertain") {
+        const host = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
+        if (!host || !env.ANSTS_BODY_CELL) return Response.json({ error: "BODY_AUTH_REQUIRED" }, { status: 401 });
+        const body = await request.clone().json() as Record<string, unknown>;
+        if (body.node_id !== host) return Response.json({ error: "BODY_SCOPE_FORBIDDEN" }, { status: 403 });
+        const state = await env.ANSTS_BODY_CELL.get(env.ANSTS_BODY_CELL.idFromName(`execution:${String(body.task_id)}`)).fetch(new Request("https://cell/v1/body/state"));
+        const execution = (await state.json() as { execution?: Record<string, unknown> }).execution;
+        if (!execution || execution.phase !== "UNCERTAIN" || execution.tenant_id !== body.tenant_id || execution.task_id !== body.task_id) return Response.json({ error: "UNCERTAIN_EXECUTION_REQUIRED" }, { status: 409 });
+      }
       const shardName = url.searchParams.get("shard") ?? "global-shard-0";
       const id = env.ANSTS_SCHEDULER_CELL.idFromName(shardName);
       const stub = env.ANSTS_SCHEDULER_CELL.get(id);
