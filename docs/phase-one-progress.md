@@ -43,3 +43,5 @@
 
 2026-11-14：下一里程碑 M1.1 进行中。Daemon 在远程准入前同步预留执行槽，默认单槽，满载返回 429，健康响应显示槽位。Body agent 明确仅支持单槽并关闭虚构 warm pool；Scheduler 心跳保存 execution_slots，分配时同时核对已分配任务，空闲心跳不能清空预留。运行时 CPU 可用并行度和内存约束用于上报预算，可通过 ANSTS_BODY_CPU_CORES / ANSTS_BODY_MEMORY_MB 降低预算。此检测不保证覆盖所有 cgroup CPU quota 配置，尚未实现沙箱强制限额、多槽并发或完整的崩溃恢复资源账本。本批尚未部署。
 M1.1 后续：增加标准 cgroup v2 与 v1 挂载位置的 CPU quota 和内存 limit 检测，支持分数 CPU。非标准挂载及祖先配额遍历尚未覆盖。构建及 7 项相关测试通过，两个 Daemon 镜像已重建部署，执行协议端到端任务达到 COMPLETED。Scheduler 恢复仍依赖原有租约重建/重新排队语义；不能将当前槽位检查视为完整持久资源账本。
+
+M1.1 恢复改造：活动租约与任务同一条 SQL 记录保存，续租同步持久化；Scheduler 重建恢复原 node/fence/acquired_at/expires_at，不因重启延长期限。新增过期续租拒绝，保留 fence 水位防止恢复旧租约覆盖新租约。跨重建测试验证活动槽位不被释放、原执行可以续租和完成。Body/Scheduler 共 28 项回归通过，已发布开发 Worker 并验证任务 COMPLETED。旧记录缺少租约快照时仍沿用保守准入保护；CPU/内存的持久预留账本及完整过期恢复矩阵仍待实现。

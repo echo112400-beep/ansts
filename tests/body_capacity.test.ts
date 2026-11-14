@@ -46,3 +46,35 @@ it("detects fractional cgroup v2 quotas and v1 limits without treating unlimited
   for (const cpu of ["max 100000", "-1 100000", "broken", "10000 0"]) assert.equal(detect({ "/sys/fs/cgroup/cpu.max": cpu }).cpu, undefined);
   assert.deepEqual(detect({}), { cpu: undefined, memoryBytes: undefined });
 });
+it("restores the exact active lease across Scheduler reconstruction without freeing its slot", async () => {
+  const storage = new MockDurableObjectState("restart-slots");
+  let cell = new AnstsSchedulerCell(storage);
+  const post = (route: string, body: unknown) => cell.fetch(new Request(`https://cell/v1/scheduler/${route}`, { method: "POST", body: JSON.stringify(body) }));
+  const hb = { ...new NodeDaemon("host").emitHeartbeat(), execution_slots: 1 };
+  await post("register-node", hb);
+  for (const id of ["one", "two"]) await post("submit", { task_id: id, tenant_id: "tenant", prompt: id, priority: 2 });
+  const tick = await (await post("schedule-tick", {})).json();
+  const [task_id, node_id, fencing_token] = tick.placements[0];
+  await post("lease-renew", { task_id, node_id, fencing_token });
+  const before = cell.scheduler.leaseCoordinator.getLease(task_id);
+  cell = new AnstsSchedulerCell(storage);
+  assert.deepEqual(cell.scheduler.leaseCoordinator.getLease(task_id), before);
+  await post("register-node", hb);
+  assert.deepEqual((await (await post("schedule-tick", {})).json()).placements, []);
+  assert.equal((await post("lease-renew", { task_id, node_id, fencing_token })).status, 200);
+  assert.equal((await post("complete", { task_id, node_id, fencing_token })).status, 200);
+  assert.equal((await (await post("schedule-tick", {})).json()).placements.length, 1);
+});
+import { LeaseCoordinator } from "../src/lease_coordinator.js";
+it("does not resurrect expired persisted leases or roll back a fencing watermark", () => {
+  const leases = new LeaseCoordinator(15);
+  const original = leases.acquireLease("task", "host", 100);
+  const restored = new LeaseCoordinator(15);
+  assert.equal(restored.restoreLease(original), true);
+  assert.equal(restored.renewLease("task", "host", original.fencing_token, 115), false);
+  assert.equal(restored.scanExpiredLeases(115).length, 1);
+  const replacement = restored.acquireLease("task", "host", 116);
+  assert.ok(replacement.fencing_token > original.fencing_token);
+  assert.equal(restored.restoreLease(original), false);
+  assert.equal(restored.getLease("task")?.fencing_token, replacement.fencing_token);
+});

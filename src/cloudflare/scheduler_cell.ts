@@ -5,7 +5,7 @@
  */
 import { DurableObjectStateLike } from "./env.js";
 import { CoreScheduler5D } from "../scheduler.js";
-import { NodeHeartbeat, ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { NodeHeartbeat, LeaseRecord, ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
 
 const ACTIVE_FINGERPRINT_STATES = new Set<TaskState>([
   TaskState.SUBMITTED,
@@ -149,6 +149,10 @@ export class AnstsSchedulerCell {
         this.scheduler.leaseCoordinator.seedHighestFencingToken(spec.task_id, spec.lease_fencing_token);
       }
 
+      const savedLease = parsed.execution_lease as LeaseRecord | undefined;
+      if ([TaskState.LEASED, TaskState.RUNNING_THINK, TaskState.RUNNING_ACT].includes(spec.state) && savedLease && savedLease.task_id === spec.task_id && savedLease.node_id === spec.assigned_node_id && savedLease.fencing_token === spec.lease_fencing_token) {
+        this.scheduler.leaseCoordinator.restoreLease(savedLease);
+      }
       if (
         spec.state === TaskState.LEASED ||
         spec.state === TaskState.RUNNING_THINK ||
@@ -213,6 +217,7 @@ export class AnstsSchedulerCell {
       task.lease_fencing_token,
       task.assigned_node_id ?? "",
       JSON.stringify({
+        execution_lease: this.scheduler.leaseCoordinator.getLease(task.task_id),
         prompt: task.prompt,
         max_turns: task.max_turns,
         current_turn: task.current_turn,
@@ -394,6 +399,7 @@ export class AnstsSchedulerCell {
         });
       }
       const renewed = this.scheduler.leaseCoordinator.renewLease(taskId, nodeId, fencingToken);
+      if (renewed) this.persistTask(task);
       return new Response(JSON.stringify({ renewed, task_id: taskId, state: task.state }), {
         status: renewed ? 200 : 409,
         headers: { "content-type": "application/json" },
