@@ -104,6 +104,18 @@ it("runs Body control independently, preserves native results on restart, and st
     assert.equal((await rpc(control.url, "/v1/scheduler/suspend-uncertain", second.lease)).status, 200);
     const suspended = await (await rpc(control.url, "/v1/scheduler/tasks")).json();
     assert.equal(suspended.tasks.find((task: { task_id: string }) => task.task_id === second.lease.task_id).state, "SUSPENDED_RECONCILIATION");
+    await daemon.stop();
+    const failedImage = options.sandboxImage ?? "node@sha256:" + "a".repeat(64);
+    daemon = new BodyDaemonServer({ ...options, sandboxImage: failedImage, containerRuntime: { recoverOrphans: async () => 0, execute: async () => { throw new Error("BODY_STOP_UNCONFIRMED"); } } });
+    address = await daemon.start();
+    const blocked = await prepare("cleanup-failure", { kind: "container", image: failedImage, argv: ["true"], timeoutMs: 1000, cpu: 0.25, memoryMb: 128 });
+    assert.equal((await rpc(daemonUrl(), "/v1/sandboxes/execute", blocked.payload)).status, 503);
+    const unhealthy = await (await rpc(daemonUrl(), "/health")).json();
+    assert.equal(unhealthy.recoveryRequired, true);
+    assert.equal(unhealthy.capacity.reserved, 1);
+    assert.equal((await rpc(daemonUrl(), "/readyz")).status, 503);
+    assert.equal((await rpc(daemonUrl(), "/v1/sandboxes/execute", blocked.payload)).status, 503);
+    assert.equal(fs.readdirSync(path.join(directory, "cleanup-ledger")).filter(name => name.endsWith(".pending")).length, 1);
     await control.close();
     assert.equal((await rpc(daemonUrl(), "/readyz")).status, 503);
     assert.equal((await fetch(brain.url + "/healthz")).status, 200);

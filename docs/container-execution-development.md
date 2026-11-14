@@ -31,4 +31,6 @@ docker run -d --name ansts-recovery-smoke --label ansts.managed=sandbox --label 
 node scripts/verify_sandbox_recovery.mjs
 ```
 
-尚未完成：工作区产物导出、实时日志、具名取消与 drain、清理失败时的持久资源占用，以及 Engine create 响应丢失等更完整故障矩阵。
+尚未完成：工作区产物导出、实时日志、具名取消与 drain、Engine create 响应丢失等更完整故障矩阵。
+
+容器启动前 fsync 写入 cleanup-ledger 记录。无法确认清理时保留记录与槽位，Daemon readiness 为 503，健康响应包含 recoveryRequired；代理以 unhealthy 心跳停止领取新工作。只有 Engine 启动回收成功后才删除阻塞记录。此机制覆盖容器执行，尚不替代完整的 CPU/内存资源账本。

@@ -1,3 +1,4 @@
+import { BodyCleanupLedger } from "./body_cleanup_ledger.js";
 import { ContainerSandbox } from "./container_sandbox.js";
 import { normalizeExecutionSpec } from "../execution_spec.js";
 /** @fileoverview Native Body execution service. No scheduler, Gateway, dashboard or control-cell store is embedded. */
@@ -22,6 +23,7 @@ export interface BodyDaemonOptions {
   executionDelayMs?: number;
   executionSlots?: number;
   sandboxImage?: string;
+  containerRuntime?: Pick<ContainerSandbox, "execute" | "recoverOrphans">;
 }
 interface Sandbox {
   taskId: string; attemptId: string; fencingToken: number; startedAt: number;
@@ -30,18 +32,26 @@ interface Sandbox {
 }
 export class BodyDaemonServer {
   private server?: http.Server;
+  private readonly containerRuntime?: Pick<ContainerSandbox, "execute" | "recoverOrphans">;
   private readonly capacity: BodyCapacity;
+  private readonly cleanup: BodyCleanupLedger;
   private readonly journal: BodyExecutionJournal;
   private readonly active = new Map<string, Sandbox>();
   private readonly operations = new Set<Promise<void>>();
   constructor(private readonly options: BodyDaemonOptions) {
     if (!options.nodeId || !/^[a-f0-9]{64}$/.test(options.token) || !/^https?:$/.test(new URL(options.bodyWorkerUrl).protocol)) throw new Error("INVALID_BODY_DAEMON_CONFIGURATION");
+    this.containerRuntime = options.containerRuntime ?? (options.sandboxImage ? new ContainerSandbox(options.sandboxImage, "/var/run/docker.sock", options.nodeId) : undefined);
     this.capacity = new BodyCapacity(options.executionSlots ?? 1);
+    this.cleanup = new BodyCleanupLedger(path.join(options.storageDir, "cleanup-ledger"));
     fs.mkdirSync(path.join(options.storageDir, "workspaces"), { recursive: true });
     this.journal = new BodyExecutionJournal(path.join(options.storageDir, "execution-journal"));
   }
   async start(): Promise<{ port: number }> {
-    if (this.options.sandboxImage) await new ContainerSandbox(this.options.sandboxImage, "/var/run/docker.sock", this.options.nodeId).recoverOrphans();
+    if (this.cleanup.pending().length && !this.options.sandboxImage) throw new Error("BODY_RECOVERY_REQUIRES_ENGINE");
+    if (this.options.sandboxImage) {
+      await this.containerRuntime!.recoverOrphans();
+      this.cleanup.confirmAllRemoved();
+    }
     this.server = http.createServer((request, response) => {
       const operation = this.handle(request, response).catch(() => {
         if (!response.destroyed && !response.writableEnded) this.json(response, 503, { error: "BODY_EXECUTION_UNCERTAIN" });
@@ -59,6 +69,7 @@ export class BodyDaemonServer {
     if (this.server) await new Promise<void>(resolve => this.server!.close(() => resolve()));
     await Promise.allSettled([...this.operations]);
   }
+  private recoveryPending(): string[] { return this.cleanup.pending().filter(key => !this.active.has(key)); }
   private json(response: http.ServerResponse, status: number, data: unknown): void {
     if (response.destroyed || response.writableEnded) return;
     response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
@@ -85,9 +96,9 @@ export class BodyDaemonServer {
   private async handle(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
     const route = new URL(request.url ?? "/", "http://daemon").pathname;
     if (request.method === "GET" && ["/health", "/healthz", "/readyz"].includes(route)) {
-      let ready = true;
-      if (route === "/readyz") { try { ready = (await this.rpc("/readyz")).ok; } catch { ready = false; } }
-      this.json(response, ready ? 200 : 503, { runtime: "native-body-daemon", nodeId: this.options.nodeId, controlPlane: "remote-celld-body", healthy: ready, activeSandboxes: this.active.size, capacity: this.capacity.snapshot() });
+      let ready = this.recoveryPending().length === 0;
+      if (route === "/readyz") { try { ready = ready && (await this.rpc("/readyz")).ok; } catch { ready = false; } }
+      this.json(response, route === "/readyz" && !ready ? 503 : 200, { recoveryRequired: this.recoveryPending().length > 0, runtime: "native-body-daemon", nodeId: this.options.nodeId, controlPlane: "remote-celld-body", healthy: ready, activeSandboxes: this.active.size, capacity: this.capacity.snapshot() });
       return;
     }
     if (!equalBodyToken(String(request.headers.authorization ?? ""), `Body ${this.options.token}`) || request.headers["x-ansts-body-id"] !== this.options.nodeId) {
@@ -117,6 +128,7 @@ export class BodyDaemonServer {
       this.json(response, sandbox.stopConfirmed === false ? 503 : 200, { stopped: sandbox.stopConfirmed !== false, taskId, attemptId }); return;
     }
     if (this.active.has(key)) { this.json(response, 409, { error: "SANDBOX_ALREADY_RUNNING" }); return; }
+    if (this.recoveryPending().length) { this.json(response, 503, { error: "BODY_RECOVERY_REQUIRED" }); return; }
     const controller = new AbortController();
     const disconnect = () => { if (!response.writableEnded) controller.abort(); };
     response.once("close", disconnect);
@@ -144,7 +156,15 @@ export class BodyDaemonServer {
         catch { controller.abort(); } finally { renewing = false; }
       }, 3000);
       if (execution) {
-        const outcome = await new ContainerSandbox(execution.image, "/var/run/docker.sock", this.options.nodeId).execute(execution, controller.signal);
+        this.cleanup.reserve(key);
+        let outcome;
+        try {
+          outcome = await this.containerRuntime!.execute(execution, controller.signal);
+        } catch (error) {
+          if (!String(error).includes("BODY_STOP_UNCONFIRMED")) this.cleanup.confirmRemoved(key);
+          throw error;
+        }
+        this.cleanup.confirmRemoved(key);
         const result = { executedByBodyId: this.options.nodeId, taskId, status: "COMPLETED", executionKind: "container", ...outcome };
         this.journal.complete(journalKey, result);
         this.json(response, 200, result); return;
@@ -172,7 +192,7 @@ export class BodyDaemonServer {
       throw error;
     } finally {
       clearTimeout(timer); if (renewal) clearInterval(renewal);
-      response.removeListener("close", disconnect); this.active.delete(key); this.capacity.release(key); done();
+      response.removeListener("close", disconnect); this.active.delete(key); if (!this.cleanup.pending().includes(key)) this.capacity.release(key); done();
     }
   }
 }

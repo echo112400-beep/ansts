@@ -16,7 +16,12 @@ const budget = bodyResourceBudget(Math.min(os.availableParallelism(), cgroup.cpu
 const daemon = new NodeDaemon(nodeId, budget.cpu, budget.memoryMb, 0);
 const executionSlots = Number(process.env.ANSTS_BODY_EXECUTION_SLOTS ?? 1);
 if (!Number.isSafeInteger(executionSlots) || executionSlots !== 1) throw new Error("BODY_AGENT_REQUIRES_SINGLE_SLOT");
-const heartbeat = running => ({ ...daemon.emitHeartbeat(running), execution_slots: executionSlots, warm_pool_ready: 0 });
+const heartbeat = async running => {
+  const response = await fetch(local + '/health', { signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error('BODY_HEALTH_UNAVAILABLE');
+  const health = await response.json();
+  return { ...daemon.emitHeartbeat(running), execution_slots: executionSlots, warm_pool_ready: 0, healthy: !health.recoveryRequired };
+};
 const base = process.env.ANSTS_BODY_CELL_URL;
 const local = `http://127.0.0.1:${process.env.ANSTS_LISTEN_PORT}`;
 const bodyToken = readFileSync(process.env.ANSTS_BODY_TOKEN_FILE, 'utf8').trim();
@@ -53,9 +58,10 @@ process.on('SIGTERM', () => { stopping = true; });
 while (!stopping) {
   try {
     await flushResults();
-    const hb = heartbeat(0);
+    const hb = await heartbeat(0);
     await rpc(`/v1/body/heartbeat?hostId=${encodeURIComponent(nodeId)}`, hb);
     await rpc('/v1/scheduler/register-node', hb);
+    if (!hb.healthy) { await new Promise(resolve => setTimeout(resolve, 2000)); continue; }
     await rpc('/v1/scheduler/schedule-tick', {});
     const { tasks } = await rpc('/v1/scheduler/tasks');
     for (const task of tasks) {
@@ -81,7 +87,7 @@ while (!stopping) {
         renewing = true;
         try {
           await rpc('/v1/scheduler/lease-renew', lease);
-          const activeHb = heartbeat(1);
+          const activeHb = await heartbeat(1);
           await rpc('/v1/scheduler/register-node', activeHb);
           await rpc(`/v1/body/heartbeat?hostId=${encodeURIComponent(nodeId)}`, activeHb);
         } catch (error) { controller.abort(error); }

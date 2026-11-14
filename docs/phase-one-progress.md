@@ -53,3 +53,5 @@ M1.2 第二批：结构化 execution（kind/container、image 摘要、argv、ti
 
 Gateway 与 Daemon 必须显式设置相同 ANSTS_SANDBOX_IMAGE 才接受该镜像；当前开发集群尚未开启，也未给 Daemon 挂载 Engine socket。32 项相关测试全部通过，真实 Engine 集成覆盖 argv 篡改被拒绝、原规范可执行并返回日志与退出码。部署启用、任务侧日志查询、产物导出、Daemon 崩溃后的孤儿容器回收和状态细化仍待交付。
 M1.2 第三批：增加按 Daemon owner 标签的启动前孤儿容器回收、Gateway 已授权任务 includeResult 查询、显式 sandbox Compose override。开发部署已启用，真实 Gateway→Scheduler→Body→Engine 任务达到 COMPLETED，退出码和日志可读，匿名及跨租户查询被拒绝。真实残留 fixture 回收通过且无剩余测试沙箱。维护命令与限制见 container-execution-development.md。未完成清理失败后的持久资源占用、产物导出及实时日志，不宣称 M1.2 全部交付。
+
+M1.2/M1.3 安全恢复补充：容器执行前增加 fsync cleanup-ledger；清理不确认时保留槽位和持久记录，阻止新执行，readiness 返回 503，代理停止调度领取。启动前 Engine 回收成功才清除阻塞；未配置 Engine 且存在记录时拒绝启动。新增失败注入与跨重建验证，31 项相关回归通过，两个开发 Daemon 已更新。取消/drain、产物导出及响应丢失矩阵仍待完成。
