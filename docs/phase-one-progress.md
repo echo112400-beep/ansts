@@ -45,3 +45,7 @@
 M1.1 后续：增加标准 cgroup v2 与 v1 挂载位置的 CPU quota 和内存 limit 检测，支持分数 CPU。非标准挂载及祖先配额遍历尚未覆盖。构建及 7 项相关测试通过，两个 Daemon 镜像已重建部署，执行协议端到端任务达到 COMPLETED。Scheduler 恢复仍依赖原有租约重建/重新排队语义；不能将当前槽位检查视为完整持久资源账本。
 
 M1.1 恢复改造：活动租约与任务同一条 SQL 记录保存，续租同步持久化；Scheduler 重建恢复原 node/fence/acquired_at/expires_at，不因重启延长期限。新增过期续租拒绝，保留 fence 水位防止恢复旧租约覆盖新租约。跨重建测试验证活动槽位不被释放、原执行可以续租和完成。Body/Scheduler 共 28 项回归通过，已发布开发 Worker 并验证任务 COMPLETED。旧记录缺少租约快照时仍沿用保守准入保护；CPU/内存的持久预留账本及完整过期恢复矩阵仍待实现。
+
+M1.2 第一批：新增独立 ContainerSandbox Engine adapter，仅接受固定摘要镜像和结构化 argv/资源限额。配置非 root、只读根文件系统、禁网、drop all capabilities、no-new-privileges、PID/CPU/内存限额、限额 tmpfs 和轮转日志；不挂载宿主目录、凭据或 Docker socket。结果返回退出码与有界日志；超时或取消后强制移除容器，无法确认清理时报 BODY_STOP_UNCONFIRMED。现有原生子进程也改用最小环境变量，停止继承服务密钥。
+
+真实 Docker 测试通过：rootfs 不可写、workspace 可写、UID 65534、无父进程测试密钥、无 Engine socket、仅 loopback 网络、退出码 7、超时终止。Engine API 按 Docker 官方文档与 Context7 /docker/docs 核对。此 adapter 尚未接入 Gateway/Body 任务协议，未给开发 Daemon 挂载 Engine socket；结构化命令与执行摘要绑定、工作区产物导出、孤儿容器恢复及任务日志 API 仍待实现。当前不能宣称完成 M1.2 或支持敌对多租户负载。

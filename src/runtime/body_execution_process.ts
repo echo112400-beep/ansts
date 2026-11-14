@@ -14,7 +14,7 @@ export function runBodyExecution(input: BodyWorkerInput, signal: AbortSignal): P
   if (signal.aborted) return Promise.reject(new Error("BODY_EXECUTION_CANCELLED"));
   return new Promise((resolve, reject) => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "ansts-body-worker-"));
-    const child = fork(require.resolve("./body_execution_worker.js"), [], { detached: process.platform !== "win32", stdio: ["ignore", "ignore", "ignore", "ipc"], execArgv: [], env: { ...process.env, TMPDIR: temporary, TEMP: temporary, TMP: temporary } });
+    const child = fork(require.resolve("./body_execution_worker.js"), [], { detached: process.platform !== "win32", stdio: ["ignore", "ignore", "ignore", "ipc"], execArgv: [], env: { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", HOME: temporary, LANG: "C.UTF-8", TMPDIR: temporary, TEMP: temporary, TMP: temporary } });
     let output: BodyWorkerOutput | undefined;
     let failure: Error | undefined;
     const abort = () => {
