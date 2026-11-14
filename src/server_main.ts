@@ -15,6 +15,7 @@ import { IngressBackpressureController } from "./gateway/backpressure.js";
 import { SseEventStreamGateway } from "./gateway/sse_stream.js";
 import { DashboardBridgeService, DashboardBackendServer, PlatformManagementPlaneEngine, ManagementScenarioId } from "./dashboard/server.js";
 import { ConsoleRbacAuthGuard, ConsoleRbacForbiddenError, type ConsolePermission, type OperatorJwtClaims } from "./dashboard/console_rbac_guard.js";
+import { handleConsoleAgentHttp } from "./console/console_agent.js";
 import { OtelAndPrometheusExporter } from "./telemetry/otel_prometheus.js";
 import { LayerFsWorkspaceDriver } from "./runtime/layerfs_workspace_driver.js";
 import { ManualFleetScaleController } from "./cluster/manual_scale_controller.js";
@@ -524,6 +525,7 @@ export class AnstsLocalAndComposeServer {
    */
   private requiresConsoleWriteAuth(method: string, pathname: string): boolean {
     if (method !== "POST" && method !== "PUT" && method !== "PATCH" && method !== "DELETE") return false;
+    if (pathname === "/v1beta1/console/agent/chat") return false;
     return pathname.startsWith("/v1beta1/management/") || pathname.startsWith("/v1beta1/console/");
   }
 
@@ -590,6 +592,12 @@ export class AnstsLocalAndComposeServer {
         this.writeJson(res, decision.status, { error: decision.error, message: decision.message });
         return;
       }
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/console/agent/chat") {
+      const body = await this.readJsonBody(req);
+      await handleConsoleAgentHttp(this, req, res, body);
+      return;
     }
 
     if (

@@ -60,6 +60,10 @@ const ROLE_PERMISSION_MAP: Record<ConsoleRole, Set<ConsolePermission>> = {
   ]),
 };
 
+export function permissionsForConsoleRole(role: ConsoleRole): ReadonlySet<ConsolePermission> {
+  return ROLE_PERMISSION_MAP[role] ?? new Set();
+}
+
 export class ConsoleRbacForbiddenError extends Error {
   constructor(message: string) {
     super(message);
