@@ -23,3 +23,6 @@ export function authenticateBodyOperator(request: Request, secret?: string): boo
 export function authenticateGatewayService(request: Request, secret?: string): boolean {
   return !!secret && /^[a-f0-9]{64}$/.test(secret) && equalBodyToken(request.headers.get("authorization") ?? "", `Gateway ${bodyServiceToken(secret, "gateway:control")}`);
 }
+export function authenticateBodyControl(request: Request, secret?: string): boolean {
+  return !!secret && /^[a-f0-9]{64}$/.test(secret) && equalBodyToken(request.headers.get("authorization") ?? "", `BodyControl ${bodyServiceToken(secret, "body:control")}`);
+}

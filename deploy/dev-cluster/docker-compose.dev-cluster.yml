@@ -193,8 +193,53 @@ services:
     environment:
       <<: *ansts-common-env
       CELLD_CONFIG: "/app/deploy/celld/wrangler.celld.json"
+      ANSTS_BODY_WORKER_URL: "http://body-celld:8080"
       ANSTS_BODY_AUTH_SECRET_FILE: "/run/secrets/body-signing.key"
       CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
+    restart: "no"
+    networks:
+      - ansts_mesh_net
+
+  body-celld:
+    image: ghcr.io/denoland/celld:0.6.3
+    container_name: ansts-body-celld
+    entrypoint: ["/usr/bin/bash", "/app/deploy/dev-cluster/start-celld-body.sh"]
+    working_dir: /app
+    depends_on:
+      celld-deploy:
+        condition: service_completed_successfully
+    ports:
+      - "18085:8080"
+    volumes:
+      - ../..:/app:ro
+      - body_control_data:/var/lib/ansts-body
+    environment:
+      ANSTS_BODY_AUTH_SECRET_FILE: "/app/.dev-secrets/body-signing.key"
+      ANSTS_SCHEDULER_URL: "http://celld-brain-01:8081"
+      CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
+    healthcheck:
+      test: ["CMD", "/usr/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - ansts_mesh_net
+
+  body-state-migrate:
+    image: node:22-alpine
+    container_name: ansts-body-state-migrate
+    command: ["node", "/app/scripts/migrate_body_control_state.mjs"]
+    working_dir: /app
+    depends_on:
+      body-celld:
+        condition: service_healthy
+    volumes:
+      - ../..:/app:ro
+    environment:
+      ANSTS_BODY_AUTH_SECRET_FILE: "/app/.dev-secrets/body-signing.key"
+      ANSTS_LEGACY_BODY_URL: "http://celld-brain-01:8081"
+      ANSTS_BODY_CELL_URL: "http://body-celld:8080"
     restart: "no"
     networks:
       - ansts_mesh_net
@@ -204,6 +249,10 @@ services:
       context: ../..
       dockerfile: Dockerfile.dev
     container_name: ansts-body-daemon-01
+    command: ["node", "scripts/start_body_daemon.mjs"]
+    depends_on:
+      body-state-migrate:
+        condition: service_completed_successfully
     privileged: true
     ports:
       - "19501:9501"
@@ -216,7 +265,7 @@ services:
       ANSTS_NODE_ID: "body-host-01"
       ANSTS_BODY_TOKEN_FILE: "/run/secrets/body.token"
       ANSTS_NODE_ROLE: "body"
-      ANSTS_BODY_CELL_URL: "http://celld-brain-01:8081"
+      ANSTS_BODY_CELL_URL: "http://body-celld:8080"
       ANSTS_LISTEN_PORT: "9501"
       ANSTS_STORAGE_DIR: "/var/lib/ansts/body-host-01"
       ANSTS_PRIMARY_GATEWAY_URL: "http://ansts-gateway-01:8080"
@@ -234,6 +283,10 @@ services:
       context: ../..
       dockerfile: Dockerfile.dev
     container_name: ansts-body-daemon-02
+    command: ["node", "scripts/start_body_daemon.mjs"]
+    depends_on:
+      body-state-migrate:
+        condition: service_completed_successfully
     privileged: true
     ports:
       - "19502:9502"
@@ -246,7 +299,7 @@ services:
       ANSTS_NODE_ID: "body-host-02"
       ANSTS_BODY_TOKEN_FILE: "/run/secrets/body.token"
       ANSTS_NODE_ROLE: "body"
-      ANSTS_BODY_CELL_URL: "http://celld-brain-01:8081"
+      ANSTS_BODY_CELL_URL: "http://body-celld:8080"
       ANSTS_LISTEN_PORT: "9502"
       ANSTS_STORAGE_DIR: "/var/lib/ansts/body-host-02"
       ANSTS_PRIMARY_GATEWAY_URL: "http://ansts-gateway-02:8080"
@@ -382,6 +435,7 @@ networks:
     driver: bridge
 
 volumes:
+  body_control_data:
   rustfs_dev_data:
   celld_01_data:
   celld_02_data:

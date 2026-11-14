@@ -48,6 +48,10 @@ fi
 PROJECT="${CELLD_PROJECT_DIR:-$(mktemp -d)/ansts-celld-brain}"
 mkdir -p "$PROJECT"
 cp "$CONFIG" "$PROJECT/wrangler.json"
+if [[ -n "${ANSTS_BODY_WORKER_URL:-}" ]]; then
+  [[ "$ANSTS_BODY_WORKER_URL" =~ ^https?://[a-zA-Z0-9._:-]+$ ]] || exit 1
+  sed -i "s|\"ANSTS_BODY_WORKER_URL\": \"\"|\"ANSTS_BODY_WORKER_URL\": \"$ANSTS_BODY_WORKER_URL\"|" "$PROJECT/wrangler.json"
+fi
 if [[ -n "${ANSTS_BODY_AUTH_SECRET_FILE:-}" ]]; then
   BODY_KEY="$(cat "$ANSTS_BODY_AUTH_SECRET_FILE")"
   if [[ ! "$BODY_KEY" =~ ^[a-f0-9]{64}$ ]]; then

@@ -5,7 +5,7 @@ import { gatewayDevAuthorization } from './gateway_dev_identity.mjs';
 const gateway = process.env.ANSTS_SMOKE_GATEWAY ?? 'http://127.0.0.1:18080';
 const brain = process.env.ANSTS_SMOKE_BRAIN ?? 'http://127.0.0.1:18082';
 assert.equal((await fetch(`${brain}/v1/body/state`)).status, 401);
-assert.equal((await fetch('http://127.0.0.1:19501/internal/v1beta1/body/execute', {
+assert.equal((await fetch(`${process.env.ANSTS_SMOKE_DAEMON ?? 'http://127.0.0.1:19501'}/internal/v1beta1/body/execute`, {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ taskId: 'anonymous-must-not-run', fencingToken: 1 }),
 })).status, 401);
 const taskId = `attempt-protocol-${Date.now()}`;

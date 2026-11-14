@@ -12,6 +12,9 @@ const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, "..");
 const require = createRequire(path.join(ROOT_DIR, "package.json"));
 
+if (process.env.ANSTS_BODY_CELL_URL && process.env.ANSTS_NODE_ROLE === 'body') {
+  await import('./start_body_daemon.mjs');
+} else {
 const { MultiNodeDevServer } = require(path.join(ROOT_DIR, "dist", "src", "index.js"));
 
 const listenPort = Number(process.env.ANSTS_LISTEN_PORT ?? process.env.ANSTS_PORT ?? 8080);
@@ -40,6 +43,4 @@ const shutdown = () => {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-if (process.env.ANSTS_BODY_CELL_URL && process.env.ANSTS_NODE_ROLE === "body") {
-  await import("./body_cell_agent.mjs");
 }

@@ -19,7 +19,7 @@ export interface CelldWorkerDevOptions {
   logs?: boolean;
 }
 
-export type CelldWorkerRole = "scheduler" | "gateway";
+export type CelldWorkerRole = "scheduler" | "gateway" | "body";
 
 export interface CelldWorkerStartOptions {
   rootDir?: string;
@@ -34,6 +34,7 @@ export interface CelldWorkerStartOptions {
 }
 
 const ROLE_DEFAULTS: Record<CelldWorkerRole, { config: string; entry: string; dirName: string; port: number }> = {
+  body: { config: "deploy/celld/wrangler.body.json", entry: "src/cloudflare/body_worker.ts", dirName: "body-worker", port: 9878 },
   scheduler: {
     config: "deploy/celld/wrangler.celld.json",
     entry: "src/cloudflare/worker.ts",
@@ -101,7 +102,9 @@ export function prepareCelldWorkerProject(
     if (process.env.ANSTS_SCHEDULER_SERVICE_TOKEN) lines.push(`ANSTS_SCHEDULER_SERVICE_TOKEN=${process.env.ANSTS_SCHEDULER_SERVICE_TOKEN}`);
     fs.writeFileSync(path.join(projectDir, ".dev.vars"), `${lines.join("\n")}\n`);
   } else if (process.env.ANSTS_BODY_AUTH_SECRET) {
-    fs.writeFileSync(path.join(projectDir, ".dev.vars"), `ANSTS_BODY_AUTH_SECRET=${process.env.ANSTS_BODY_AUTH_SECRET}\n`);
+    const lines = [`ANSTS_BODY_AUTH_SECRET=${process.env.ANSTS_BODY_AUTH_SECRET}`];
+    if (role === "body") lines.push(`ANSTS_SCHEDULER_URL=${options.schedulerUrl ?? process.env.ANSTS_SCHEDULER_URL ?? ""}`);
+    fs.writeFileSync(path.join(projectDir, ".dev.vars"), `${lines.join("\n")}\n`);
   }
   return { projectDir, wranglerPath };
 }
@@ -147,8 +150,8 @@ export function resolveCelldWorkerStart(options: CelldWorkerStartOptions = {}): 
 
 function roleFromEnv(): CelldWorkerRole {
   const raw = (process.env.CELLD_ROLE ?? "scheduler").trim();
-  if (raw !== "scheduler" && raw !== "gateway") {
-    throw new Error(`CELLD_ROLE must be scheduler or gateway, got '${raw}'`);
+  if (raw !== "scheduler" && raw !== "gateway" && raw !== "body") {
+    throw new Error(`CELLD_ROLE must be scheduler, gateway or body, got '${raw}'`);
   }
   return raw;
 }

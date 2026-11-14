@@ -1,5 +1,8 @@
 # ANSTS — Agent-Native Sandbox Task Scheduler
 
+> 2026-11-14：Body 已拆分为独立 celld 控制模块（18085）与原生执行 Daemon（19501/19502）。Compose 共 14 个服务、两个一次性作业；下文旧的 Brain 内 Body 与通用执行器描述以 [拆分说明](docs/body-celld-daemon-split.md) 为准。
+
+
 TypeScript implementation with celld Gateway and Scheduler workers, durable Body control cells, and native Body execution agents. Current implementation baseline: `8eef81e` (2026-11-13).
 
 See [current architecture and limitations](docs/current-architecture.md) and [Body execution recovery](docs/body-cell-development.md). Earlier design documents describe targets and historical designs; their production, capacity and test-count claims are not current verification results.

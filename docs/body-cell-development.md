@@ -1,5 +1,8 @@
 # Body control plane in the development cluster
 
+> 2026-11-14：Body 已拆分为独立 celld 控制模块（18085）与原生执行 Daemon（19501/19502）。Compose 共 14 个服务、两个一次性作业；下文旧的 Brain 内 Body 与通用执行器描述以 [拆分说明](body-celld-daemon-split.md) 为准。
+
+
 The scheduler fleet exports `AnstsBodyCell`. Each host has a named cell with its
 latest heartbeat and execution receipts keyed by task ID and fencing token.
 `GET /v1/body/state?hostId=body-host-01` reports freshness and receipts.

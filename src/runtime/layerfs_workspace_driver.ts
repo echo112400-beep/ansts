@@ -562,7 +562,7 @@ export class LayerFsWorkspaceDriver {
     this.branchHeads.set(bundle.branchName, idRemap.get(bundle.headCommitId) ?? bundle.headCommitId);
   }
 
-  public async pushBranchToRemoteS3(branchName: string, s3Endpoint: string): Promise<boolean> {
+  public async pushBranchToRemoteS3(branchName: string, s3Endpoint: string, signal?: AbortSignal): Promise<boolean> {
     try {
       const bundle = this.exportBranchBundle(branchName);
       const resp = await fetch(
@@ -571,6 +571,7 @@ export class LayerFsWorkspaceDriver {
           method: "PUT",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(bundle),
+          signal,
         }
       );
       return resp.ok;
@@ -579,13 +580,14 @@ export class LayerFsWorkspaceDriver {
     }
   }
 
-  public async pullBranchFromRemoteS3(branchName: string, s3Endpoint: string): Promise<boolean> {
+  public async pullBranchFromRemoteS3(branchName: string, s3Endpoint: string, signal?: AbortSignal): Promise<boolean> {
     try {
       const resp = await fetch(
-        `${s3Endpoint.replace(/\/$/, "")}/ansts-fleet/layerfs/branches/${encodeURIComponent(branchName)}.json`
+        `${s3Endpoint.replace(/\/$/, "")}/ansts-fleet/layerfs/branches/${encodeURIComponent(branchName)}.json`, { signal }
       );
       if (!resp.ok) return false;
       const bundle = (await resp.json()) as ReturnType<LayerFsWorkspaceDriver["exportBranchBundle"]>;
+      if (signal?.aborted) return false;
       if (bundle && Array.isArray(bundle.commits)) {
         this.importBranchBundle(bundle);
         return true;

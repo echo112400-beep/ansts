@@ -5,7 +5,7 @@ WORKDIR /app
 # Install curl & bash for healthchecks and cluster bootstrap scripts
 RUN apk add --no-cache curl bash
 
-COPY package.json tsconfig.json wrangler.json wrangler.toml Makefile ./
+COPY package.json package-lock.json tsconfig.json wrangler.json wrangler.toml Makefile ./
 COPY types ./types
 COPY proto ./proto
 COPY migrations ./migrations
@@ -15,7 +15,7 @@ COPY scripts ./scripts
 COPY docs ./docs
 COPY specs ./specs
 
-RUN npm install --no-audit --no-fund 2>/dev/null && node scripts/ci_check.mjs --stage build
+RUN --mount=type=cache,target=/root/.npm npm ci --prefer-offline --no-audit --no-fund && node scripts/ci_check.mjs --stage build
 
 EXPOSE 8080 8081 8082 8083 9443 9501 9502
 

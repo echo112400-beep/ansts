@@ -1,19 +1,22 @@
 # 当前代码架构与开发部署
 
-核对日期：2026-11-13。代码基线：`8eef81e`。本文描述已接入的运行路径；早期设计中的容量、延迟、RPO/RTO 和生产安全指标不构成当前验证结论。
+> 2026-11-14：Body 已拆分为独立 celld 控制模块（18085）与原生执行 Daemon（19501/19502）。Compose 共 14 个服务、两个一次性作业；下文旧的 Brain 内 Body 与通用执行器描述以 [拆分说明](body-celld-daemon-split.md) 为准。
+
+
+核对日期：2026-11-14。本文描述已接入的运行路径；早期设计中的容量、延迟、RPO/RTO 和生产安全指标不构成当前验证结论。
 
 ## 进程与状态边界
 
 | 组件 | 当前实现 | 状态与边界 |
 | --- | --- | --- |
 | Gateway | `src/cloudflare/gateway_worker.ts`、`gateway_cell.ts` | 独立 celld Worker，Gateway Cell 保存提交、租约和会话；经 HTTP 调用 Scheduler |
-| Scheduler | `src/cloudflare/worker.ts`、`scheduler_cell.ts` | 三节点 celld fleet 承载 Scheduler、Harness、Tunnel、Body Cell；默认调度对象为 `global-shard-0` |
-| Body Cell | `src/cloudflare/body_cell.ts` | 按 host 保存心跳与回执；按 `execution:<taskId>` 保存共享执行准入与完成结果 |
+| Scheduler | `src/cloudflare/worker.ts`、`scheduler_cell.ts` | 三节点 celld fleet 承载 Scheduler、Harness、Tunnel；旧 Body 绑定仅供兼容与迁移导出；默认调度对象为 `global-shard-0` |
+| Body Cell | `src/cloudflare/body_worker.ts`、`body_cell.ts` | 独立 celld Worker 与持久卷； 按 host 保存心跳与回执；按 `execution:<taskId>` 保存共享执行准入与完成结果 |
 | Body 执行代理 | `scripts/body_cell_agent.mjs` | 在原生 Node 进程中向 Scheduler 注册容量、轮询任务、续租、调用本地执行接口并回报完成 |
-| 本地执行器 | `src/server_main.ts`、`runtime/body_execution_journal.ts` | LayerFS 工作区执行与宿主机文件操作；执行日志位于 Body 持久卷 |
+| 本地执行器 | `src/runtime/body_daemon_server.ts`、`runtime/body_execution_journal.ts` | LayerFS 工作区执行与宿主机文件操作；执行日志位于 Body 持久卷 |
 | 控制台 | Nginx、`docs/` | 静态页面和 API 代理；页面中存在的功能不代表独立 Gateway Worker 已实现对应后端路由 |
 
-当前 Compose 有 12 个 service，其中 `celld-deploy` 为一次性部署作业。两个 Gateway 使用 `celld dev`，各自持有容器临时目录中的独立状态；它们不组成共享 Gateway 状态集群。Brain 才是使用对象存储发布的三节点 fleet。
+当前 Compose 有 14 个 service，其中 `celld-deploy` 与 `body-state-migrate` 为一次性作业。两个 Gateway 使用 `celld dev`，各自持有容器临时目录中的独立状态；它们不组成共享 Gateway 状态集群。Brain 才是使用对象存储发布的三节点 fleet。
 
 ## 提交、执行与恢复
 
@@ -49,7 +52,7 @@ curl -fsS http://localhost:18081/health
 
 Gateway 源码更新后需重建其容器以重新暂存 Worker；Brain 源码更新后需重跑一次性部署服务。Body 镜像需重新构建；开发配置单独挂载代理脚本，修改后重启 Body 进程生效。
 
-入口：控制台 `8088`；Gateway `18080/18081`；Brain `18082–18084`；Body `19501/19502`；RustFS `9000/9001`；Prometheus `9090`；Grafana `3000`。
+入口：控制台 `8088`；Gateway `18080/18081`；Brain `18082–18084`，Body celld `18085`；Body `19501/19502`；RustFS `9000/9001`；Prometheus `9090`；Grafana `3000`。
 
 已有验证记录：TypeScript 构建通过；Body Cell/执行日志/Gateway 相关 6 项测试通过；实际提交任务达到 `COMPLETED`，Gateway 查询租约为 `RELEASED`。这些记录不等同于全套测试、长任务故障注入、生产容量或安全验证。
 

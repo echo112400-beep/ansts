@@ -18,7 +18,9 @@
     "dev:cluster:down": "cat deploy/dev-cluster/dev-cluster-down.sh | bash",
     "start:local": "cat scripts/run-local.sh | bash",
     "start:celld-scheduler": "bash scripts/celld_scheduler_up.sh",
-    "start:celld-gateway": "bash scripts/celld_gateway_up.sh"
+    "start:celld-gateway": "bash scripts/celld_gateway_up.sh",
+    "start:celld-body": "bash scripts/celld_body_up.sh",
+    "start:body-daemon": "node scripts/start_body_daemon.mjs"
   },
   "engines": {
     "node": ">=22.0.0 <23.0.0"
