@@ -41,6 +41,7 @@ export class BodyDaemonServer {
     this.journal = new BodyExecutionJournal(path.join(options.storageDir, "execution-journal"));
   }
   async start(): Promise<{ port: number }> {
+    if (this.options.sandboxImage) await new ContainerSandbox(this.options.sandboxImage, "/var/run/docker.sock", this.options.nodeId).recoverOrphans();
     this.server = http.createServer((request, response) => {
       const operation = this.handle(request, response).catch(() => {
         if (!response.destroyed && !response.writableEnded) this.json(response, 503, { error: "BODY_EXECUTION_UNCERTAIN" });
@@ -143,7 +144,7 @@ export class BodyDaemonServer {
         catch { controller.abort(); } finally { renewing = false; }
       }, 3000);
       if (execution) {
-        const outcome = await new ContainerSandbox(execution.image).execute(execution, controller.signal);
+        const outcome = await new ContainerSandbox(execution.image, "/var/run/docker.sock", this.options.nodeId).execute(execution, controller.signal);
         const result = { executedByBodyId: this.options.nodeId, taskId, status: "COMPLETED", executionKind: "container", ...outcome };
         this.journal.complete(journalKey, result);
         this.json(response, 200, result); return;

@@ -21,4 +21,5 @@ if [[ -n "${ANSTS_USER_AUTH_SECRET_FILE:-}" ]]; then
   fi
   unset USER_KEY
 fi
+if [[ -n "${ANSTS_SANDBOX_IMAGE:-}" ]]; then printf 'ANSTS_SANDBOX_IMAGE=%s\n' "$ANSTS_SANDBOX_IMAGE" >> "$PROJECT/.dev.vars"; fi
 exec celld dev "$PROJECT" --host 0.0.0.0 --port 8080 --no-watch --logs

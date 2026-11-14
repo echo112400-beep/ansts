@@ -1,0 +1,18 @@
+# Trusted development hosts only: Daemons receive Engine authority; task containers do not.
+services:
+  body-daemon-01:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      ANSTS_SANDBOX_IMAGE: node@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
+  body-daemon-02:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      ANSTS_SANDBOX_IMAGE: node@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
+  ansts-gateway-01:
+    environment:
+      ANSTS_SANDBOX_IMAGE: node@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
+  ansts-gateway-02:
+    environment:
+      ANSTS_SANDBOX_IMAGE: node@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914

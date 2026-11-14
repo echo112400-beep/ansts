@@ -52,3 +52,4 @@ M1.2 第一批：新增独立 ContainerSandbox Engine adapter，仅接受固定�
 M1.2 第二批：结构化 execution（kind/container、image 摘要、argv、timeoutMs、cpu、memoryMb）接入 Gateway 验证、TaskSpec、Scheduler 存储、代理和 Daemon。限制规范大小及未知字段，执行预算不得超过任务声明。所有执行字段加入输入摘要，旧 trace 摘要保持兼容；内容去重包含执行规范。独立 Body Worker 在 acquire/start 时对容器任务核对 Scheduler 规范摘要。Daemon 使用绑定该摘要的单次凭证，容器退出结果写入原有 journal/outbox 路径，返回 exitCode、有界日志及截断信息；COMPLETED 表示执行尝试完成，业务成功需检查 exitCode。
 
 Gateway 与 Daemon 必须显式设置相同 ANSTS_SANDBOX_IMAGE 才接受该镜像；当前开发集群尚未开启，也未给 Daemon 挂载 Engine socket。32 项相关测试全部通过，真实 Engine 集成覆盖 argv 篡改被拒绝、原规范可执行并返回日志与退出码。部署启用、任务侧日志查询、产物导出、Daemon 崩溃后的孤儿容器回收和状态细化仍待交付。
+M1.2 第三批：增加按 Daemon owner 标签的启动前孤儿容器回收、Gateway 已授权任务 includeResult 查询、显式 sandbox Compose override。开发部署已启用，真实 Gateway→Scheduler→Body→Engine 任务达到 COMPLETED，退出码和日志可读，匿名及跨租户查询被拒绝。真实残留 fixture 回收通过且无剩余测试沙箱。维护命令与限制见 container-execution-development.md。未完成清理失败后的持久资源占用、产物导出及实时日志，不宣称 M1.2 全部交付。

@@ -1,6 +1,6 @@
 /** @fileoverview Body control routes shared by the standalone Worker and legacy migration host. */
 import { DurableObjectNamespaceLike } from "./env.js";
-import { authenticateBody, authenticateBodyOperator, bodyServiceToken } from "./body_auth.js";
+import { authenticateBody, authenticateBodyOperator, authenticateGatewayService, bodyServiceToken } from "./body_auth.js";
 import { issueExecutionGrant, verifyExecutionGrant } from "./execution_token.js";
 import { ExecutionAttempt, sameOwner, taskInputDigest } from "./execution_attempt.js";
 
@@ -23,6 +23,15 @@ export function bodySchedulerClient(env: BodyWorkerEnv): { fetch(request: Reques
 export async function handleBodyRequest(request: Request, env: BodyWorkerEnv): Promise<Response> {
   const url = new URL(request.url);
     if (url.pathname.startsWith("/v1/body/") && env.ANSTS_BODY_CELL) {
+      if (url.pathname === "/v1/body/result") {
+        if (request.method !== "GET" || !authenticateGatewayService(request, env.ANSTS_BODY_AUTH_SECRET)) return Response.json({ error: "GATEWAY_SERVICE_REQUIRED" }, { status: 401 });
+        const taskId = url.searchParams.get("taskId"), tenantId = url.searchParams.get("tenantId");
+        if (!taskId || !tenantId) return Response.json({ error: "TASK_IDENTITY_REQUIRED" }, { status: 400 });
+        const response = await env.ANSTS_BODY_CELL.get(env.ANSTS_BODY_CELL.idFromName(`execution:${taskId}`)).fetch(new Request("https://cell/v1/body/state"));
+        const { execution } = await response.json() as { execution?: ExecutionAttempt };
+        if (!execution || execution.tenant_id !== tenantId) return Response.json({ error: "RESULT_NOT_FOUND" }, { status: 404 });
+        return Response.json({ phase: execution.phase, result: execution.result ?? null }, { headers: { "cache-control": "no-store" } });
+      }
       if (url.pathname === "/v1/body/consume-grant") return Response.json({ error: "INTERNAL_ROUTE" }, { status: 403 });
       if (["/v1/body/export", "/v1/body/import"].includes(url.pathname)) {
         if (!authenticateBodyOperator(request, env.ANSTS_BODY_AUTH_SECRET)) return Response.json({ error: "OPERATOR_AUTH_REQUIRED" }, { status: 401 });

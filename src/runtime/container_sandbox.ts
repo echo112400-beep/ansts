@@ -10,7 +10,7 @@ export interface SandboxCommand {
 }
 export interface SandboxResult { exitCode: number; logs: string; logsTruncated: boolean; logsTailLimited: boolean; }
 export class ContainerSandbox {
-  constructor(private readonly image: string, private readonly socketPath = "/var/run/docker.sock") {
+  constructor(private readonly image: string, private readonly socketPath = "/var/run/docker.sock", private readonly owner = "standalone") {
     if (!/^[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}$/.test(image)) throw new Error("SANDBOX_IMAGE_DIGEST_REQUIRED");
   }
   private request(method: string, route: string, payload?: unknown, signal = AbortSignal.timeout(10000), limit = 1048576): Promise<Buffer> {
@@ -25,6 +25,17 @@ export class ContainerSandbox {
       request.on("error", reject); request.end(body);
     });
   }
+  /** Called before advertising readiness. Only this Daemon's labelled containers are eligible. */
+  async recoverOrphans(): Promise<number> {
+    const filters = encodeURIComponent(JSON.stringify({ label: ["ansts.managed=sandbox", `ansts.owner=${this.owner}`] }));
+    const containers = JSON.parse((await this.request("GET", `/containers/json?all=true&filters=${filters}`)).toString()) as Array<{ Id: string; Labels?: Record<string, string> }>;
+    let removed = 0;
+    for (const container of containers) {
+      if (!/^[a-f0-9]{64}$/.test(container.Id) || container.Labels?.["ansts.managed"] !== "sandbox" || container.Labels?.["ansts.owner"] !== this.owner) throw new Error("INVALID_ORPHAN_IDENTITY");
+      await this.request("DELETE", `/containers/${container.Id}?force=true&v=true`); removed++;
+    }
+    return removed;
+  }
   async execute(command: SandboxCommand, signal: AbortSignal): Promise<SandboxResult> {
     if (!Array.isArray(command.argv) || !command.argv.length || command.argv.length > 64 || command.argv.some(value => typeof value !== "string" || value.includes("\0") || value.length > 8192) || !Number.isSafeInteger(command.timeoutMs) || command.timeoutMs < 1 || command.timeoutMs > 3600000 || !Number.isFinite(command.cpu) || command.cpu <= 0 || command.cpu > 32 || !Number.isSafeInteger(command.memoryMb) || command.memoryMb < 16 || command.memoryMb > 65536) throw new Error("INVALID_SANDBOX_COMMAND");
     signal.throwIfAborted();
@@ -38,7 +49,7 @@ export class ContainerSandbox {
         Image: this.image, Cmd: command.argv, Entrypoint: [], User: "65534:65534", WorkingDir: "/workspace",
         Env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/workspace", "TMPDIR=/tmp"],
         NetworkDisabled: true, AttachStdout: true, AttachStderr: true, Tty: false,
-        Labels: { "ansts.managed": "sandbox" },
+        Labels: { "ansts.managed": "sandbox", "ansts.owner": this.owner },
         HostConfig: { NetworkMode: "none", ReadonlyRootfs: true, CapDrop: ["ALL"], SecurityOpt: ["no-new-privileges:true"],
           Memory: command.memoryMb * 1048576, MemorySwap: command.memoryMb * 1048576, NanoCpus: Math.ceil(command.cpu * 1e9), PidsLimit: 64,
           Tmpfs: { "/workspace": "rw,noexec,nosuid,nodev,size=32m,mode=1777", "/tmp": "rw,noexec,nosuid,nodev,size=16m,mode=1777" },

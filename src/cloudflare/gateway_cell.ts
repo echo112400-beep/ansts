@@ -346,6 +346,9 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
     if (candidates.length > 1) return json({ error: "TENANT_REQUIRED" }, 400);
     const found = candidates[0];
     if (!found) return json({ error: "TASK_NOT_FOUND", task_id: taskId }, 404);
+    if (url.searchParams.get("includeResult") === "1") {
+      return schedulerFetch(env, `/v1/body/result?taskId=${encodeURIComponent(String(found.task_id))}&tenantId=${encodeURIComponent(String(found.tenant_id))}`);
+    }
     const gateway = await readGatewayState(env);
     const leases = Array.isArray(gateway?.leases) ? (gateway.leases as Array<Record<string, unknown>>) : [];
     const lease = leases.find((row) => row.task_id === found.task_id) ?? null;
