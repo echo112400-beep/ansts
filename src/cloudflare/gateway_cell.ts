@@ -14,6 +14,7 @@ export interface UnifiedGatewayEnv {
   ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;
   /** Base URL of the separate scheduler celld worker. Empty or unset fail-closes cross-worker calls. */
   ANSTS_SCHEDULER_URL?: string;
+  ANSTS_SANDBOX_IMAGE?: string;
   ANSTS_SCHEDULER_SERVICE_TOKEN?: string;
   ANSTS_USER_AUTH_SECRET?: string;
   ANSTS_USER_AUTH_PREVIOUS_SECRET?: string;
@@ -391,6 +392,7 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
   if (legacy) spec.task_id = String(legacy.task_id);
   const gateway = gatewayStub(env);
   if (!gateway) return json({ error: "GATEWAY_CELL_UNBOUND" }, 503);
+  if (spec.execution && spec.execution.image !== env.ANSTS_SANDBOX_IMAGE) return json({ error: "SANDBOX_IMAGE_NOT_ENABLED" }, 503);
   const submitResp = await schedulerFetch(env, "/v1/scheduler/submit", {
     method: "POST",
     headers: JSON_HEADERS,
@@ -398,6 +400,7 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
       task_id: spec.task_id,
       tenant_id: spec.tenant_id,
       priority: spec.priority,
+      execution: spec.execution,
       prompt: spec.prompt,
       max_turns: spec.max_turns,
       timeout_seconds: spec.timeout_seconds,
@@ -426,7 +429,8 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
       body: JSON.stringify({
         task_id: spec.task_id,
         tenant_id: spec.tenant_id,
-        prompt: spec.prompt,
+        execution: spec.execution,
+      prompt: spec.prompt,
         state,
         assigned_node_id: assigned,
         fencing_token: fencing,

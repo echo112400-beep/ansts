@@ -106,6 +106,7 @@ export class AnstsSchedulerCell {
         task_id: String(r.task_id),
         tenant_id: String(r.tenant_id),
         priority: Number(r.priority ?? TaskPriority.P2_STANDARD) as TaskPriority,
+        execution: parsed.execution as TaskSpec["execution"],
         prompt: String(parsed.prompt ?? ""),
         max_turns: Number(parsed.max_turns ?? 30),
         timeout_seconds: Number(parsed.timeout_seconds ?? 1800),
@@ -218,6 +219,7 @@ export class AnstsSchedulerCell {
       task.assigned_node_id ?? "",
       JSON.stringify({
         execution_lease: this.scheduler.leaseCoordinator.getLease(task.task_id),
+        execution: task.execution,
         prompt: task.prompt,
         max_turns: task.max_turns,
         current_turn: task.current_turn,
@@ -296,6 +298,7 @@ export class AnstsSchedulerCell {
         task_id: String(body.task_id ?? `task-${Date.now()}`),
         tenant_id: String(body.tenant_id ?? "default"),
         priority: Number(body.priority ?? TaskPriority.P2_STANDARD) as TaskPriority,
+        execution: body.execution as TaskSpec["execution"],
         prompt: String(body.prompt ?? ""),
         max_turns: body.max_turns !== undefined ? Number(body.max_turns) : undefined,
         timeout_seconds: body.timeout_seconds !== undefined ? Number(body.timeout_seconds) : undefined,

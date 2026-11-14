@@ -1,3 +1,4 @@
+import { ContainerExecutionSpec, normalizeExecutionSpec } from "./execution_spec.js";
 /**
  * @fileoverview Core Domain Models, TaskSpec v1beta1, 5D Resource Profiles, Monotonic Lease Fencing & LlmEndpointMetrics.
  */
@@ -202,6 +203,7 @@ export interface TaskSpecInit {
   task_id: string;
   tenant_id: string;
   priority?: TaskPriority;
+  execution?: ContainerExecutionSpec;
   prompt?: string;
   max_turns?: number;
   timeout_seconds?: number;
@@ -221,6 +223,7 @@ export class TaskSpec {
   public task_id: string;
   public tenant_id: string;
   public priority: TaskPriority;
+  public execution?: ContainerExecutionSpec;
   public prompt: string;
   public max_turns: number;
   public current_turn = 0;
@@ -248,6 +251,7 @@ export class TaskSpec {
     this.task_id = init.task_id;
     this.tenant_id = init.tenant_id;
     this.priority = init.priority ?? TaskPriority.P2_STANDARD;
+    this.execution = normalizeExecutionSpec(init.execution);
     this.prompt = init.prompt ?? "";
     this.max_turns = init.max_turns ?? 30;
     this.timeout_seconds = init.timeout_seconds ?? 1800;

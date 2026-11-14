@@ -84,11 +84,11 @@ export class CoreScheduler5D {
    * so identical concurrent submissions can be inspected and merged into an existing in-flight task.
    */
   public static computeTaskContentFingerprint(
-    task: Pick<TaskSpec, "tenant_id" | "prompt" | "dependencies" | "parent_task_id">
+    task: Pick<TaskSpec, "tenant_id" | "prompt" | "dependencies" | "parent_task_id"> & Partial<Pick<TaskSpec, "execution">>
   ): string {
     const sortedDeps = [...(task.dependencies ?? [])].sort().join(",");
     const canonical = `${task.tenant_id}::${task.parent_task_id ?? ""}::${sortedDeps}::${(task.prompt ?? "").trim()}`;
-    return crypto.createHash("sha256").update(canonical, "utf-8").digest("hex");
+    return crypto.createHash("sha256").update(task.execution ? canonical + "::" + JSON.stringify(task.execution) : canonical, "utf-8").digest("hex");
   }
 
   private releaseContentFingerprintIfOwned(task: TaskSpec): void {

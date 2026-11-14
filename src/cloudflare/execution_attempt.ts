@@ -57,3 +57,8 @@ export function sameExecution(saved: ExecutionAttempt, body: Record<string, unkn
 export function sameOwner(saved: ExecutionAttempt, body: Record<string, unknown>): boolean {
   return sameExecution(saved, body) && saved.attempt_id === body.attempt_id && saved.node_id === body.node_id && saved.fencing_token === body.fencing_token;
 }
+
+/** Preserve legacy digests while binding every field of structured execution. */
+export function taskInputDigest(tenantId: unknown, taskId: unknown, prompt: unknown, execution?: unknown): string {
+  return executionDigest(execution === undefined ? { tenant_id: tenantId, task_id: taskId, prompt } : { tenant_id: tenantId, task_id: taskId, prompt, execution });
+}

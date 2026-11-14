@@ -1,10 +1,12 @@
+import { ContainerSandbox } from "./container_sandbox.js";
+import { normalizeExecutionSpec } from "../execution_spec.js";
 /** @fileoverview Native Body execution service. No scheduler, Gateway, dashboard or control-cell store is embedded. */
 import * as http from "node:http";
 import { BodyCapacity } from "./body_capacity.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { equalBodyToken } from "../cloudflare/body_auth.js";
-import { executionDigest } from "../cloudflare/execution_attempt.js";
+import { executionDigest, taskInputDigest } from "../cloudflare/execution_attempt.js";
 import { BodyExecutionJournal } from "./body_execution_journal.js";
 import { LayerFsWorkspaceDriver } from "./layerfs_workspace_driver.js";
 import { runBodyExecution } from "./body_execution_process.js";
@@ -19,6 +21,7 @@ export interface BodyDaemonOptions {
   s3Endpoint?: string;
   executionDelayMs?: number;
   executionSlots?: number;
+  sandboxImage?: string;
 }
 interface Sandbox {
   taskId: string; attemptId: string; fencingToken: number; startedAt: number;
@@ -102,6 +105,9 @@ export class BodyDaemonServer {
     if (![taskId, tenantId, attemptId].every(value => typeof value === "string" && value.length > 0 && value.length <= 2048) || !Number.isSafeInteger(fencingToken) || Number(fencingToken) < 1) {
       this.json(response, 400, { error: "EXECUTION_IDENTITY_REQUIRED" }); return;
     }
+    let execution;
+    try { execution = normalizeExecutionSpec(body.execution); } catch { this.json(response, 400, { error: "INVALID_EXECUTION_SPEC" }); return; }
+    if (execution && execution.image !== this.options.sandboxImage) { this.json(response, 503, { error: "SANDBOX_IMAGE_NOT_ENABLED" }); return; }
     const key = executionDigest([tenantId, taskId]);
     if (route === "/v1/sandboxes/stop") {
       const sandbox = this.active.get(key);
@@ -122,7 +128,7 @@ export class BodyDaemonServer {
     this.active.set(key, sandbox);
     let renewal: ReturnType<typeof setInterval> | undefined;
     try {
-      const lease = { task_id: taskId, tenant_id: tenantId, attempt_id: attemptId, node_id: this.options.nodeId, fencing_token: fencingToken, input_digest: executionDigest({ tenant_id: tenantId, task_id: taskId, prompt: body.promptText }) };
+      const lease = { task_id: taskId, tenant_id: tenantId, attempt_id: attemptId, node_id: this.options.nodeId, fencing_token: fencingToken, input_digest: taskInputDigest(tenantId, taskId, body.promptText, execution) };
       const granted = await this.rpc(`/v1/body/verify-execution-token?taskId=${encodeURIComponent(String(taskId))}`, { ...lease, execution_token: body.executionToken }, controller.signal);
       if (!granted.ok) { this.json(response, granted.status, { error: "EXECUTION_GRANT_REJECTED" }); return; }
       const leaseResponse = await this.rpc("/v1/scheduler/lease-renew", lease, controller.signal);
@@ -136,6 +142,12 @@ export class BodyDaemonServer {
         try { if (!(await this.rpc("/v1/scheduler/lease-renew", lease, controller.signal)).ok) controller.abort(); }
         catch { controller.abort(); } finally { renewing = false; }
       }, 3000);
+      if (execution) {
+        const outcome = await new ContainerSandbox(execution.image).execute(execution, controller.signal);
+        const result = { executedByBodyId: this.options.nodeId, taskId, status: "COMPLETED", executionKind: "container", ...outcome };
+        this.journal.complete(journalKey, result);
+        this.json(response, 200, result); return;
+      }
       const branchName = `body-${key.slice(0, 32)}`;
       const snapshot = path.join(this.options.storageDir, "workspaces", `${key}.json`);
       const driver = new LayerFsWorkspaceDriver();

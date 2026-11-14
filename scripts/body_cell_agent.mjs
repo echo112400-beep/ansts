@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 const require = createRequire(import.meta.url);
 const { NodeDaemon } = require('../dist/src/node_daemon.js');
-const { executionDigest } = require('../dist/src/cloudflare/execution_attempt.js');
+const { taskInputDigest } = require('../dist/src/cloudflare/execution_attempt.js');
 const { BodyResultOutbox } = require('../dist/src/runtime/body_result_outbox.js');
 const nodeId = process.env.ANSTS_NODE_ID;
 const { bodyResourceBudget, cgroupResourceLimits } = require('../dist/src/runtime/body_resource_budget.js');
@@ -62,7 +62,7 @@ while (!stopping) {
       if (task.assigned_node_id !== nodeId || task.state !== 'LEASED') continue;
       if (outbox.pending().some(delivery => delivery.lease.task_id === task.task_id && delivery.lease.tenant_id === task.tenant_id)) continue;
       try {
-      const lease = { task_id: task.task_id, tenant_id: task.tenant_id, attempt_id: `${task.task_id}:${task.lease_fencing_token}`, input_digest: executionDigest({ tenant_id: task.tenant_id, task_id: task.task_id, prompt: task.prompt }), node_id: nodeId, fencing_token: task.lease_fencing_token };
+      const lease = { task_id: task.task_id, tenant_id: task.tenant_id, attempt_id: `${task.task_id}:${task.lease_fencing_token}`, input_digest: taskInputDigest(task.tenant_id, task.task_id, task.prompt, task.execution), node_id: nodeId, fencing_token: task.lease_fencing_token };
       await rpc('/v1/scheduler/lease-renew', lease);
       const controller = new AbortController();
       const executionPath = `/v1/body/acquire?taskId=${encodeURIComponent(task.task_id)}`;
@@ -89,7 +89,7 @@ while (!stopping) {
       }, 3000);
       let response;
       try {
-        response = await fetch(local + '/v1/sandboxes/execute', { method: 'POST', headers: { 'content-type': 'application/json', ...serviceHeaders }, body: JSON.stringify({ taskId: task.task_id, tenantId: task.tenant_id, promptText: task.prompt, attemptId: lease.attempt_id, fencingToken: lease.fencing_token, timeoutSeconds: task.timeout_seconds, executionToken: started.execution_token }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(Math.min(2147483647, Math.max(10000, Number(task.timeout_seconds ?? 1800) * 1000)))]) });
+        response = await fetch(local + '/v1/sandboxes/execute', { method: 'POST', headers: { 'content-type': 'application/json', ...serviceHeaders }, body: JSON.stringify({ taskId: task.task_id, tenantId: task.tenant_id, promptText: task.prompt, execution: task.execution, attemptId: lease.attempt_id, fencingToken: lease.fencing_token, timeoutSeconds: task.timeout_seconds, executionToken: started.execution_token }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(Math.min(2147483647, Math.max(10000, Number(task.timeout_seconds ?? 1800) * 1000)))]) });
         if (!response.ok) throw new Error(`execute: ${response.status}`);
         response = await response.json();
         outbox.put({ lease, expected_version: started.execution.version, result: response, attempts: 0, next_retry_at: 0 });

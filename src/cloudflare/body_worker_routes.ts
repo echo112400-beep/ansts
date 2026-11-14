@@ -2,7 +2,7 @@
 import { DurableObjectNamespaceLike } from "./env.js";
 import { authenticateBody, authenticateBodyOperator, bodyServiceToken } from "./body_auth.js";
 import { issueExecutionGrant, verifyExecutionGrant } from "./execution_token.js";
-import { ExecutionAttempt, sameOwner } from "./execution_attempt.js";
+import { ExecutionAttempt, sameOwner, taskInputDigest } from "./execution_attempt.js";
 
 export interface BodyWorkerEnv {
   ANSTS_BODY_CELL?: DurableObjectNamespaceLike;
@@ -75,6 +75,12 @@ export async function handleBodyRequest(request: Request, env: BodyWorkerEnv): P
           if (raw.length > 65536) return Response.json({ error: "PAYLOAD_TOO_LARGE" }, { status: 413 });
           const body = JSON.parse(raw);
           if (body.node_id !== host || (taskId && body.task_id !== taskId)) return Response.json({ error: "BODY_SCOPE_FORBIDDEN" }, { status: 403 });
+          if (taskId && ["/v1/body/acquire", "/v1/body/start"].includes(url.pathname) && env.ANSTS_SCHEDULER_URL) {
+            const listed = await bodySchedulerClient(env).fetch(new Request("https://scheduler/v1/scheduler/tasks"));
+            if (!listed.ok) return Response.json({ error: "SCHEDULER_UNAVAILABLE" }, { status: 503 });
+            const task = ((await listed.json()) as { tasks: Record<string, unknown>[] }).tasks.find(task => task.task_id === taskId && task.tenant_id === body.tenant_id);
+            if (task?.execution && body.input_digest !== taskInputDigest(task.tenant_id, task.task_id, task.prompt, task.execution)) return Response.json({ error: "TASK_INPUT_CONFLICT" }, { status: 409 });
+          }
         } catch { return Response.json({ error: "INVALID_JSON" }, { status: 400 }); }
       }
       const id = env.ANSTS_BODY_CELL.idFromName(taskId ? `execution:${taskId}` : url.searchParams.get("hostId") ?? "body-host-01");

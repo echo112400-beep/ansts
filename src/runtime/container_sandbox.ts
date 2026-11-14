@@ -56,7 +56,7 @@ export class ContainerSandbox {
         chunks.push(raw.subarray(offset, offset + size)); offset += size;
       }
       const logs = Buffer.concat(chunks);
-      result = { exitCode: waited.StatusCode, logs: logs.subarray(0, 65536).toString("utf8"), logsTruncated: logs.length > 65536, logsTailLimited: true };
+      result = { exitCode: waited.StatusCode, logs: logs.subarray(0, 8192).toString("utf8"), logsTruncated: logs.length > 8192, logsTailLimited: true };
     } catch (error) { failure = error; }
     // Force-removal waits for Engine termination; inability to confirm removal is uncertainty.
     try { await this.request("DELETE", `/containers/${name}?force=true&v=true`); }

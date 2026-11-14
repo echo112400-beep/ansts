@@ -49,3 +49,6 @@ M1.1 恢复改造：活动租约与任务同一条 SQL 记录保存，续租同�
 M1.2 第一批：新增独立 ContainerSandbox Engine adapter，仅接受固定摘要镜像和结构化 argv/资源限额。配置非 root、只读根文件系统、禁网、drop all capabilities、no-new-privileges、PID/CPU/内存限额、限额 tmpfs 和轮转日志；不挂载宿主目录、凭据或 Docker socket。结果返回退出码与有界日志；超时或取消后强制移除容器，无法确认清理时报 BODY_STOP_UNCONFIRMED。现有原生子进程也改用最小环境变量，停止继承服务密钥。
 
 真实 Docker 测试通过：rootfs 不可写、workspace 可写、UID 65534、无父进程测试密钥、无 Engine socket、仅 loopback 网络、退出码 7、超时终止。Engine API 按 Docker 官方文档与 Context7 /docker/docs 核对。此 adapter 尚未接入 Gateway/Body 任务协议，未给开发 Daemon 挂载 Engine socket；结构化命令与执行摘要绑定、工作区产物导出、孤儿容器恢复及任务日志 API 仍待实现。当前不能宣称完成 M1.2 或支持敌对多租户负载。
+M1.2 第二批：结构化 execution（kind/container、image 摘要、argv、timeoutMs、cpu、memoryMb）接入 Gateway 验证、TaskSpec、Scheduler 存储、代理和 Daemon。限制规范大小及未知字段，执行预算不得超过任务声明。所有执行字段加入输入摘要，旧 trace 摘要保持兼容；内容去重包含执行规范。独立 Body Worker 在 acquire/start 时对容器任务核对 Scheduler 规范摘要。Daemon 使用绑定该摘要的单次凭证，容器退出结果写入原有 journal/outbox 路径，返回 exitCode、有界日志及截断信息；COMPLETED 表示执行尝试完成，业务成功需检查 exitCode。
+
+Gateway 与 Daemon 必须显式设置相同 ANSTS_SANDBOX_IMAGE 才接受该镜像；当前开发集群尚未开启，也未给 Daemon 挂载 Engine socket。32 项相关测试全部通过，真实 Engine 集成覆盖 argv 篡改被拒绝、原规范可执行并返回日志与退出码。部署启用、任务侧日志查询、产物导出、Daemon 崩溃后的孤儿容器回收和状态细化仍待交付。

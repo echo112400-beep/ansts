@@ -13,7 +13,7 @@ import { MockDurableObjectState, DurableObjectNamespaceLike, CloudflareCelldEnv 
 import { BodyWorkerEnv } from "../src/cloudflare/body_worker_routes.js";
 import { BodyDaemonServer } from "../src/runtime/body_daemon_server.js";
 import { bodyServiceToken } from "../src/cloudflare/body_auth.js";
-import { executionDigest } from "../src/cloudflare/execution_attempt.js";
+import { executionDigest, taskInputDigest } from "../src/cloudflare/execution_attempt.js";
 import { taskStorageId } from "../src/cloudflare/task_identity.js";
 import { NodeDaemon } from "../src/node_daemon.js";
 
@@ -47,21 +47,21 @@ it("runs Body control independently, preserves native results on restart, and st
   const control = await serve(request => bodyWorker.fetch(request, bodyEnv));
   brainEnv.ANSTS_BODY_WORKER_URL = control.url;
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "body-split-"));
-  const options = { nodeId, token, bodyWorkerUrl: control.url, storageDir: directory, host: "127.0.0.1", port: 0 };
+  const options = { sandboxImage: process.env.ANSTS_SANDBOX_TEST_IMAGE, nodeId, token, bodyWorkerUrl: control.url, storageDir: directory, host: "127.0.0.1", port: 0 };
   let daemon = new BodyDaemonServer(options);
   let address = await daemon.start();
   const rpc = (base: string, route: string, payload?: unknown, headers = bodyHeaders) => fetch(base + route, { method: payload === undefined ? "GET" : "POST", headers, body: payload === undefined ? undefined : JSON.stringify(payload) });
   const daemonUrl = () => `http://127.0.0.1:${address.port}`;
-  async function prepare(publicId: string) {
+  async function prepare(publicId: string, execution?: unknown) {
     await rpc(control.url, "/v1/scheduler/register-node", new NodeDaemon(nodeId).emitHeartbeat());
-    await rpc(brain.url, "/v1/scheduler/submit", { tenant_id: "tenant", task_id: publicId, prompt: "work" }, { ...bodyHeaders, authorization: `Gateway ${bodyServiceToken(secret, "gateway:control")}` });
+    await rpc(brain.url, "/v1/scheduler/submit", { tenant_id: "tenant", task_id: publicId, execution, prompt: "work" }, { ...bodyHeaders, authorization: `Gateway ${bodyServiceToken(secret, "gateway:control")}` });
     const tick = await (await rpc(control.url, "/v1/scheduler/schedule-tick", {})).json();
     const taskId = taskStorageId("tenant", publicId);
     const fence = tick.placements.find((row: unknown[]) => row[0] === taskId)[2];
-    const lease = { task_id: taskId, tenant_id: "tenant", node_id: nodeId, attempt_id: `${taskId}:${fence}`, fencing_token: fence, input_digest: executionDigest({ tenant_id: "tenant", task_id: taskId, prompt: "work" }) };
+    const lease = { task_id: taskId, tenant_id: "tenant", node_id: nodeId, attempt_id: `${taskId}:${fence}`, fencing_token: fence, input_digest: taskInputDigest("tenant", taskId, "work", execution) };
     await rpc(control.url, `/v1/body/acquire?taskId=${encodeURIComponent(taskId)}`, lease);
     const started = await (await rpc(control.url, `/v1/body/start?taskId=${encodeURIComponent(taskId)}`, { ...lease, expected_version: 1 })).json();
-    return { lease, payload: { taskId, tenantId: "tenant", attemptId: lease.attempt_id, fencingToken: fence, promptText: "work", executionToken: started.execution_token } };
+    return { lease, payload: { taskId, tenantId: "tenant", attemptId: lease.attempt_id, fencingToken: fence, promptText: "work", execution, executionToken: started.execution_token } };
   }
   try {
     assert.equal((await (await rpc(daemonUrl(), "/health")).json()).runtime, "native-body-daemon");
@@ -76,6 +76,16 @@ it("runs Body control independently, preserves native results on restart, and st
     const recovered = await rpc(daemonUrl(), "/v1/sandboxes/execute", { ...first.payload, executionToken: reissued.execution_token });
     assert.deepEqual(await recovered.json(), result);
     await rpc(control.url, "/v1/scheduler/complete", first.lease);
+    if (options.sandboxImage) {
+      const spec = { kind: "container", image: options.sandboxImage, argv: ["node", "-e", "console.log('bound-command')"], cpu: 0.5, memoryMb: 128, timeoutMs: 10000 };
+      const command = await prepare("command", spec);
+      assert.equal((await rpc(daemonUrl(), "/v1/sandboxes/execute", { ...command.payload, execution: { ...spec, argv: ["node", "-e", "console.log('tampered')"] } })).status, 409);
+      const completed = await rpc(daemonUrl(), "/v1/sandboxes/execute", command.payload);
+      assert.equal(completed.status, 200);
+      const outcome = await completed.json();
+      assert.equal(outcome.exitCode, 0); assert.match(outcome.logs, /bound-command/);
+      await rpc(control.url, "/v1/scheduler/complete", command.lease);
+    }
     await daemon.stop(); daemon = new BodyDaemonServer({ ...options, executionDelayMs: 30000 }); address = await daemon.start();
     const second = await prepare("second");
     const running = rpc(daemonUrl(), "/v1/sandboxes/execute", second.payload);
