@@ -316,6 +316,7 @@ export class CoreScheduler5D {
     if (nowSec - node.timestamp > heartbeatTtlSeconds) {
       return -1.0;
     }
+    if (node.execution_slots !== undefined && node.running_tasks >= node.execution_slots) return -1.0;
     const reqCpu = task.resource_profile.think_cpu_cores;
     const reqMem = task.resource_profile.act_memory_mb;
     if (node.free_cpu_cores < reqCpu || node.free_memory_mb < reqMem) {
@@ -389,6 +390,7 @@ export class CoreScheduler5D {
     let bestNode: NodeHeartbeat | null = null;
     let bestScore = -1.0;
     for (const node of this.nodes.values()) {
+      if (node.execution_slots !== undefined && [...this.allTasks.values()].filter(candidate => candidate.assigned_node_id === node.node_id && [TaskState.LEASED, TaskState.PREEMPTING, TaskState.RUNNING_THINK, TaskState.RUNNING_ACT].includes(candidate.state)).length >= node.execution_slots) continue;
       const s = CoreScheduler5D.scoreNodeForTask(task, node, nowSec, this.nodeHeartbeatTtlSeconds);
       if (s > bestScore) {
         bestScore = s;

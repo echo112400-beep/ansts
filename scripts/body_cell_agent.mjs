@@ -2,12 +2,21 @@
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 const require = createRequire(import.meta.url);
 const { NodeDaemon } = require('../dist/src/node_daemon.js');
 const { executionDigest } = require('../dist/src/cloudflare/execution_attempt.js');
 const { BodyResultOutbox } = require('../dist/src/runtime/body_result_outbox.js');
 const nodeId = process.env.ANSTS_NODE_ID;
-const daemon = new NodeDaemon(nodeId);
+const { bodyResourceBudget, cgroupResourceLimits } = require('../dist/src/runtime/body_resource_budget.js');
+const constrained = process.constrainedMemory?.();
+const cgroup = cgroupResourceLimits(file => { try { return readFileSync(file, "utf8"); } catch (error) { if (["ENOENT", "ENOTDIR"].includes(error.code)) return undefined; throw error; } });
+const memoryLimit = Math.min(os.totalmem(), constrained > 0 ? constrained : Infinity, cgroup.memoryBytes ?? Infinity) / 1048576;
+const budget = bodyResourceBudget(Math.min(os.availableParallelism(), cgroup.cpu ?? Infinity), memoryLimit, process.env.ANSTS_BODY_CPU_CORES, process.env.ANSTS_BODY_MEMORY_MB);
+const daemon = new NodeDaemon(nodeId, budget.cpu, budget.memoryMb, 0);
+const executionSlots = Number(process.env.ANSTS_BODY_EXECUTION_SLOTS ?? 1);
+if (!Number.isSafeInteger(executionSlots) || executionSlots !== 1) throw new Error("BODY_AGENT_REQUIRES_SINGLE_SLOT");
+const heartbeat = running => ({ ...daemon.emitHeartbeat(running), execution_slots: executionSlots, warm_pool_ready: 0 });
 const base = process.env.ANSTS_BODY_CELL_URL;
 const local = `http://127.0.0.1:${process.env.ANSTS_LISTEN_PORT}`;
 const bodyToken = readFileSync(process.env.ANSTS_BODY_TOKEN_FILE, 'utf8').trim();
@@ -44,7 +53,7 @@ process.on('SIGTERM', () => { stopping = true; });
 while (!stopping) {
   try {
     await flushResults();
-    const hb = daemon.emitHeartbeat(0);
+    const hb = heartbeat(0);
     await rpc(`/v1/body/heartbeat?hostId=${encodeURIComponent(nodeId)}`, hb);
     await rpc('/v1/scheduler/register-node', hb);
     await rpc('/v1/scheduler/schedule-tick', {});
@@ -72,7 +81,7 @@ while (!stopping) {
         renewing = true;
         try {
           await rpc('/v1/scheduler/lease-renew', lease);
-          const activeHb = daemon.emitHeartbeat(1);
+          const activeHb = heartbeat(1);
           await rpc('/v1/scheduler/register-node', activeHb);
           await rpc(`/v1/body/heartbeat?hostId=${encodeURIComponent(nodeId)}`, activeHb);
         } catch (error) { controller.abort(error); }

@@ -81,7 +81,8 @@ export class AnstsSchedulerCell {
             free_memory_mb: Number(parsedHb.free_memory_mb ?? 65536),
             warm_pool_ready: Number(parsedHb.warm_pool_ready ?? 8),
             psi_memory_some_avg10: Number(parsedHb.psi_memory_some_avg10 ?? 1.5),
-            running_tasks: Number(parsedHb.running_tasks ?? 0),
+            execution_slots: parsedHb.execution_slots === undefined ? undefined : Number(parsedHb.execution_slots),
+              running_tasks: Number(parsedHb.running_tasks ?? 0),
             healthy: Boolean(parsedHb.healthy ?? true),
           })
         );
@@ -332,7 +333,8 @@ export class AnstsSchedulerCell {
         free_memory_mb: Number(body.free_memory_mb ?? 65536),
         warm_pool_ready: Number(body.warm_pool_ready ?? 8),
         psi_memory_some_avg10: Number(body.psi_memory_some_avg10 ?? 1.0),
-        running_tasks: Number(body.running_tasks ?? 0),
+        execution_slots: body.execution_slots === undefined ? undefined : Number(body.execution_slots),
+          running_tasks: Number(body.running_tasks ?? 0),
         healthy: body.healthy !== undefined ? Boolean(body.healthy) : true,
       });
       this.registerNode(hb);

@@ -282,6 +282,7 @@ export interface NodeHeartbeatInit {
   free_memory_mb?: number;
   warm_pool_ready?: number;
   psi_memory_some_avg10?: number;
+  execution_slots?: number;
   running_tasks?: number;
   healthy?: boolean;
   cached_images?: Iterable<string>;
@@ -296,6 +297,7 @@ export class NodeHeartbeat {
   public free_memory_mb: number;
   public warm_pool_ready: number;
   public psi_memory_some_avg10: number;
+  public execution_slots?: number;
   public running_tasks: number;
   public healthy: boolean;
   public cached_images: Set<string>;
@@ -309,6 +311,8 @@ export class NodeHeartbeat {
     this.free_memory_mb = init.free_memory_mb ?? this.total_memory_mb;
     this.warm_pool_ready = init.warm_pool_ready ?? 8;
     this.psi_memory_some_avg10 = init.psi_memory_some_avg10 ?? 1.5;
+    if (init.execution_slots !== undefined && (!Number.isSafeInteger(init.execution_slots) || init.execution_slots < 1 || init.execution_slots > 256)) throw new Error("INVALID_EXECUTION_SLOTS");
+    this.execution_slots = init.execution_slots;
     this.running_tasks = init.running_tasks ?? 0;
     this.healthy = init.healthy ?? true;
     this.cached_images = new Set(init.cached_images ?? []);

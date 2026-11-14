@@ -10,6 +10,7 @@ const server = new BodyDaemonServer({
   token: readFileSync(process.env.ANSTS_BODY_TOKEN_FILE, 'utf8').trim(),
   host: process.env.ANSTS_HOST ?? '0.0.0.0', port: Number(process.env.ANSTS_LISTEN_PORT ?? 9501),
   s3Endpoint: process.env.S3_ENDPOINT,
+  executionSlots: Number(process.env.ANSTS_BODY_EXECUTION_SLOTS ?? 1),
   executionDelayMs: Number(process.env.ANSTS_BODY_EXECUTION_DELAY_MS ?? 0),
 });
 const address = await server.start();

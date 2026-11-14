@@ -1,5 +1,6 @@
 /** @fileoverview Native Body execution service. No scheduler, Gateway, dashboard or control-cell store is embedded. */
 import * as http from "node:http";
+import { BodyCapacity } from "./body_capacity.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { equalBodyToken } from "../cloudflare/body_auth.js";
@@ -17,6 +18,7 @@ export interface BodyDaemonOptions {
   port?: number;
   s3Endpoint?: string;
   executionDelayMs?: number;
+  executionSlots?: number;
 }
 interface Sandbox {
   taskId: string; attemptId: string; fencingToken: number; startedAt: number;
@@ -25,11 +27,13 @@ interface Sandbox {
 }
 export class BodyDaemonServer {
   private server?: http.Server;
+  private readonly capacity: BodyCapacity;
   private readonly journal: BodyExecutionJournal;
   private readonly active = new Map<string, Sandbox>();
   private readonly operations = new Set<Promise<void>>();
   constructor(private readonly options: BodyDaemonOptions) {
     if (!options.nodeId || !/^[a-f0-9]{64}$/.test(options.token) || !/^https?:$/.test(new URL(options.bodyWorkerUrl).protocol)) throw new Error("INVALID_BODY_DAEMON_CONFIGURATION");
+    this.capacity = new BodyCapacity(options.executionSlots ?? 1);
     fs.mkdirSync(path.join(options.storageDir, "workspaces"), { recursive: true });
     this.journal = new BodyExecutionJournal(path.join(options.storageDir, "execution-journal"));
   }
@@ -79,7 +83,7 @@ export class BodyDaemonServer {
     if (request.method === "GET" && ["/health", "/healthz", "/readyz"].includes(route)) {
       let ready = true;
       if (route === "/readyz") { try { ready = (await this.rpc("/readyz")).ok; } catch { ready = false; } }
-      this.json(response, ready ? 200 : 503, { runtime: "native-body-daemon", nodeId: this.options.nodeId, controlPlane: "remote-celld-body", healthy: ready, activeSandboxes: this.active.size });
+      this.json(response, ready ? 200 : 503, { runtime: "native-body-daemon", nodeId: this.options.nodeId, controlPlane: "remote-celld-body", healthy: ready, activeSandboxes: this.active.size, capacity: this.capacity.snapshot() });
       return;
     }
     if (!equalBodyToken(String(request.headers.authorization ?? ""), `Body ${this.options.token}`) || request.headers["x-ansts-body-id"] !== this.options.nodeId) {
@@ -111,6 +115,7 @@ export class BodyDaemonServer {
     response.once("close", disconnect);
     const timeoutSeconds = Number(body.timeoutSeconds ?? 1800);
     if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 86400) { this.json(response, 400, { error: "INVALID_TIMEOUT" }); response.removeListener("close", disconnect); return; }
+    if (!this.capacity.reserve(key)) { response.removeListener("close", disconnect); this.json(response, 429, { error: "BODY_CAPACITY_EXHAUSTED" }); return; }
     const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
     let done!: () => void;
     const sandbox: Sandbox = { taskId: String(taskId), attemptId: String(attemptId), fencingToken: Number(fencingToken), startedAt: Date.now(), controller, done: new Promise<void>(resolve => { done = resolve; }) };
@@ -154,7 +159,7 @@ export class BodyDaemonServer {
       throw error;
     } finally {
       clearTimeout(timer); if (renewal) clearInterval(renewal);
-      response.removeListener("close", disconnect); this.active.delete(key); done();
+      response.removeListener("close", disconnect); this.active.delete(key); this.capacity.release(key); done();
     }
   }
 }
