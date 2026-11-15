@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.HierarchicalQueueManager = void 0;
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.MultiTenantQueueManager = exports.HierarchicalQueueManager = void 0;
 
 
 
@@ -377,3 +377,14 @@ class HierarchicalQueueManager {
     };
   }
 }exports.HierarchicalQueueManager = HierarchicalQueueManager;
+
+
+
+
+
+
+
+
+
+
+const MultiTenantQueueManager = HierarchicalQueueManager;exports.MultiTenantQueueManager = MultiTenantQueueManager;

@@ -351,3 +351,29 @@ export interface ToolExecutionLog {
   compensation_tool?: string;
   executed_at: number;
 }
+
+// [M94] Unified main (M1-M15) + feat/celld-v25 (M16-M94) contract compatibility aliases
+export type AgentTaskInit = ConstructorParameters<typeof TaskSpec>[0];
+export const AgentTask = TaskSpec;
+export type AgentTask = TaskSpec;
+export type ResourceVector5D = ResourceProfile;
+export const ToolEffectClass = ToolCallEffectClass;
+export type ToolEffectClass = ToolCallEffectClass;
+export type SandboxPhase = "THINK" | "ACT" | "HIBERNATED";
+export type IsolationDriver = "microvm" | "gvisor" | "kata" | "bwrap";
+export type HibernationReason = "IDLE_TIMEOUT" | "APPROVAL_WAIT" | "QUOTA_PREEMPTED" | "MEMORY_PRESSURE";
+export type ReasoningEffort = "low" | "medium" | "high";
+export const EFFORT_MULTIPLIERS: Record<ReasoningEffort, number> = { low: 0.6, medium: 1.0, high: 1.6 };
+export type ModelPoolName = "DEEPSEEK_R1_POOL" | "QWEN_CODER_POOL" | "CLAUDE_SONNET_POOL" | string;
+export interface EscrowVoucher {
+  voucherId: string;
+  parentTaskId: string;
+  reservedTokens: number;
+  reservedSubAgentSlots: number;
+}
+export interface EphemeralHeavyExecutorSpec {
+  executorId: string;
+  taskId: string;
+  cpuCores: number;
+  memoryMb: number;
+}

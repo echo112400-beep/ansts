@@ -377,3 +377,15 @@ export class HierarchicalQueueManager {
     };
   }
 }
+
+export interface TenantQueueQuota {
+  tenantId: string;
+  maxConcurrentSlots: number;
+  weight: number;
+}
+export interface SubAgentDagGroup {
+  parentTaskId: string;
+  childTaskIds: string[];
+}
+export const MultiTenantQueueManager = HierarchicalQueueManager;
+export type MultiTenantQueueManager = HierarchicalQueueManager;

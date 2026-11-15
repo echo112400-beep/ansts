@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ZeroTrustVsockHostDaemon = void 0;
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.ZeroTrustVsockHostDaemon = void 0;exports.computeCrc32 = computeCrc32;exports.decodeLengthPrefixedCrcFrames = decodeLengthPrefixedCrcFrames;exports.encodeLengthPrefixedCrcFrame = encodeLengthPrefixedCrcFrame;
 
 
 
@@ -153,3 +153,68 @@ var fs = _interopRequireWildcard(require("node:fs"));function _getRequireWildcar
     });
   }
 }exports.ZeroTrustVsockHostDaemon = ZeroTrustVsockHostDaemon;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function computeCrc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let j = 0; j < 8; j++) {
+      crc = crc >>> 1 ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function encodeLengthPrefixedCrcFrame(obj) {
+  const jsonBytes = Buffer.from(JSON.stringify(obj), "utf-8");
+  const header = Buffer.alloc(8);
+  header.writeUInt32BE(jsonBytes.length, 0);
+  header.writeUInt32BE(computeCrc32(jsonBytes), 4);
+  return Buffer.concat([header, jsonBytes]);
+}
+
+function decodeLengthPrefixedCrcFrames(buffer)
+
+
+{
+  const frames = [];
+  let offset = 0;
+  while (buffer.length - offset >= 8) {
+    const payloadLen = buffer.readUInt32BE(offset);
+    const expectedCrc = buffer.readUInt32BE(offset + 4);
+    if (buffer.length - offset < 8 + payloadLen) {
+      break;
+    }
+    const body = buffer.subarray(offset + 8, offset + 8 + payloadLen);
+    const actualCrc = computeCrc32(body);
+    if (actualCrc !== expectedCrc) {
+      throw new Error(`Vsock CRC32 mismatch: expected ${expectedCrc}, got ${actualCrc}`);
+    }
+    frames.push(JSON.parse(body.toString("utf-8")));
+    offset += 8 + payloadLen;
+  }
+  return {
+    frames,
+    remaining: buffer.subarray(offset)
+  };
+}

@@ -120,3 +120,12 @@ export class TaskResourceProfiler {
     }));
   }
 }
+
+export interface FingerprintStatsData {
+  peakCpuEwma: number;
+  peakMemMbEwma: number;
+  samples: number;
+}
+export type FingerprintStats = FingerprintStatsData;
+export const BayesianTaskProfiler = TaskResourceProfiler;
+export type BayesianTaskProfiler = TaskResourceProfiler;

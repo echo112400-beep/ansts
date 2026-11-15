@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TaskResourceProfiler = void 0; /**
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TaskResourceProfiler = exports.BayesianTaskProfiler = void 0; /**
  * @fileoverview M2 TASK-05B, M58-5 & M65-2: Bayesian EWMA Task Resource Profiler for Think/Act Right-Sizing
  * with Finite Positive Sample Guard & SQLite Persistence (`persisted_profiler_history`).
  */
@@ -120,3 +120,11 @@ class TaskResourceProfiler {
     }));
   }
 }exports.TaskResourceProfiler = TaskResourceProfiler;
+
+
+
+
+
+
+
+const BayesianTaskProfiler = TaskResourceProfiler;exports.BayesianTaskProfiler = BayesianTaskProfiler;

@@ -1,4 +1,4 @@
-"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TurnWalFrame = exports.ToolCallEffectClass = exports.TaskState = exports.TaskSpec = exports.TaskPriority = exports.NodeHeartbeat = exports.LlmEndpointMetrics = exports.FenceToken = void 0; /**
+"use strict";Object.defineProperty(exports, "__esModule", { value: true });exports.TurnWalFrame = exports.ToolEffectClass = exports.ToolCallEffectClass = exports.TaskState = exports.TaskSpec = exports.TaskPriority = exports.NodeHeartbeat = exports.LlmEndpointMetrics = exports.FenceToken = exports.EFFORT_MULTIPLIERS = exports.AgentTask = void 0; /**
  * @fileoverview Core Domain Models, TaskSpec v1beta1, 5D Resource Profiles, Monotonic Lease Fencing & LlmEndpointMetrics.
  */let
 TaskPriority;exports.TaskPriority = TaskPriority;(function (TaskPriority) {TaskPriority[TaskPriority["P0_EMERGENCY"] = 0] = "P0_EMERGENCY";TaskPriority[TaskPriority["P1_HIGH"] = 1] = "P1_HIGH";TaskPriority[TaskPriority["P2_STANDARD"] = 2] = "P2_STANDARD";TaskPriority[TaskPriority["P3_BATCH"] = 3] = "P3_BATCH";})(TaskPriority || (exports.TaskPriority = TaskPriority = {}));let
@@ -321,3 +321,46 @@ class LlmEndpointMetrics {
     return Math.max(0, this.tpm_limit - this.tpm_used);
   }
 }exports.LlmEndpointMetrics = LlmEndpointMetrics;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const AgentTask = TaskSpec;exports.AgentTask = AgentTask;
+
+
+const ToolEffectClass = ToolCallEffectClass;exports.ToolEffectClass = ToolEffectClass;
+
+
+
+
+
+const EFFORT_MULTIPLIERS = { low: 0.6, medium: 1.0, high: 1.6 };exports.EFFORT_MULTIPLIERS = EFFORT_MULTIPLIERS;
