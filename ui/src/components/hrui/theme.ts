@@ -1,0 +1,50 @@
+/**
+ * @fileoverview Canonical `hrui` Design System Tokens & Stylesheet (`ui/src/components/hrui/theme.ts`)
+ * Synchronized across `ui/` (Next.js App Router) and `docs/console-management/prototype.css` + `docs/index.html`.
+ */
+export const HRUI_DESIGN_TOKENS = {
+  designSystem: 'hrui',
+  version: '2.5.0',
+  framework: 'Next.js App Router (ui/)',
+  light: {
+    bg: '#ffffff',
+    surface: '#f6f6f8',
+    surface2: '#ececf0',
+    line: '#e8e8ec',
+    fg: '#1d1d1f',
+    muted: '#5b5b64',
+    faint: '#6e6e77',
+    accent: '#285aff',
+    accentHover: '#1641d8',
+    accentSoft: '#eef3ff',
+    ok: '#1a7a43',
+    okSoft: '#e9f6ee',
+    warn: '#9a6500',
+    warnSoft: '#fff6dd',
+    bad: '#c0262f',
+    badSoft: '#fdeeee',
+  },
+  dark: {
+    bg: '#0f0f11',
+    surface: '#1a1a1e',
+    surface2: '#25252a',
+    line: '#2a2a30',
+    fg: '#f5f5f7',
+    muted: '#b4b4bc',
+    faint: '#8b8b95',
+    accent: '#6b8cff',
+    accentHover: '#8aa4ff',
+    accentSoft: '#1c2440',
+    ok: '#4cc38a',
+    okSoft: '#13261c',
+    warn: '#e3b341',
+    warnSoft: '#2b2312',
+    bad: '#ff7b84',
+    badSoft: '#321a1d',
+  },
+  fonts: {
+    sans: '"Geist", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif',
+    mono: '"Geist Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace',
+    display: '"Bricolage Grotesque", "Geist", -apple-system, system-ui, sans-serif',
+  },
+} as const;

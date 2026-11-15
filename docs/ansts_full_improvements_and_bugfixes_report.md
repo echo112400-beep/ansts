@@ -49,3 +49,20 @@ ANSTS v2.5 采用 **控制面 (`denoland/celld` v0.6.3 Durable Object Actor) + �
 - **反代与 Console 前端全动态拓扑渲染 (`scripts/dev_cluster_local_supervisor.mjs` & `docs/console-management/prototype.js`)**:
   - `:8088` 反代周期同步 `/v1beta1/console/topology` 的 `activeGatewayUrls`，动态发现新上线 `gateway` 节点。
   - 前端移除 3 节点硬编码，基于 `slotOwners` (256 项) 与 `slotDistribution` 动态渲染任意数量 `brain` 节点的 256 槽一致性哈希环与节点选择表单，并在「节点与分片单元编排」页面新增「全角色动态拓扑注册表与自动伸缩工作台」。
+
+---
+
+## M96 — Next.js `ui/` App Router 实现与 `hrui` 设计系统同步 (UI & Prototype Synchronization)
+
+### 1. `ui/` Next.js App Router 工程落地
+- **工程结构**：在仓库根目录创建 `ui/` Next.js 15 App Router 工程（`ui/package.json`、`ui/tsconfig.json`、`ui/next.config.ts`、`ui/src/app/layout.tsx`、`ui/src/app/page.tsx`），通过 `rewrites()` 将 `/v1beta1/*`、`/v1/*`、`/internal/v1beta1/*`、`/.well-known/celld/health`、`/state`、`/metrics` 代理至 `celld` 后端。
+- **`hrui` 组件库 (`ui/src/components/hrui/*`)**：
+  - `theme.ts` & `hrui.css`：对齐 `hrui` 标准亮/暗色 CSS 变量体系（`--accent: #285aff` / `#6b8cff`、`--bg`、`--surface`、`--line`、`Geist` / `Geist Mono` / `Bricolage Grotesque` 字体栈、`980px` 胶囊按钮、14px 4 列统一 KPI 指标栏、999px 状态胶囊）。
+  - `icons.tsx`：24x24 `1.8` stroke 线性 SVG 图标库与 `HrMark` 品牌标识。
+  - `Shell.tsx` & `AnstsHruiConsole.tsx`：覆盖全部 6 大治理域与 256-Slot 零硬编码动态集群拓扑、实时 `celld` 探测及主题切换。
+
+### 2. 平台管理台与原型设计 (`docs/`) 同步更新
+- 同步更新 `docs/console-management/prototype.css`、`docs/console-management/prototype.js`、`docs/index.html`、`docs/ansts_console_management.html` 与 `docs/console-management-design.md`：
+  - 根作用域挂载 `id="hrui"` 与 `data-theme="light"|"dark"` 属性，支持一键切换亮/暗色 `hrui` 主题；
+  - 侧边栏升级为 `HrMark` SVG 徽标、`HRUI · NEXT.JS (ui/)` 标识与 24x24 线性 SVG 图标导航；
+  - 顶部状态栏新增 `HRUI · Next.js (ui/)` 架构同步检视弹窗（`open-hrui-nextjs-sync-dialog`），并接入后端 `GET /v1beta1/console/ui-architecture` 与 `anstsctl mgmt-ui-arch`。

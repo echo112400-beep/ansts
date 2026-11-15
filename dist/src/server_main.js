@@ -2965,6 +2965,72 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M96] Next.js ui/ App Router + hrui Design System Architecture & Sync Metadata
+    if (method === "GET" && pathname === "/v1beta1/console/ui-architecture") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+      JSON.stringify({
+        framework: "Next.js App Router (ui/)",
+        designSystem: "hrui",
+        version: "2.5.0",
+        synchronizedWithPrototype: true,
+        themeTokens: {
+          light: {
+            bg: "#ffffff",
+            surface: "#f6f6f8",
+            surface2: "#ececf0",
+            line: "#e8e8ec",
+            fg: "#1d1d1f",
+            muted: "#5b5b64",
+            faint: "#6e6e77",
+            accent: "#285aff",
+            accentHover: "#1641d8",
+            accentSoft: "#eef3ff",
+            ok: "#1a7a43",
+            okSoft: "#e9f6ee",
+            warn: "#9a6500",
+            warnSoft: "#fff6dd",
+            bad: "#c0262f",
+            badSoft: "#fdeeee"
+          },
+          dark: {
+            bg: "#0f0f11",
+            surface: "#1a1a1e",
+            surface2: "#25252a",
+            line: "#2a2a30",
+            fg: "#f5f5f7",
+            accent: "#6b8cff",
+            ok: "#4cc38a",
+            warn: "#e3b341",
+            bad: "#ff7b84"
+          },
+          fonts: {
+            sans: "Geist, Inter, system-ui, sans-serif",
+            mono: "Geist Mono, ui-monospace, monospace",
+            display: "Bricolage Grotesque, Geist, sans-serif"
+          }
+        },
+        files: [
+        "ui/package.json",
+        "ui/tsconfig.json",
+        "ui/next.config.ts",
+        "ui/src/components/hrui/theme.ts",
+        "ui/src/components/hrui/hrui.css",
+        "ui/src/components/hrui/icons.tsx",
+        "ui/src/components/hrui/Shell.tsx",
+        "ui/src/components/hrui/AnstsHruiConsole.tsx",
+        "ui/src/app/layout.tsx",
+        "ui/src/app/page.tsx",
+        "docs/index.html",
+        "docs/ansts_console_management.html",
+        "docs/console-management/prototype.css",
+        "docs/console-management/prototype.js"]
+
+      }));
+
+      return;
+    }
+
     // [M95] Dynamic Cluster Topology Self-Registration, Heartbeat & TTL Auto-Eviction
     if (method === "POST" && pathname === "/internal/v1beta1/cluster/register") {
       const body = await this.readJsonBody(req);

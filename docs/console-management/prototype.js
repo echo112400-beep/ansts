@@ -510,15 +510,30 @@
     return { text: `${brCount} 分支`, cls: '' };
   }
 
+  const HRUI_ICONS = {
+    overview: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M10.2 8.9l5 3.1-5 3.1z"/></svg>',
+    queues: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
+    nodes: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="9" width="17" height="10.5" rx="2"/><rect x="6.5" y="5" width="4" height="4" rx="1"/><rect x="13.5" y="5" width="4" height="4" rx="1"/></svg>',
+    tenants: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5.5" width="18" height="13" rx="2.2"/><path d="M3 10h18M7 15h4"/></svg>',
+    tasks: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6l2 2 3-3M3 13l2 2 3-3M12 7h9M12 14h9M3 20h18"/></svg>',
+    approvals: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+    configs: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="10" width="8" height="10" rx="1.5"/><rect x="13" y="10" width="8" height="10" rx="1.5"/><path d="M5 10V8M9 10V8M15 10V8M19 10V8"/></svg>',
+    runtime: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M15 4v16"/></svg>',
+    observability: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="7" r="2.4"/><circle cx="18" cy="7" r="2.4"/><circle cx="12" cy="17.5" r="2.4"/><path d="M8.4 7h7.2M7.3 9.1l3.4 6.2M16.7 9.1l-3.4 6.2"/></svg>',
+    swarm: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8.5" r="3.2"/><path d="M3 19.5c.7-3.2 3-5 6-5s5.3 1.8 6 5"/><path d="M15.5 5.6a3.2 3.2 0 0 1 0 5.8M17.5 14.8c1.8.6 3 2.2 3.5 4.7"/></svg>',
+    federation: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3.6 9h16.8M3.6 15h16.8M12 3a14.5 14.5 0 0 0 0 18M12 3a14.5 14.5 0 0 1 0 18"/></svg>',
+    security: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3"/></svg>'
+  };
+
   function renderNavigation() {
     const nav = document.getElementById('navigation');
     if (!nav) return;
     nav.innerHTML = NAV_ITEMS.map((item) => {
       const badge = getNavBadge(item.badgeKey);
-      const activeCls = state.activeNav === item.id ? 'active' : '';
+      const activeCls = state.activeNav === item.id ? 'active on' : '';
       return `
-        <button type="button" class="nav-item ${activeCls}" data-action="switch-nav" data-nav="${item.id}">
-          <span>${item.label}</span>
+        <button type="button" class="nav-item rail-btn ${activeCls}" data-action="switch-nav" data-nav="${item.id}">
+          <span class="nav-item-label">${HRUI_ICONS[item.id] || ''}<span>${item.label}</span></span>
           <span class="nav-badge ${badge.cls}">${badge.text}</span>
         </button>
       `;
@@ -4716,12 +4731,33 @@
       );
       return;
     }
+    if (action === "open-hrui-nextjs-sync-dialog") {
+      const res = await callBackendApi("GET", "/v1beta1/console/ui-architecture");
+      const info = res.data || {
+        framework: "Next.js App Router (ui/)",
+        designSystem: "hrui",
+        themeTokens: { accent: "#285aff", ok: "#1a7a43", warn: "#9a6500", bad: "#c0262f" },
+        files: ["ui/package.json", "ui/next.config.ts", "ui/src/components/hrui/hrui.css", "ui/src/components/hrui/Shell.tsx", "ui/src/components/hrui/AnstsHruiConsole.tsx"]
+      };
+      state.lastApiOutput = JSON.stringify(info, null, 2);
+      openDialog(
+        "ui/ Next.js App Router + hrui 设计系统同步状态 (GET /v1beta1/console/ui-architecture)",
+        `<div><strong>当前 UI 架构：</strong> <span class="status-pill ok">${esc(info.framework || "Next.js App Router (ui/)")}</span> · <span class="status-pill unknown">Design System: ${esc(info.designSystem || "hrui")}</span></div>
+        <div class="muted">平台管理台已与 <code>ui/</code> 目录下的 Next.js App Router 组件树 (<code>HruiShell</code>、<code>AnstsHruiConsole</code>、<code>hrui.css</code>、<code>theme.ts</code>、<code>icons.tsx</code>) 实时同步。</div>
+        <pre class="mono" style="background:var(--surface);border:1px solid var(--line);padding:10px;border-radius:10px;font-size:11.5px;max-height:280px;overflow:auto;">${esc(state.lastApiOutput)}</pre>`,
+        "关闭详情",
+        () => closeDialog()
+      );
+      return;
+    }
     if (action === "toggle-theme") {
       state.darkTheme = !state.darkTheme;
+      document.documentElement.id = "hrui";
       document.documentElement.classList.toggle("dark-theme", state.darkTheme);
+      document.documentElement.setAttribute("data-theme", state.darkTheme ? "dark" : "light");
       const btn = document.getElementById("theme-toggle-btn");
       if (btn) btn.textContent = state.darkTheme ? "☀ 亮色模式" : "☾ 暗色模式";
-      showToast(state.darkTheme ? "已切换至暗色 SRE 夜间运维主题" : "已切换至亮色控制台主题");
+      showToast(state.darkTheme ? "已切换至 hrui 暗色主题 (data-theme=dark)" : "已切换至 hrui 亮色主题 (data-theme=light)");
       return;
     }
     if (action === "toggle-auto-refresh") {
@@ -6560,6 +6596,10 @@
   }
 
   async function init() {
+    if (typeof document !== 'undefined' && document.documentElement) {
+      document.documentElement.id = 'hrui';
+      document.documentElement.setAttribute('data-theme', state.darkTheme ? 'dark' : 'light');
+    }
     hydrateStateFromUrl();
     populateTenantFilter();
     updateHeaderAndRail();

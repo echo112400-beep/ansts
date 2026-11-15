@@ -694,6 +694,12 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-ui-arch") {
+    const resp = await fetch(`${baseUrl}/v1beta1/console/ui-architecture`);
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-topology") {
     const resp = await fetch(`${baseUrl}/v1beta1/console/topology`);
     const data = await resp.json();

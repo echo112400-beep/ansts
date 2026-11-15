@@ -49,3 +49,20 @@ ANSTS v2.5 采用 **控制面 (`denoland/celld` v0.6.3 Durable Object Actor) + �
 - **反代与 Console 前端全动态拓扑渲染 (`scripts/dev_cluster_local_supervisor.mjs` & `docs/console-management/prototype.js`)**:
   - `:8088` 反代周期同步 `/v1beta1/console/topology` 的 `activeGatewayUrls`，动态发现新上线 `gateway` 节点。
   - 前端移除 3 节点硬编码，基于 `slotOwners` (256 项) 与 `slotDistribution` 动态渲染任意数量 `brain` 节点的 256 槽一致性哈希环与节点选择表单，并在「节点与分片单元编排」页面新增「全角色动态拓扑注册表与自动伸缩工作台」。
+
+---
+
+## 9. M96 — Next.js `ui/` App Router 实现与 `hrui` 设计语言同步规范
+
+### 9.1 `ui/` Next.js App Router 工程架构
+管理控制台前端已同步至仓库根目录下的 `ui/` Next.js 15 App Router 工程：
+- `ui/package.json` & `ui/tsconfig.json`：Next.js 15 + React 19 TypeScript 严格模式工程配置。
+- `ui/next.config.ts`：内置 API Rewrites，将 `/v1beta1/:path*`、`/v1/:path*`、`/internal/v1beta1/:path*`、`/.well-known/celld/health`、`/state`、`/metrics` 零配置代理至 ANSTS `celld` 后端（默认 `http://127.0.0.1:8088` 或环境变量 `ANSTS_BACKEND_URL`）。
+- `ui/src/components/hrui/theme.ts` & `ui/src/components/hrui/hrui.css`：完整实现 `hrui` 双主题设计系统（`#hrui[data-theme="light"|"dark"]`），包含 `--bg`、`--surface`、`--surface-2`、`--line`、`--fg`、`--muted`、`--faint`、`--accent: #285aff`（暗色 `#6b8cff`）、`--ok: #1a7a43`、`--warn: #9a6500`、`--bad: #c0262f` 色彩语义令牌，`Geist` / `Geist Mono` / `Bricolage Grotesque` 字体栈，`980px` 胶囊按钮、14px 4 列统一指标条（26px Tabular 数值）、999px 语义状态徽章与 12px 卡片/表格容器。
+- `ui/src/components/hrui/icons.tsx`：统一 24x24 `1.8` 线宽 SVG 图标集（`HRUI_ICONS`）与 `HrMark` 品牌标识。
+- `ui/src/components/hrui/Shell.tsx` & `ui/src/components/hrui/AnstsHruiConsole.tsx`：基于 `hrui` 布局的 6 大治理工作台（Tenants & Quotas、Nodes & Leases、Sessions & Time-Travel、Model Pool & Gateways、Audit & 4-Eyes Approvals、Cluster & Live Dev (`celld`)），支持实时 256-Slot 动态拓扑、扩缩容、租户 CAS、WAL 分叉与 4-Eyes 审批。
+- `ui/src/app/layout.tsx` & `ui/src/app/page.tsx`：Next.js App Router 根布局与入口页。
+
+### 9.2 平台管理台与原型设计 (`docs/`) 同步
+- `docs/console-management/prototype.css`、`docs/console-management/prototype.js`、`docs/index.html` 与 `docs/ansts_console_management.html` 已全面同步为 `hrui` 设计风格（根容器 `#hrui`、`data-theme` 亮/暗双主题、24x24 1.8px 线性 SVG 导航图标、980px 胶囊按钮、14px 统一指标条与模态框）。
+- 新增后端架构自省端点 `GET /v1beta1/console/ui-architecture` 与 CLI 命令 `anstsctl mgmt-ui-arch`，实时返回 `ui/` Next.js 组件清单与 `docs/` 原型同步状态。
