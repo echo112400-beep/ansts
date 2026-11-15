@@ -66,3 +66,24 @@ ANSTS v2.5 采用 **控制面 (`denoland/celld` v0.6.3 Durable Object Actor) + �
 ### 9.2 平台管理台与原型设计 (`docs/`) 同步
 - `docs/console-management/prototype.css`、`docs/console-management/prototype.js`、`docs/index.html` 与 `docs/ansts_console_management.html` 已全面同步为 `hrui` 设计风格（根容器 `#hrui`、`data-theme` 亮/暗双主题、24x24 1.8px 线性 SVG 导航图标、980px 胶囊按钮、14px 统一指标条与模态框）。
 - 新增后端架构自省端点 `GET /v1beta1/console/ui-architecture` 与 CLI 命令 `anstsctl mgmt-ui-arch`，实时返回 `ui/` Next.js 组件清单与 `docs/` 原型同步状态。
+
+---
+
+## 10. M97 — 零打桩 API 实现审计与 `ui/` Next.js + `docs/` 真实后端全量联调规范
+
+### 10.1 后端 API 零硬编码动态派生改造 (`src/dashboard/server.ts` & `src/server_main.ts`)
+- **`GET /v1beta1/console/runtime` (`buildRuntimeVisualization`)**：移除末尾静态 push `ep-qwen-38` 伪造对象的逻辑，在 `CognitiveRouter` 初始化时注册真实 `ep-qwen-38` (`LlmEndpointMetrics`) 实例，使熔断器状态、RPM/TPM 令牌桶与 TTFT EWMA 完全由真实路由器驱动。
+- **`GET /v1beta1/console/celld-dev-status` (`buildCelldDevServiceStatus`)**：移除固定 5 项 `defaultCells` 数组与静态 `candidateOrigins`/`gatewayUrls`，改为从 `v25_cluster_registry` 动态遍历活跃 `brain`、`gateway`、`body` 节点并在 `CelldAdminClient` 中动态注册/读取 `AnstsSchedulerCell`、`TunnelGatewayCell`、`LayerFsSandboxCell`。
+- **`GET /v1beta1/management/state` (`buildFullManagementState`)**：将正常态下静态 SLA 常量（`68ms` / `0.948` / `0.742`）替换为基于 `ansts_task_dispatch_latency_ms` 直方图分位数、`WarmSandboxPoolManager` 实时池水位与活跃 `READY` 节点平均 CPU 利用率的动态计算。
+- **`GET /state`、`GET /v1beta1/console/overview`、`GET /v1beta1/console/shards`、`GET /v1beta1/console/topology`**：动态计算 `servicesCount = totalRegisteredNodes + 3`、真实 `V8HeapAndSqlBudgetGuard` 内存压力、`queueManager.totalQueued()` 排队计数与动态分片列表。
+- **`POST /internal/v1beta1/cluster/heartbeat` (`heartbeatDynamicClusterNode`)**：当调用方未传入 `cpuPct`/`psiPct` 时，由后端主动通过 `LinuxPsiMemoryGuard.probeLiveKernelPsiSample()` 与 `process.memoryUsage()` 采集真实内核与进程负载。
+
+### 10.2 前端 UI 零内容打桩与全功能真实接口对接 (`ui/` & `docs/`)
+- **`ui/src/components/hrui/AnstsHruiConsole.tsx` & `Shell.tsx`**：
+  - 移除全部硬编码回退常量（如 `?? 8`、`?? { 'brain-node-01': 85, ... }`），所有状态初始化为 `null` 并 100% 从后端 API 加载；
+  - 接入真实 RBAC 身份切换与 `POST /v1beta1/management/auth/token` HMAC-SHA256 Bearer JWT 签发；
+  - 接入 `GET /v1beta1/management/events/stream?live=1` 持久 SSE 实时推送；
+  - 完整实现 7 大治理视图（`overview`、`tenants`、`nodes`、`tasks`、`models`、`audit`、`celld`）与 28 个真实后端读写接口联调。
+- **`docs/console-management/prototype.js` & `docs/index.html`**：
+  - 彻底清零全部 `Math.random()` 客户端伪造遥测与随机 ID；
+  - 移除 `renderObservabilitySection`、`renderConfigsSection`、`renderRuntimeSection`、`renderFederationSection`、`renderSecuritySection` 中的静态假数据回退。

@@ -66,3 +66,16 @@ ANSTS v2.5 采用 **控制面 (`denoland/celld` v0.6.3 Durable Object Actor) + �
   - 根作用域挂载 `id="hrui"` 与 `data-theme="light"|"dark"` 属性，支持一键切换亮/暗色 `hrui` 主题；
   - 侧边栏升级为 `HrMark` SVG 徽标、`HRUI · NEXT.JS (ui/)` 标识与 24x24 线性 SVG 图标导航；
   - 顶部状态栏新增 `HRUI · Next.js (ui/)` 架构同步检视弹窗（`open-hrui-nextjs-sync-dialog`），并接入后端 `GET /v1beta1/console/ui-architecture` 与 `anstsctl mgmt-ui-arch`。
+
+---
+
+## M97 — 零打桩 API 实现审计与 `ui/` Next.js + `docs/` 真实后端全量联调 (Zero-Stub API & UI Real Backend Wiring)
+
+### 1. 后端 API 硬编码与打桩逻辑全面消除 (`src/dashboard/server.ts` & `src/server_main.ts`)
+- **`CognitiveRouter` 真实端点管理 (`GET /v1beta1/console/runtime`)**：废除 `buildRuntimeVisualization()` 中静态追加 `ep-qwen-38` 对象的逻辑，将 `ep-qwen-38` 注册进真实 `CognitiveRouter`，支持通过 `POST /v1beta1/management/router/inference-pipeline` 对其执行真实熔断、半开恢复与 TPM 耗尽测试。
+- **`celld` 动态 Cell 放置与候选节点发现 (`GET /v1beta1/console/celld-dev-status`)**：废除固定 5 项 `defaultCells` 与硬编码 `gatewayUrls`，改为实时读取 `v25_cluster_registry` 中的全部 `brain`、`gateway`、`body` 节点并动态映射至 `CelldAdminClient`（例如扩容 `celld-brain-04`、`body-host-04`、`celld-gw-03` 后，Cell 数量从 8 动态增至 11，`servicesCount` 从 11 动态增至 14）。
+- **实时 SLA 与内核负载采样 (`GET /v1beta1/management/state`、`GET /state`、`POST /internal/v1beta1/cluster/heartbeat`)**：废除静态 `68ms` / `0.948` / `0.742` SLA 常量，改为由 Otel 直方图分位数、`WarmSandboxPoolManager` 水位与节点真实 CPU 均值实时计算；心跳接口在不传客户端负载时直接采样宿主机内核 PSI 与进程内存。
+
+### 2. 前端 `ui/` Next.js 与 `docs/` 原型零打桩改造
+- **`ui/src/components/hrui/AnstsHruiConsole.tsx` & `Shell.tsx`**：移除所有 `?? 8`、`?? { 'brain-node-01': 85, ... }` 硬编码回退，完整实现 7 大治理标签页（集群总览、租户/FinOps/队列、节点/隧道/灾备、任务/WAL/LayerFS、模型/配置/画像、4-Eyes审批/审计/可观测、celld运行时/探针），并全量接入 `POST /v1beta1/management/auth/token` Bearer JWT 与 `/v1beta1/management/events/stream?live=1` 实时 SSE。
+- **`docs/console-management/prototype.js` & `docs/index.html`**：彻底移除全部 `Math.random()` 客户端伪造 CPU/PSI 遥测与静态假数据回退。

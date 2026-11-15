@@ -723,9 +723,9 @@
     const isBudgetUnknown = state.scenario === 'budget';
     const isQuotaFull = state.scenario === 'quota';
 
-    const p99Ms = state.sla ? state.sla.p0QueueWaitP99Ms : 68;
+    const p99Ms = state.sla ? state.sla.p0QueueWaitP99Ms : 0;
     const p99Text = isOffline ? 'UNKNOWN (503 离线)' : `${p99Ms} ms`;
-    const capText = isOffline ? 'UNKNOWN' : `${Math.round((state.sla?.utilizationRatio || 0.742) * 1000) / 10}%`;
+    const capText = isOffline ? 'UNKNOWN' : `${Math.round((state.sla?.utilizationRatio || 0) * 1000) / 10}%`;
     const totalSpent = state.tenants.reduce((acc, t) => acc + (t.spentUsd || 0), 0);
     const totalBudget = state.tenants.reduce((acc, t) => acc + (t.dailyBudgetUsd || 0), 0);
     const finopsText = isOffline || isBudgetUnknown ? 'UNKNOWN (计费流延迟)' : `$${totalSpent} / $${totalBudget}`;
@@ -1709,23 +1709,9 @@
 
   function renderConfigsSection() {
     const cv = state.configVisualization || {
-      activeRevision: 1,
+      activeRevision: 0,
       sha256Checksum: '',
-      activeConfig: {
-        clusterName: 'ansts-v2-celld-scheduler',
-        compatibilityDate: '2026-01-01',
-        maxCellConcurrentRequests: 64,
-        maxQueueConcurrentProducers: 256,
-        durabilityMode: 'fleet',
-        logPipelineLimit: 4,
-        ltxCompactionEnabled: true,
-        ltxTruncatePages: 128,
-        thinkCpuCores: 0.25,
-        actCpuCores: 4.0,
-        actMemoryMb: 8192,
-        psiFullFreezePct: 70.0,
-        targetSloRatio: 0.999
-      },
+      activeConfig: {},
       revisions: [],
       schemaRules: []
     };
@@ -1908,7 +1894,7 @@
   function renderRuntimeSection() {
     const bDist = state.slotDistribution && Object.keys(state.slotDistribution).length > 0
       ? state.slotDistribution
-      : { 'brain-node-01': 85, 'brain-node-02': 86, 'brain-node-03': 85 };
+      : {};
     const brainKeys = Object.keys(bDist);
     const brainColors = ['#2563eb', '#0d9488', '#d97706', '#7c3aed', '#e11d48', '#059669', '#4f46e5', '#b45309'];
     const slotOwnersList = Array.isArray(state.slotOwners) && state.slotOwners.length === 256
@@ -2472,17 +2458,8 @@
 
   function renderObservabilitySection() {
     const ov = state.observabilityVisualization || {
-      sloEvaluation: {
-        targetSloRatio: 0.999,
-        actualAvailabilityRatio: 0.9996,
-        errorBudgetRemainingPct: 60.0,
-        burnRate1h: 0.4,
-        p99LatencyMs: 88,
-        latencySloTargetMs: 250,
-        alertSeverity: 'HEALTHY',
-        recommendedRunbook: 'NONE'
-      },
-      latencyQuantiles: { count: 9, sum: 341, p50: 31, p95: 88, p99: 88 },
+      sloEvaluation: {},
+      latencyQuantiles: { count: 0, sum: 0, p50: 0, p95: 0, p99: 0 },
       traceWaterfalls: [],
       dlqAndOutbox: {
         deadLetterTaskCount: 0,
@@ -2503,13 +2480,13 @@
       <section class="kpi-grid" aria-label="可观测性与自愈核心指标">
         <div class="kpi-card">
           <div class="kpi-label"><span>多窗口 SLO 燃烧率与错误预算</span><span class="status-pill ${sevCls}">${esc(slo.alertSeverity || 'HEALTHY')}</span></div>
-          <div class="kpi-value">${slo.burnRate1h ?? 0.4}x Burn</div>
-          <div class="kpi-sub">剩余错误预算: <span class="mono">${slo.errorBudgetRemainingPct ?? 60}%</span> · 目标 SLO: <span class="mono">${Number(((slo.targetSloRatio ?? 0.999) * 100).toFixed(2))}%</span></div>
+          <div class="kpi-value">${slo.burnRate1h ?? 0}x Burn</div>
+          <div class="kpi-sub">剩余错误预算: <span class="mono">${slo.errorBudgetRemainingPct ?? 0}%</span> · 目标 SLO: <span class="mono">${Number(((slo.targetSloRatio ?? 0.999) * 100).toFixed(2))}%</span></div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label"><span>全链路调度与执行延迟分位数 (Otel Histogram)</span><span class="status-pill ${Number(slo.p99LatencyMs ?? 88) > 250 ? 'danger' : 'ok'}">阈值 &lt; ${slo.latencySloTargetMs ?? 250}ms</span></div>
-          <div class="kpi-value">P99 ${slo.p99LatencyMs ?? q.p99 ?? 88} ms</div>
-          <div class="kpi-sub">P50: <span class="mono">${q.p50 ?? 31}ms</span> · P95: <span class="mono">${q.p95 ?? 88}ms</span> · 采样数: <span class="mono">${q.count ?? 9}</span></div>
+          <div class="kpi-value">P99 ${slo.p99LatencyMs ?? q.p99 ?? 0} ms</div>
+          <div class="kpi-sub">P50: <span class="mono">${q.p50 ?? 0}ms</span> · P95: <span class="mono">${q.p95 ?? 0}ms</span> · 采样数: <span class="mono">${q.count ?? 0}</span></div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label"><span>死信队列 (DLQ) 与 Outbox Webhook 状态</span><span class="status-pill ${(dlq.deadLetterTaskCount || 0) + (dlq.deadLetterWebhookCount || 0) > 0 ? 'danger' : 'ok'}">Gen #${dlq.keyRotation?.keyRotationGeneration ?? 1} HMAC</span></div>
@@ -2864,7 +2841,7 @@
   function renderFederationSection() {
     const fv = state.federationVisualization || {
       federatedRegions: [],
-      reverseTunnels: { totalBindingsCount: 6, healthyBindingsCount: 6, hosts: [], allBindings: [] },
+      reverseTunnels: { totalBindingsCount: 0, healthyBindingsCount: 0, hosts: [], allBindings: [] },
       erasureCoding: { scheme: 'Cauchy Reed-Solomon GF(2^8) RS(K=4, M=2)', manifestsCount: 1, manifests: [], lastRebuildReport: null },
       chaosEngineering: { partitionedHosts: [], jitterByHost: {}, activePartitionCount: 0 }
     };
@@ -3057,7 +3034,7 @@
         ebpfLsmPosture: { lsmActive: true, kernelVersion: '6.8-ansts' },
         webhookKeyRotation: { keyRotationGeneration: 1, secondaryActive: false }
       },
-      releaseReadiness: { readyForProduction: true, passedCount: 8, totalGates: 8, gates: [], evaluatedAtUtc: '' },
+      releaseReadiness: { readyForProduction: false, passedCount: 0, totalGates: 0, gates: [], evaluatedAtUtc: '' },
       lastIntrusionProbe: null
     };
     const ac = sv.auditChainIntegrity || { valid: true, totalEntries: 0, headHashHex: '' };
@@ -3285,7 +3262,7 @@
   function openQuotaDialog(tenantId) {
     const tenant = state.tenants.find((t) => t.id === tenantId) || state.tenants[0];
     // In conflict scenario, the operator form starts with baseline v14 while backend SQLite was updated to v15 by zhou
-    const formBaselineVersion = state.scenario === 'conflict' && tenant.id === 'Northstar' ? 14 : tenant.configVersion;
+    const formBaselineVersion = tenant.configVersion;
 
     openDialog(
       `编辑租户配额与 FinOps 预算 · ${tenant.id} (POST /v1beta1/management/tenants/config)`,
@@ -3348,7 +3325,7 @@
   }
 
   function openDispatchTaskDialog() {
-    const nextNum = Math.floor(100 + Math.random() * 899);
+    const nextNum = (100 + (state.tasks.length + state.nodes.length + state.approvals.length));
     openDialog(
       '派发分布式任务 (POST /v1beta1/tasks/dispatch)',
       `
@@ -3808,7 +3785,7 @@
       return;
     }
     if (action === 'open-enqueue-task-dialog') {
-      const nextNum = Math.floor(100 + Math.random() * 899);
+      const nextNum = (100 + (state.tasks.length + state.nodes.length + state.approvals.length));
       const dynamicTenants = Array.isArray(state.allTenantIds) && state.allTenantIds.length > 0
         ? state.allTenantIds
         : ['Northstar', 'Helios', 'Vanguard', 'Aegis'];
@@ -4007,7 +3984,7 @@
       return;
     }
     if (action === 'open-register-mcp-dialog') {
-      const nextId = Math.floor(100 + Math.random() * 899);
+      const nextId = (100 + (state.tasks.length + state.nodes.length + state.approvals.length));
       openDialog(
         '注册动态 MCP JSON-RPC 2.0 事务工具 (POST /v1beta1/management/mcp)',
         '<div class="form-field"><label for="dlg-mcp-name">MCP 工具名称 (Tool Name)</label>' +
@@ -5120,7 +5097,7 @@
         `
           <div class="form-field">
             <label for="dlg-pol-id">规则 ID (Rule ID)</label>
-            <input id="dlg-pol-id" type="text" value="RULE-PROD-K8S-${Math.floor(100 + Math.random() * 899)}" />
+            <input id="dlg-pol-id" type="text" value="RULE-PROD-K8S-${(100 + (state.tasks.length + state.nodes.length + state.approvals.length))}" />
           </div>
           <div class="form-field">
             <label for="dlg-pol-pattern">匹配工具名正则 (toolNamePattern)</label>
@@ -5519,7 +5496,7 @@
           </div>
           <div class="form-field">
             <label for="dlg-lfs-new-branch">新分支名称 (New Branch Name)</label>
-            <input id="dlg-lfs-new-branch" type="text" value="feat-cow-${Math.floor(100 + Math.random() * 899)}" />
+            <input id="dlg-lfs-new-branch" type="text" value="feat-cow-${(100 + (state.tasks.length + state.nodes.length + state.approvals.length))}" />
           </div>
         `,
         "执行 O(1) 零拷贝分叉",
@@ -6266,9 +6243,7 @@
       const role = target.getAttribute('data-role') || 'body';
       const res = await callBackendApi('POST', '/internal/v1beta1/cluster/heartbeat', {
         nodeId,
-        role,
-        cpuPct: Number((35 + Math.random() * 25).toFixed(1)),
-        psiPct: Number((1.2 + Math.random() * 3.5).toFixed(1))
+        role
       });
       state.lastApiOutput = JSON.stringify(res.data, null, 2);
       await fetchBackendState();

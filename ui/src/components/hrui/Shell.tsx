@@ -1,29 +1,40 @@
 'use client';
 import React from 'react';
-import './hrui.css';
-import { HrMark, Ic } from './icons';
+import {
+  HrMark,
+  IconCheck,
+  IconCpu,
+  IconFolder,
+  IconKey,
+  IconLayers,
+  IconRefresh,
+  IconRoute,
+  IconSun,
+  IconTerminal,
+} from './icons';
 
 export interface HruiNavItem {
   id: string;
   label: string;
-  shortLabel: string;
-  iconKey: keyof typeof Ic;
+  icon: React.ReactNode;
 }
 
-export const HRUI_NAV_ITEMS: HruiNavItem[] = [
-  { id: 'overview', label: '平台态势与容量恢复', shortLabel: '态势', iconKey: 'overview' },
-  { id: 'queues', label: '队列与健康状态可视', shortLabel: '队列', iconKey: 'queues' },
-  { id: 'nodes', label: '节点与分片单元编排', shortLabel: '拓扑', iconKey: 'nodes' },
-  { id: 'tenants', label: '租户配额与 FinOps 治理', shortLabel: '租户', iconKey: 'tenants' },
-  { id: 'tasks', label: '任务运行与回合诊断', shortLabel: '任务', iconKey: 'tasks' },
-  { id: 'approvals', label: '高危审批与变更审计', shortLabel: '审批', iconKey: 'approvals' },
-  { id: 'configs', label: '配置中心与版本治理', shortLabel: '配置', iconKey: 'configs' },
-  { id: 'runtime', label: '分布式运行面与 LayerFS', shortLabel: '运行面', iconKey: 'runtime' },
-  { id: 'observability', label: '可观测性、SLO 与自愈', shortLabel: '观测', iconKey: 'observability' },
-  { id: 'swarm', label: '智能体协同与算力市场', shortLabel: '协同', iconKey: 'swarm' },
-  { id: 'federation', label: '多地域联邦与隧道灾备', shortLabel: '联邦', iconKey: 'federation' },
-  { id: 'security', label: '安全合规、RBAC 与门控', shortLabel: '安全', iconKey: 'security' },
-];
+export interface HruiShellProps {
+  activeNav: string;
+  onSelectNav: (id: string) => void;
+  darkTheme: boolean;
+  onToggleTheme: () => void;
+  backendOrigin: string;
+  onChangeOrigin?: (nextOrigin: string) => void;
+  liveConnected: boolean;
+  sseConnected?: boolean;
+  principalId?: string;
+  principalRole?: string;
+  onSelectPrincipal?: (principalId: string) => void;
+  navBadges?: Record<string, string>;
+  onRefresh?: () => void;
+  children: React.ReactNode;
+}
 
 export function HruiShell({
   activeNav,
@@ -31,72 +42,121 @@ export function HruiShell({
   darkTheme,
   onToggleTheme,
   backendOrigin,
+  onChangeOrigin,
   liveConnected,
+  sseConnected,
+  principalId = 'chen',
+  principalRole = 'SRE_ADMIN',
+  onSelectPrincipal,
+  navBadges = {},
+  onRefresh,
   children,
-}: {
-  activeNav: string;
-  onSelectNav: (id: string) => void;
-  darkTheme: boolean;
-  onToggleTheme: () => void;
-  backendOrigin: string;
-  liveConnected: boolean;
-  children: React.ReactNode;
-}) {
+}: HruiShellProps) {
+  const navItems: HruiNavItem[] = [
+    { id: 'overview', label: '集群总览与动态拓扑', icon: <IconLayers size={15} /> },
+    { id: 'tenants', label: '租户、FinOps 与队列', icon: <IconKey size={15} /> },
+    { id: 'nodes', label: '节点伸缩、隧道与灾备', icon: <IconCpu size={15} /> },
+    { id: 'tasks', label: '任务、WAL 与 LayerFS', icon: <IconFolder size={15} /> },
+    { id: 'models', label: '模型路由、配置与画像', icon: <IconRoute size={15} /> },
+    { id: 'audit', label: '4-Eyes 审批、审计与可观测', icon: <IconCheck size={15} /> },
+    { id: 'celld', label: 'celld 运行时与探针', icon: <IconTerminal size={15} /> },
+  ];
+
   return (
     <div id="hrui" data-theme={darkTheme ? 'dark' : 'light'}>
-      <div className="app">
-        <aside className="rail" aria-label="hrui 主导航栏">
-          <div className="wordmark">
-            <span className="brand-mark" aria-hidden="true">
-              <HrMark />
-            </span>
-            <span>
-              ANSTS
-              <small>HRUI · NEXT.JS</small>
-            </span>
+      <div className="shell app-shell">
+        <aside className="rail" aria-label="ANSTS 管理导航">
+          <div className="brand">
+            <HrMark size={20} />
+            <div className="brand-title">
+              <strong>ANSTS Control</strong>
+              <span className="tag">HRUI · NEXT.JS</span>
+            </div>
           </div>
-          <div className="workspace">
-            <span className={`dot ${liveConnected ? 'ok' : 'bad'}`} />
-            <span>
-              <strong>平台管理工作区</strong>
-              <small className="mono">ui/nextjs · hrui v2.5</small>
-            </span>
-            <span className="pill run">HRUI</span>
-          </div>
-          <nav id="navigation" aria-label="主导航">
-            {HRUI_NAV_ITEMS.map((item) => (
+
+          <div className="sect-lbl">GOVERNANCE</div>
+          <nav className="navigation">
+            {navItems.map((it) => (
               <button
-                key={item.id}
+                key={it.id}
                 type="button"
-                className={`nav-item rail-btn ${activeNav === item.id ? 'active on' : ''}`}
-                onClick={() => onSelectNav(item.id)}
+                className={`rail-btn nav-item ${activeNav === it.id ? 'on active' : ''}`}
+                onClick={() => onSelectNav(it.id)}
               >
                 <span className="nav-item-label">
-                  {Ic[item.iconKey]}
-                  <span>{item.label}</span>
+                  {it.icon}
+                  <span>{it.label}</span>
                 </span>
+                {navBadges[it.id] ? <span className="nav-badge">{navBadges[it.id]}</span> : null}
               </button>
             ))}
           </nav>
-        </aside>
-        <div className="shell page">
-          <header className="context topbar">
-            <div className="breadcrumbs">
-              <span className={`dot ${liveConnected ? 'ok' : 'bad'}`} />
-              <span>ANSTS Console</span>
-              <span>/</span>
-              <b>{HRUI_NAV_ITEMS.find((i) => i.id === activeNav)?.label ?? '平台控制面'}</b>
+
+          <div className="rail-foot rail-footer">
+            <button type="button" className="rail-btn nav-item" onClick={onToggleTheme}>
+              <span className="nav-item-label">
+                <IconSun size={15} />
+                <span>{darkTheme ? '亮色模式 (Light)' : '暗色模式 (Dark)'}</span>
+              </span>
+            </button>
+            <div className="muted mono" style={{ fontSize: 11, padding: '6px 10px' }}>
+              {liveConnected ? `LIVE · ${backendOrigin}` : `OFFLINE · ${backendOrigin}`}
             </div>
-            <div className="account">
-              <span className="pill ok mono">{backendOrigin}</span>
+          </div>
+        </aside>
+
+        <div className="main-area">
+          <header className="topbar">
+            <div className="topbar-title-group">
+              <span className={`pill ${liveConnected ? 'ok' : 'bad'}`}>
+                {liveConnected ? 'CELLD LIVE CONNECTED' : 'BACKEND OFFLINE (503)'}
+              </span>
+              <span className={`pill ${sseConnected ? 'run' : 'neutral'}`}>
+                {sseConnected ? 'SSE ?live=1 STREAMING' : 'POLLING'}
+              </span>
+              <span className="pill neutral mono">RBAC: {principalId} ({principalRole})</span>
+            </div>
+            <div className="topbar-controls">
+              {onSelectPrincipal ? (
+                <label className="ctrl-group">
+                  <span>RBAC 身份</span>
+                  <select
+                    value={principalId}
+                    onChange={(e) => onSelectPrincipal(e.target.value)}
+                    aria-label="RBAC 身份切换"
+                  >
+                    <option value="chen">chen (SRE_ADMIN)</option>
+                    <option value="zhou">zhou (SRE_ADMIN · 异体复核人)</option>
+                    <option value="lin">lin (TENANT_OPERATOR)</option>
+                    <option value="xu">xu (VIEWER · 只读观察员)</option>
+                  </select>
+                </label>
+              ) : null}
+              {onChangeOrigin ? (
+                <label className="ctrl-group">
+                  <span>后端 Origin</span>
+                  <input
+                    type="text"
+                    className="mono"
+                    value={backendOrigin}
+                    onChange={(e) => onChangeOrigin(e.target.value)}
+                    style={{ width: 175 }}
+                  />
+                </label>
+              ) : null}
+              {onRefresh ? (
+                <button type="button" className="btn small" onClick={onRefresh}>
+                  <IconRefresh size={13} />
+                  <span>刷新同步</span>
+                </button>
+              ) : null}
               <button type="button" className="btn small" onClick={onToggleTheme}>
-                {darkTheme ? '☀ 亮色模式' : '☾ 暗色模式'}
+                {darkTheme ? '切换亮色' : '切换暗色'}
               </button>
             </div>
           </header>
-          <main id="content" className="scroll view">
-            {children}
-          </main>
+
+          <main className="main content">{children}</main>
         </div>
       </div>
     </div>

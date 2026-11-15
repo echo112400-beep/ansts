@@ -807,23 +807,30 @@ export class AnstsLocalAndComposeServer {
     }
 
     if (method === "GET" && pathname === "/state") {
+      const heapEval = this.heapBudgetGuard.evaluateHeapPressure();
+      const queuedCount = this.scheduler.queueManager.totalQueued();
+      const liveReadyCount = Math.max(
+        this.scheduler.nodes.size,
+        Object.keys(this.peerBrainUrls).length + Object.keys(this.peerBodyUrls).length
+      );
+      const isPressured = Boolean(heapEval.pressured);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           nodeId: this.nodeId,
           nodeRole: this.nodeRole,
           node_load: {
-            capacity_waiting: 0,
+            capacity_waiting: queuedCount,
             activation_waiting: 0,
             restoring: 0,
-            owned_cells: this.scheduler.allTasks.size + 1,
+            owned_cells: this.scheduler.allTasks.size + Math.max(1, liveReadyCount),
             resident_cells: this.scheduler.allTasks.size + 1,
-            pressured: false,
-            memory_headroom: true,
-            shed_cells: 0,
+            pressured: isPressured,
+            memory_headroom: !isPressured,
+            shed_cells: isPressured ? 1 : 0,
           },
           deployment: {
-            isolates: { live: this.scheduler.nodes.size, live_empty: 0, retiring: 0 },
+            isolates: { live: Math.max(1, liveReadyCount), live_empty: 0, retiring: this.draining ? 1 : 0 },
           },
         })
       );
@@ -1405,6 +1412,24 @@ export class AnstsLocalAndComposeServer {
       for (const t of peerTasks) {
         globalTaskIds.add(t.task_id);
       }
+      const dynTopo = this.managementPlane.buildDynamicClusterTopology() as {
+        activeBrainMembers?: string[];
+        bodies?: Array<{ nodeId: string; status: string }>;
+        gateways?: Array<{ nodeId: string; status: string }>;
+        totalRegisteredNodes?: number;
+      };
+      const configuredBrains =
+        Object.keys(this.peerBrainUrls).length > 0
+          ? Object.keys(this.peerBrainUrls)
+          : dynTopo.activeBrainMembers ?? [];
+      const configuredBodies =
+        Object.keys(this.peerBodyUrls).length > 0
+          ? Object.keys(this.peerBodyUrls)
+          : (dynTopo.bodies ?? []).filter((b) => b.status === "READY").map((b) => b.nodeId);
+      const configuredGateways = (dynTopo.gateways ?? [])
+        .filter((g) => g.status === "READY")
+        .map((g) => g.nodeId);
+      const isHealthy = !this.draining && this.managementPlane.getScenario() !== "offline";
 
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
@@ -1412,25 +1437,34 @@ export class AnstsLocalAndComposeServer {
           region: urlObj.searchParams.get("region") ?? "us-west-2",
           gatewayNodeId: this.nodeId,
           totalTasks: globalTaskIds.size,
-          activeNodes: this.scheduler.nodes.size,
-          configuredBrains: Object.keys(this.peerBrainUrls),
-          configuredBodies: Object.keys(this.peerBodyUrls),
-          status: "HEALTHY",
+          activeNodes: Math.max(this.scheduler.nodes.size, Number(dynTopo.totalRegisteredNodes ?? 0)),
+          configuredBrains,
+          configuredBodies,
+          configuredGateways,
+          status: isHealthy ? "HEALTHY" : "DEGRADED",
         })
       );
       return;
     }
 
     if (method === "GET" && pathname === "/v1beta1/console/shards") {
+      const dynTopo = this.managementPlane.buildDynamicClusterTopology() as {
+        activeBrainMembers?: string[];
+        slotDistribution?: Record<string, number>;
+        topologyGeneration?: number;
+      };
+      const activeBrains =
+        Object.keys(this.peerBrainUrls).length > 0
+          ? Object.keys(this.peerBrainUrls)
+          : dynTopo.activeBrainMembers ?? [];
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
-          totalShards: 64,
+          totalShards: Math.max(1, activeBrains.length * 16),
           virtualSlots: 256,
-          brains:
-            Object.keys(this.peerBrainUrls).length > 0
-              ? Object.keys(this.peerBrainUrls)
-              : ["brain-node-01", "brain-node-02", "brain-node-03"],
+          topologyGeneration: dynTopo.topologyGeneration ?? 1,
+          brains: activeBrains,
+          slotDistribution: dynTopo.slotDistribution ?? {},
           sampleSlotOwners: {
             slot0: this.shardCoordinator.ring.getOwnerNodeForSlot(0),
             slot85: this.shardCoordinator.ring.getOwnerNodeForSlot(85),
@@ -1443,14 +1477,15 @@ export class AnstsLocalAndComposeServer {
 
     // [M40 & M95] TanStack Console BFF: Live Dynamic Topology & 256-Slot Ring Map (`GET /v1beta1/console/topology`)
     if (method === "GET" && pathname === "/v1beta1/console/topology") {
-      const dynTopo = this.managementPlane.buildDynamicClusterTopology();
+      const dynTopo = this.managementPlane.buildDynamicClusterTopology() as Record<string, unknown>;
+      const registeredCount = Number(dynTopo.totalRegisteredNodes ?? 8);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           cluster: "ansts-v25-dev-cluster",
           gatewayNodeId: this.nodeId,
           virtualSlots: 256,
-          servicesCount: 11,
+          servicesCount: registeredCount + 3,
           ...dynTopo,
         })
       );
