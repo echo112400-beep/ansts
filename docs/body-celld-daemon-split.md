@@ -1,5 +1,7 @@
 # Body celld 与原生 Daemon 拆分
 
+2026-11-14 更新：本页保留独立 Body Worker 阶段的设计。当前开发集群已经将 Body 状态迁入共享 fleet 的新命名空间，18085 变成兼容代理；最新状态和迁移命令见 [当前架构](current-architecture.md)。
+
 更新：2026-11-14。
 
 Body 控制状态由独立 `src/cloudflare/body_worker.ts` 承载，绑定 `AnstsBodyCell`。原生 `src/runtime/body_daemon_server.ts` 管理执行进程、停止、工作区快照和执行日志，不再实例化通用 Node 主机中的 Scheduler、Gateway 或控制台。

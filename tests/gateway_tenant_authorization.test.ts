@@ -46,10 +46,28 @@ it("rejects anonymous, expired, viewer writes and cross-tenant operations; filte
     const consoleTasks = await (await request("/v1/console/tasks", token("a", "VIEWER"))).json();
     assert.equal(consoleTasks.total, 1);
     assert.equal(consoleTasks.tasks[0].tenant_id, "a");
+    assert.equal(consoleTasks.counts.total, 1);
+    assert.equal(Object.entries(consoleTasks.counts).filter(([key]) => key !== "total").reduce((sum, [, count]) => sum + Number(count), 0), 1);
+    const noMatch = await (await request("/v1/console/tasks?q=does-not-exist&limit=1", token("a", "VIEWER"))).json();
+    assert.equal(noMatch.tasks.length, 0);
+    assert.equal(noMatch.total, 0);
+    assert.equal(noMatch.counts.total, 1);
+    const secondPage = await (await request("/v1/console/tasks?page=2&limit=1", token("a", "VIEWER"))).json();
+    assert.equal(secondPage.tasks.length, 0);
+    assert.equal(secondPage.total, 1);
+    const allTenants = await (await request("/v1/console/tasks?limit=1", token("all", "SRE_ADMIN"))).json();
+    assert.equal(allTenants.counts.total, 2);
+    assert.equal(allTenants.tasks.length, 1);
+
     assert.equal((await request("/v1/console/tasks?tenantId=b", token("a", "VIEWER"))).status, 403);
     assert.equal((await request("/v1/tasks/same-name?tenantId=b", token("a", "VIEWER"))).status, 403);
     const task = await (await request("/v1/tasks/same-name", token("a", "VIEWER"))).json();
     assert.equal(task.tenant_id, "a");
+    assert.equal((await request("/v1/tasks/same-name/cancel?tenantId=a", token("a", "VIEWER"), { tenant_id: "a", reason: "stop" })).status, 403);
+    assert.equal((await request("/v1/tasks/same-name/cancel?tenantId=b", token("a", "OPERATOR"), { tenant_id: "b", reason: "stop" })).status, 403);
+    const cancelled = await request("/v1/tasks/same-name/cancel?tenantId=a", token("a", "OPERATOR"), { tenant_id: "a", reason: "stop", actor: "forged" });
+    assert.equal(cancelled.status, 200);
+    assert.equal((await cancelled.json()).cancel_requested.actor, "test-user");
     const state = await (await request("/v1beta1/gateway/state", token("a", "VIEWER"))).json();
     assert.equal(state.dispatches.length, 1);
     assert.equal(state.dispatches[0].tenant_id, "a");

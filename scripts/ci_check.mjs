@@ -169,7 +169,8 @@ function runLint() {
         if (node.type === "ImportDeclaration") {
           const src = node.source.value;
           if (src.startsWith(".")) {
-            const targetTs = path.resolve(path.dirname(f), src.replace(/\.js$/, ".ts"));
+            const resolved = path.resolve(path.dirname(f), src.replace(/\.js$/, ".ts"));
+            const targetTs = exportsByFile.has(resolved) ? resolved : resolved + ".ts";
             const targetExp = exportsByFile.get(targetTs);
             if (!targetExp) {
               throw new Error(`[CROSS-FILE IMPORT ERROR] ${rel} imports from missing module ${src}`);

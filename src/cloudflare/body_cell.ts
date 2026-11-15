@@ -10,7 +10,7 @@ export class AnstsBodyCell {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     const route = path.slice("/v1/body/".length);
-    const allowed = ["acquire", "start", "finish", "acknowledge", "uncertain", "reconcile", "heartbeat", "receipt", "state", "consume-grant", "export", "import"];
+    const allowed = ["acquire", "start", "finish", "acknowledge", "uncertain", "reconcile", "heartbeat", "receipt", "state", "consume-grant", "export", "import", "logs"];
     if (!path.startsWith("/v1/body/") || !allowed.includes(route)) return Response.json({ error: "NOT_FOUND" }, { status: 404 });
     if ((["state", "export"].includes(route) && request.method !== "GET") || (!["state", "export"].includes(route) && request.method !== "POST")) {
       return Response.json({ error: "METHOD_NOT_ALLOWED" }, { status: 405 });
@@ -27,7 +27,7 @@ export class AnstsBodyCell {
         if (!request.headers.get("x-ansts-verified-operator")) return Response.json({ error: "OPERATOR_AUTH_REQUIRED" }, { status: 401 });
         if (body.schema_version !== 1 || !Array.isArray(body.rows) || body.rows.length > 10000) return Response.json({ error: "INVALID_MIGRATION" }, { status: 400 });
         for (const row of body.rows) {
-          if (!row || typeof row.id !== "string" || row.id.length > 1024 || !/^(execution$|heartbeat$|receipt:|grant:)/.test(row.id) || typeof row.payload !== "string") return Response.json({ error: "INVALID_MIGRATION" }, { status: 400 });
+          if (!row || typeof row.id !== "string" || row.id.length > 1024 || !/^(execution$|heartbeat$|runtime_logs$|receipt:|grant:)/.test(row.id) || typeof row.payload !== "string") return Response.json({ error: "INVALID_MIGRATION" }, { status: 400 });
           try { JSON.parse(row.payload); } catch { return Response.json({ error: "INVALID_MIGRATION" }, { status: 400 }); }
         }
         if (this.ctx.storage.sql.exec("SELECT * FROM body_state").toArray().length) return Response.json({ imported: false, already_initialized: true });
@@ -42,6 +42,15 @@ export class AnstsBodyCell {
         if (this.ctx.storage.sql.exec("SELECT * FROM body_state WHERE id = ?", id).toArray().length) return Response.json({ error: "EXECUTION_GRANT_REPLAY" }, { status: 409 });
         this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", id, JSON.stringify({ consumed_at: Date.now() }));
         return Response.json({ authorized: true });
+      }
+      if (route === "logs") {
+        const execution = this.loadAttempt();
+        if (!execution || execution.phase !== "RUNNING" || !sameOwner(execution, body)) return Response.json({ error: "STALE_LOG_OWNER" }, { status: 409 });
+        if (typeof body.logs !== "string" || Buffer.byteLength(body.logs) > 24576 || !Number.isSafeInteger(body.sequence) || Number(body.sequence) < 1) return Response.json({ error: "INVALID_LOG_SNAPSHOT" }, { status: 400 });
+        const old = this.ctx.storage.sql.exec<{ payload: string }>("SELECT * FROM body_state WHERE id = ?", "runtime_logs").toArray()[0];
+        if (old && JSON.parse(old.payload).attempt_id === execution.attempt_id && JSON.parse(old.payload).sequence >= Number(body.sequence)) return Response.json({ recorded: true });
+        this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", "runtime_logs", JSON.stringify({ attempt_id: execution.attempt_id, sequence: body.sequence, logs: body.logs, updated_at: Date.now() }));
+        return Response.json({ recorded: true });
       }
       if (route === "reconcile") return this.reconcile(body, request.headers.get("x-ansts-verified-operator"));
       if (["acquire", "start", "finish", "acknowledge", "uncertain"].includes(route)) return this.transition(route, body);
@@ -60,7 +69,9 @@ export class AnstsBodyCell {
     const heartbeat = rows.find(row => row.id === "heartbeat");
     const hb = heartbeat ? JSON.parse(heartbeat.payload) : null;
     const execution = this.loadAttempt();
-    return Response.json({ controlPlane: "celld-body", heartbeat: hb, online: !!hb && Date.now() - hb.updated_at < 15000, execution, receipts: rows.filter(row => row.id.startsWith("receipt:")).map(row => JSON.parse(row.payload)) });
+    const logs = rows.find(row => row.id === "runtime_logs");
+    const runtimeLogs = logs ? JSON.parse(logs.payload) : null;
+    return Response.json({ controlPlane: "celld-body", heartbeat: hb, online: !!hb && Date.now() - hb.updated_at < 15000, execution, runtimeLogs: runtimeLogs?.attempt_id === execution?.attempt_id ? runtimeLogs : null, receipts: rows.filter(row => row.id.startsWith("receipt:")).map(row => JSON.parse(row.payload)) });
   }
   private finishMigration(): void {
     const pending = this.ctx.storage.sql.exec<{ payload: string }>("SELECT * FROM body_state WHERE id = ?", "__migration_pending").toArray()[0];
@@ -89,12 +100,12 @@ export class AnstsBodyCell {
       const digest = executionDigest(body.result);
       if (saved.result_digest && saved.result_digest !== digest) return Response.json({ error: "RESULT_CONFLICT" }, { status: 409 });
       next = { ...next, phase: "RESULT_PENDING", result: body.result as Record<string, unknown>, result_digest: digest };
-    } else if (body.action === "confirm_not_started") {
+    } else if (body.action === "confirm_not_started" || body.action === "resume_from_checkpoint") {
       const replacement = body.replacement && typeof body.replacement === "object" ? newAttempt(body.replacement as Record<string, unknown>) : null;
       if (!replacement || !sameExecution(saved, replacement as unknown as Record<string, unknown>) || replacement.attempt_id === saved.attempt_id || replacement.fencing_token <= saved.fencing_token) {
         return Response.json({ error: "INVALID_REPLACEMENT_ATTEMPT" }, { status: 400 });
       }
-      next = { ...replacement, version: saved.version + 1, reason: "RECONCILED_NOT_STARTED" };
+      next = { ...replacement, version: saved.version + 1, reason: body.action === "resume_from_checkpoint" ? "RECONCILED_CHECKPOINT_RESUME" : "RECONCILED_NOT_STARTED" };
     } else if (body.action !== "retain_block") return Response.json({ error: "INVALID_RECONCILIATION_ACTION" }, { status: 400 });
     const audit = saved.audit ?? [];
     const entry = { version: next.version, actor, action: String(body.action), evidence: body.evidence, reason: body.reason, timestamp: Date.now(), previous_hash: audit.at(-1)?.hash ?? "" };
@@ -121,7 +132,7 @@ export class AnstsBodyCell {
     }
     if (!saved || !sameExecution(saved, body)) return Response.json({ error: "EXECUTION_IDENTITY_CONFLICT", execution: saved }, { status: 409 });
     if (route === "acquire") {
-      if (saved.phase === "ADMITTED" && saved.reason === "RECONCILED_NOT_STARTED" && proposed.fencing_token >= saved.fencing_token) {
+      if (saved.phase === "ADMITTED" && ["RECONCILED_NOT_STARTED", "RECONCILED_CHECKPOINT_RESUME"].includes(saved.reason ?? "") && proposed.fencing_token >= saved.fencing_token) {
         const bound = { ...proposed, version: saved.version + 1, audit: saved.audit };
         this.saveAttempt(bound);
         return Response.json({ acquired: true, execution: bound });

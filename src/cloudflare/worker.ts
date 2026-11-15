@@ -11,6 +11,7 @@ import { normalizeTaskStorageId } from "./task_identity.js";
 export { AnstsSchedulerCell } from "./scheduler_cell.js";
 export { AgentTaskHarnessCell } from "./harness_cell.js";
 export { TunnelGatewayCell } from "./tunnel_gateway_cell.js";
+export { AnstsGatewayCell } from "./gateway_cell.js";
 
 /** Reads the scheduler cell's task list; used by the brain read contract and by single-task lookups. */
 async function listCellTasks(env: CloudflareCelldEnv, shardName: string): Promise<Record<string, unknown>[]> {
@@ -75,6 +76,12 @@ export { AnstsBodyCell } from "./body_cell.js";
 export default {
   async fetch(request: Request, env: CloudflareCelldEnv): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname.startsWith("/internal/v1/gateway/")) {
+      if (!authenticateGatewayService(request, env)) return Response.json({ error: "GATEWAY_SERVICE_REQUIRED" }, { status: 401 });
+      if (!env.ANSTS_GATEWAY_CELL) return Response.json({ error: "GATEWAY_CELL_UNBOUND" }, { status: 503 });
+      const cell = env.ANSTS_GATEWAY_CELL.get(env.ANSTS_GATEWAY_CELL.idFromName("gateway-control-plane"));
+      return cell.fetch(new Request("https://cell" + url.pathname.slice("/internal".length), request));
+    }
     if (
       request.method === "GET" &&
       (url.pathname === "/health" || url.pathname === "/healthz" || url.pathname === "/readyz")
@@ -86,13 +93,15 @@ export default {
           runtime: "denoland/celld-cloudflare-workers",
           region: env.CELLD_REGION ?? "local",
           controlPlane: "celld-scheduler",
+          bodyAuthority: env.ANSTS_BODY_WORKER_URL ? "remote-worker" : "fleet",
+          bodyNamespace: env.ANSTS_BODY_NAMESPACE_PREFIX ?? "",
           planes: { scheduler: "durable-object" },
         }),
         { status: 200, headers: { "content-type": "application/json" } }
       );
     }
     if (url.pathname === "/internal/v1/body-legacy/export") {
-      if (!authenticateBodyOperator(request, env.ANSTS_BODY_AUTH_SECRET)) return Response.json({ error: "OPERATOR_AUTH_REQUIRED" }, { status: 401 });
+      if (!authenticateBodyOperator(request, env)) return Response.json({ error: "OPERATOR_AUTH_REQUIRED" }, { status: 401 });
       if (!env.ANSTS_BODY_CELL) return Response.json({ error: "LEGACY_BODY_CELL_UNBOUND" }, { status: 503 });
       const taskId = url.searchParams.get("taskId");
       const name = taskId ? `execution:${taskId}` : url.searchParams.get("hostId");
@@ -100,9 +109,9 @@ export default {
       return env.ANSTS_BODY_CELL.get(env.ANSTS_BODY_CELL.idFromName(name)).fetch(new Request("https://cell/v1/body/export", { headers: { "x-ansts-verified-operator": "development-migration" } }));
     }
     if (["/v1/scheduler", "/v1/harness", "/v1/tunnel", "/internal/v1beta1/brain/"].some(prefix => url.pathname.startsWith(prefix))) {
-      const bodyHost = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
-      const gatewayService = authenticateGatewayService(request, env.ANSTS_BODY_AUTH_SECRET);
-      const bodyControl = authenticateBodyControl(request, env.ANSTS_BODY_AUTH_SECRET);
+      const bodyHost = authenticateBody(request, env);
+      const gatewayService = authenticateGatewayService(request, env);
+      const bodyControl = authenticateBodyControl(request, env);
       if (bodyControl && !["/v1/scheduler/tasks", "/v1/scheduler/suspend-uncertain", "/v1/scheduler/resolve-uncertain"].includes(url.pathname)) return Response.json({ error: "BODY_CONTROL_SCOPE_FORBIDDEN" }, { status: 403 });
       if (!bodyHost && !gatewayService && !bodyControl) return Response.json({ error: "SERVICE_AUTH_REQUIRED" }, { status: 401 });
       if (bodyHost && (url.pathname === "/v1/scheduler/submit" || url.pathname === "/internal/v1beta1/brain/schedule")) return Response.json({ error: "GATEWAY_SERVICE_REQUIRED" }, { status: 403 });
@@ -143,9 +152,10 @@ export default {
       return handleBodyRequest(request, env);
     }
     if (url.pathname.startsWith("/v1/scheduler")) {
+      if (url.pathname === "/v1/scheduler/cancel" && !authenticateGatewayService(request, env)) return Response.json({ error: "GATEWAY_SERVICE_REQUIRED" }, { status: 403 });
       if (request.method === "POST" && ["/v1/scheduler/register-node", "/v1/scheduler/lease-renew", "/v1/scheduler/complete", "/v1/scheduler/schedule-tick"].includes(url.pathname)) {
-        const host = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
-        const gateway = authenticateGatewayService(request, env.ANSTS_BODY_AUTH_SECRET);
+        const host = authenticateBody(request, env);
+        const gateway = authenticateGatewayService(request, env);
         if (!host && !gateway) return Response.json({ error: "SERVICE_AUTH_REQUIRED" }, { status: 401 });
         if (host && url.pathname !== "/v1/scheduler/schedule-tick") {
           const body = await request.clone().json() as Record<string, unknown>;
@@ -158,15 +168,15 @@ export default {
           }
         }
       }
-      if (url.pathname === "/v1/scheduler/resolve-uncertain" && !authenticateBodyControl(request, env.ANSTS_BODY_AUTH_SECRET)) return Response.json({ error: "OPERATOR_ROUTE_REQUIRED" }, { status: 403 });
-      if (url.pathname === "/v1/scheduler/suspend-uncertain" && !authenticateBodyControl(request, env.ANSTS_BODY_AUTH_SECRET)) {
-        const host = authenticateBody(request, env.ANSTS_BODY_AUTH_SECRET);
+      if (url.pathname === "/v1/scheduler/resolve-uncertain" && !authenticateBodyControl(request, env)) return Response.json({ error: "OPERATOR_ROUTE_REQUIRED" }, { status: 403 });
+      if (url.pathname === "/v1/scheduler/suspend-uncertain" && !authenticateBodyControl(request, env)) {
+        const host = authenticateBody(request, env);
         if (!host || (!env.ANSTS_BODY_CELL && !env.ANSTS_BODY_WORKER_URL)) return Response.json({ error: "BODY_AUTH_REQUIRED" }, { status: 401 });
         const body = await request.clone().json() as Record<string, unknown>;
         if (body.node_id !== host) return Response.json({ error: "BODY_SCOPE_FORBIDDEN" }, { status: 403 });
         const state = env.ANSTS_BODY_WORKER_URL
           ? await fetch(new URL(`/v1/body/state?taskId=${encodeURIComponent(String(body.task_id))}`, env.ANSTS_BODY_WORKER_URL), { headers: { authorization: request.headers.get("authorization") ?? "", "x-ansts-body-id": host }, redirect: "error", signal: AbortSignal.timeout(10000) })
-          : await env.ANSTS_BODY_CELL!.get(env.ANSTS_BODY_CELL!.idFromName(`execution:${String(body.task_id)}`)).fetch(new Request("https://cell/v1/body/state"));
+          : await env.ANSTS_BODY_CELL!.get(env.ANSTS_BODY_CELL!.idFromName(`${env.ANSTS_BODY_NAMESPACE_PREFIX ?? ""}execution:${String(body.task_id)}`)).fetch(new Request("https://cell/v1/body/state"));
         const execution = (await state.json() as { execution?: Record<string, unknown> }).execution;
         if (!execution || execution.phase !== "UNCERTAIN" || execution.tenant_id !== body.tenant_id || execution.task_id !== body.task_id) return Response.json({ error: "UNCERTAIN_EXECUTION_REQUIRED" }, { status: 409 });
       }

@@ -9,11 +9,21 @@ import { TaskSpecValidationError, TaskSpecValidator } from "../gateway/validator
 import { DurableObjectNamespaceLike, DurableObjectStateLike } from "./env.js";
 import { publicTaskId, taskStorageId } from "./task_identity.js";
 import { gatewayPrincipal, gatewayAuthorizationError, tenantAllowed } from "./gateway_authorization.js";
+import { controlPlaneFetch } from "./control_plane_fetch.js";
+import { oidcPrincipal, OidcConfiguration } from "./oidc_identity.js";
+import { collectSystemTopology } from "./system_topology.js";
+import { githubConfigured } from "./github_identity.js";
+import { githubProfileForSubject } from "./github_profile.js";
+import { applicationSession, githubAuthRequest, GithubConfiguration } from "./github_identity.js";
 
-export interface UnifiedGatewayEnv {
+export interface UnifiedGatewayEnv extends OidcConfiguration, GithubConfiguration {
   ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;
   /** Base URL of the separate scheduler celld worker. Empty or unset fail-closes cross-worker calls. */
   ANSTS_SCHEDULER_URL?: string;
+  ANSTS_SCHEDULER_URLS?: string;
+  ANSTS_GATEWAY_STATE_MODE?: string;
+  ANSTS_AGENT_ENABLED?: string;
+  ANSTS_SYSTEM_TOPOLOGY_JSON?: string;
   ANSTS_SANDBOX_IMAGE?: string;
   ANSTS_SCHEDULER_SERVICE_TOKEN?: string;
   ANSTS_USER_AUTH_SECRET?: string;
@@ -139,6 +149,12 @@ export class AnstsGatewayCell {
 }
 
 function gatewayStub(env: UnifiedGatewayEnv) {
+  if (env.ANSTS_GATEWAY_STATE_MODE === "remote") return {
+    async fetch(request: Request): Promise<Response> {
+      const url = new URL(request.url);
+      return schedulerFetch(env, "/internal" + url.pathname + url.search, { method: request.method, headers: JSON_HEADERS, body: request.method === "GET" ? undefined : await request.arrayBuffer() });
+    },
+  };
   const ns = env.ANSTS_GATEWAY_CELL;
   if (!ns) return null;
   return ns.get(ns.idFromName("gateway-control-plane"));
@@ -178,7 +194,7 @@ async function schedulerFetch(env: UnifiedGatewayEnv, path: string, init?: Reque
   try {
     const headers = new Headers(init?.headers);
     if (env.ANSTS_SCHEDULER_SERVICE_TOKEN) headers.set("authorization", `Gateway ${env.ANSTS_SCHEDULER_SERVICE_TOKEN}`);
-    return await fetch(`${base}${path}`, { ...init, headers });
+    return await controlPlaneFetch(env.ANSTS_SCHEDULER_URLS || base, path, { ...init, headers });
   } catch (err) {
     return schedulerClientError(
       {
@@ -218,10 +234,12 @@ async function listSchedulerTasks(env: UnifiedGatewayEnv): Promise<{ tasks: Reco
 }
 
 function isGatewayPath(method: string, pathname: string): boolean {
-  if (method === "GET" && pathname === "/v1/auth/me") return true;
+  if (method === "GET" && (pathname === "/v1/auth/me" || pathname === "/v1/auth/profile")) return true;
+  if (method === "GET" && pathname === "/v1/console/system") return true;
   if (method === "GET" && pathname === "/v1/console/tasks") return true;
   if (method === "GET" && (pathname === "/health" || pathname === "/healthz" || pathname === "/readyz")) return true;
   if (method === "POST" && pathname === "/v1/tasks") return true;
+  if (method === "POST" && /^\/v1\/tasks\/[^/]+\/(cancel|reconcile)$/.test(pathname)) return true;
   if (method === "GET" && pathname.startsWith("/v1/tasks/") && pathname.length > "/v1/tasks/".length) return true;
   if (method === "POST" && pathname === "/v1beta1/tasks/dispatch") return true;
   if (method === "GET" && (pathname === "/v1beta1/gateway/state" || pathname === "/v1beta1/console/gateway")) return true;
@@ -235,9 +253,16 @@ function isGatewayPath(method: string, pathname: string): boolean {
  */
 export async function handleUnifiedGatewayRequest(request: Request, env: UnifiedGatewayEnv): Promise<Response | null> {
   const url = new URL(request.url);
+  const github = await githubAuthRequest(request, env);
+  if (github) return github;
+  const session = applicationSession(request, env);
+  if (session && !request.headers.get("authorization")) {
+    if (request.method !== "GET" && request.headers.get("origin") !== env.ANSTS_PUBLIC_ORIGIN) return json({ error: "CSRF_REJECTED" }, 403);
+    const headers = new Headers(request.headers); headers.set("authorization", `Bearer ${session}`); request = new Request(request, { headers });
+  }
   if (!isGatewayPath(request.method, url.pathname)) return null;
   const publicHealth = request.method === "GET" && ["/health", "/healthz", "/readyz"].includes(url.pathname);
-  const principal = publicHealth ? null : gatewayPrincipal(request, env.ANSTS_USER_AUTH_SECRET, env.ANSTS_USER_AUTH_PREVIOUS_SECRET, Number(env.ANSTS_USER_AUTH_PREVIOUS_UNTIL));
+  const principal = publicHealth ? null : env.ANSTS_OIDC_ISSUER ? await oidcPrincipal(request, env) : gatewayPrincipal(request, env.ANSTS_USER_AUTH_SECRET, env.ANSTS_USER_AUTH_PREVIOUS_SECRET, Number(env.ANSTS_USER_AUTH_PREVIOUS_UNTIL));
   if (!publicHealth) {
     if (!principal) return json({ error: "USER_AUTH_REQUIRED" }, 401);
     const denied = gatewayAuthorizationError(request, principal);
@@ -248,6 +273,7 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
         const raw = await request.clone().text();
         if (raw.length > 65536) return json({ error: "PAYLOAD_TOO_LARGE" }, 413);
         body = JSON.parse(raw) as Record<string, unknown>;
+        if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "INVALID_JSON" }, 400);
       }
       catch { return json({ error: "INVALID_JSON" }, 400); }
       const tenantDenied = gatewayAuthorizationError(request, principal, body.tenant_id ?? body.tenantId);
@@ -257,15 +283,32 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
   if (request.method === "GET" && url.pathname === "/v1/auth/me" && principal) {
     return Response.json({ authenticated: true, user: { sub: principal.sub, role: principal.role, scopeTenant: principal.scopeTenant, scopeRegion: principal.scopeRegion, canWrite: !principal.readOnly }, expiresAt: principal.exp * 1000 }, { headers: { "cache-control": "no-store" } });
   }
+  if (request.method === "GET" && url.pathname === "/v1/auth/profile" && principal) {
+    try { return Response.json({ profile: await githubProfileForSubject(principal.sub, principal.profile) }, { headers: { "cache-control": "no-store" } }); }
+    catch { return Response.json({ error: "GITHUB_PROFILE_UNAVAILABLE" }, { status: 503, headers: { "cache-control": "no-store" } }); }
+  }
+  if (request.method === "GET" && url.pathname === "/v1/console/system" && principal) {
+    if (principal.role !== "SRE_ADMIN") return Response.json({ error: "SYSTEM_ADMIN_REQUIRED" }, { status: 403, headers: { "cache-control": "no-store" } });
+    try { return Response.json(await collectSystemTopology(env, githubConfigured(env)), { headers: { "cache-control": "no-store" } }); }
+    catch { return Response.json({ error: "SYSTEM_TOPOLOGY_UNAVAILABLE" }, { status: 503, headers: { "cache-control": "no-store" } }); }
+  }
   if (request.method === "GET" && url.pathname === "/v1/console/tasks" && principal) {
     const tenant = url.searchParams.get("tenantId");
     if (tenant && !tenantAllowed(principal, tenant)) return json({ error: "TENANT_FORBIDDEN" }, 403);
     const listed = await listSchedulerTasks(env);
     if (listed.failure) return listed.failure;
     const tasks = listed.tasks.filter(task => tenantAllowed(principal, task.tenant_id) && (!tenant || task.tenant_id === tenant)).sort((a, b) => Number(b.created_at ?? 0) - Number(a.created_at ?? 0));
-    return Response.json({ total: tasks.length, tasks: tasks.slice(0, 50).map(task => ({ task_id: publicTaskId(String(task.task_id))?.taskId ?? task.task_id, tenant_id: task.tenant_id, state: task.state, assigned_node_id: task.assigned_node_id ?? null, created_at: task.created_at ?? null })), refreshedAt: Date.now() }, { headers: { "cache-control": "no-store" } });
+    const category = (task: Record<string, unknown>) => task.execution_outcome === "CANCELLED" ? "cancelled" : task.state === "SUSPENDED_RECONCILIATION" ? "uncertain" : ["COMPLETED", "SUCCEEDED"].includes(String(task.state)) ? "completed" : ["FAILED", "DEAD_LETTER"].includes(String(task.state)) ? "failed" : ["SUBMITTED", "PENDING", "QUEUED", "CREATED"].includes(String(task.state)) ? "queued" : "active";
+    const counts: Record<string, number> = { total: tasks.length, active: 0, queued: 0, completed: 0, failed: 0, cancelled: 0, uncertain: 0 };
+    for (const task of tasks) counts[category(task)]++;
+    const query = (url.searchParams.get("q") ?? "").toLowerCase().slice(0, 128);
+    const status = url.searchParams.get("status") ?? "all";
+    const filtered = tasks.filter(task => (status === "all" || category(task) === status) && `${publicTaskId(String(task.task_id))?.taskId ?? task.task_id} ${task.tenant_id}`.toLowerCase().includes(query));
+    const limit = Math.floor(Math.min(50, Math.max(1, Number(url.searchParams.get("limit")) || 50)));
+    const page = Math.max(1, Math.min(1000000, Math.floor(Number(url.searchParams.get("page")) || 1)));
+    return Response.json({ total: filtered.length, counts, page, limit, attention: tasks.filter(task => category(task) === "uncertain").slice(0, 3).map(task => ({ task_id: publicTaskId(String(task.task_id))?.taskId ?? task.task_id, tenant_id: task.tenant_id, state: task.state, category: "uncertain", execution_kind: (task.execution as { kind?: string } | undefined)?.kind ?? "trace", assigned_node_id: task.assigned_node_id ?? null, created_at: task.created_at ?? null })), capabilities: { sandboxImage: env.ANSTS_SANDBOX_IMAGE ?? null, agentEnabled: env.ANSTS_AGENT_ENABLED === "true" }, tasks: filtered.slice((page - 1) * limit, page * limit).map(task => ({ task_id: publicTaskId(String(task.task_id))?.taskId ?? task.task_id, tenant_id: task.tenant_id, state: task.state, category: category(task), execution_outcome: task.execution_outcome ?? null, execution_kind: (task.execution as { kind?: string } | undefined)?.kind ?? "trace", assigned_node_id: task.assigned_node_id ?? null, created_at: task.created_at ?? null })), refreshedAt: Date.now() }, { headers: { "cache-control": "no-store" } });
   }
-  if (!env.ANSTS_GATEWAY_CELL) {
+  if (!env.ANSTS_GATEWAY_CELL && env.ANSTS_GATEWAY_STATE_MODE !== "remote") {
     return json({ error: "GATEWAY_CELL_UNBOUND", controlPlane: "celld-gateway" }, 503);
   }
   if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz" || url.pathname === "/readyz")) {
@@ -280,7 +323,7 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
     return json(
       {
         status: "ok",
-        healthy: true,
+        healthy: !!gateway && !peerIsLocal && peer.ok && peerPlane === "celld-scheduler",
         runtime: "denoland/celld-cloudflare-workers",
         region: env.CELLD_REGION ?? "local",
         controlPlane: "celld-gateway",
@@ -299,7 +342,7 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
           reachable: !peerIsLocal && peer.ok && peerPlane === "celld-scheduler",
         },
       },
-      200
+      url.pathname === "/readyz" && (!gateway || peerIsLocal || !peer.ok || peerPlane !== "celld-scheduler") ? 503 : 200
     );
   }
   if (request.method === "GET" && url.pathname === "/v1beta1/gateway/state") {
@@ -333,8 +376,10 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
       200
     );
   }
-  if (request.method === "GET" && url.pathname.startsWith("/v1/tasks/")) {
-    const taskId = decodeURIComponent(url.pathname.slice("/v1/tasks/".length));
+  if ((request.method === "GET" || request.method === "POST") && url.pathname.startsWith("/v1/tasks/")) {
+    const cancelling = request.method === "POST" && url.pathname.endsWith("/cancel");
+    const reconciling = request.method === "POST" && url.pathname.endsWith("/reconcile");
+    const taskId = decodeURIComponent(url.pathname.slice("/v1/tasks/".length, cancelling ? -7 : reconciling ? -10 : undefined));
     const listed = await listSchedulerTasks(env);
     if (listed.failure) return listed.failure;
     const tenantId = url.searchParams.get("tenantId");
@@ -346,6 +391,17 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
     if (candidates.length > 1) return json({ error: "TENANT_REQUIRED" }, 400);
     const found = candidates[0];
     if (!found) return json({ error: "TASK_NOT_FOUND", task_id: taskId }, 404);
+    if (reconciling) {
+      if (principal!.role !== "SRE_ADMIN") return json({ error: "ADMIN_REQUIRED" }, 403);
+      const body = await request.json() as Record<string, unknown>;
+      if (body.action === "resume_from_checkpoint" && (found.execution as { kind?: string } | undefined)?.kind !== "agent") return json({ error: "AGENT_CHECKPOINT_REQUIRED" }, 400);
+      return schedulerFetch(env, `/v1/body/reconcile?taskId=${encodeURIComponent(String(found.task_id))}`, { method: "POST", headers: { ...JSON_HEADERS, "x-ansts-operator-sub": principal!.sub }, body: JSON.stringify({ ...body, actor: principal!.sub, task_id: found.task_id, tenant_id: found.tenant_id }) });
+    }
+    if (cancelling) {
+      const body = await request.json() as Record<string, unknown>;
+      if ((body.tenant_id ?? body.tenantId) !== found.tenant_id || typeof body.reason !== "string" || !body.reason.trim() || body.reason.length > 1024) return json({ error: "INVALID_CANCEL_REQUEST" }, 400);
+      return schedulerFetch(env, "/v1/scheduler/cancel", { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ task_id: found.task_id, tenant_id: found.tenant_id, actor: principal!.sub, reason: body.reason }) });
+    }
     if (url.searchParams.get("includeResult") === "1") {
       return schedulerFetch(env, `/v1/body/result?taskId=${encodeURIComponent(String(found.task_id))}&tenantId=${encodeURIComponent(String(found.tenant_id))}`);
     }
@@ -396,6 +452,7 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
   const gateway = gatewayStub(env);
   if (!gateway) return json({ error: "GATEWAY_CELL_UNBOUND" }, 503);
   if (spec.execution && spec.execution.image !== env.ANSTS_SANDBOX_IMAGE) return json({ error: "SANDBOX_IMAGE_NOT_ENABLED" }, 503);
+  if (spec.execution?.kind === "agent" && env.ANSTS_AGENT_ENABLED !== "true") return json({ error: "AGENT_EXECUTION_NOT_ENABLED" }, 503);
   const submitResp = await schedulerFetch(env, "/v1/scheduler/submit", {
     method: "POST",
     headers: JSON_HEADERS,

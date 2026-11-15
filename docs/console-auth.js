@@ -2,6 +2,7 @@
 (() => {
   'use strict';
   let bearer = '';
+  let cookieSession = false;
   let user = null;
   let expiresAt = 0;
   let generation = 0;
@@ -11,7 +12,7 @@
   let dialog, error, input, submit, close, identity;
   const notify = () => listeners.forEach(listener => listener());
   function lock(message = '请使用有效的短期凭据登录。') {
-    bearer = ''; user = null; expiresAt = 0; generation++;
+    bearer = ''; cookieSession = false; user = null; expiresAt = 0; generation++;
     clearTimeout(expiryTimer); requests.abort(); requests = new AbortController();
     document.documentElement.dataset.authState = 'locked';
     if (input) input.value = '';
@@ -20,8 +21,8 @@
     open();
   }
   function authenticated() {
-    if (bearer && Date.now() >= expiresAt) lock('凭据已过期，请重新登录。');
-    return !!bearer;
+    if ((bearer || cookieSession) && Date.now() >= expiresAt) lock('凭据已过期，请重新登录。');
+    return !!bearer || cookieSession;
   }
   function open() {
     if (!dialog) return;
@@ -32,7 +33,7 @@
   window.AnstsConsoleAuth = {
     open, logout: lock,
     isAuthenticated: authenticated,
-    authorization: () => authenticated() ? `Bearer ${bearer}` : '',
+    authorization: () => authenticated() && bearer ? `Bearer ${bearer}` : '',
     profile: () => authenticated() ? { ...user } : null,
     signal: () => requests.signal,
     onChange: listener => listeners.add(listener),
@@ -51,9 +52,29 @@
     dialog.addEventListener('cancel', event => { if (!authenticated()) event.preventDefault(); });
     const bar = document.createElement('div'); bar.className = 'auth-session-bar';
     bar.innerHTML = '<span id="console-auth-identity"></span><button type="button">退出登录</button>';
-    bar.querySelector('button').onclick = () => lock('已退出登录，当前页面凭据和已载入数据已清除。');
+    bar.querySelector('button').onclick = async () => {
+      if (cookieSession) {
+        try { const response = await fetch('/v1/auth/logout', { method: 'POST', redirect: 'error' }); if (!response.ok) throw new Error(); }
+        catch { error.textContent = '退出失败，请恢复连接后重试。'; open(); return; }
+      }
+      lock('已退出登录，当前页面凭据和已载入数据已清除。');
+    };
     document.querySelector('.shell')?.prepend(bar);
     identity = bar.querySelector('span');
+    const bootstrapVersion = generation;
+    fetch('/v1/auth/providers', { cache: 'no-store', redirect: 'error' }).then(response => response.json()).then(async providers => {
+      if (!providers.github) return;
+      const link = document.createElement('a'); link.href = '/v1/auth/github'; link.textContent = '使用 GitHub 登录'; dialog.querySelector('footer').prepend(link);
+      const response = await fetch('/v1/auth/me', { cache: 'no-store', redirect: 'error' });
+      if (!response.ok || generation !== bootstrapVersion) return;
+      const result = await response.json();
+      if (generation !== bootstrapVersion || !result.authenticated || !result.user || !Number.isFinite(result.expiresAt) || result.expiresAt <= Date.now()) return;
+      cookieSession = true; user = result.user; expiresAt = result.expiresAt; generation++;
+      identity.textContent = `${user.sub} · ${user.role} · 租户 ${user.scopeTenant}`;
+      document.documentElement.dataset.authState = 'authenticated';
+      expiryTimer = setTimeout(() => lock('会话已过期，请重新登录。'), Math.min(2147483647, expiresAt - Date.now()));
+      dialog.close(); notify();
+    }).catch(() => {});
     for (const id of ['identity', 'reset-demo']) {
       const element = document.getElementById(id); if (element) { element.disabled = true; element.hidden = true; }
     }

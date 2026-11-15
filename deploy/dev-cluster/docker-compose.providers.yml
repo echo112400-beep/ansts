@@ -1,0 +1,26 @@
+# Optional provider credentials. No external project's env file enters these containers.
+services:
+  body-daemon-01:
+    volumes:
+      - ../../.dev-secrets/deepseek.key:/run/secrets/deepseek.key:ro
+    environment:
+      ANSTS_DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek.key
+      ANSTS_DEEPSEEK_MODEL: deepseek-flash
+  body-daemon-02:
+    volumes:
+      - ../../.dev-secrets/deepseek.key:/run/secrets/deepseek.key:ro
+    environment:
+      ANSTS_DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek.key
+      ANSTS_DEEPSEEK_MODEL: deepseek-flash
+  ansts-gateway-01:
+    env_file:
+      - ../../.dev-secrets/providers.env
+    volumes:
+      - ../../.dev-secrets/github-client-secret:/run/secrets/github-client-secret:ro
+      - ../../.dev-secrets/github-identities.json:/run/secrets/github-identities.json:ro
+  ansts-gateway-02:
+    env_file:
+      - ../../.dev-secrets/providers.env
+    volumes:
+      - ../../.dev-secrets/github-client-secret:/run/secrets/github-client-secret:ro
+      - ../../.dev-secrets/github-identities.json:/run/secrets/github-identities.json:ro

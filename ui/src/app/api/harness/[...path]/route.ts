@@ -1,0 +1,191 @@
+// BFF proxy to the Harness Gateway (ACA), same-origin /api/harness/* -> gateway.
+//
+// The gateway's OpenAI Responses-compatible /v1 surface authenticates either by a public
+// per-org Bearer API key OR by an internal trust header (the web app, already behind the engine
+// JWT). The browser is the latter: this BFF injects X-Harness-Internal (HARNESS_INTERNAL_KEY,
+// server-only) and forwards the caller's org/member (X-Harness-Org / X-Harness-Member) so the
+// gateway resolves the principal without the browser ever holding the internal key.
+//
+// SSE responses (text/event-stream from /v1/responses?stream) stream through unbuffered so the
+// Workbench gets live reasoning/tool/text deltas instead of one blob at turn end.
+//   HARNESS_GATEWAY_URL   e.g. http://127.0.0.1:8080 (self-hosted) or your gateway's URL
+//   HARNESS_INTERNAL_KEY  internal trust key (matches the gateway's secret)
+//
+// SELF-HOSTED: there is no login, so there is no JWT to gate the key on. The BFF is instead the
+// only thing that can reach the gateway (it is bound to the container's loopback, and only this
+// UI's port is published), so it presents the key on its own and PINS org/member from server
+// constants — a request from the browser cannot claim an identity this box doesn't have.
+import type { NextRequest } from 'next/server';
+import { Agent } from 'undici';
+import { LOCAL_MEMBER, LOCAL_ORG, SELF_HOSTED } from '@/lib/edition';
+import { AUTH_DISABLED, SESSION_COOKIE, sessionValid } from '@/lib/selfhost-auth';
+import { relayContentSecurityPolicy } from '@/lib/public-artifact-response';
+import { gatewayFirstSegment, oddSegment } from '@/lib/relay-path';
+
+export const dynamic = 'force-dynamic';
+export const maxDuration = 3700; // a synchronous turn may run for the gateway's full hour; this hop must outlast it
+
+const GATEWAY =
+  process.env.HARNESS_GATEWAY_URL ||
+  'https://api.harnessrouter.ai';
+const INTERNAL_KEY = process.env.HARNESS_INTERNAL_KEY || '';
+// maxDuration above is not what bounds the upstream call: Node's fetch gives the gateway 300 s to
+// answer with response HEADERS and 300 s between body chunks (undici's headersTimeout and
+// bodyTimeout defaults), then fails the request as "fetch failed". A synchronous
+// POST /v1/responses sends nothing until the turn ends, so a turn longer than five minutes came
+// back 502 "harness-gateway unreachable" while the runner finished it (measured: 301.0 s and
+// 300.3 s on turns the session store shows completing at 340 s and 354 s), and a streamed turn
+// silent for five minutes inside one tool call would end the same way. The gateway's own hop to
+// the runner reads for an hour on purpose; this hop allows the same hour plus a margin. The 800 s
+// it allowed before cut every synchronous turn longer than 13.4 minutes with the same 502 while
+// the runner kept working and the caller held no id to poll (a customer benchmark, 2026-09-30).
+// A caller who would rather not hold a connection that long sends `background: true` and polls.
+const upstream = new Agent({ headersTimeout: maxDuration * 1000, bodyTimeout: maxDuration * 1000 });
+
+async function proxy(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
+  const { path } = await ctx.params;
+  const segs = path || [];
+  // The gateway's /internal/* routes are for services that hold the internal key themselves. A
+  // browser has no business on them through a multi-tenant console, where this proxy attaches the
+  // key beside any bearer: they are not forwarded there at all. (A self-hosted box is its owner's:
+  // the signed-in operator may call them, and the gateway refuses any that arrives with a bearer.)
+  // A segment the gateway's URL could read as another path is refused first, in both editions
+  // (lib/relay-path, the hosted proxy's rule): '..%2finternal%2fx' or '%2e%2e' took a call past the
+  // first-segment check to another route. The check then reads the first segment as the gateway will.
+  if (!segs.length || segs.some(oddSegment) || (!SELF_HOSTED && gatewayFirstSegment(segs) === 'internal')) {
+    return new Response(JSON.stringify({ detail: 'not found' }), { status: 404, headers: {
+      'content-type': 'application/json', 'x-content-type-options': 'nosniff',
+      'content-security-policy': relayContentSecurityPolicy(null, 'application/json') } });
+  }
+  const target = `${GATEWAY.replace(/\/$/, '')}/${segs.join('/')}${req.nextUrl.search}`;
+  const headers: Record<string, string> = {};
+  const ct = req.headers.get('content-type');
+  if (ct) headers['content-type'] = ct;
+  const auth = req.headers.get('authorization');
+  if (auth) headers['authorization'] = auth;
+  // A kit app (served at /kits/<id> on this origin) sends no workspace of its own: the active workspace
+  // comes from the cookie the console keeps beside its session (lib/workspace.tsx writeWorkspaceCookie),
+  // as the console's own calls carry it in a header. Without it a kit app listed every workspace's
+  // harnesses and ran the first of its kit, another workspace's (Super Mario ran one whose package the
+  // kit page had not checked). A request that names its workspace keeps it.
+  if (!req.headers.get('x-harness-workspace')) {
+    const [wsId, wsDefault] = (req.cookies.get('hr_workspace')?.value || '').split('|');
+    if (wsId && /^[A-Za-z0-9._-]{1,128}$/.test(wsId)) {
+      headers['x-harness-workspace'] = wsId;
+      if (wsDefault === '1') headers['x-harness-workspace-default'] = '1';
+    }
+  }
+  // Internal trust path (LIVE-B closed): the key is attached ONLY alongside the caller's login
+  // JWT, which the console now sends on EVERY /api/harness call via the harnessFetch wrapper. The
+  // gateway (HR_IDENTITY_MODE=enforce) VERIFIES that JWT and derives org/member from its signed
+  // claims, the forwarded org/member headers are no longer trusted for identity. A request with
+  // no bearer (no session) gets no key -> the gateway 401s it, so it can't ride the BFF onto the
+  // internal path with self-asserted identity.
+  //
+  // SELF-HOSTED: trust is the SESSION, not the transport. This used to stamp the internal key on
+  // every request because "there is no login" — written before the login gate existed. Once the
+  // gate let bearer-carrying API calls through to here (so console-minted sk-hr keys work at
+  // all), unconditional stamping would have authenticated ANY bearer as the local org. So: a
+  // caller with a valid session cookie (the signed-in console) gets internal trust and the
+  // pinned local identity; anyone else forwards their Authorization bare, and the gateway's
+  // _apikey_resolve is the judge — an invalid key gets the gateway's own 401.
+  const selfhostTrusted = SELF_HOSTED
+    && (AUTH_DISABLED || await sessionValid(req.cookies.get(SESSION_COOKIE)?.value));
+  if (INTERNAL_KEY && (SELF_HOSTED ? selfhostTrusted : auth)) {
+    headers['x-harness-internal'] = INTERNAL_KEY;
+  }
+  if (selfhostTrusted) {
+    headers['x-harness-org'] = LOCAL_ORG;
+    headers['x-harness-member'] = LOCAL_MEMBER;
+  } else if (!SELF_HOSTED) {
+    const org = req.headers.get('x-harness-org');
+    if (org) headers['x-harness-org'] = org;
+    const member = req.headers.get('x-harness-member');
+    if (member) headers['x-harness-member'] = member;
+  }
+
+  // Additional Headers (app-level auth pass-through): the Playground sends the harness's declared
+  // custom headers as real request headers. Forward anything not hop-by-hop / browser-infra so the
+  // gateway can capture declared names and render $headers.{name} refs into MCP configs. Names the
+  // gateway hasn't declared on the harness are simply ignored there.
+  const HOP: Set<string> = new Set(['host', 'connection', 'content-length', 'accept-encoding',
+    'accept', 'accept-language', 'cookie', 'user-agent', 'referer', 'origin', 'dnt', 'priority',
+    'upgrade-insecure-requests', 'cache-control', 'pragma', 'te', 'trailer', 'transfer-encoding',
+    'keep-alive', 'proxy-authorization', 'proxy-authenticate', 'upgrade']);
+  req.headers.forEach((v, k) => {
+    const lk = k.toLowerCase();
+    if (HOP.has(lk) || lk.startsWith('sec-') || lk.startsWith('x-forwarded') ||
+        lk.startsWith('x-vercel') || lk.startsWith('x-real-ip') || lk in headers || headers[lk]) return;
+    if (lk === 'x-harness-internal') return;   // never let a browser spoof the trust key
+    headers[lk] = v;
+  });
+
+  const init: RequestInit & { dispatcher: Agent; duplex?: 'half' } =
+    { method: req.method, headers, cache: 'no-store', dispatcher: upstream };
+  // STREAM the request body straight through (byte-exact, no buffering) so large uploads (up to GBs)
+  // never get fully materialized in the BFF's memory. duplex:'half' is required by undici/fetch when
+  // body is a ReadableStream. Falls back to arrayBuffer if the runtime didn't expose a body stream.
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    if (req.body) { init.body = req.body; init.duplex = 'half'; }
+    else init.body = await req.arrayBuffer();
+  }
+
+  const started = Date.now();
+  try {
+    const res = await fetch(target, init);
+    const ctType = res.headers.get('content-type') || 'application/json';
+    // What comes back is the gateway's, not the console's own page, and this route takes the session
+    // cookie: an agent's HTML or SVG file opened here must never run with the console's origin.
+    const csp = relayContentSecurityPolicy(res.headers.get('content-security-policy'), ctType);
+    // Stream SSE through without buffering (live deltas).
+    if (ctType.includes('text/event-stream') && res.body) {
+      const sse: Record<string, string> = {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache, no-transform',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+        'x-content-type-options': 'nosniff',
+        'content-security-policy': csp,
+      };
+      const uhpV = res.headers.get('uhp-version');
+      if (uhpV) sse['uhp-version'] = uhpV;
+      return new Response(res.body, { status: res.status, headers: sse });
+    }
+    // STREAM the response body straight through (HR-INF-015): traces, workspace artifacts, ZIP
+    // archives, and file downloads can be GBs, buffering them in the BFF's memory (the old
+    // arrayBuffer()) was a per-request materialization. Pass res.body through byte-exact so peak
+    // BFF memory stays O(chunk) regardless of payload size. content-length/disposition are
+    // preserved when present so downloads still name + size correctly.
+    const out: Record<string, string> = { 'content-type': ctType, 'x-content-type-options': 'nosniff',
+      'content-security-policy': csp };
+    // content-range is NOT optional on a 206: a partial response without it is malformed, and a
+    // browser given one stops playing rather than seeking. Generated video is served from this
+    // proxy, so dropping these turned a correct ranged route into a file that Safari refuses to
+    // play at all and that no timeline can scrub. accept-ranges is what advertises the capability
+    // in the first place; etag/cache-control let an immutable clip be fetched once instead of on
+    // every scrub.
+    // uhp-version is part of the protocol's contract ("on every response", UHP V-01): the
+    // gateway stamps it and this allow-list was silently eating it.
+    for (const h of ['content-disposition', 'content-length', 'content-range', 'accept-ranges',
+      'etag', 'cache-control', 'last-modified', 'vary', 'uhp-version']) {
+      const v = res.headers.get(h);
+      if (v) out[h] = v;
+    }
+    return new Response(res.body, { status: res.status, headers: out });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Said in the log, with the time it took: a connection that drops after thirteen minutes
+    // looks exactly like one that never opened, and nothing recorded the difference.
+    console.error(`harness proxy: ${req.method} /${(path || []).join('/')} failed after `
+      + `${((Date.now() - started) / 1000).toFixed(1)} s: ${msg}`);
+    return new Response(JSON.stringify({ detail: `harness-gateway unreachable: ${msg}` }), {
+      status: 502, headers: { 'content-type': 'application/json', 'x-content-type-options': 'nosniff',
+        'content-security-policy': relayContentSecurityPolicy(null, 'application/json') },
+    });
+  }
+}
+export const GET = proxy;
+export const POST = proxy;
+export const PUT = proxy;
+export const PATCH = proxy;
+export const DELETE = proxy;

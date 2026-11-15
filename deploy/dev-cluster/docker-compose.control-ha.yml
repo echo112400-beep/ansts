@@ -1,0 +1,15 @@
+# Apply only after drain and verified Body snapshot migration. Keep this override on subsequent updates.
+services:
+  celld-deploy:
+    environment:
+      ANSTS_BODY_WORKER_URL: ""
+      ANSTS_BODY_NAMESPACE_PREFIX: "body-ha-v1:"
+  body-celld:
+    environment:
+      ANSTS_BODY_PROXY_URLS: "http://celld-brain-01:8081,http://celld-brain-02:8081,http://celld-brain-03:8081"
+  body-daemon-01:
+    environment:
+      ANSTS_BODY_CELL_URLS: "http://celld-brain-01:8081,http://celld-brain-02:8081,http://celld-brain-03:8081"
+  body-daemon-02:
+    environment:
+      ANSTS_BODY_CELL_URLS: "http://celld-brain-01:8081,http://celld-brain-02:8081,http://celld-brain-03:8081"

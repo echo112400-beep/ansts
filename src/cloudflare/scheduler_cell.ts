@@ -137,6 +137,9 @@ export class AnstsSchedulerCell {
         spec.created_at = Number(parsed.created_at);
       }
       spec.state = (r.state as TaskState) ?? TaskState.QUEUED;
+      spec.cancel_requested = parsed.cancel_requested as TaskSpec["cancel_requested"];
+      spec.execution_outcome = parsed.execution_outcome as TaskSpec["execution_outcome"];
+      spec.resume_node_id = typeof parsed.resume_node_id === "string" ? parsed.resume_node_id : undefined;
       spec.lease_fencing_token = Number(r.fencing_token ?? 0);
       spec.retry_count = Number(parsed.retry_count ?? 0);
       spec.preempted_count = Number(parsed.preempted_count ?? 0);
@@ -220,6 +223,9 @@ export class AnstsSchedulerCell {
       JSON.stringify({
         execution_lease: this.scheduler.leaseCoordinator.getLease(task.task_id),
         execution: task.execution,
+        cancel_requested: task.cancel_requested,
+        execution_outcome: task.execution_outcome,
+        resume_node_id: task.resume_node_id,
         prompt: task.prompt,
         max_turns: task.max_turns,
         current_turn: task.current_turn,
@@ -403,17 +409,26 @@ export class AnstsSchedulerCell {
       }
       const renewed = this.scheduler.leaseCoordinator.renewLease(taskId, nodeId, fencingToken);
       if (renewed) this.persistTask(task);
-      return new Response(JSON.stringify({ renewed, task_id: taskId, state: task.state }), {
+      return new Response(JSON.stringify({ renewed, task_id: taskId, state: task.state, lease_expires_at: this.scheduler.leaseCoordinator.getLease(taskId)?.expires_at, cancel_requested: task.cancel_requested, resume_node_id: task.resume_node_id }), {
         status: renewed ? 200 : 409,
         headers: { "content-type": "application/json" },
       });
     }
 
+    if (request.method === "POST" && normalizedPath === "/cancel") {
+      const body = await request.json() as Record<string, unknown>;
+      const task = this.scheduler.allTasks.get(String(body.task_id));
+      if (!task || task.tenant_id !== body.tenant_id) return Response.json({ error: "TASK_NOT_FOUND" }, { status: 404 });
+      if (typeof body.actor !== "string" || !body.actor.trim() || body.actor.length > 256 || typeof body.reason !== "string" || body.reason.length > 1024) return Response.json({ error: "INVALID_CANCEL_REQUEST" }, { status: 400 });
+      const cancelled = this.scheduler.requestCancellation(task.task_id, task.tenant_id, body.actor, body.reason);
+      if (cancelled) for (const changed of this.scheduler.allTasks.values()) this.persistTask(changed);
+      return Response.json({ cancelled, state: task.state, cancel_requested: task.cancel_requested, execution_outcome: task.execution_outcome }, { status: cancelled ? 200 : 409 });
+    }
     if (request.method === "POST" && normalizedPath === "/resolve-uncertain") {
       const body = await request.json() as Record<string, unknown>;
       const resolved = this.scheduler.resolveReconciliation(String(body.task_id), String(body.tenant_id), Number(body.fencing_token), body.retry === true);
       const task = this.scheduler.allTasks.get(String(body.task_id));
-      if (resolved && task) this.persistTask(task);
+      if (resolved && task) { if (typeof body.resume_node_id === "string") task.resume_node_id = body.resume_node_id; this.persistTask(task); }
       return Response.json({ resolved }, { status: resolved ? 200 : 409 });
     }
     if (request.method === "POST" && normalizedPath === "/suspend-uncertain") {
@@ -427,6 +442,10 @@ export class AnstsSchedulerCell {
     if (request.method === "POST" && normalizedPath === "/complete") {
       const body = (await request.json()) as Record<string, unknown>;
       const taskId = String(body.task_id ?? "");
+      const existing = this.scheduler.allTasks.get(taskId);
+      const outcome = body.execution_outcome;
+      if (outcome !== undefined && !["SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"].includes(String(outcome))) return Response.json({ error: "INVALID_EXECUTION_OUTCOME" }, { status: 400 });
+      if (existing && existing.assigned_node_id === body.node_id && existing.lease_fencing_token === Number(body.fencing_token) && [TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED].includes(existing.state) && existing.execution_outcome === outcome) return Response.json({ completed: true, task_id: taskId });
       const completed = this.scheduler.completeTaskExecution(
         taskId,
         String(body.node_id ?? ""),
@@ -436,7 +455,16 @@ export class AnstsSchedulerCell {
       );
       if (completed) {
         const task = this.scheduler.allTasks.get(taskId);
-        if (task) this.persistTask(task);
+        if (task) {
+          task.execution_outcome = outcome as TaskSpec["execution_outcome"];
+          if (outcome === "FAILED" || outcome === "TIMED_OUT" || outcome === "CANCELLED") {
+            task.state = outcome === "CANCELLED" ? TaskState.CANCELLED : TaskState.FAILED;
+            this.scheduler.completedIds.delete(taskId);
+            task.dead_letter_reason = String(outcome);
+            this.scheduler.cascadeDeadLetterToDependents(taskId);
+          }
+          for (const changed of this.scheduler.allTasks.values()) this.persistTask(changed);
+        }
         this.ctx.storage.sql.exec("DELETE FROM ansts_claims WHERE task_id = ?", taskId);
       }
       return new Response(JSON.stringify({ completed, task_id: taskId }), {

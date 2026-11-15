@@ -55,3 +55,5 @@ Gateway 与 Daemon 必须显式设置相同 ANSTS_SANDBOX_IMAGE 才接受该镜�
 M1.2 第三批：增加按 Daemon owner 标签的启动前孤儿容器回收、Gateway 已授权任务 includeResult 查询、显式 sandbox Compose override。开发部署已启用，真实 Gateway→Scheduler→Body→Engine 任务达到 COMPLETED，退出码和日志可读，匿名及跨租户查询被拒绝。真实残留 fixture 回收通过且无剩余测试沙箱。维护命令与限制见 container-execution-development.md。未完成清理失败后的持久资源占用、产物导出及实时日志，不宣称 M1.2 全部交付。
 
 M1.2/M1.3 安全恢复补充：容器执行前增加 fsync cleanup-ledger；清理不确认时保留槽位和持久记录，阻止新执行，readiness 返回 503，代理停止调度领取。启动前 Engine 回收成功才清除阻塞；未配置 Engine 且存在记录时拒绝启动。新增失败注入与跨重建验证，31 项相关回归通过，两个开发 Daemon 已更新。取消/drain、产物导出及响应丢失矩阵仍待完成。
+
+2026-11-14 后续交付：持久 drain、具名取消、明确执行结果、CPU/内存资源账本、有界产物与运行日志、十分钟断网执行、三轮故障矩阵、共享 Gateway/Body fleet 状态、隔离快照恢复、GitHub OAuth、服务密钥轮换支持及真实 DeepSeek 工具循环已实现。实测 DeepSeek 修改与原测试通过；共享状态迁移、首入口故障后的真实任务、Daemon SIGKILL 后保守阻塞及孤儿回收均已验证。当前状态、完整命令、基线失败和生产验证边界见 remaining-work-delivery.md；不要再根据前文历史“待实现”判断本轮交付。

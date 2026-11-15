@@ -48,7 +48,7 @@ try {
   for (const block of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) window.eval(block[1]);
   const document = window.document;
   assert.equal(document.documentElement.dataset.authState, 'locked');
-  assert.equal(calls.length, 0);
+  assert.equal(calls.filter(call => !String(call).includes('/v1/auth/providers')).length, 0);
   const submitLogin = value => {
     document.querySelector('#console-login-token').value = value;
     document.querySelector('#console-login form').dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));

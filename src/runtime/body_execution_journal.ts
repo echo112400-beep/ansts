@@ -2,9 +2,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
+import { executionDigest } from "../cloudflare/execution_attempt.js";
 
 export class BodyExecutionJournal {
   constructor(private readonly directory: string) { fs.mkdirSync(directory, { recursive: true }); }
+  private sync(): void { const fd = fs.openSync(this.directory, "r"); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
   private file(taskId: string): string {
     return path.join(this.directory, createHash("sha256").update(taskId).digest("hex") + ".json");
   }
@@ -14,7 +16,7 @@ export class BodyExecutionJournal {
       const fd = fs.openSync(file, "wx");
       try { fs.writeFileSync(fd, JSON.stringify({ state: "RUNNING" })); fs.fsyncSync(fd); }
       finally { fs.closeSync(fd); }
-      return { admitted: true };
+      this.sync(); return { admitted: true };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       const saved = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -23,10 +25,16 @@ export class BodyExecutionJournal {
   }
   complete(taskId: string, result: Record<string, unknown>): void {
     const file = this.file(taskId);
+    const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (saved.state === "COMPLETED") {
+      if (executionDigest(saved.result) !== executionDigest(result)) throw new Error("JOURNAL_RESULT_CONFLICT");
+      return;
+    }
     const temporary = file + ".tmp";
     const fd = fs.openSync(temporary, "w");
     try { fs.writeFileSync(fd, JSON.stringify({ state: "COMPLETED", result })); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
     fs.renameSync(temporary, file);
+    this.sync();
   }
 }

@@ -1,0 +1,19 @@
+{
+  "tasks": 8,
+  "elapsedSeconds": 12.676289294002345,
+  "throughputTasksPerSecond": 0.6310995129927428,
+  "p95EndToEndSeconds": 11.621784073009621,
+  "tenants": {
+    "capacity-tenant-0": {
+      "completed": 4,
+      "meanLatencySeconds": 7.190499396754603
+    },
+    "capacity-tenant-1": {
+      "completed": 4,
+      "meanLatencySeconds": 6.9326493560147355
+    }
+  },
+  "workload": "2 tenants; 100ms timer; 0.5 configured CPU; 128MiB configured memory; includes polling/queue overhead",
+  "actualCpuMemoryUsage": "not collected",
+  "slo": "not established"
+}

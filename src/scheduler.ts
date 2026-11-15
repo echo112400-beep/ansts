@@ -267,7 +267,7 @@ export class CoreScheduler5D {
       return inspection.canonicalTask;
     }
 
-    task.resource_profile = this.profiler.recommendProfile(task);
+    if (!task.execution) task.resource_profile = this.profiler.recommendProfile(task);
     this.allTasks.set(task.task_id, task);
     if (task.idempotency_key) {
       const scopedKey = CoreScheduler5D.scopeIdempotencyKey(task.tenant_id, task.idempotency_key);
@@ -312,6 +312,7 @@ export class CoreScheduler5D {
     if (!node.healthy || node.psi_memory_some_avg10 > 60.0) {
       return -1.0;
     }
+    if (task.resume_node_id && task.resume_node_id !== node.node_id) return -1.0;
     // [M51-1 / Stale-1 Fix] Reject nodes with stale heartbeat timestamps
     if (nowSec - node.timestamp > heartbeatTtlSeconds) {
       return -1.0;
@@ -494,6 +495,24 @@ export class CoreScheduler5D {
     return true;
   }
 
+  /** Leased attempts retain their reservation until the executor reports confirmed exit. */
+  public requestCancellation(taskId: string, tenantId: string, actor: string, reason: string): boolean {
+    const task = this.allTasks.get(taskId);
+    if (!task || task.tenant_id !== tenantId || !actor.trim() || reason.length > 1024) return false;
+    if (task.cancel_requested) return true;
+    if (![TaskState.SUBMITTED, TaskState.QUEUED, TaskState.LEASED, TaskState.RUNNING_THINK, TaskState.RUNNING_ACT].includes(task.state)) return false;
+    task.cancel_requested = { actor, reason, requested_at: Date.now() };
+    if ([TaskState.SUBMITTED, TaskState.QUEUED].includes(task.state)) {
+      this.queueManager.removeQueuedTask(taskId);
+      task.state = TaskState.CANCELLED;
+      task.execution_outcome = "CANCELLED";
+      task.dead_letter_reason = "USER_CANCELLED";
+      this.releaseContentFingerprintIfOwned(task);
+      this.cascadeDeadLetterToDependents(taskId);
+    }
+    return true;
+  }
+
   public completeTaskExecution(
     taskId: string,
     nodeId: string,
@@ -501,7 +520,7 @@ export class CoreScheduler5D {
     observedPeakCpu = 1.0,
     observedPeakMemoryMb = 1024
   ): boolean {
-    if (!this.leaseCoordinator.validateFencingToken(taskId, fencingToken)) {
+    if (this.allTasks.get(taskId)?.assigned_node_id !== nodeId || !this.leaseCoordinator.validateFencingToken(taskId, fencingToken)) {
       return false;
     }
     const task = this.allTasks.get(taskId);

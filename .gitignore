@@ -2,3 +2,4 @@ node_modules/
 dist/
 .celld/
 .dev-secrets/
+__pycache__/

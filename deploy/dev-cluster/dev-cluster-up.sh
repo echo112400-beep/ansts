@@ -12,14 +12,22 @@ elif [ ! -f "deploy/dev-cluster/docker-compose.dev-cluster.yml" ] && [ -n "${BAS
 fi
 
 COMPOSE_FILE="deploy/dev-cluster/docker-compose.dev-cluster.yml"
+COMPOSE_ARGS=(-f "$COMPOSE_FILE" -f deploy/dev-cluster/docker-compose.sandbox.yml)
+if [[ -f .dev-secrets/providers.env ]]; then COMPOSE_ARGS+=(-f deploy/dev-cluster/docker-compose.providers.yml); fi
+if [[ -f .dev-secrets/body-fleet-migration.verified ]] && [[ "$(cat .dev-secrets/body-fleet-migration.verified)" == "body-ha-v1:" ]]; then
+  COMPOSE_ARGS+=(-f deploy/dev-cluster/docker-compose.control-ha.yml)
+elif [[ -f .dev-secrets/body-fleet-migration.json || -f .dev-secrets/body-fleet-migration.verified ]]; then
+  echo 'Body migration is not verified; refusing to select an older state authority.' >&2
+  exit 1
+fi
 python3 scripts/prepare_body_dev_credentials.py
 export RUSTFS_ACCESS_KEY="${RUSTFS_ACCESS_KEY:-rustfsadmin}"
 export RUSTFS_SECRET_KEY="${RUSTFS_SECRET_KEY:-rustfs_prod_secret_key_2026}"
 
 echo "===> [1/4] Starting ANSTS v2.5 Full Dev Cluster (TanStack Console + 2 Gateways + 3 celld Brains + Body celld + 2 Native Daemons + RustFS + Prometheus + Grafana)..."
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  docker compose -f "${COMPOSE_FILE}" stop body-daemon-01 body-daemon-02
-  docker compose -f "${COMPOSE_FILE}" up -d --build
+  docker compose "${COMPOSE_ARGS[@]}" stop body-daemon-01 body-daemon-02
+  docker compose "${COMPOSE_ARGS[@]}" up -d --build
 else
   echo 'Docker is required for the independent Body celld + native Daemon cluster.' >&2
   exit 1
@@ -35,13 +43,13 @@ for i in $(seq 1 30); do
 done
 
 echo "===> [3/4] Verifying independent Body control and native execution..."
-docker compose -f "$COMPOSE_FILE" run --rm -T --no-deps \
+docker compose "${COMPOSE_ARGS[@]}" run --rm -T --no-deps \
   -e ANSTS_SMOKE_GATEWAY=http://ansts-gateway-01:8080 \
   -e ANSTS_SMOKE_BRAIN=http://body-celld:8080 \
   -e ANSTS_SMOKE_DAEMON=http://body-daemon-01:9501 \
   body-state-migrate node /app/scripts/verify_body_attempt_protocol.mjs
 
 echo "===> [4/4] Verifying the authenticated console..."
-docker compose -f "$COMPOSE_FILE" run --rm -T --no-deps \
+docker compose "${COMPOSE_ARGS[@]}" run --rm -T --no-deps \
   -e ANSTS_SMOKE_CONSOLE=http://tanstack-console \
   body-state-migrate node /app/scripts/verify_console_deployment.mjs

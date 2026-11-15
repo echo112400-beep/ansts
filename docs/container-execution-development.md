@@ -31,6 +31,6 @@ docker run -d --name ansts-recovery-smoke --label ansts.managed=sandbox --label 
 node scripts/verify_sandbox_recovery.mjs
 ```
 
-尚未完成：工作区产物导出、实时日志、具名取消与 drain、Engine create 响应丢失等更完整故障矩阵。
+本轮已加入有界产物导出、约三秒运行日志快照、具名取消、持久 drain、CPU/内存账本和故障矩阵。接口、限制及最新部署命令见 [当前架构](current-architecture.md)。旧的基础 Compose 命令不包含 provider / control-ha override，不应直接用于更新已经迁移的集群。
 
-容器启动前 fsync 写入 cleanup-ledger 记录。无法确认清理时保留记录与槽位，Daemon readiness 为 503，健康响应包含 recoveryRequired；代理以 unhealthy 心跳停止领取新工作。只有 Engine 启动回收成功后才删除阻塞记录。此机制覆盖容器执行，尚不替代完整的 CPU/内存资源账本。
+容器启动前 fsync 写入 cleanup-ledger 和 resource-ledger。无法确认清理时保留槽位及 CPU/内存预留，Daemon readiness 为 503，代理以 unhealthy 心跳停止领取新工作。只有 Engine 启动回收成功后才删除遗留预留。health 的 resources 字段是声明预算和预留，不是实际使用量。

@@ -1,59 +1,56 @@
 # 当前代码架构与开发部署
 
-> 2026-11-14：Body 已拆分为独立 celld 控制模块（18085）与原生执行 Daemon（19501/19502）。Compose 共 14 个服务、两个一次性作业；下文旧的 Brain 内 Body 与通用执行器描述以 [拆分说明](body-celld-daemon-split.md) 为准。
+核对日期：2026-11-14。最新交付和验收见 [剩余任务交付记录](remaining-work-delivery.md)。早期设计中的容量、延迟、RPO/RTO 不作为生产承诺。
 
+## 进程与状态
 
-核对日期：2026-11-14。本文描述已接入的运行路径；早期设计中的容量、延迟、RPO/RTO 和生产安全指标不构成当前验证结论。
+| 组件 | 职责与权威 |
+| --- | --- |
+| 两个 Gateway Worker | 用户鉴权、任务 API；经受鉴权的内部接口使用同一个 fleet Gateway Cell，容器重建不丢失共享状态 |
+| 三节点 celld fleet | Scheduler、Gateway、Body、Harness、Tunnel 的持久对象；Scheduler 对象为 global-shard-0 |
+| Body 控制状态 | 迁移后使用 body-ha-v1: 命名空间；按任务保存准入、凭证消费、结果、运行日志和核对审计 |
+| 原 Body celld 监听器 | 18085 保留兼容代理，停止它不会中断 Daemon 到 fleet 的路径；原持久卷保留作迁移证据 |
+| 两个原生 Daemon | 管理 Engine、执行 journal、结果 outbox、drain、资源及清理账本；默认每宿主单槽 |
+| 沙箱 | 固定摘要 Node 镜像；非 root、禁网、只读根、限额 tmpfs、CPU/内存/PID 硬限制，无宿主目录或服务凭据 |
+| 控制台 | 8088；真实任务列表、提交、短期凭据或配置后的 GitHub 登录 |
 
-## 进程与状态边界
+## 执行与恢复
 
-| 组件 | 当前实现 | 状态与边界 |
-| --- | --- | --- |
-| Gateway | `src/cloudflare/gateway_worker.ts`、`gateway_cell.ts` | 独立 celld Worker，Gateway Cell 保存提交、租约和会话；经 HTTP 调用 Scheduler |
-| Scheduler | `src/cloudflare/worker.ts`、`scheduler_cell.ts` | 三节点 celld fleet 承载 Scheduler、Harness、Tunnel；旧 Body 绑定仅供兼容与迁移导出；默认调度对象为 `global-shard-0` |
-| Body Cell | `src/cloudflare/body_worker.ts`、`body_cell.ts` | 独立 celld Worker 与持久卷； 按 host 保存心跳与回执；按 `execution:<taskId>` 保存共享执行准入与完成结果 |
-| Body 执行代理 | `scripts/body_cell_agent.mjs` | 在原生 Node 进程中向 Scheduler 注册容量、轮询任务、续租、调用本地执行接口并回报完成 |
-| 本地执行器 | `src/runtime/body_daemon_server.ts`、`runtime/body_execution_journal.ts` | LayerFS 工作区执行与宿主机文件操作；执行日志位于 Body 持久卷 |
-| 控制台 | Nginx、`docs/` | 静态页面和 API 代理；页面中存在的功能不代表独立 Gateway Worker 已实现对应后端路由 |
+Gateway 验证结构化 execution 并将其绑定到输入摘要。Scheduler 保存原始容器预算，Daemon 在远程准入前预留槽位和 CPU/内存。容器启动前写入 fsync cleanup-ledger。无法确认清理时保留资源，readiness 返回 503。
 
-当前 Compose 有 14 个 service，其中 `celld-deploy` 与 `body-state-migrate` 为一次性作业。两个 Gateway 使用 `celld dev`，各自持有容器临时目录中的独立状态；它们不组成共享 Gateway 状态集群。Brain 才是使用对象存储发布的三节点 fleet。
+容器以独立 exec 运行 argv。命令退出后在沙箱内冻结遗留子进程，采集有界工作区产物，再强制移除容器。Docker archive 不包含 tmpfs，因此产物通过固定的沙箱内采集器读取。不会把归档解包到宿主。
 
-## 提交、执行与恢复
+结果包含 SUCCEEDED / FAILED / TIMED_OUT / CANCELLED。执行记录的 COMPLETED 表示结果交付完成；命令成败看 executionOutcome 和 exitCode。旧 TaskState 的 CANCELLED 枚举仍映射 DEAD_LETTER，用户应结合 execution_outcome 判断取消。结果不可覆盖，重复完成按同一 owner、fence 和 outcome 确认。
 
-1. Gateway 校验任务，经 `/v1/scheduler/submit` 提交并触发调度 tick，保存 Gateway 提交记录。
-2. Body 代理向同一调度对象注册真实容量并轮询分配给自己的 `LEASED` 任务；Gateway 不再替 Body 驱动执行。
-3. 代理验证租约并向任务共享 Body Cell 申请执行准入。未完成记录仅允许同宿主机、同 fence 重试；其他宿主机或 fence 被阻止。已有完成结果可用于完成新分配，无需再次执行。
-4. Body 执行入口再次向 Scheduler 校验租约，使用本地独占、fsync 日志防止重启后的自动重放。当前执行契约是在 LayerFS 工作区写入任务 trace，并提交快照；不是完整的长周期 Agent 工具循环。
-5. 执行期间代理每 3 秒续租并更新心跳；执行完成后依次保存共享完成结果、host 回执，再完成 Scheduler 租约。
-6. Gateway 查询租约时结合 Scheduler 的终态计算 `RELEASED`；这是读取视图的协调，不会改写原始 Gateway 租约行。
+运行日志每约三秒保存有界快照；授权用户通过 includeResult=1 轮询。最终日志最多保留前 8KiB；产物最多 16 个、单文件 8KiB、合计 12KiB，并返回截断标记。链接、路径越界和非普通文件不导出。
 
-## 故障语义与已知限制
+Daemon drain 持久化，停止新准入并允许已有任务完成；重启后需显式 resume。取消先持久记录具名用户请求；已租赁任务在确认退出前不释放资源。无法证明结果的尝试进入 UNCERTAIN，禁止自动重跑。
 
-- host 心跳超过 15 秒时 Body Cell 查询显示离线；调度容量与任务恢复仍由 Scheduler 自己的节点、租约策略决定。
-- 本地执行日志存在但没有完成结果时返回 `EXECUTION_OUTCOME_UNCERTAIN`。共享准入没有完成结果时禁止跨宿主机自动重跑；任务进入 `SUSPENDED_RECONCILIATION`，等待管理员带证据核对。
-- 原生工作在独立进程组中运行；超时、客户端断开或失租会终止进程组并等待退出。已经发生的宿主机副作用仍不能撤销，外部工具需要幂等键与 fence 校验，不承诺严格 exactly-once。
-- 结果先写 Body 持久 outbox，再依次重试共享结果、回执、Scheduler 完成和确认。队列包含持久退避时间，重启后继续回报。
-- Body Cell 和本地执行使用宿主机凭据及单次执行凭证；后台数据路径要求服务身份。Gateway 用户接口校验 JWT、角色及租户范围，开发用户密钥支持只读宽限轮换。生产 IdP 和服务根密钥滚动轮换尚未接入。
-- Body 默认固定访问 `celld-brain-01:8081`；celld 对象可以跨节点路由，但客户端入口故障自动切换尚未实现。
-- Gateway Worker 只实现代码中显式路由的任务、健康、Gateway 状态和租约管理接口。旧 Node host 中的控制台、隧道等接口不能据此视为已经迁入 Gateway Worker。
-- 根目录 `docker-compose.yml` 仍使用 Node host 入口；开发集群必须显式选择 `deploy/dev-cluster/docker-compose.dev-cluster.yml`。
+本机执行请求使用原生 HTTP 客户端，避免 fetch 默认的五分钟响应头等待期限。续租在已知有效期内容忍短暂网络错误，超过安全期限停止执行。实际十分钟任务经历四秒断网后成功完成。
 
-## 开发部署与验证
+## 身份与 Agent
+
+GitHub OAuth 使用 state、PKCE、服务端数字用户 ID 权限表及 HttpOnly 会话。生产 HTTPS 使用 Secure / __Host- Cookie；仅 development 配置下的回环 HTTP 地址使用独立开发 Cookie。Cookie 写请求校验 Origin。另有固定 issuer/audience/JWKS 的 RS256 API 身份验证。
+
+DeepSeek 密钥只在 Daemon 中使用。Agent 仅可读写有界文本工作区、在禁网容器中执行测试、结束任务；最后一次写入后必须有通过的测试。Turn、工作区、调用次数与 token 预算落盘；已提交 Turn 可恢复，测试执行证据不完整时保留核对。跨宿主机自动迁移 Agent 工作区尚未开放。
+
+详见 [GitHub 与 DeepSeek 配置](provider-configuration.md)。
+
+## 更新与迁移
+
+已完成迁移的集群必须同时保留四个 Compose 文件：
 
 ```bash
-python3 scripts/prepare_body_dev_credentials.py
-docker compose -f deploy/dev-cluster/docker-compose.dev-cluster.yml up -d --build
-docker compose -f deploy/dev-cluster/docker-compose.dev-cluster.yml up -d --force-recreate celld-deploy
-docker compose -f deploy/dev-cluster/docker-compose.dev-cluster.yml ps -a
-curl -fsS http://localhost:18080/health
-curl -fsS http://localhost:18081/health
-# Body 状态现在需要宿主机服务凭据；匿名访问返回 401。
+docker compose -f deploy/dev-cluster/docker-compose.dev-cluster.yml \
+  -f deploy/dev-cluster/docker-compose.sandbox.yml \
+  -f deploy/dev-cluster/docker-compose.providers.yml \
+  -f deploy/dev-cluster/docker-compose.control-ha.yml up -d --build
 ```
 
-Gateway 源码更新后需重建其容器以重新暂存 Worker；Brain 源码更新后需重跑一次性部署服务。Body 镜像需重新构建；开发配置单独挂载代理脚本，修改后重启 Body 进程生效。
+先 drain 再更新 Daemon。不要对有在途任务的集群直接运行旧重启脚本。dev-cluster-up.sh 会依据忽略目录中的 provider 配置和已验证迁移标记选择 override；存在未验证迁移时拒绝回到旧权威。
 
-入口：控制台 `8088`；Gateway `18080/18081`；Brain `18082–18084`，Body celld `18085`；Body `19501/19502`；RustFS `9000/9001`；Prometheus `9090`；Grafana `3000`。
+迁移工具 scripts/migrate_body_to_fleet.py 要求两台 Daemon drained，先保存私有快照，导入后逐项比较；冲突目标不覆盖。恢复演练 scripts/verify_body_restore.py 将 fleet 快照还原到隔离的 celld 实例，保留线上权威。若要回退流量，须再次 drain、向全新命名空间反向复制并核对，再切换客户端；不能直接恢复已经落后的旧卷。
 
-已有验证记录：TypeScript 构建通过；Body Cell/执行日志/Gateway 相关 6 项测试通过；实际提交任务达到 `COMPLETED`，Gateway 查询租约为 `RELEASED`。这些记录不等同于全套测试、长任务故障注入、生产容量或安全验证。
+## 验证边界
 
-第一阶段已开始实施，新增执行尝试状态、版本与不可变结果；旧记录缺少身份和输入证据时转为待核对。最新验证与剩余范围见 [推进记录](phase-one-progress.md)。
+已验证真实容器生命周期、租户隔离、DeepSeek 修改与测试、drain 跨重启、Daemon 崩溃回收、入口切换与真实任务执行，以及快照恢复。容量测量为固定小工作负载，不构成 SLO。容器 Engine 权限仍属于受信任开发宿主边界，不宣称敌对多租户隔离。

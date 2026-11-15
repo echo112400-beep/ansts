@@ -21,7 +21,14 @@ it("persists suspended uncertainty and fences the replacement after explicit res
   assert.equal(tasks.tasks[0].state, "SUSPENDED_RECONCILIATION");
   assert.deepEqual((await (await post("schedule-tick", {})).json()).placements, []);
   assert.equal((await post("resolve-uncertain", { ...lease, tenant_id: "other", retry: true })).status, 409);
-  assert.equal((await post("resolve-uncertain", { ...lease, retry: true })).status, 200);
+  assert.equal((await post("resolve-uncertain", { ...lease, retry: true, resume_node_id: "host" })).status, 200);
+  await post("register-node", new NodeDaemon("other").emitHeartbeat());
+  await post("register-node", { ...new NodeDaemon("host").emitHeartbeat(), healthy: false });
+  cell = new AnstsSchedulerCell(storage);
+  assert.equal(cell.scheduler.allTasks.get("task")?.resume_node_id, "host");
+  assert.deepEqual((await (await post("schedule-tick", {})).json()).placements, []);
+  await post("register-node", new NodeDaemon("host").emitHeartbeat());
   const replacement = await (await post("schedule-tick", {})).json();
+  assert.equal(replacement.placements[0][1], "host");
   assert.ok(replacement.placements[0][2] > fence);
 });

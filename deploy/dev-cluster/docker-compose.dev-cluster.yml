@@ -3,6 +3,7 @@ name: ansts-v25-dev-cluster
 # Shared cluster wiring: object storage + credentials every node speaks to.
 x-ansts-common-env: &ansts-common-env
   ANSTS_RUNTIME_PROFILE: "development"
+  ANSTS_SCHEDULER_URLS: "http://celld-brain-01:8081,http://celld-brain-02:8081,http://celld-brain-03:8081"
   CELLD_BUCKET: "s3://ansts-fleet"
   S3_ENDPOINT: "http://rustfs:9000"
   AWS_ACCESS_KEY_ID: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
@@ -20,6 +21,7 @@ x-ansts-celld-env: &ansts-celld-env
 
 # Gateway view of the fleet: dispatch goes through the celld HTTP client, reads fan out to the same listeners.
 x-ansts-gateway-routing-env: &ansts-gateway-routing-env
+  ANSTS_SYSTEM_TOPOLOGY_FILE: "/app/deploy/dev-cluster/system-topology.json"
   ANSTS_CELLD_FLEET_URLS: '{"celld-node-01":"http://celld-brain-01:8081","celld-node-02":"http://celld-brain-02:8081","celld-node-03":"http://celld-brain-03:8081"}'
   ANSTS_CELLD_INTERNAL_URLS: '{"celld-node-01":"http://celld-brain-01:8082","celld-node-02":"http://celld-brain-02:8082","celld-node-03":"http://celld-brain-03:8082"}'
   ANSTS_PEER_BRAIN_URLS: '{"celld-node-01":"http://celld-brain-01:8081","celld-node-02":"http://celld-brain-02:8081","celld-node-03":"http://celld-brain-03:8081"}'
@@ -214,6 +216,7 @@ services:
       - ../..:/app:ro
       - body_control_data:/var/lib/ansts-body
     environment:
+      ANSTS_SCHEDULER_URLS: "http://celld-brain-01:8081,http://celld-brain-02:8081,http://celld-brain-03:8081"
       ANSTS_BODY_AUTH_SECRET_FILE: "/app/.dev-secrets/body-signing.key"
       ANSTS_SCHEDULER_URL: "http://celld-brain-01:8081"
       CELLD_ESBUILD: "/app/node_modules/@esbuild/linux-x64/bin/esbuild"
@@ -378,10 +381,31 @@ services:
     networks:
       - ansts_mesh_net
 
+  dev-server:
+    build:
+      context: ../../ui/console
+      dockerfile: Dockerfile.dev
+    container_name: ansts-console-dev-server
+    restart: unless-stopped
+    volumes:
+      - ../../ui/console/app:/app/app:ro
+      - ../../ui/console/components:/app/components:ro
+      - ../../ui/console/lib:/app/lib:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 45s
+    networks:
+      - ansts_mesh_net
+
   tanstack-console:
     image: nginx:1.27-alpine
     container_name: ansts-tanstack-console
     depends_on:
+      dev-server:
+        condition: service_healthy
       ansts-gateway-01:
         condition: service_healthy
       ansts-gateway-02:
@@ -389,7 +413,6 @@ services:
     ports:
       - "8088:80"
     volumes:
-      - ../../docs:/usr/share/nginx/html:ro
       - ./nginx-tanstack-console.conf:/etc/nginx/conf.d/default.conf:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]

@@ -22,3 +22,16 @@ it("retains unresolved cleanup across reconstruction and prevents startup withou
     assert.deepEqual(new BodyCleanupLedger(directory).pending(), []);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+import { BodyDrainState } from "../src/runtime/body_drain_state.js";
+it("persists both drain and explicit resume and rejects corrupt state", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "body-drain-"));
+  try {
+    const file = path.join(root, "drain.json");
+    const state = new BodyDrainState(file);
+    assert.equal(state.draining, false);
+    state.set(true); assert.equal(new BodyDrainState(file).draining, true);
+    state.set(false); assert.equal(new BodyDrainState(file).draining, false);
+    fs.writeFileSync(file, '{"schema_version":1,"draining":"false"}');
+    assert.throws(() => new BodyDrainState(file), /INVALID_DRAIN_STATE/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

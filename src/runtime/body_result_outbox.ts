@@ -32,7 +32,10 @@ export class BodyResultOutbox {
   pending(): BodyResultDelivery[] {
     return fs.readdirSync(this.directory).filter(name => name.endsWith(".json")).map(name => JSON.parse(fs.readFileSync(path.join(this.directory, name), "utf8")) as BodyResultDelivery);
   }
-  remove(lease: Record<string, unknown>): void { fs.unlinkSync(this.file(lease)); }
+  remove(lease: Record<string, unknown>): void {
+    fs.unlinkSync(this.file(lease));
+    const directory = fs.openSync(this.directory, "r"); try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  }
   defer(delivery: BodyResultDelivery): void {
     delivery.attempts++;
     delivery.next_retry_at = Date.now() + Math.min(60000, 1000 * 2 ** Math.min(delivery.attempts, 6)) + Math.floor(Math.random() * 1000);

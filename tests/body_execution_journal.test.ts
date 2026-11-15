@@ -13,6 +13,8 @@ it("blocks uncertain replay after restart and returns durable completed results"
     const restored = new BodyExecutionJournal(directory);
     assert.deepEqual(restored.admit("task"), { admitted: false, result: undefined });
     restored.complete("task", { status: "COMPLETED" });
+    restored.complete("task", { status: "COMPLETED" });
+    assert.throws(() => restored.complete("task", { status: "FAILED" }), /JOURNAL_RESULT_CONFLICT/);
     assert.deepEqual(new BodyExecutionJournal(directory).admit("task"), { admitted: false, result: { status: "COMPLETED" } });
   } finally { fs.rmSync(directory, { recursive: true }); }
 });

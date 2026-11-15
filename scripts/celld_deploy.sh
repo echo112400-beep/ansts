@@ -48,6 +48,10 @@ fi
 PROJECT="${CELLD_PROJECT_DIR:-$(mktemp -d)/ansts-celld-brain}"
 mkdir -p "$PROJECT"
 cp "$CONFIG" "$PROJECT/wrangler.json"
+if [[ -n "${ANSTS_BODY_NAMESPACE_PREFIX:-}" ]]; then
+  [[ "$ANSTS_BODY_NAMESPACE_PREFIX" =~ ^[a-zA-Z0-9:_-]+$ ]] || exit 1
+  sed -i "s/\"ANSTS_BODY_NAMESPACE_PREFIX\": \"\"/\"ANSTS_BODY_NAMESPACE_PREFIX\": \"$ANSTS_BODY_NAMESPACE_PREFIX\"/" "$PROJECT/wrangler.json"
+fi
 if [[ -n "${ANSTS_BODY_WORKER_URL:-}" ]]; then
   [[ "$ANSTS_BODY_WORKER_URL" =~ ^https?://[a-zA-Z0-9._:-]+$ ]] || exit 1
   sed -i "s|\"ANSTS_BODY_WORKER_URL\": \"\"|\"ANSTS_BODY_WORKER_URL\": \"$ANSTS_BODY_WORKER_URL\"|" "$PROJECT/wrangler.json"
@@ -60,6 +64,14 @@ if [[ -n "${ANSTS_BODY_AUTH_SECRET_FILE:-}" ]]; then
   fi
   sed -i "s/\"ANSTS_BODY_AUTH_SECRET\": \"\"/\"ANSTS_BODY_AUTH_SECRET\": \"$BODY_KEY\"/" "$PROJECT/wrangler.json"
   unset BODY_KEY
+  PREVIOUS_FILE="${ANSTS_BODY_AUTH_PREVIOUS_SECRET_FILE:-$ROOT/.dev-secrets/body-signing.key.previous}"
+  if [[ -f "$PREVIOUS_FILE" && -f "$PREVIOUS_FILE-until" ]]; then
+    PREVIOUS_KEY="$(cat "$PREVIOUS_FILE")"
+    PREVIOUS_UNTIL="$(cat "$PREVIOUS_FILE-until")"
+    [[ "$PREVIOUS_KEY" =~ ^[a-f0-9]{64}$ && "$PREVIOUS_UNTIL" =~ ^[0-9]+$ ]] || exit 1
+    sed -i "s/\"ANSTS_BODY_AUTH_PREVIOUS_SECRET\": \"\"/\"ANSTS_BODY_AUTH_PREVIOUS_SECRET\": \"$PREVIOUS_KEY\"/; s/\"ANSTS_BODY_AUTH_PREVIOUS_UNTIL\": \"\"/\"ANSTS_BODY_AUTH_PREVIOUS_UNTIL\": \"$PREVIOUS_UNTIL\"/" "$PROJECT/wrangler.json"
+    unset PREVIOUS_KEY PREVIOUS_UNTIL
+  fi
 fi
 cp -R "$ROOT/src" "$PROJECT/src"
 if [[ -d "$ROOT/migrations" ]]; then

@@ -122,7 +122,10 @@ export interface DynamicWorkerLoaderBindingLike {
 
 export interface CloudflareCelldEnv {
   ANSTS_BODY_WORKER_URL?: string;
+  ANSTS_BODY_NAMESPACE_PREFIX?: string;
   ANSTS_BODY_AUTH_SECRET?: string;
+  ANSTS_BODY_AUTH_PREVIOUS_SECRET?: string;
+  ANSTS_BODY_AUTH_PREVIOUS_UNTIL?: string;
   ANSTS_BODY_CELL?: DurableObjectNamespaceLike;
   ANSTS_SCHEDULER_CELL: DurableObjectNamespaceLike;
   ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;

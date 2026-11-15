@@ -18,6 +18,9 @@ it("runs isolated commands, records nonzero exits and confirms timeout cleanup",
     assert.deepEqual(output, { uid: 65534, readonly: true, socket: false, network: ["lo"] });
     const failed = await runtime.execute({ ...base, argv: ["node", "-e", "process.exit(7)"] }, new AbortController().signal);
     assert.equal(failed.exitCode, 7);
-    await assert.rejects(runtime.execute({ ...base, timeoutMs: 1500, argv: ["node", "-e", "setInterval(()=>{},1000)"] }, new AbortController().signal));
+    const timedOut = await runtime.execute({ ...base, timeoutMs: 1500, argv: ["node", "-e", "setInterval(()=>{},1000)"] }, new AbortController().signal);
+    assert.equal(timedOut.executionOutcome, "TIMED_OUT");
+    assert.equal(result.artifacts?.[0].path, "result");
+    assert.equal(Buffer.from(result.artifacts![0].contentBase64, "base64").toString(), "ok");
   } finally { delete process.env.ANSTS_TEST_PARENT_SECRET; }
 });

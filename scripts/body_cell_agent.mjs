@@ -7,6 +7,8 @@ const require = createRequire(import.meta.url);
 const { NodeDaemon } = require('../dist/src/node_daemon.js');
 const { taskInputDigest } = require('../dist/src/cloudflare/execution_attempt.js');
 const { BodyResultOutbox } = require('../dist/src/runtime/body_result_outbox.js');
+const { requestBodyExecution } = require('../dist/src/runtime/body_execution_client.js');
+const { controlPlaneFetch } = require('../dist/src/cloudflare/control_plane_fetch.js');
 const nodeId = process.env.ANSTS_NODE_ID;
 const { bodyResourceBudget, cgroupResourceLimits } = require('../dist/src/runtime/body_resource_budget.js');
 const constrained = process.constrainedMemory?.();
@@ -20,7 +22,7 @@ const heartbeat = async running => {
   const response = await fetch(local + '/health', { signal: AbortSignal.timeout(5000) });
   if (!response.ok) throw new Error('BODY_HEALTH_UNAVAILABLE');
   const health = await response.json();
-  return { ...daemon.emitHeartbeat(running), execution_slots: executionSlots, warm_pool_ready: 0, healthy: !health.recoveryRequired };
+  return { ...daemon.emitHeartbeat(running), execution_slots: executionSlots, warm_pool_ready: 0, healthy: !health.recoveryRequired && !health.draining };
 };
 const base = process.env.ANSTS_BODY_CELL_URL;
 const local = `http://127.0.0.1:${process.env.ANSTS_LISTEN_PORT}`;
@@ -33,7 +35,7 @@ async function deliverResult(delivery) {
   await rpc(`/v1/body/receipt?hostId=${encodeURIComponent(nodeId)}`, { ...lease, result });
   const { tasks } = await rpc('/v1/scheduler/tasks');
   const task = tasks.find(task => task.task_id === lease.task_id && task.tenant_id === lease.tenant_id);
-  if (task?.state !== 'COMPLETED') await rpc('/v1/scheduler/complete', lease);
+  await rpc('/v1/scheduler/complete', { ...lease, execution_outcome: result.executionOutcome });
   await rpc(`/v1/body/acknowledge?taskId=${encodeURIComponent(lease.task_id)}`, { ...lease, expected_version: finished.execution.version });
   outbox.remove(lease);
 }
@@ -45,7 +47,7 @@ async function flushResults() {
   }
 }
 async function rpc(path, body) {
-  const response = await fetch(base + path, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json', ...serviceHeaders }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(10000) });
+  const response = await controlPlaneFetch(process.env.ANSTS_BODY_CELL_URLS || base, path, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json', ...serviceHeaders }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(10000) });
   if (!response.ok) {
     const error = new Error(`${path}: ${response.status}`);
     error.payload = await response.json().catch(() => ({}));
@@ -68,13 +70,14 @@ while (!stopping) {
       if (task.assigned_node_id !== nodeId || task.state !== 'LEASED') continue;
       if (outbox.pending().some(delivery => delivery.lease.task_id === task.task_id && delivery.lease.tenant_id === task.tenant_id)) continue;
       try {
+      if (!(await heartbeat(0)).healthy) break;
       const lease = { task_id: task.task_id, tenant_id: task.tenant_id, attempt_id: `${task.task_id}:${task.lease_fencing_token}`, input_digest: taskInputDigest(task.tenant_id, task.task_id, task.prompt, task.execution), node_id: nodeId, fencing_token: task.lease_fencing_token };
       await rpc('/v1/scheduler/lease-renew', lease);
       const controller = new AbortController();
       const executionPath = `/v1/body/acquire?taskId=${encodeURIComponent(task.task_id)}`;
       const admission = await rpc(executionPath, lease);
       if (!admission.acquired && admission.result) {
-        await rpc('/v1/scheduler/complete', lease);
+        await rpc('/v1/scheduler/complete', { ...lease, execution_outcome: admission.result.executionOutcome });
         if (admission.execution.node_id === nodeId && admission.execution.attempt_id === lease.attempt_id) {
           await rpc(`/v1/body/acknowledge?taskId=${encodeURIComponent(task.task_id)}`, { ...lease, expected_version: admission.execution.version });
         }
@@ -82,22 +85,22 @@ while (!stopping) {
       }
       const started = await rpc(`/v1/body/start?taskId=${encodeURIComponent(task.task_id)}`, { ...lease, expected_version: admission.execution.version });
       let renewing = false;
+      let lastLeaseAck = Date.now();
       const renewal = setInterval(async () => {
         if (renewing) return;
         renewing = true;
         try {
           await rpc('/v1/scheduler/lease-renew', lease);
+          lastLeaseAck = Date.now();
           const activeHb = await heartbeat(1);
           await rpc('/v1/scheduler/register-node', activeHb);
           await rpc(`/v1/body/heartbeat?hostId=${encodeURIComponent(nodeId)}`, activeHb);
-        } catch (error) { controller.abort(error); }
+        } catch (error) { if (Date.now() - lastLeaseAck >= 12000) controller.abort(error); }
         finally { renewing = false; }
       }, 3000);
       let response;
       try {
-        response = await fetch(local + '/v1/sandboxes/execute', { method: 'POST', headers: { 'content-type': 'application/json', ...serviceHeaders }, body: JSON.stringify({ taskId: task.task_id, tenantId: task.tenant_id, promptText: task.prompt, execution: task.execution, attemptId: lease.attempt_id, fencingToken: lease.fencing_token, timeoutSeconds: task.timeout_seconds, executionToken: started.execution_token }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(Math.min(2147483647, Math.max(10000, Number(task.timeout_seconds ?? 1800) * 1000)))]) });
-        if (!response.ok) throw new Error(`execute: ${response.status}`);
-        response = await response.json();
+        response = await requestBodyExecution(local + '/v1/sandboxes/execute', { taskId: task.task_id, tenantId: task.tenant_id, promptText: task.prompt, execution: task.execution, attemptId: lease.attempt_id, fencingToken: lease.fencing_token, timeoutSeconds: task.timeout_seconds, executionToken: started.execution_token }, serviceHeaders, AbortSignal.any([controller.signal, AbortSignal.timeout(Math.min(2147483647, Math.max(30000, Number(task.timeout_seconds ?? 1800) * 1000 + 30000)))]));
         outbox.put({ lease, expected_version: started.execution.version, result: response, attempts: 0, next_retry_at: 0 });
       } catch (error) {
         clearInterval(renewal);

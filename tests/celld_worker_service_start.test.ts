@@ -42,9 +42,10 @@ describe("celld-loaded worker service start", () => {
         ["ANSTS_HARNESS_CELL", "AgentTaskHarnessCell"],
         ["ANSTS_TUNNEL_CELL", "TunnelGatewayCell"],
         ["ANSTS_BODY_CELL", "AnstsBodyCell"],
+        ["ANSTS_GATEWAY_CELL", "AnstsGatewayCell"],
       ]
     );
-    assert.equal(bindings.some((binding) => binding.class_name === "AnstsGatewayCell"), false);
+    assert.equal(bindings.some((binding) => binding.class_name === "AnstsGatewayCell"), true);
 
     const gatewayDir = fs.mkdtempSync(path.join(os.tmpdir(), "ansts-celld-gateway-stage-"));
     const gateway = prepareCelldWorkerProject({

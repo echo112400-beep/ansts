@@ -1,0 +1,92 @@
+import path from "node:path";
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  // Nothing here uses next/image, so the image optimizer is off: it would decode whatever image a request
+  // names, a shared file or an agent's among them, with no sign-in, and it has been the road to two remote
+  // code execution bugs in its image library (GHSA-2464-fhr4-w9xw, GHSA-2xp9-vwfh-vxw4).
+  images: { unoptimized: true },
+  // This repository is the self-hosted edition and cannot build another, so that is the default
+  // rather than something every command has to remember to pass.
+  //
+  // The console is one codebase serving two editions, and which one it is gets inlined into the
+  // client bundle from this value at build time. The Dockerfile sets it too; nothing set it for
+  // `npm run dev`, so running the console locally rendered the HOSTED sign-in — an email field, a
+  // password reset, and a "Create one" button pointing at an accounts service no single box has.
+  // The first thing a new contributor saw was a form that cannot work, and a build that loses the
+  // flag SHIPS that form: an instance once went out with a sign-in nobody could pass.
+  //
+  // Still an override, not a constant, because the same source also builds the hosted console.
+  env: { NEXT_PUBLIC_HR_EDITION: process.env.NEXT_PUBLIC_HR_EDITION || "selfhost" },
+  // Blue-green deploys: each slot builds AND serves from its own dist dir, so a build never
+  // clobbers the directory the live server is reading (mismatched-chunk 404s) and the new
+  // slot boots fully before nginx flips — zero 502s during rollout.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
+  // Self-hosted ships as one container: emit a server bundle with only the modules it needs.
+  output: "standalone",
+  // V1C02-007: baseline browser security headers on every response — clickjacking defense
+  // (frame-ancestors 'none' + X-Frame-Options DENY), HSTS, MIME-sniff off, tight referrer,
+  // and a locked-down permissions policy. The console renders no third-party iframes and is
+  // never meant to be embedded, so 'none' is safe and has no functional regression. The one frame
+  // it draws is its own: a kit's app inside the Shop's try page, from this same origin.
+  async headers() {
+    const baseline = [
+      { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" },
+      { key: "X-Content-Type-Options", value: "nosniff" },
+      { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+      { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
+    ];
+    return [
+      {
+        // Public artifact proxies set their own stricter CSP and referrer policy, and the relays of
+        // gateway content (/api/harness, /data/workspaces) their own sandbox. Next's configured
+        // headers can overwrite route response headers, so exclude them here.
+        source: "/((?!api/share/|api/harness/|data/workspaces/|kits/|[^/]+/[^/]+/workspace/).*)",
+        headers: [
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "Content-Security-Policy", value: "frame-ancestors 'none'" },
+          ...baseline,
+        ],
+      },
+      ...["/api/share/:path*", "/:harness/:sid/workspace/:path*"].map((source) => ({
+        source,
+        headers: [
+          { key: "X-Frame-Options", value: "DENY" },
+          ...baseline.filter(({ key }) => key !== "Referrer-Policy"),
+        ],
+      })),
+      ...["/api/harness/:path*", "/data/workspaces/:path*"].map((source) => ({
+        source,
+        headers: [{ key: "X-Frame-Options", value: "DENY" }, ...baseline],
+      })),
+      {
+        // A kit's own app, shown inside its Shop try page: framed by the console itself and by
+        // nothing else. Safe only because /kits/* serves the first-party kit apps built into the
+        // image (HR_KITS_DIR). If the Shop ever serves a third party's kit app, it moves to a
+        // sandboxed frame on another origin first, never this one.
+        source: "/kits/:path*",
+        headers: [
+          { key: "X-Frame-Options", value: "SAMEORIGIN" },
+          { key: "Content-Security-Policy", value: "frame-ancestors 'self'" },
+          ...baseline,
+        ],
+      },
+    ];
+  },
+  webpack: (config) => {
+    // One copy of the document library, whichever way a package imports it: two copies make its own `instanceof`
+    // checks fail (it warns when it happens), which breaks writing a change into a live document.
+    config.resolve.alias = { ...config.resolve.alias, yjs: path.resolve(__dirname, "node_modules/yjs/dist/yjs.mjs") };
+    // NOTE: do NOT alias react/react-dom here — Next.js installs its own layer-aware react
+    // aliases (RSC vs client) that must also apply to the out-of-root UI Core source; overriding
+    // them breaks server prerender (`null.useContext`).
+    // UI Core's CodeBlock lazy-imports highlight.js from outside the app root, where webpack's
+    // node_modules walk-up can't find this app's copy. Append this app's node_modules as a
+    // FALLBACK dir (not an alias — an alias would also hijack react-syntax-highlighter's nested
+    // highlight.js@10 grammar imports, which need v10-only files v11 removed).
+    config.resolve.modules = [...(config.resolve.modules ?? ["node_modules"]), path.resolve(__dirname, "node_modules")];
+    return config;
+  },
+};
+
+export default nextConfig;

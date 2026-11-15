@@ -1,5 +1,7 @@
 # 控制台登录与真实任务工作区
 
+2026-11-14 更新：新增 GitHub OAuth 登录和 HttpOnly 应用会话，开发回调为 `http://127.0.0.1:8088/auth/callback/github`。短期凭据模式保持内存保存；下文“刷新需要重新登录”仅适用于该模式。GitHub 会话刷新后通过 `/v1/auth/me` 恢复，退出时调用服务端清除 Cookie。完整配置见 [provider-configuration.md](provider-configuration.md)。
+
 入口：http://localhost:8088/ 。默认页面只连接已实现的身份、任务查询和任务提交接口，不展示尚未接入的旧管理指标。原管理页面代码保留在 `legacy-management-console.html`，旧演示身份与固定 JWT 已移除，历史渲染器默认停用。
 
 ## 开发环境登录

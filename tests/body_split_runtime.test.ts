@@ -47,7 +47,7 @@ it("runs Body control independently, preserves native results on restart, and st
   const control = await serve(request => bodyWorker.fetch(request, bodyEnv));
   brainEnv.ANSTS_BODY_WORKER_URL = control.url;
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "body-split-"));
-  const options = { sandboxImage: process.env.ANSTS_SANDBOX_TEST_IMAGE, nodeId, token, bodyWorkerUrl: control.url, storageDir: directory, host: "127.0.0.1", port: 0 };
+  const options = { executionDelayMs: 100, sandboxImage: process.env.ANSTS_SANDBOX_TEST_IMAGE, nodeId, token, bodyWorkerUrl: control.url, storageDir: directory, host: "127.0.0.1", port: 0 };
   let daemon = new BodyDaemonServer(options);
   let address = await daemon.start();
   const rpc = (base: string, route: string, payload?: unknown, headers = bodyHeaders) => fetch(base + route, { method: payload === undefined ? "GET" : "POST", headers, body: payload === undefined ? undefined : JSON.stringify(payload) });
@@ -68,10 +68,23 @@ it("runs Body control independently, preserves native results on restart, and st
     assert.equal((await rpc(daemonUrl(), "/v1beta1/management/state")).status, 404);
     assert.equal((await rpc(daemonUrl(), "/v1/scheduler/tasks")).status, 404);
     const first = await prepare("first");
-    const executed = await rpc(daemonUrl(), "/v1/sandboxes/execute", first.payload);
+    const executing = rpc(daemonUrl(), "/v1/sandboxes/execute", first.payload);
+    for (let i = 0; i < 100; i++) {
+      if ((await (await rpc(daemonUrl(), "/health")).json()).activeSandboxes === 1) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal((await rpc(daemonUrl(), "/v1/daemon/drain", { draining: true }, { ...bodyHeaders, authorization: "Body invalid" })).status, 401);
+    assert.equal((await rpc(daemonUrl(), "/v1/daemon/drain", { draining: true })).status, 200);
+    assert.equal((await rpc(daemonUrl(), "/readyz")).status, 503);
+    assert.equal((await rpc(daemonUrl(), "/v1/sandboxes/execute", first.payload)).status, 503);
+    const executed = await executing;
     assert.equal(executed.status, 200);
     const result = await executed.json();
+    assert.equal((await (await rpc(daemonUrl(), "/health")).json()).drained, true);
     await daemon.stop(); daemon = new BodyDaemonServer(options); address = await daemon.start();
+    assert.equal((await (await rpc(daemonUrl(), "/health")).json()).draining, true);
+    assert.equal((await rpc(daemonUrl(), "/v1/daemon/drain", { draining: false })).status, 200);
+    assert.equal((await rpc(daemonUrl(), "/readyz")).status, 200);
     const reissued = await (await rpc(control.url, `/v1/body/start?taskId=${encodeURIComponent(first.lease.task_id)}`, { ...first.lease, expected_version: 2 })).json();
     const recovered = await rpc(daemonUrl(), "/v1/sandboxes/execute", { ...first.payload, executionToken: reissued.execution_token });
     assert.deepEqual(await recovered.json(), result);
@@ -96,7 +109,9 @@ it("runs Body control independently, preserves native results on restart, and st
     }
     const stopped = await rpc(daemonUrl(), "/v1/sandboxes/stop", second.payload);
     assert.equal(stopped.status, 200); assert.equal((await stopped.json()).stopped, true);
-    assert.equal((await running).status, 503);
+    const cancelled = await running;
+    assert.equal(cancelled.status, 200);
+    assert.equal((await cancelled.json()).executionOutcome, "CANCELLED");
     assert.equal((await (await rpc(daemonUrl(), "/v1/sandboxes")).json()).sandboxes.length, 0);
     assert.equal(fs.readdirSync(path.join(directory, "workspaces")).filter(name => name.endsWith(".json")).length, 1);
     assert.equal((await rpc(control.url, `/v1/body/uncertain?taskId=${encodeURIComponent(second.lease.task_id)}`, { ...second.lease, expected_version: 2, reason: "test stopped execution" })).status, 200);

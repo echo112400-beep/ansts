@@ -1,0 +1,26 @@
+# Update the Next.js server inside the existing development cluster.
+# The canonical browser entry remains http://127.0.0.1:8088 through Nginx.
+name: ansts-v25-dev-cluster
+services:
+  dev-server:
+    build:
+      context: ./console
+      dockerfile: Dockerfile.dev
+    container_name: ansts-console-dev-server
+    restart: unless-stopped
+    volumes:
+      - ./console/app:/app/app:ro
+      - ./console/components:/app/components:ro
+      - ./console/lib:/app/lib:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 45s
+    networks:
+      - ansts_mesh_net
+networks:
+  ansts_mesh_net:
+    external: true
+    name: ansts-v25-dev-cluster_ansts_mesh_net
