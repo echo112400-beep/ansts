@@ -245,6 +245,13 @@ export interface ManagementPlaneDeps {
   scheduler: CoreScheduler5D;
   v25Store: SchedulerV25SingleWritePathStore;
   shardCoordinator: HaSchedulerShardCoordinator;
+  onPeerTopologyUpdated?: (ev: {
+    action: "register" | "deregister";
+    role: "brain" | "body" | "gateway";
+    nodeId: string;
+    brainKey?: string;
+    baseUrl?: string;
+  }) => void;
   fleetController: ManualFleetScaleController;
   finopsController: FinOpsBudgetController;
   dagEscrow: DagEscrowCoordinator;
@@ -495,6 +502,9 @@ export class PlatformManagementPlaneEngine {
       "CREATE TABLE IF NOT EXISTS v25_mgmt_node_overrides (node_id TEXT PRIMARY KEY, region TEXT, role_label TEXT, status TEXT, cpu_pct REAL, psi_pct REAL, base_leases INTEGER)"
     );
     sql.exec(
+      "CREATE TABLE IF NOT EXISTS v25_cluster_registry (node_id TEXT PRIMARY KEY, role TEXT, region TEXT, base_url TEXT, status TEXT, cpu_pct REAL, psi_pct REAL, active_leases INTEGER, capacity_slots INTEGER, registered_via TEXT, last_heartbeat_ms INTEGER, lease_epoch INTEGER)"
+    );
+    sql.exec(
       "CREATE TABLE IF NOT EXISTS v25_mgmt_a2a_blackboard (bb_key TEXT PRIMARY KEY, value_json TEXT, version INTEGER, author_agent TEXT, updated_at_ms INTEGER)"
     );
     sql.exec(
@@ -553,6 +563,12 @@ export class PlatformManagementPlaneEngine {
     sql.exec("DELETE FROM v25_mgmt_approvals");
     sql.exec("DELETE FROM v25_mgmt_audit_logs");
     sql.exec("DELETE FROM v25_mgmt_node_overrides");
+    sql.exec("DELETE FROM v25_cluster_registry");
+    for (const member of this.deps.shardCoordinator.topologyCas.getMembers()) {
+      if (!["brain-node-01", "brain-node-02", "brain-node-03"].includes(member)) {
+        this.deps.shardCoordinator.evictUnhealthyBrainShardNode(member);
+      }
+    }
     this.ensureConfigCenterTable();
     sql.exec("DELETE FROM v25_mgmt_config_revisions");
     this.ensureConfigCenterTable();
@@ -623,6 +639,34 @@ export class PlatformManagementPlaneEngine {
         n.cpu,
         n.psi,
         12
+      );
+    }
+    const nowSeedMs = Date.now();
+    const initialRegistry = [
+      { id: "celld-brain-01", role: "brain", region: "us-west-2", url: "http://127.0.0.1:18082", cpu: 62, psi: 4.2, leases: 12, slots: 85 },
+      { id: "celld-brain-02", role: "brain", region: "us-west-2", url: "http://127.0.0.1:18083", cpu: 68, psi: 5.8, leases: 12, slots: 86 },
+      { id: "celld-brain-03", role: "brain", region: "eu-central-1", url: "http://127.0.0.1:18084", cpu: 54, psi: 3.1, leases: 12, slots: 85 },
+      { id: "body-host-01", role: "body", region: "us-west-2", url: "http://127.0.0.1:19501", cpu: 74, psi: 8.4, leases: 14, slots: 64 },
+      { id: "body-host-02", role: "body", region: "eu-central-1", url: "http://127.0.0.1:19502", cpu: 79, psi: 11.2, leases: 15, slots: 64 },
+      { id: "body-host-03", role: "body", region: "ap-northeast-1", url: "http://127.0.0.1:19503", cpu: 48, psi: 2.5, leases: 12, slots: 64 },
+      { id: "celld-gw-01", role: "gateway", region: "us-west-2", url: "http://127.0.0.1:18080", cpu: 41, psi: 2.1, leases: 0, slots: 256 },
+      { id: "celld-gw-02", role: "gateway", region: "eu-central-1", url: "http://127.0.0.1:18081", cpu: 39, psi: 1.9, leases: 0, slots: 256 },
+    ];
+    for (const r of initialRegistry) {
+      sql.exec(
+        "INSERT OR REPLACE INTO v25_cluster_registry (node_id, role, region, base_url, status, cpu_pct, psi_pct, active_leases, capacity_slots, registered_via, last_heartbeat_ms, lease_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        r.id,
+        r.role,
+        r.region,
+        r.url,
+        "READY",
+        r.cpu,
+        r.psi,
+        r.leases,
+        r.slots,
+        "SEED",
+        nowSeedMs,
+        1
       );
     }
 
@@ -1276,8 +1320,13 @@ export class PlatformManagementPlaneEngine {
     const nodes: ManagementNodeRecord[] = nodeRows
       .map((nr) => {
         const nId = String(nr.node_id);
-        const brainKey = nId.replace("celld-brain-", "brain-node-");
-        const slots = nId.startsWith("celld-brain-") ? (slotDistribution[brainKey] ?? 0) : 0;
+        const roleLbl = String(nr.role_label ?? "");
+        const isBrainNode =
+          nId.startsWith("celld-brain-") ||
+          nId.startsWith("brain-node-") ||
+          roleLbl.toLowerCase().includes("brain");
+        const brainKey = nId.startsWith("celld-brain-") ? nId.replace("celld-brain-", "brain-node-") : nId;
+        const slots = isBrainNode ? (slotDistribution[brainKey] ?? slotDistribution[nId] ?? 0) : 0;
         const assignedTasks = Array.from(taskMap.values()).filter(
           (t) =>
             (t.assigned_node_id === nId || this.deps.shardCoordinator.resolveBrainForTask(t.tenant_id, t.task_id).brainNodeId === brainKey) &&
@@ -1289,16 +1338,27 @@ export class PlatformManagementPlaneEngine {
           .filter((t) => Number(t.priority) === 0 && t.assigned_node_id === nId)
           .map((t) => t.task_id);
 
-        let activeGw = "celld-gw-01 (PRIMARY)";
-        if (nId.startsWith("body-host-")) {
+        const gwRegRows = sql
+          .exec<Record<string, unknown>>(
+            "SELECT * FROM v25_cluster_registry WHERE role = ? AND status = ?",
+            "gateway",
+            "READY"
+          )
+          .toArray();
+        const regionMatchedGw = gwRegRows.find((g) => String(g.region) === String(nr.region));
+        const defaultGwId = String(regionMatchedGw?.node_id ?? gwRegRows[0]?.node_id ?? "celld-gw-01");
+        let activeGw = `${defaultGwId} (PRIMARY)`;
+        if (nId.startsWith("celld-gw-") || roleLbl.toLowerCase().includes("gateway")) {
+          activeGw = `${nId} (INGRESS_GW)`;
+        } else if (nId.startsWith("body-") || roleLbl.toLowerCase().includes("body")) {
           try {
             const binding = this.deps.tunnelRouter.tunnelCell.selectActiveTunnel(nId);
             activeGw = `${binding.gatewayId} (${binding.role})`;
           } catch {
-            activeGw = nId === "body-host-02" ? "celld-gw-02 (SECONDARY)" : "celld-gw-01 (PRIMARY)";
+            activeGw = nId === "body-host-02" ? "celld-gw-02 (SECONDARY)" : `${defaultGwId} (PRIMARY)`;
           }
         } else {
-          activeGw = nId === "celld-brain-03" ? "celld-gw-02" : "celld-gw-01";
+          activeGw = nId === "celld-brain-03" ? "celld-gw-02" : defaultGwId;
         }
 
         const baseCpu = Number(nr.cpu_pct ?? 60);
@@ -1624,6 +1684,8 @@ export class PlatformManagementPlaneEngine {
       finopsVisualization: this.buildFinOpsVisualization(),
       approvalsSagaVisualization: this.buildApprovalsAndSagaVisualization(),
       celldDevService: this.buildCelldDevServiceStatus(),
+      dynamicTopology: this.buildDynamicClusterTopology(),
+      slotOwners,
       status: "HEALTHY",
     };
   }
@@ -5616,12 +5678,439 @@ export const updatedAt = ${Date.now()};
     return { allowed: true, statusCode: 200, usedSlots, maxSlots };
   }
 
+  public registerDynamicClusterNode(params: {
+    nodeId: string;
+    role: "brain" | "body" | "gateway";
+    region?: string;
+    baseUrl?: string;
+    ipAddress?: string;
+    capacitySlots?: number;
+    registeredVia?: "SELF_REG" | "TUNNEL" | "SCALE_API" | "SEED";
+    actor?: string;
+    actorRole?: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const nodeId = String(params.nodeId ?? "").trim();
+    if (!nodeId) {
+      return {
+        status: 400,
+        body: { error: "MISSING_REQUIRED_PARAMETERS", message: "Required parameter: nodeId" },
+      };
+    }
+    const role: "brain" | "body" | "gateway" =
+      params.role === "brain" ? "brain" : params.role === "gateway" ? "gateway" : "body";
+    const region = String(params.region ?? "us-west-2").trim() || "us-west-2";
+    const ip = params.ipAddress ?? `10.240.0.${Math.floor(50 + Math.random() * 150)}`;
+    const sql = this.deps.v25Store.sql;
+    const existingReg = sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_cluster_registry WHERE node_id = ?", nodeId)
+      .one();
+    const defaultPort = role === "brain" ? 18085 : role === "gateway" ? 18086 : 19505;
+    const explicitBaseUrl =
+      params.baseUrl && String(params.baseUrl).trim().length > 0
+        ? String(params.baseUrl).trim().replace(/\/$/, "")
+        : undefined;
+    const rawBaseUrl =
+      explicitBaseUrl ??
+      (existingReg && String(existingReg.base_url ?? "").trim().length > 0
+        ? String(existingReg.base_url).trim()
+        : `http://127.0.0.1:${defaultPort}`);
+    const baseUrl = rawBaseUrl.replace(/\/$/, "");
+    const registeredVia = params.registeredVia ?? "SELF_REG";
+    const capacitySlots = Number(params.capacitySlots ?? (role === "gateway" ? 256 : role === "brain" ? 85 : 64));
+    const roleLabel =
+      role === "brain"
+        ? `Brain Shard (${nodeId})`
+        : role === "gateway"
+        ? `Edge Gateway (${nodeId})`
+        : `Body LayerFS (${nodeId})`;
+
+    const scaleRes = this.deps.fleetController.scaleOutNode(
+      nodeId,
+      ip,
+      role === "body" ? "worker" : "control-plane"
+    );
+
+    if (role === "body") {
+      const daemon = new NodeDaemon(nodeId, 32, 65536, 8);
+      this.deps.scheduler.registerOrUpdateNode(daemon.emitHeartbeat(0));
+      this.celldAdmin.registerCell(`LayerFsSandboxCell:${nodeId}`, nodeId, 1);
+    } else if (role === "gateway") {
+      this.celldAdmin.registerCell(`TunnelGatewayCell:${nodeId}`, nodeId, 1);
+    }
+
+    let newEpoch = 1;
+    let brainKey = nodeId;
+    if (role === "brain" || nodeId.startsWith("celld-brain-") || nodeId.startsWith("brain-node-")) {
+      brainKey = nodeId.startsWith("celld-brain-") ? nodeId.replace("celld-brain-", "brain-node-") : nodeId;
+      newEpoch = this.deps.shardCoordinator.registerBrainShardNode(brainKey);
+      this.topologyCas.forceSyncMembers(this.deps.shardCoordinator.topologyCas.getMembers());
+      this.celldAdmin.registerCell(`AnstsSchedulerCell:${nodeId}`, nodeId, newEpoch);
+    }
+
+    sql.exec(
+      "INSERT OR REPLACE INTO v25_mgmt_node_overrides (node_id, region, role_label, status, cpu_pct, psi_pct, base_leases) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      nodeId,
+      region,
+      roleLabel,
+      "READY",
+      36.0,
+      1.8,
+      role === "gateway" ? 0 : 8
+    );
+
+    sql.exec(
+      "INSERT OR REPLACE INTO v25_cluster_registry (node_id, role, region, base_url, status, cpu_pct, psi_pct, active_leases, capacity_slots, registered_via, last_heartbeat_ms, lease_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      nodeId,
+      role,
+      region,
+      baseUrl,
+      "READY",
+      36.0,
+      1.8,
+      0,
+      capacitySlots,
+      registeredVia,
+      Date.now(),
+      newEpoch
+    );
+
+    this.deps.onPeerTopologyUpdated?.({
+      action: "register",
+      role,
+      nodeId,
+      brainKey: role === "brain" ? brainKey : undefined,
+      baseUrl: explicitBaseUrl,
+    });
+
+    this.appendAudit(
+      params.actor ?? nodeId,
+      params.actorRole ?? "SRE_ADMIN",
+      `动态注册/扩容节点 ${nodeId} (role=${role}, url=${baseUrl}, via=${registeredVia}) 并同步集群拓扑`,
+      `${region} / ${nodeId}`,
+      `REGISTERED_READY (epoch:${newEpoch})`
+    );
+
+    const dynamicTopology = this.buildDynamicClusterTopology();
+    return {
+      status: 201,
+      body: {
+        action: "scale_out",
+        registered: true,
+        nodeId,
+        brainKey: role === "brain" ? brainKey : undefined,
+        role,
+        region,
+        baseUrl,
+        ipAddress: ip,
+        registeredVia,
+        rebalancedCells: scaleRes.rebalancedCells,
+        epoch: newEpoch,
+        dynamicTopology,
+      },
+    };
+  }
+
+  public heartbeatDynamicClusterNode(params: {
+    nodeId: string;
+    role?: "brain" | "body" | "gateway";
+    region?: string;
+    baseUrl?: string;
+    cpuPct?: number;
+    psiPct?: number;
+    activeLeases?: number;
+    nowMs?: number;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const nodeId = String(params.nodeId ?? "").trim();
+    if (!nodeId) {
+      return {
+        status: 400,
+        body: { error: "MISSING_REQUIRED_PARAMETERS", message: "Required parameter: nodeId" },
+      };
+    }
+    const sql = this.deps.v25Store.sql;
+    const existing = sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_cluster_registry WHERE node_id = ?", nodeId)
+      .one();
+    const nowMs = params.nowMs ?? Date.now();
+    if (!existing) {
+      const regRes = this.registerDynamicClusterNode({
+        nodeId,
+        role: params.role ?? (nodeId.includes("brain") ? "brain" : nodeId.includes("gw") ? "gateway" : "body"),
+        region: params.region ?? "us-west-2",
+        baseUrl: params.baseUrl,
+        registeredVia: "SELF_REG",
+        actor: nodeId,
+        actorRole: "SYSTEM",
+      });
+      sql.exec("UPDATE v25_cluster_registry SET last_heartbeat_ms = ? WHERE node_id = ?", nowMs, nodeId);
+      return {
+        status: 200,
+        body: {
+          heartbeatAccepted: true,
+          autoRegistered: true,
+          nodeId,
+          lastHeartbeatMs: nowMs,
+          dynamicTopology: regRes.body.dynamicTopology,
+        },
+      };
+    }
+
+    const cpuPct = params.cpuPct !== undefined ? Number(params.cpuPct) : Number(existing.cpu_pct ?? 42);
+    const psiPct = params.psiPct !== undefined ? Number(params.psiPct) : Number(existing.psi_pct ?? 2.4);
+    const activeLeases =
+      params.activeLeases !== undefined ? Number(params.activeLeases) : Number(existing.active_leases ?? 0);
+    const baseUrl = params.baseUrl ? String(params.baseUrl).trim() : String(existing.base_url ?? "");
+    const wasOffline = String(existing.status) === "OFFLINE";
+
+    sql.exec(
+      "UPDATE v25_cluster_registry SET status = ?, cpu_pct = ?, psi_pct = ?, active_leases = ?, base_url = ?, last_heartbeat_ms = ? WHERE node_id = ?",
+      "READY",
+      cpuPct,
+      psiPct,
+      activeLeases,
+      baseUrl,
+      nowMs,
+      nodeId
+    );
+    sql.exec(
+      "UPDATE v25_mgmt_node_overrides SET status = ?, cpu_pct = ?, psi_pct = ? WHERE node_id = ?",
+      "READY",
+      cpuPct,
+      psiPct,
+      nodeId
+    );
+
+    if (wasOffline && String(existing.role) === "brain") {
+      const brainKey = nodeId.startsWith("celld-brain-") ? nodeId.replace("celld-brain-", "brain-node-") : nodeId;
+      this.deps.shardCoordinator.registerBrainShardNode(brainKey);
+      this.topologyCas.forceSyncMembers(this.deps.shardCoordinator.topologyCas.getMembers());
+    }
+
+    return {
+      status: 200,
+      body: {
+        heartbeatAccepted: true,
+        autoRegistered: false,
+        nodeId,
+        lastHeartbeatMs: nowMs,
+        status: "READY",
+      },
+    };
+  }
+
+  public deregisterDynamicClusterNode(params: {
+    nodeId: string;
+    region?: string;
+    reason?: string;
+    actor?: string;
+    actorRole?: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const nodeId = String(params.nodeId ?? "").trim();
+    const sql = this.deps.v25Store.sql;
+    const regRow = sql
+      .exec<Record<string, unknown>>("SELECT * FROM v25_cluster_registry WHERE node_id = ?", nodeId)
+      .one();
+    const role = (regRow ? String(regRow.role) : nodeId.includes("brain") ? "brain" : nodeId.includes("gw") ? "gateway" : "body") as
+      | "brain"
+      | "body"
+      | "gateway";
+
+    this.executeBatchNodeOperation({
+      operation: "drain",
+      nodeIds: [nodeId],
+      forceMigrateLeases: true,
+      actor: params.actor ?? "chen",
+      role: params.actorRole ?? "SRE_ADMIN",
+    });
+
+    sql.exec("DELETE FROM v25_mgmt_node_overrides WHERE node_id = ?", nodeId);
+    sql.exec("DELETE FROM v25_cluster_registry WHERE node_id = ?", nodeId);
+
+    const brainKey = nodeId.startsWith("celld-brain-") ? nodeId.replace("celld-brain-", "brain-node-") : nodeId;
+    if (role === "brain" || nodeId.startsWith("celld-brain-") || nodeId.startsWith("brain-node-")) {
+      this.deps.shardCoordinator.evictUnhealthyBrainShardNode(brainKey);
+      this.topologyCas.forceSyncMembers(this.deps.shardCoordinator.topologyCas.getMembers());
+    }
+
+    this.deps.onPeerTopologyUpdated?.({
+      action: "deregister",
+      role,
+      nodeId,
+      brainKey,
+    });
+
+    this.appendAudit(
+      params.actor ?? "chen",
+      params.actorRole ?? "SRE_ADMIN",
+      `下线并移除节点 ${nodeId} (role=${role}, reason=${params.reason ?? "DECOMMISSIONED"}，已迁移全部活跃租约与分片槽位)`,
+      `${params.region ?? String(regRow?.region ?? "us-west-2")} / ${nodeId}`,
+      "DECOMMISSIONED"
+    );
+
+    return {
+      status: 200,
+      body: {
+        action: "decommission",
+        nodeId,
+        role,
+        decommissioned: true,
+        dynamicTopology: this.buildDynamicClusterTopology(),
+      },
+    };
+  }
+
+  public evictExpiredClusterNodes(params?: {
+    ttlMs?: number;
+    nowMs?: number;
+    includeSeedNodes?: boolean;
+    actor?: string;
+    role?: string;
+  }): { status: number; body: Record<string, unknown> } {
+    this.ensureInitialized();
+    const ttlMs = Math.max(100, Number(params?.ttlMs ?? 15000));
+    const nowMs = Number(params?.nowMs ?? Date.now());
+    const includeSeed = Boolean(params?.includeSeedNodes ?? false);
+    const sql = this.deps.v25Store.sql;
+    const rows = sql.exec<Record<string, unknown>>("SELECT * FROM v25_cluster_registry").toArray();
+    const evictedNodes: Array<{ nodeId: string; role: string; staleDurationMs: number }> = [];
+
+    for (const r of rows) {
+      const nodeId = String(r.node_id);
+      const role = String(r.role) as "brain" | "body" | "gateway";
+      const via = String(r.registered_via ?? "SEED");
+      const status = String(r.status ?? "READY");
+      const lastHb = Number(r.last_heartbeat_ms ?? nowMs);
+      if (status === "OFFLINE") continue;
+      if (!includeSeed && via === "SEED") continue;
+      if (nowMs - lastHb > ttlMs) {
+        sql.exec("UPDATE v25_cluster_registry SET status = ? WHERE node_id = ?", "OFFLINE", nodeId);
+        sql.exec("UPDATE v25_mgmt_node_overrides SET status = ? WHERE node_id = ?", "OFFLINE", nodeId);
+        const brainKey = nodeId.startsWith("celld-brain-") ? nodeId.replace("celld-brain-", "brain-node-") : nodeId;
+        if (role === "brain") {
+          this.deps.shardCoordinator.evictUnhealthyBrainShardNode(brainKey);
+          this.topologyCas.forceSyncMembers(this.deps.shardCoordinator.topologyCas.getMembers());
+        }
+        this.deps.onPeerTopologyUpdated?.({
+          action: "deregister",
+          role,
+          nodeId,
+          brainKey,
+        });
+        evictedNodes.push({ nodeId, role, staleDurationMs: nowMs - lastHb });
+      }
+    }
+
+    if (evictedNodes.length > 0) {
+      this.appendAudit(
+        params?.actor ?? "system-watchdog",
+        params?.role ?? "SRE_ADMIN",
+        `心跳超时自动摘除失联节点: ${evictedNodes.map((n) => `${n.nodeId}(${n.role})`).join(", ")} (TTL=${ttlMs}ms)`,
+        "Global / TopologyWatchdog",
+        `EVICTED_${evictedNodes.length}_NODES`
+      );
+    }
+
+    return {
+      status: 200,
+      body: {
+        ttlMs,
+        evictedCount: evictedNodes.length,
+        evictedNodes,
+        dynamicTopology: this.buildDynamicClusterTopology(),
+      },
+    };
+  }
+
+  public buildDynamicClusterTopology(): Record<string, unknown> {
+    this.ensureInitialized();
+    const sql = this.deps.v25Store.sql;
+    const regRows = sql.exec<Record<string, unknown>>("SELECT * FROM v25_cluster_registry ORDER BY node_id ASC").toArray();
+    const slotOwners = Array.from({ length: 256 }, (_, idx) =>
+      this.deps.shardCoordinator.ring.getOwnerNodeForSlot(idx) ?? "brain-node-01"
+    );
+    const slotDistribution: Record<string, number> = {};
+    for (const owner of slotOwners) {
+      slotDistribution[owner] = (slotDistribution[owner] ?? 0) + 1;
+    }
+
+    const nowMs = Date.now();
+    const mapEntry = (r: Record<string, unknown>) => {
+      const nodeId = String(r.node_id);
+      const role = String(r.role ?? "body");
+      const brainKey = nodeId.startsWith("celld-brain-") ? nodeId.replace("celld-brain-", "brain-node-") : nodeId;
+      const ownedSlots = role === "brain" ? (slotDistribution[brainKey] ?? slotDistribution[nodeId] ?? 0) : 0;
+      const lastHb = Number(r.last_heartbeat_ms ?? nowMs);
+      return {
+        nodeId,
+        brainKey: role === "brain" ? brainKey : undefined,
+        role,
+        region: String(r.region ?? "us-west-2"),
+        baseUrl: String(r.base_url ?? ""),
+        status: String(r.status ?? "READY"),
+        cpuPct: Number(r.cpu_pct ?? 40),
+        psiPct: Number(r.psi_pct ?? 2.0),
+        activeLeases: Number(r.active_leases ?? 0),
+        capacitySlots: Number(r.capacity_slots ?? 64),
+        ownedSlots,
+        registeredVia: String(r.registered_via ?? "SEED"),
+        lastHeartbeatMs: lastHb,
+        heartbeatAgeMs: Math.max(0, nowMs - lastHb),
+        leaseEpoch: Number(r.lease_epoch ?? 1),
+      };
+    };
+
+    const allNodes = regRows.map(mapEntry);
+    const brains = allNodes.filter((n) => n.role === "brain");
+    const bodies = allNodes.filter((n) => n.role === "body");
+    const gateways = allNodes.filter((n) => n.role === "gateway");
+
+    const peerBrainUrls: Record<string, string> = {};
+    for (const b of brains) {
+      if (b.status === "READY" && b.baseUrl) {
+        peerBrainUrls[b.brainKey || b.nodeId] = b.baseUrl;
+        peerBrainUrls[b.nodeId] = b.baseUrl;
+      }
+    }
+    const peerBodyUrls: Record<string, string> = {};
+    for (const bd of bodies) {
+      if (bd.status === "READY" && bd.baseUrl) {
+        peerBodyUrls[bd.nodeId] = bd.baseUrl;
+      }
+    }
+    const activeGatewayUrls = gateways.filter((g) => g.status === "READY" && g.baseUrl).map((g) => g.baseUrl);
+
+    return {
+      topologyGeneration: this.deps.shardCoordinator.topologyCas.getGeneration(),
+      ringDigest: this.deps.shardCoordinator.topologyCas.computeRingDigest(),
+      activeBrainMembers: this.deps.shardCoordinator.topologyCas.getMembers(),
+      totalRegisteredNodes: allNodes.length,
+      countsByRole: {
+        brain: brains.length,
+        body: bodies.length,
+        gateway: gateways.length,
+      },
+      brains,
+      bodies,
+      gateways,
+      slotDistribution,
+      slotOwners,
+      peerBrainUrls,
+      peerBodyUrls,
+      activeGatewayUrls,
+    };
+  }
+
   public scaleOutOrDecommissionNode(params: {
     action: "scale_out" | "decommission";
     nodeId: string;
     region: string;
-    role: "brain" | "body";
+    role: "brain" | "body" | "gateway";
     ipAddress?: string;
+    baseUrl?: string;
+    capacitySlots?: number;
     actor: string;
     actorRole: string;
   }): { status: number; body: Record<string, unknown> } {
@@ -5632,79 +6121,26 @@ export const updatedAt = ${Date.now()};
         body: { error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权执行节点扩缩容" },
       };
     }
-    const sql = this.deps.v25Store.sql;
     if (params.action === "decommission") {
-      this.executeBatchNodeOperation({
-        operation: "drain",
-        nodeIds: [params.nodeId],
-        forceMigrateLeases: true,
-        actor: params.actor,
-        role: params.actorRole,
-      });
-      sql.exec("DELETE FROM v25_mgmt_node_overrides WHERE node_id = ?", params.nodeId);
-      if (params.nodeId.startsWith("celld-brain-")) {
-        const brainKey = params.nodeId.replace("celld-brain-", "brain-node-");
-        this.deps.shardCoordinator.evictUnhealthyBrainShardNode(brainKey);
-      }
-      this.appendAudit(
-        params.actor,
-        params.actorRole,
-        `下线并移除节点 ${params.nodeId} (已迁移全部活跃租约)`,
-        `${params.region} / ${params.nodeId}`,
-        "DECOMMISSIONED"
-      );
-      return { status: 200, body: { action: "decommission", nodeId: params.nodeId, decommissioned: true } };
-    }
-
-    const ip = params.ipAddress ?? `10.240.0.${Math.floor(50 + Math.random() * 150)}`;
-    const roleLabel =
-      params.role === "brain"
-        ? `Brain Shard (${params.nodeId})`
-        : `Body LayerFS (${params.nodeId})`;
-    const scaleRes = this.deps.fleetController.scaleOutNode(
-      params.nodeId,
-      ip,
-      params.role === "brain" ? "control-plane" : "worker"
-    );
-    const daemon = new NodeDaemon(params.nodeId, 32, 65536, 8);
-    this.deps.scheduler.registerOrUpdateNode(daemon.emitHeartbeat(0));
-
-    sql.exec(
-      "INSERT OR REPLACE INTO v25_mgmt_node_overrides (node_id, region, role_label, status, cpu_pct, psi_pct) VALUES (?, ?, ?, ?, ?, ?)",
-      params.nodeId,
-      params.region,
-      roleLabel,
-      "READY",
-      38.5,
-      1.8
-    );
-
-    let newEpoch = 1;
-    if (params.role === "brain" || params.nodeId.startsWith("celld-brain-")) {
-      const brainKey = params.nodeId.replace("celld-brain-", "brain-node-");
-      newEpoch = this.deps.shardCoordinator.registerBrainShardNode(brainKey);
-    }
-
-    this.appendAudit(
-      params.actor,
-      params.actorRole,
-      `扩容新节点 ${params.nodeId} (${roleLabel}, IP=${ip}) 并加入集群拓扑`,
-      `${params.region} / ${params.nodeId}`,
-      `READY (epoch:${newEpoch})`
-    );
-
-    return {
-      status: 201,
-      body: {
-        action: "scale_out",
+      return this.deregisterDynamicClusterNode({
         nodeId: params.nodeId,
         region: params.region,
-        role: params.role,
-        ipAddress: ip,
-        rebalancedCells: scaleRes.rebalancedCells,
-        epoch: newEpoch,
-      },
-    };
+        reason: "DECOMMISSIONED",
+        actor: params.actor,
+        actorRole: params.actorRole,
+      });
+    }
+    return this.registerDynamicClusterNode({
+      nodeId: params.nodeId,
+      role: params.role,
+      region: params.region,
+      baseUrl: params.baseUrl,
+      ipAddress: params.ipAddress,
+      capacitySlots: params.capacitySlots,
+      registeredVia: "SCALE_API",
+      actor: params.actor,
+      actorRole: params.actorRole,
+    });
   }
 
   public mutateTenantFinOpsOrEscrow(params: {

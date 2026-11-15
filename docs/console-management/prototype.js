@@ -164,6 +164,8 @@
       backendOriginOverride: '',
       celldDevService: null,
       celldProbeResult: null,
+      dynamicTopology: null,
+      slotOwners: [],
       autoRefreshPaused: false,
       darkTheme: false,
       lastBffRttMs: 0,
@@ -349,6 +351,8 @@
       if (d.finopsVisualization) state.finopsVisualization = d.finopsVisualization;
       if (d.approvalsSagaVisualization) state.approvalsSagaVisualization = d.approvalsSagaVisualization;
       if (d.celldDevService) state.celldDevService = d.celldDevService;
+      if (d.dynamicTopology) state.dynamicTopology = d.dynamicTopology;
+      if (Array.isArray(d.slotOwners)) state.slotOwners = d.slotOwners;
       state.regions = Array.isArray(d.regions) ? d.regions : [];
       state.nodes = Array.isArray(d.nodes) ? d.nodes : [];
       state.tenants = Array.isArray(d.tenants) ? d.tenants : [];
@@ -724,7 +728,7 @@
         <div class="kpi-card">
           <div class="kpi-label"><span>集群计算与 256 哈希槽分布</span><span class="status-pill ${isCap && !state.loadSheddingActive ? 'danger' : 'ok'}">${state.loadSheddingActive ? '已开启削峰' : 'RPO=0 SQL'}</span></div>
           <div class="kpi-value">${capText}</div>
-          <div class="kpi-sub">槽位分布: <span class="mono">${bDist['brain-node-01'] || 0} / ${bDist['brain-node-02'] || 0} / ${bDist['brain-node-03'] || 0}</span></div>
+          <div class="kpi-sub">槽位分布 (${Object.keys(bDist).length} Brain): <span class="mono">${Object.entries(bDist).map(([k, v]) => `${esc(k.replace('brain-node-', 'B'))}:${v}`).join(' / ')}</span></div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label"><span>多租户并发沙箱配额</span><span class="status-pill ${isQuotaFull ? 'warn' : 'ok'}">${isQuotaFull ? 'Northstar 触顶' : 'DRF 均衡'}</span></div>
@@ -964,6 +968,69 @@
     const hasBatchFail = state.batchReport && state.batchReport.partialFailure;
 
     return `
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">全角色动态拓扑注册表与自动伸缩工作台 (GET /v1beta1/console/topology · POST /internal/v1beta1/cluster/register)</h2>
+            <p class="panel-subtitle">支持新增 <code>brain</code>（自动重平衡 256 哈希槽并更新 RPC 路由表）、<code>body</code>（出站自注册或反向隧道上线）与 <code>gateway</code>（自动加入反代上游池），并支持心跳 TTL 超时自动摘除。</p>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="small primary" data-action="quick-self-register-node" data-role="brain" ${!perm.ok ? 'disabled' : ''}>+ 自注册新 Brain 节点</button>
+            <button type="button" class="small primary" data-action="quick-self-register-node" data-role="body" ${!perm.ok ? 'disabled' : ''}>+ 自注册新 Body 节点</button>
+            <button type="button" class="small primary" data-action="quick-self-register-node" data-role="gateway" ${!perm.ok ? 'disabled' : ''}>+ 自注册新 Gateway 网关</button>
+            <button type="button" class="small" data-action="evict-expired-cluster-nodes" ${!perm.ok ? 'disabled' : ''}>⏱ 扫描心跳超时摘除 (TTL Evict)</button>
+          </div>
+        </div>
+        <div class="btn-row" style="margin-bottom:10px;">
+          <span class="status-pill ok">Topology CAS: <strong class="mono">Gen #${state.dynamicTopology?.topologyGeneration ?? 1}</strong></span>
+          <span class="status-pill ok">Brain 分片节点: <strong class="mono">${state.dynamicTopology?.countsByRole?.brain ?? 3} 个</strong></span>
+          <span class="status-pill ok">Body 执行节点: <strong class="mono">${state.dynamicTopology?.countsByRole?.body ?? 3} 个</strong></span>
+          <span class="status-pill ok">Gateway 边缘网关: <strong class="mono">${state.dynamicTopology?.countsByRole?.gateway ?? 2} 个</strong></span>
+          <span class="status-pill ok">256-Slot 实时归属: <strong class="mono">${Object.entries(state.slotDistribution || {}).map(([k, v]) => `${esc(k)}=${v}`).join(' · ')}</strong></span>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>注册节点 ID</th>
+                <th>角色 (Role)</th>
+                <th>区域</th>
+                <th>通信端点 (baseUrl)</th>
+                <th>注册来源</th>
+                <th>分片槽 / 容量</th>
+                <th>心跳新鲜度</th>
+                <th>状态</th>
+                <th>动态拓扑操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${([
+                ...(state.dynamicTopology?.brains || []),
+                ...(state.dynamicTopology?.bodies || []),
+                ...(state.dynamicTopology?.gateways || [])
+              ]).map((rn) => `
+                <tr>
+                  <td class="mono"><strong>${esc(rn.nodeId)}</strong>${rn.brainKey && rn.brainKey !== rn.nodeId ? ` <span class="muted">(${esc(rn.brainKey)})</span>` : ''}</td>
+                  <td><span class="status-pill ${rn.role === 'brain' ? 'ok' : rn.role === 'gateway' ? 'warn' : ''}">${esc(rn.role.toUpperCase())}</span></td>
+                  <td class="mono">${esc(rn.region)}</td>
+                  <td class="mono">${esc(rn.baseUrl || 'tunnel://outbound')}</td>
+                  <td class="mono"><span class="status-pill">${esc(rn.registeredVia)}</span></td>
+                  <td class="mono">${rn.role === 'brain' ? `${rn.ownedSlots} / 256 槽` : `${rn.capacitySlots} 槽`} (epoch #${rn.leaseEpoch})</td>
+                  <td class="mono">${rn.heartbeatAgeMs ?? 0}ms ago</td>
+                  <td><span class="status-pill ${rn.status === 'READY' ? 'ok' : 'danger'}">${esc(rn.status)}</span></td>
+                  <td>
+                    <div class="btn-row">
+                      <button type="button" class="small" data-action="send-node-heartbeat" data-node="${esc(rn.nodeId)}" data-role="${esc(rn.role)}" ${!perm.ok ? 'disabled' : ''}>♥ 发送心跳</button>
+                      <button type="button" class="small danger" data-action="decommission-node" data-node="${esc(rn.nodeId)}" data-region="${esc(rn.region)}" ${!canMutateTarget('all', 'all', true).ok ? 'disabled' : ''}>摘除下线</button>
+                    </div>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="panel">
         <div class="panel-header">
           <div>
@@ -1824,14 +1891,28 @@
   }
 
   function renderRuntimeSection() {
-    const bDist = state.slotDistribution || { 'brain-node-01': 85, 'brain-node-02': 86, 'brain-node-03': 85 };
+    const bDist = state.slotDistribution && Object.keys(state.slotDistribution).length > 0
+      ? state.slotDistribution
+      : { 'brain-node-01': 85, 'brain-node-02': 86, 'brain-node-03': 85 };
+    const brainKeys = Object.keys(bDist);
+    const brainColors = ['#2563eb', '#0d9488', '#d97706', '#7c3aed', '#e11d48', '#059669', '#4f46e5', '#b45309'];
+    const slotOwnersList = Array.isArray(state.slotOwners) && state.slotOwners.length === 256
+      ? state.slotOwners
+      : (() => {
+          const fallback = [];
+          for (const [bKey, cnt] of Object.entries(bDist)) {
+            for (let k = 0; k < Number(cnt || 0) && fallback.length < 256; k++) fallback.push(bKey);
+          }
+          while (fallback.length < 256) fallback.push(brainKeys[0] || 'brain-node-01');
+          return fallback;
+        })();
     const slotBoxes = [];
     for (let i = 0; i < 256; i++) {
-      const b1Count = bDist['brain-node-01'] ?? 85;
-      const b2Count = bDist['brain-node-02'] ?? 86;
-      const cls = i < b1Count ? 'b1' : i < b1Count + b2Count ? 'b2' : 'b3';
-      const owner = cls === 'b1' ? 'brain-node-01' : cls === 'b2' ? 'brain-node-02' : 'brain-node-03';
-      slotBoxes.push(`<div class="slot-box ${cls}" title="Slot #${i} → ${owner}"></div>`);
+      const owner = slotOwnersList[i] || brainKeys[0] || 'brain-node-01';
+      const bIdx = Math.max(0, brainKeys.indexOf(owner));
+      const cls = bIdx === 0 ? 'b1' : bIdx === 1 ? 'b2' : 'b3';
+      const bgStyle = bIdx >= 3 ? `style="background:${brainColors[bIdx % brainColors.length]};"` : '';
+      slotBoxes.push(`<div class="slot-box ${cls}" ${bgStyle} title="Slot #${i} → ${esc(owner)}"></div>`);
     }
     const rv = state.runtimeVisualization || {
       layerfsBranches: [],
@@ -1982,7 +2063,7 @@
           <div class="panel-header">
             <div>
               <h2 class="panel-title">256-Slot 一致性哈希环与 Brain 分片故障演练 (对接 /v1beta1/console/shards/rebalance)</h2>
-              <p class="panel-subtitle">蓝色: brain-node-01 (${bDist['brain-node-01'] ?? 0} 槽) · 青色: brain-node-02 (${bDist['brain-node-02'] ?? 0} 槽) · 琥珀色: brain-node-03 (${bDist['brain-node-03'] ?? 0} 槽)</p>
+              <p class="panel-subtitle">当前活跃分片节点 (${brainKeys.length} 个): ${Object.entries(bDist).map(([k, v]) => `${esc(k)} (${v} 槽)`).join(' · ')}</p>
             </div>
             <div class="btn-row">
               <button type="button" class="small danger" data-action="runtime-evict-brain02">驱逐 brain-node-02</button>
@@ -3271,8 +3352,10 @@
         <div class="form-field">
           <label for="dlg-disp-body">目标 Body LayerFS 宿主</label>
           <select id="dlg-disp-body">
-            <option value="body-host-01" selected>body-host-01 (:19501)</option>
-            <option value="body-host-02">body-host-02 (:19502)</option>
+            ${((state.dynamicTopology?.bodies && state.dynamicTopology.bodies.length > 0)
+              ? state.dynamicTopology.bodies.filter((b) => b.status === 'READY')
+              : [{ nodeId: 'body-host-01', baseUrl: ':19501' }, { nodeId: 'body-host-02', baseUrl: ':19502' }]
+            ).map((b, idx) => `<option value="${esc(b.nodeId)}" ${idx === 0 ? 'selected' : ''}>${esc(b.nodeId)} (${esc(b.baseUrl || b.region || 'READY')})</option>`).join('')}
           </select>
         </div>
         <div class="form-field">
@@ -3386,13 +3469,16 @@
     const p = getPrincipal();
     const nextIdx = state.nodes.length + 1;
     openDialog(
-      '扩容裸金属 / 容器节点 (POST /v1beta1/management/nodes/scale)',
+      '全角色弹性扩容节点 (POST /v1beta1/management/nodes/scale)',
+      '<div class="form-field"><label for="dlg-scale-role">节点角色 (Role)</label><select id="dlg-scale-role">' +
+      '<option value="body" selected>Body LayerFS 沙箱宿主 (Worker 执行面)</option>' +
+      '<option value="brain">celld Brain 调度分片节点 (动态加入 256-Slot 哈希环)</option>' +
+      '<option value="gateway">Edge Gateway 边缘接入网关 (动态加入反代上游池)</option>' +
+      '</select></div>' +
       '<div class="form-field"><label for="dlg-scale-id">新节点 ID (Node ID)</label>' +
       '<input id="dlg-scale-id" type="text" value="body-host-0' + nextIdx + '" class="mono" /></div>' +
-      '<div class="form-field"><label for="dlg-scale-role">节点角色</label><select id="dlg-scale-role">' +
-      '<option value="body" selected>Body LayerFS 沙箱宿主 (Worker)</option>' +
-      '<option value="brain">celld Brain 调度分片节点 (加入 256-Slot 哈希环)</option>' +
-      '</select></div>' +
+      '<div class="form-field"><label for="dlg-scale-url">节点通信地址 (baseUrl)</label>' +
+      '<input id="dlg-scale-url" type="text" value="http://127.0.0.1:1950' + nextIdx + '" class="mono" /></div>' +
       '<div class="form-field"><label for="dlg-scale-region">部署区域</label><select id="dlg-scale-region">' +
       '<option value="us-west-2" selected>US West · us-west-2</option>' +
       '<option value="eu-central-1">EU Central · eu-central-1</option>' +
@@ -3402,20 +3488,42 @@
       async () => {
         const nodeId = document.getElementById('dlg-scale-id').value.trim();
         const role = document.getElementById('dlg-scale-role').value;
+        const baseUrl = document.getElementById('dlg-scale-url').value.trim();
         const region = document.getElementById('dlg-scale-region').value;
         await callBackendApi('POST', '/v1beta1/management/nodes/scale', {
           action: 'scale_out',
           nodeId,
           role,
+          baseUrl,
           region,
           actor: p.id,
           actorRole: p.role
         });
         closeDialog();
         await fetchBackendState();
-        showToast('后端已完成节点 ' + nodeId + ' 扩容并同步集群拓扑');
+        showToast('后端已完成 ' + role.toUpperCase() + ' 节点 ' + nodeId + ' 扩容并同步集群拓扑');
       }
     );
+    const roleEl = document.getElementById('dlg-scale-role');
+    const idEl = document.getElementById('dlg-scale-id');
+    const urlEl = document.getElementById('dlg-scale-url');
+    if (roleEl && idEl && urlEl) {
+      roleEl.addEventListener('change', () => {
+        if (roleEl.value === 'brain') {
+          const cnt = (state.dynamicTopology?.countsByRole?.brain ?? 3) + 1;
+          idEl.value = 'celld-brain-0' + cnt;
+          urlEl.value = 'http://127.0.0.1:' + (18081 + cnt);
+        } else if (roleEl.value === 'gateway') {
+          const cnt = (state.dynamicTopology?.countsByRole?.gateway ?? 2) + 1;
+          idEl.value = 'celld-gw-0' + cnt;
+          urlEl.value = 'http://127.0.0.1:' + (18079 + cnt + 5);
+        } else {
+          const cnt = (state.dynamicTopology?.countsByRole?.body ?? 3) + 1;
+          idEl.value = 'body-host-0' + cnt;
+          urlEl.value = 'http://127.0.0.1:' + (19500 + cnt);
+        }
+      });
+    }
   }
 
   function openCreateApprovalDialog() {
@@ -6095,6 +6203,52 @@
       state.lastApiOutput = JSON.stringify(res.data, null, 2);
       renderMainContent();
       showToast('后端已完成 LayerFS Rule D9 远端 SQLite Store 同步 (gen=' + (res.data.remoteGeneration || 1) + ')');
+      return;
+    }
+    if (action === 'quick-self-register-node') {
+      const role = target.getAttribute('data-role') || 'body';
+      const counts = state.dynamicTopology?.countsByRole || { brain: 3, body: 3, gateway: 2 };
+      const nextNum = (counts[role] || 2) + 1;
+      const nodeId = role === 'brain' ? `celld-brain-0${nextNum}` : role === 'gateway' ? `celld-gw-0${nextNum}` : `body-host-0${nextNum}`;
+      const port = role === 'brain' ? 18081 + nextNum : role === 'gateway' ? 18085 + nextNum : 19500 + nextNum;
+      const baseUrl = `http://127.0.0.1:${port}`;
+      const res = await callBackendApi('POST', '/internal/v1beta1/cluster/register', {
+        nodeId,
+        role,
+        region: state.region === 'all' ? 'us-west-2' : state.region,
+        baseUrl,
+        registeredVia: 'SELF_REG',
+        actor: getPrincipal().id
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast(`新节点 ${nodeId} (${role.toUpperCase()}, ${baseUrl}) 已完成自注册并接入动态拓扑`);
+      return;
+    }
+    if (action === 'send-node-heartbeat') {
+      const nodeId = target.getAttribute('data-node') || 'body-host-01';
+      const role = target.getAttribute('data-role') || 'body';
+      const res = await callBackendApi('POST', '/internal/v1beta1/cluster/heartbeat', {
+        nodeId,
+        role,
+        cpuPct: Number((35 + Math.random() * 25).toFixed(1)),
+        psiPct: Number((1.2 + Math.random() * 3.5).toFixed(1))
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast(`已刷新节点 ${nodeId} 心跳与负载指标 (status=READY)`);
+      return;
+    }
+    if (action === 'evict-expired-cluster-nodes') {
+      const p = getPrincipal();
+      const res = await callBackendApi('POST', '/v1beta1/management/topology/evict-expired', {
+        ttlMs: 15000,
+        actor: p.id,
+        role: p.role
+      });
+      state.lastApiOutput = JSON.stringify(res.data, null, 2);
+      await fetchBackendState();
+      showToast(`已完成心跳超时扫描：摘除 ${res.data?.evictedCount ?? 0} 个失联节点`);
       return;
     }
     if (action === 'probe-celld-dev-service') {

@@ -88,6 +88,8 @@ var _outbox_webhook = require("./telemetry/outbox_webhook.js");function _getRequ
 
 
 
+
+
 function parseJsonEnvMap(raw) {
   if (!raw || !raw.trim()) return {};
   try {
@@ -112,6 +114,9 @@ class AnstsLocalAndComposeServer {
   secondaryGatewayUrl;
   peerBrainUrls;
   peerBodyUrls;
+  peerGatewayUrls;
+  seedGatewayUrls;
+  nodeRegion;
   scheduler;
   backpressure;
   sseGateway;
@@ -191,6 +196,19 @@ class AnstsLocalAndComposeServer {
     this.secondaryGatewayUrl = options.secondaryGatewayUrl ?? process.env.ANSTS_SECONDARY_GATEWAY_URL ?? null;
     this.peerBrainUrls = options.peerBrainUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BRAIN_URLS);
     this.peerBodyUrls = options.peerBodyUrls ?? parseJsonEnvMap(process.env.ANSTS_PEER_BODY_URLS);
+    this.peerGatewayUrls = parseJsonEnvMap(process.env.ANSTS_PEER_GATEWAY_URLS);
+    this.nodeRegion = options.region ?? process.env.ANSTS_REGION ?? "us-west-2";
+    const envSeeds = process.env.ANSTS_SEED_GATEWAY_URLS ?
+    process.env.ANSTS_SEED_GATEWAY_URLS.split(",").map((s) => s.trim()).filter(Boolean) :
+    [];
+    this.seedGatewayUrls = Array.from(
+    new Set([
+    ...(options.seedGatewayUrls ?? []),
+    ...envSeeds,
+    ...(this.primaryGatewayUrl ? [this.primaryGatewayUrl] : []),
+    ...(this.secondaryGatewayUrl ? [this.secondaryGatewayUrl] : [])]));
+
+
 
     this.tickIntervalMs = options.tickIntervalMs ?? Number(process.env.ANSTS_TICK_INTERVAL_MS ?? 1000);
     this.scheduler = new _scheduler.CoreScheduler5D(15.0);
@@ -371,6 +389,25 @@ class AnstsLocalAndComposeServer {
       scheduler: this.scheduler,
       v25Store: this.v25Store,
       shardCoordinator: this.shardCoordinator,
+      onPeerTopologyUpdated: (ev) => {
+        if (ev.action === "register") {
+          if (ev.role === "brain" && ev.baseUrl) {
+            if (ev.brainKey) this.peerBrainUrls[ev.brainKey] = ev.baseUrl;
+            this.peerBrainUrls[ev.nodeId] = ev.baseUrl;
+            this.invalidatePeerTasksCache();
+          } else if (ev.role === "body" && ev.baseUrl) {
+            this.peerBodyUrls[ev.nodeId] = ev.baseUrl;
+          } else if (ev.role === "gateway" && ev.baseUrl) {
+            this.peerGatewayUrls[ev.nodeId] = ev.baseUrl;
+          }
+        } else if (ev.action === "deregister") {
+          if (ev.brainKey) delete this.peerBrainUrls[ev.brainKey];
+          delete this.peerBrainUrls[ev.nodeId];
+          delete this.peerBodyUrls[ev.nodeId];
+          delete this.peerGatewayUrls[ev.nodeId];
+          this.invalidatePeerTasksCache();
+        }
+      },
       fleetController: this.fleetController,
       finopsController: this.finopsController,
       dagEscrow: this.dagEscrow,
@@ -450,6 +487,10 @@ class AnstsLocalAndComposeServer {
 
     const boundDashPort = await this.dashboardServer.listen(targetDashPort);
 
+    if (this.seedGatewayUrls.length > 0) {
+      await this.registerSelfWithClusterSeeds(boundApiPort);
+    }
+
     // If this node is a `body` daemon and gateway URLs are configured, proactively register dual-homed reverse tunnels
     if (this.nodeRole === "body") {
       await this.registerOutboundReverseTunnels();
@@ -490,6 +531,39 @@ class AnstsLocalAndComposeServer {
     idemKey,
     JSON.stringify(task));
 
+  }
+
+  async registerSelfWithClusterSeeds(boundApiPort) {
+    const connectHost = this.host === "0.0.0.0" ? "127.0.0.1" : this.host;
+    const selfBaseUrl = `http://${connectHost}:${boundApiPort}`;
+    this.managementPlane.registerDynamicClusterNode({
+      nodeId: this.nodeId,
+      role: this.nodeRole,
+      region: this.nodeRegion,
+      baseUrl: selfBaseUrl,
+      registeredVia: "SELF_REG",
+      actor: this.nodeId,
+      actorRole: "SYSTEM"
+    });
+    for (const seedUrl of this.seedGatewayUrls) {
+      const cleanSeed = seedUrl.replace(/\/$/, "");
+      if (cleanSeed === selfBaseUrl) continue;
+      try {
+        await fetch(`${cleanSeed}/internal/v1beta1/cluster/register`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            nodeId: this.nodeId,
+            role: this.nodeRole,
+            region: this.nodeRegion,
+            baseUrl: selfBaseUrl,
+            registeredVia: "SELF_REG"
+          })
+        });
+      } catch {
+
+        // ignore unreachable seed during bootstrap
+      }}
   }
 
   async registerOutboundReverseTunnels() {
@@ -673,7 +747,9 @@ class AnstsLocalAndComposeServer {
             const verified = this.managementPlane.rbacGuard.verifyAuthorizationHeader(authHeader);
             if (verified.authenticated && verified.claims) {
               parsed.actor = verified.claims.sub;
-              parsed.role = verified.claims.role;
+              if (parsed.role !== "brain" && parsed.role !== "body" && parsed.role !== "gateway") {
+                parsed.role = verified.claims.role;
+              }
               parsed.actorRole = verified.claims.role;
             }
           }
@@ -1102,6 +1178,15 @@ class AnstsLocalAndComposeServer {
         connGeneration,
         epoch
       });
+      this.managementPlane.registerDynamicClusterNode({
+        nodeId: hostId,
+        role: "body",
+        region: body.region ? String(body.region) : "us-west-2",
+        baseUrl: body.baseUrl ? String(body.baseUrl) : "",
+        registeredVia: "TUNNEL",
+        actor: hostId,
+        actorRole: "SYSTEM"
+      });
 
       const activeBinding = this.tunnelRouter.tunnelCell.selectActiveTunnel(hostId);
       res.writeHead(200, { "content-type": "application/json" });
@@ -1356,61 +1441,17 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
-    // [M40] TanStack Console BFF: Live 11-Service Topology & 256-Slot Ring Map (`GET /v1beta1/console/topology`)
+    // [M40 & M95] TanStack Console BFF: Live Dynamic Topology & 256-Slot Ring Map (`GET /v1beta1/console/topology`)
     if (method === "GET" && pathname === "/v1beta1/console/topology") {
-      const slotOwners = Array.from({ length: 256 }, (_, idx) =>
-      this.shardCoordinator.ring.getOwnerNodeForSlot(idx) ?? "brain-node-01");
-
-      const slotDistribution = {};
-      for (const owner of slotOwners) {
-        slotDistribution[owner] = (slotDistribution[owner] ?? 0) + 1;
-      }
-      const brainKeys =
-      Object.keys(this.peerBrainUrls).length > 0 ?
-      Object.keys(this.peerBrainUrls) :
-      ["brain-node-01", "brain-node-02", "brain-node-03"];
-      const bodyKeys =
-      Object.keys(this.peerBodyUrls).length > 0 ?
-      Object.keys(this.peerBodyUrls) :
-      ["body-host-01", "body-host-02"];
-
-      const brains = brainKeys.map((bId, idx) => ({
-        nodeId: bId,
-        url: this.peerBrainUrls[bId] ?? `http://127.0.0.1:${18082 + idx}`,
-        ownedSlots: slotDistribution[bId] ?? 0,
-        status: (slotDistribution[bId] ?? 0) > 0 ? "HEALTHY" : "EVICTED"
-      }));
-
-      const bodies = bodyKeys.map((bdId, idx) => {
-        let activeGatewayId = "celld-gw-01";
-        let activeRole = "PRIMARY";
-        try {
-          const active = this.tunnelRouter.tunnelCell.selectActiveTunnel(bdId);
-          activeGatewayId = active.gatewayId;
-          activeRole = active.role;
-        } catch {
-
-          // default primary tunnel
-        }return {
-          nodeId: bdId,
-          url: this.peerBodyUrls[bdId] ?? `http://127.0.0.1:${19501 + idx}`,
-          status: "HEALTHY",
-          activeGatewayId,
-          activeRole
-        };
-      });
-
+      const dynTopo = this.managementPlane.buildDynamicClusterTopology();
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
       JSON.stringify({
         cluster: "ansts-v25-dev-cluster",
         gatewayNodeId: this.nodeId,
         virtualSlots: 256,
-        slotOwners,
-        slotDistribution,
-        brains,
-        bodies,
-        servicesCount: 11
+        servicesCount: 11,
+        ...dynTopo
       }));
 
       return;
@@ -2924,6 +2965,93 @@ class AnstsLocalAndComposeServer {
       return;
     }
 
+    // [M95] Dynamic Cluster Topology Self-Registration, Heartbeat & TTL Auto-Eviction
+    if (method === "POST" && pathname === "/internal/v1beta1/cluster/register") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.registerDynamicClusterNode({
+        nodeId: String(body.nodeId ?? "").trim(),
+        role: body.role === "brain" ? "brain" : body.role === "gateway" ? "gateway" : "body",
+
+
+
+        region: body.region ? String(body.region) : "us-west-2",
+        baseUrl: body.baseUrl ? String(body.baseUrl) : undefined,
+        ipAddress: body.ipAddress ? String(body.ipAddress) : undefined,
+        capacitySlots: body.capacitySlots !== undefined ? Number(body.capacitySlots) : undefined,
+        registeredVia: body.registeredVia ?? "SELF_REG",
+        actor: body.actor ? String(body.actor) : String(body.nodeId ?? "cluster-node"),
+        actorRole: "SYSTEM"
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/internal/v1beta1/cluster/heartbeat") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.heartbeatDynamicClusterNode({
+        nodeId: String(body.nodeId ?? "").trim(),
+        role: body.role,
+        region: body.region ? String(body.region) : undefined,
+        baseUrl: body.baseUrl ? String(body.baseUrl) : undefined,
+        cpuPct: body.cpuPct !== undefined ? Number(body.cpuPct) : undefined,
+        psiPct: body.psiPct !== undefined ? Number(body.psiPct) : undefined,
+        activeLeases: body.activeLeases !== undefined ? Number(body.activeLeases) : undefined,
+        nowMs: body.nowMs !== undefined ? Number(body.nowMs) : undefined
+      });
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/internal/v1beta1/cluster/deregister") {
+      const body = await this.readJsonBody(req);
+      const out = this.managementPlane.deregisterDynamicClusterNode({
+        nodeId: String(body.nodeId ?? "").trim(),
+        region: body.region ? String(body.region) : undefined,
+        reason: body.reason ? String(body.reason) : "DEREGISTERED",
+        actor: body.actor ? String(body.actor) : String(body.nodeId ?? "cluster-node"),
+        actorRole: "SYSTEM"
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
+    if (method === "POST" && pathname === "/v1beta1/management/topology/evict-expired") {
+      const body = await this.readJsonBody(req);
+      const auth = this.resolveAuthPrincipal(req, body, false);
+      if (!auth.ok) {
+        res.writeHead(auth.status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error, message: auth.message }));
+        return;
+      }
+      if (auth.role === "VIEWER") {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "RBAC_FORBIDDEN", message: "VIEWER 角色无权触发失联节点摘除" }));
+        return;
+      }
+      const out = this.managementPlane.evictExpiredClusterNodes({
+        ttlMs: body.ttlMs !== undefined ? Number(body.ttlMs) : 15000,
+        nowMs: body.nowMs !== undefined ? Number(body.nowMs) : Date.now(),
+        includeSeedNodes: Boolean(body.includeSeedNodes ?? false),
+        actor: auth.actor,
+        role: auth.role
+      });
+      if (out.status < 400) {
+        await this.managementPlane.pushManagementStateToS3();
+      }
+      res.writeHead(out.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(out.body));
+      return;
+    }
+
     // [M93] celld Dev Service Status & Console Live Backend Probe
     if (method === "GET" && pathname === "/v1beta1/console/celld-dev-status") {
       const statusPayload = this.managementPlane.buildCelldDevServiceStatus({
@@ -3282,8 +3410,13 @@ class AnstsLocalAndComposeServer {
         action: body.action,
         nodeId: body.nodeId.trim(),
         region: String(body.region ?? "us-west-2"),
-        role: body.role === "brain" ? "brain" : "body",
+        role: body.role === "brain" ? "brain" : body.role === "gateway" ? "gateway" : "body",
+
+
+
         ipAddress: body.ipAddress ? String(body.ipAddress) : undefined,
+        baseUrl: body.baseUrl ? String(body.baseUrl).trim() : undefined,
+        capacitySlots: body.capacitySlots !== undefined ? Number(body.capacitySlots) : undefined,
         actor: auth.actor,
         actorRole: auth.role
       });

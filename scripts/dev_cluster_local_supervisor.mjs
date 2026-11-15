@@ -165,7 +165,38 @@ async function bootAll() {
 
   // 5. Start TanStack Console Nginx-equivalent Reverse Proxy & Static Server (:8088)
   let rrCounter = 0;
-  const gatewayUpstreamPorts = [18080, 18081];
+  let gatewayUpstreamPorts = [18080, 18081];
+  const refreshDynamicGateways = async () => {
+    for (const seedPort of [18080, 18081, ...gatewayUpstreamPorts]) {
+      try {
+        const r = await fetch(`http://127.0.0.1:${seedPort}/v1beta1/console/topology`);
+        if (r.ok) {
+          const topo = await r.json();
+          if (Array.isArray(topo.activeGatewayUrls) && topo.activeGatewayUrls.length > 0) {
+            const ports = topo.activeGatewayUrls
+              .map((u) => {
+                try {
+                  return Number(new URL(u).port);
+                } catch {
+                  return 0;
+                }
+              })
+              .filter((p) => Number.isInteger(p) && p > 0);
+            if (ports.length > 0) {
+              gatewayUpstreamPorts = Array.from(new Set(ports));
+            }
+          }
+          break;
+        }
+      } catch {
+        // try next gateway
+      }
+    }
+  };
+  const gwDiscoveryTimer = setInterval(() => {
+    refreshDynamicGateways().catch(() => {});
+  }, 2000);
+  gwDiscoveryTimer.unref?.();
   await startAuxServer(
     8088,
     async (req, res) => {

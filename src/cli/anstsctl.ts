@@ -694,6 +694,41 @@ export async function runAnstsCtlRemote(
     return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
   }
 
+  if (cmd === "mgmt-topology") {
+    const resp = await fetch(`${baseUrl}/v1beta1/console/topology`);
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "cluster-register") {
+    const nodeId = (rest[0] ?? "brain-node-04").trim();
+    const role = (rest[1] ?? "brain").trim();
+    const nodeBaseUrl = (rest[2] ?? "http://127.0.0.1:18085").trim();
+    const region = (rest[3] ?? "us-west-2").trim();
+    const resp = await fetch(`${baseUrl}/internal/v1beta1/cluster/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nodeId, role, baseUrl: nodeBaseUrl, region, registeredVia: "SELF_REG" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
+  if (cmd === "mgmt-scale-node") {
+    const action = (rest[0] ?? "scale_out").trim();
+    const nodeId = (rest[1] ?? "celld-gw-03").trim();
+    const role = (rest[2] ?? "gateway").trim();
+    const nodeBaseUrl = (rest[3] ?? "http://127.0.0.1:18086").trim();
+    const region = (rest[4] ?? "us-west-2").trim();
+    const resp = await fetch(`${baseUrl}/v1beta1/management/nodes/scale`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action, nodeId, role, baseUrl: nodeBaseUrl, region, actor: "chen", role_name: "SRE_ADMIN" }),
+    });
+    const data = await resp.json();
+    return { exitCode: resp.ok ? 0 : 1, stdout: JSON.stringify(data) };
+  }
+
   if (cmd === "mgmt-celld-status") {
     const resp = await fetch(`${baseUrl}/v1beta1/console/celld-dev-status`);
     const data = await resp.json();

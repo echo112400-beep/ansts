@@ -40,3 +40,12 @@ ANSTS v2.5 采用 **控制面 (`denoland/celld` v0.6.3 Durable Object Actor) + �
   - 完整保留 `main` 分支的 6 份核心架构设计文档 (`docs/architecture_design_doc.md`、`docs/microservices_architecture.md`、`docs/celld_persistent_recoverable_ha_scheduler_design.md`、`docs/ansts_production_deployment_architecture_design.md`、`docs/ansts_v2_implementation_backlog.md`、`docs/agent_sandbox_scheduler_dashboard.html`) 以及 `feat/celld-v25` 的全部 Console 与后端工程实现。
 - **跨阶段符号与接口向后兼容**:
   - 统一导出 `AgentTask` (`TaskSpec`)、`ResourceVector5D` (`ResourceProfile`)、`ToolEffectClass` (`ToolCallEffectClass`)、`BayesianTaskProfiler` (`TaskResourceProfiler`)、`MultiTenantQueueManager` (`HierarchicalQueueManager`) 及 `computeCrc32`、`encodeLengthPrefixedCrcFrame`、`decodeLengthPrefixedCrcFrames`，并通过 `tests/m94_git_branch_merge_and_contract_unification.test.ts` 验证（83 个测试套件共 223 项测试 100% 通过）。
+
+## M95: 全角色动态拓扑发现、节点自注册与 256-Slot 自动伸缩 (Dynamic Cluster Topology, Self-Registration & Multi-Role Elastic Scaling)
+- **后端动态拓扑注册表与自注册/心跳 API (`src/dashboard/server.ts` & `src/server_main.ts`)**:
+  - 新增持久化集群拓扑注册表 `v25_cluster_registry`，统一管理 `brain`、`body`、`gateway` 三类节点的 `baseUrl`、`registeredVia` (`SEED` / `SELF_REG` / `TUNNEL` / `SCALE_API`)、`lastHeartbeatMs`、`ownedSlots` 与 `leaseEpoch`。
+  - 新增 `POST /internal/v1beta1/cluster/register`、`POST /internal/v1beta1/cluster/heartbeat`、`POST /internal/v1beta1/cluster/deregister` 与 `POST /v1beta1/management/topology/evict-expired`，任意新启动的 `brain` / `body` / `gateway` 进程配置 `seedGatewayUrls` 或 `primaryGatewayUrl` 后自动完成注册、加入 256-Slot 哈希环、同步更新 `peerBrainUrls` / `peerBodyUrls` / `peerGatewayUrls`，并在心跳超时后自动摘除失联节点并重平衡哈希槽。
+  - 修复 `readJsonBody` 在 Bearer JWT 鉴权时覆盖请求体节点 `role` (`brain`/`body`/`gateway`) 的缺陷，扩展 `POST /v1beta1/management/nodes/scale` 支持 `gateway` 角色。
+- **反代与 Console 前端全动态拓扑渲染 (`scripts/dev_cluster_local_supervisor.mjs` & `docs/console-management/prototype.js`)**:
+  - `:8088` 反代周期同步 `/v1beta1/console/topology` 的 `activeGatewayUrls`，动态发现新上线 `gateway` 节点。
+  - 前端移除 3 节点硬编码，基于 `slotOwners` (256 项) 与 `slotDistribution` 动态渲染任意数量 `brain` 节点的 256 槽一致性哈希环与节点选择表单，并在「节点与分片单元编排」页面新增「全角色动态拓扑注册表与自动伸缩工作台」。
