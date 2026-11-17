@@ -1,3 +1,9 @@
 .git
 node_modules
 *.tar.gz
+.dev-secrets/
+.celld/
+__pycache__/
+**/node_modules
+**/.next
+.oil-ui

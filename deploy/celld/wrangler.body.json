@@ -1,0 +1,9 @@
+{
+  "name": "ansts-celld-body",
+  "main": "src/cloudflare/body_worker.ts",
+  "compatibility_date": "2025-08-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "name": "ANSTS_BODY_CELL", "class_name": "AnstsBodyCell" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AnstsBodyCell"] }],
+  "vars": { "ANSTS_BODY_AUTH_SECRET": "", "ANSTS_SCHEDULER_URL": "" }
+}

@@ -1,11 +1,9 @@
 FROM node:22-alpine
-
 WORKDIR /app
-
-# Install curl & bash for healthchecks and cluster bootstrap scripts
-RUN apk add --no-cache curl bash
-
-COPY package.json tsconfig.json wrangler.json wrangler.toml Makefile ./
+RUN apk add --no-cache curl bash docker-cli
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY tsconfig.json wrangler.json wrangler.toml Makefile ./
 COPY types ./types
 COPY proto ./proto
 COPY migrations ./migrations
@@ -13,11 +11,6 @@ COPY src ./src
 COPY tests ./tests
 COPY scripts ./scripts
 COPY docs ./docs
-COPY specs ./specs
-COPY dist ./dist
-
-RUN npm install --no-audit --no-fund 2>/dev/null && node scripts/ci_check.mjs --stage build || true
-
+RUN node scripts/ci_check.mjs --stage build
 EXPOSE 8080 8081 8082 8083 9443 9501 9502
-
-CMD ["node", "scripts/start_cluster_node.mjs"]
+CMD ["node", "scripts/start_body_daemon.mjs"]

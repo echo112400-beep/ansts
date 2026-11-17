@@ -1,0 +1,75 @@
+rule_files:
+  - usage-alerts.yml
+evaluation_interval: 5s
+tests:
+  - interval: 5s
+    input_series:
+      - series: 'ansts_body_usage_quarantined_streams{instance="fixture"}'
+        values: '1 1 1 1 1 1 1'
+      - series: 'ansts_body_usage_unknown_provider_calls{instance="fixture"}'
+        values: '1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 0s
+        alertname: AnstsUsageConflict
+        exp_alerts:
+          - exp_labels:
+              instance: fixture
+              severity: critical
+            exp_annotations:
+              summary: Usage event conflict requires reconciliation
+              description: A metering stream is quarantined. Preserve immutable events and review the authenticated receipt before resuming.
+      - eval_time: 30s
+        alertname: AnstsProviderUsageUnknown
+        exp_alerts:
+          - exp_labels:
+              instance: fixture
+              severity: warning
+            exp_annotations:
+              summary: Provider response usage is missing
+              description: Resource closure does not settle requests with unknown provider quantities.
+  - interval: 5s
+    input_series:
+      - series: 'ansts_body_usage_oldest_pending_seconds{instance="fixture"}'
+        values: '400 400 400 400 400 400 400 400'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: AnstsUsageDeliveryStalled
+        exp_alerts:
+          - exp_labels:
+              instance: fixture
+              severity: warning
+            exp_annotations:
+              summary: Usage outbox delivery is delayed
+              description: Immutable events remain pending. Do not report missing quantities as zero or discard unknown occupancy.
+  - interval: 5s
+    input_series:
+      - series: 'ansts_body_usage_quarantined_streams{instance="healthy"}'
+        values: '0 0 0 0 0 0 0 0'
+      - series: 'ansts_body_usage_unknown_provider_calls{instance="healthy"}'
+        values: '0 0 0 0 0 0 0 0'
+      - series: 'ansts_body_usage_oldest_pending_seconds{instance="healthy"}'
+        values: '0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: AnstsUsageConflict
+        exp_alerts: []
+      - eval_time: 30s
+        alertname: AnstsProviderUsageUnknown
+        exp_alerts: []
+      - eval_time: 30s
+        alertname: AnstsUsageDeliveryStalled
+        exp_alerts: []
+  - interval: 5s
+    input_series:
+      - series: 'ansts_body_usage_incomplete_resource_streams{instance="fixture"}'
+        values: '1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: AnstsUsageResourceCoverageMissing
+        exp_alerts:
+          - exp_labels:
+              instance: fixture
+              severity: warning
+            exp_annotations:
+              summary: Resource usage dimensions are incomplete
+              description: Legacy slot measurements do not prove CPU or memory allocation. Preserve missing dimensions for reconciliation.

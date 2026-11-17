@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-COMPOSE_FILE="deploy/dev-cluster/docker-compose.dev-cluster.yml"
-
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  docker compose -f "${COMPOSE_FILE}" down -v
+if [[ -n "${INIT_CWD:-}" && -f "$INIT_CWD/scripts/restart_dev_cluster.py" ]]; then
+  cd "$INIT_CWD"
+elif [[ ! -f scripts/restart_dev_cluster.py ]]; then
+  cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fi
-
-if [ -f /tmp/ansts-dev-cluster.pid ]; then
-  PID="$(cat /tmp/ansts-dev-cluster.pid)"
-  if kill -0 "${PID}" 2>/dev/null; then
-    kill "${PID}" 2>/dev/null || true
-    echo "Stopped local 11-container dev-cluster supervisor (PID ${PID})."
-  fi
-  rm -f /tmp/ansts-dev-cluster.pid /tmp/ansts-dev-cluster-status.json
-fi
+exec python3 scripts/restart_dev_cluster.py --skip-build --stop-only

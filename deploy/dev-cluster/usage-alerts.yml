@@ -1,0 +1,36 @@
+groups:
+  - name: ansts-usage-integrity
+    interval: 5s
+    rules:
+      - alert: AnstsUsageConflict
+        expr: ansts_body_usage_quarantined_streams > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: Usage event conflict requires reconciliation
+          description: A metering stream is quarantined. Preserve immutable events and review the authenticated receipt before resuming.
+      - alert: AnstsUsageDeliveryStalled
+        expr: ansts_body_usage_oldest_pending_seconds > 300
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: Usage outbox delivery is delayed
+          description: Immutable events remain pending. Do not report missing quantities as zero or discard unknown occupancy.
+      - alert: AnstsProviderUsageUnknown
+        expr: ansts_body_usage_unknown_provider_calls > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: Provider response usage is missing
+          description: Resource closure does not settle requests with unknown provider quantities.
+      - alert: AnstsUsageResourceCoverageMissing
+        expr: ansts_body_usage_incomplete_resource_streams > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: Resource usage dimensions are incomplete
+          description: Legacy slot measurements do not prove CPU or memory allocation. Preserve missing dimensions for reconciliation.

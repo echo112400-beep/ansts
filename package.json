@@ -16,7 +16,9 @@
     "prestart": "node scripts/ci_check.mjs --stage build-if-missing",
     "dev:cluster:up": "cat deploy/dev-cluster/dev-cluster-up.sh | bash",
     "dev:cluster:down": "cat deploy/dev-cluster/dev-cluster-down.sh | bash",
-    "start:local": "cat scripts/run-local.sh | bash"
+    "start:local": "cat scripts/run-local.sh | bash",
+    "test:control": "node scripts/check_control.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -28,6 +30,7 @@
     "@babel/plugin-transform-typescript": "^7.20.0",
     "@types/node": "^20.11.0",
     "js-yaml": "^4.1.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "esbuild": "^0.25.11"
   }
 }

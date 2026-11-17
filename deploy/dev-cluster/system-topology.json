@@ -1,0 +1,340 @@
+{
+  "schemaVersion": 1,
+  "nodes": [
+    {
+      "id": "ingress",
+      "label": "Nginx 入口",
+      "kind": "http",
+      "plane": "ingress",
+      "description": "同源 API 代理、双 Gateway 分流与 OAuth 回调",
+      "url": "http://tanstack-console:80",
+      "healthPath": "/"
+    },
+    {
+      "id": "console",
+      "label": "Next.js Console",
+      "kind": "http",
+      "plane": "ingress",
+      "description": "控制台页面与 GitHub 头像优化，不持有模型/身份服务密钥",
+      "url": "http://dev-server:3000",
+      "healthPath": "/api/health"
+    },
+    {
+      "id": "gateway-1",
+      "label": "Gateway 01",
+      "kind": "gateway",
+      "plane": "gateway",
+      "description": "用户鉴权、租户权限、任务入口；共享 Fleet Gateway Cell",
+      "url": "http://ansts-gateway-01:8080",
+      "healthPath": "/healthz"
+    },
+    {
+      "id": "gateway-2",
+      "label": "Gateway 02",
+      "kind": "gateway",
+      "plane": "gateway",
+      "description": "用户鉴权、租户权限、任务入口；共享 Fleet Gateway Cell",
+      "url": "http://ansts-gateway-02:8080",
+      "healthPath": "/healthz"
+    },
+    {
+      "id": "fleet-1",
+      "label": "celld-node-01",
+      "kind": "fleet",
+      "plane": "control",
+      "description": "Durable Object 宿主，持久对象由 Fleet 路由与恢复",
+      "url": "http://celld-brain-01:8081",
+      "healthPath": "/healthz",
+      "telemetryUrl": "http://celld-brain-01:8082",
+      "telemetryPath": "/state"
+    },
+    {
+      "id": "fleet-2",
+      "label": "celld-node-02",
+      "kind": "fleet",
+      "plane": "control",
+      "description": "Durable Object 宿主，持久对象由 Fleet 路由与恢复",
+      "url": "http://celld-brain-02:8081",
+      "healthPath": "/healthz",
+      "telemetryUrl": "http://celld-brain-02:8082",
+      "telemetryPath": "/state"
+    },
+    {
+      "id": "fleet-3",
+      "label": "celld-node-03",
+      "kind": "fleet",
+      "plane": "control",
+      "description": "Durable Object 宿主，持久对象由 Fleet 路由与恢复",
+      "url": "http://celld-brain-03:8081",
+      "healthPath": "/healthz",
+      "telemetryUrl": "http://celld-brain-03:8082",
+      "telemetryPath": "/state"
+    },
+    {
+      "id": "body-1",
+      "label": "body-host-01",
+      "kind": "daemon",
+      "plane": "execution",
+      "description": "原生执行器；维护准入、资源预留、清理账本、Journal 和结果 Outbox",
+      "url": "http://body-daemon-01:9501",
+      "healthPath": "/readyz"
+    },
+    {
+      "id": "body-2",
+      "label": "body-host-02",
+      "kind": "daemon",
+      "plane": "execution",
+      "description": "原生执行器；维护准入、资源预留、清理账本、Journal 和结果 Outbox",
+      "url": "http://body-daemon-02:9502",
+      "healthPath": "/readyz"
+    },
+    {
+      "id": "rustfs",
+      "label": "RustFS",
+      "kind": "storage",
+      "plane": "storage",
+      "description": "S3 对象存储；celld Fleet 的持久化依赖",
+      "url": "http://rustfs:9000",
+      "healthPath": "/health/ready"
+    },
+    {
+      "id": "prometheus",
+      "label": "Prometheus",
+      "kind": "prometheus",
+      "plane": "observability",
+      "description": "采集 Gateway 与 Daemon；探测服务响应及每个抓取目标",
+      "url": "http://prometheus:9090",
+      "healthPath": "/api/v1/targets",
+      "critical": false
+    },
+    {
+      "id": "grafana",
+      "label": "Grafana",
+      "kind": "grafana",
+      "plane": "observability",
+      "description": "观测看板与 Grafana 数据库健康",
+      "url": "http://grafana:3000",
+      "healthPath": "/api/health",
+      "critical": false
+    },
+    {
+      "id": "body-proxy",
+      "label": "Body 兼容代理",
+      "kind": "http",
+      "plane": "control",
+      "description": "保留旧监听地址；Daemon 当前直接访问 Fleet，不在主执行路径",
+      "url": "http://body-celld:8080",
+      "healthPath": "/readyz",
+      "critical": false
+    },
+    {
+      "id": "github",
+      "label": "GitHub OAuth",
+      "kind": "external",
+      "plane": "external",
+      "description": "外部身份服务；仅显示服务端配置，不主动触发授权"
+    },
+    {
+      "id": "deepseek",
+      "label": "DeepSeek",
+      "kind": "external",
+      "plane": "external",
+      "description": "由 Daemon 按需调用模型；不在拓扑探测中消费模型请求"
+    },
+    {
+      "id": "engine",
+      "label": "Docker Engine",
+      "kind": "logical",
+      "plane": "execution",
+      "description": "每台 Daemon 本地独立 Engine；未提供独立 Engine 健康探针"
+    }
+  ],
+  "edges": [
+    {
+      "source": "ingress",
+      "target": "console",
+      "label": "页面 / HMR",
+      "kind": "request"
+    },
+    {
+      "source": "ingress",
+      "target": "gateway-1",
+      "label": "API / OAuth",
+      "kind": "request"
+    },
+    {
+      "source": "gateway-1",
+      "target": "fleet-1",
+      "label": "控制请求 / 故障转移",
+      "kind": "state"
+    },
+    {
+      "source": "gateway-1",
+      "target": "fleet-2",
+      "label": "控制请求 / 故障转移",
+      "kind": "state"
+    },
+    {
+      "source": "gateway-1",
+      "target": "fleet-3",
+      "label": "控制请求 / 故障转移",
+      "kind": "state"
+    },
+    {
+      "source": "body-1",
+      "target": "fleet-1",
+      "label": "准入 / 续租 / 结果",
+      "kind": "execution"
+    },
+    {
+      "source": "body-1",
+      "target": "fleet-2",
+      "label": "准入 / 续租 / 结果",
+      "kind": "execution"
+    },
+    {
+      "source": "body-1",
+      "target": "fleet-3",
+      "label": "准入 / 续租 / 结果",
+      "kind": "execution"
+    },
+    {
+      "source": "body-1",
+      "target": "engine",
+      "label": "本地沙箱",
+      "kind": "execution"
+    },
+    {
+      "source": "prometheus",
+      "target": "body-1",
+      "label": "抓取指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "prometheus",
+      "target": "gateway-1",
+      "label": "抓取指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "body-1",
+      "target": "deepseek",
+      "label": "Agent 模型调用",
+      "kind": "provider"
+    },
+    {
+      "source": "ingress",
+      "target": "gateway-2",
+      "label": "API / OAuth",
+      "kind": "request"
+    },
+    {
+      "source": "gateway-2",
+      "target": "fleet-1",
+      "label": "控制请求 / 故障转移",
+      "kind": "state"
+    },
+    {
+      "source": "gateway-2",
+      "target": "fleet-2",
+      "label": "控制请求 / 故障转移",
+      "kind": "state"
+    },
+    {
+      "source": "gateway-2",
+      "target": "fleet-3",
+      "label": "控制请求 / 故障转移",
+      "kind": "state"
+    },
+    {
+      "source": "body-2",
+      "target": "fleet-1",
+      "label": "准入 / 续租 / 结果",
+      "kind": "execution"
+    },
+    {
+      "source": "body-2",
+      "target": "fleet-2",
+      "label": "准入 / 续租 / 结果",
+      "kind": "execution"
+    },
+    {
+      "source": "body-2",
+      "target": "fleet-3",
+      "label": "准入 / 续租 / 结果",
+      "kind": "execution"
+    },
+    {
+      "source": "body-2",
+      "target": "engine",
+      "label": "本地沙箱",
+      "kind": "execution"
+    },
+    {
+      "source": "prometheus",
+      "target": "body-2",
+      "label": "抓取指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "prometheus",
+      "target": "gateway-2",
+      "label": "抓取指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "body-2",
+      "target": "deepseek",
+      "label": "Agent 模型调用",
+      "kind": "provider"
+    },
+    {
+      "source": "fleet-1",
+      "target": "rustfs",
+      "label": "对象持久化",
+      "kind": "storage"
+    },
+    {
+      "source": "body-proxy",
+      "target": "fleet-1",
+      "label": "兼容转发",
+      "kind": "compatibility"
+    },
+    {
+      "source": "fleet-2",
+      "target": "rustfs",
+      "label": "对象持久化",
+      "kind": "storage"
+    },
+    {
+      "source": "body-proxy",
+      "target": "fleet-2",
+      "label": "兼容转发",
+      "kind": "compatibility"
+    },
+    {
+      "source": "fleet-3",
+      "target": "rustfs",
+      "label": "对象持久化",
+      "kind": "storage"
+    },
+    {
+      "source": "body-proxy",
+      "target": "fleet-3",
+      "label": "兼容转发",
+      "kind": "compatibility"
+    },
+    {
+      "source": "grafana",
+      "target": "prometheus",
+      "label": "查询指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "ingress",
+      "target": "github",
+      "label": "OAuth / PKCE",
+      "kind": "provider"
+    }
+  ]
+}
