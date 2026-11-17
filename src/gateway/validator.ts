@@ -1,3 +1,4 @@
+import { normalizeExecutionSpec } from "../execution_spec.js";
 /**
  * @fileoverview M1 TASK-01 & M57-5: TaskSpec v1beta1 Schema Validator & Semantic Sanitizer
  * with Strict Finite-Number DRF Poisoning Guard & Dependency Deduplication.
@@ -88,7 +89,11 @@ export class TaskSpecValidator {
     if (deps.includes(taskId)) {
       throw new TaskSpecValidationError("dependencies", "Task cannot depend on itself");
     }
+    let execution;
+    try { execution = normalizeExecutionSpec(payload.execution); } catch { throw new TaskSpecValidationError("execution", "Invalid container execution specification"); }
+    if (execution && (execution.timeoutMs > timeoutSeconds * 1000 || execution.cpu > resourceProfile.think_cpu_cores || execution.memoryMb > resourceProfile.act_memory_mb)) throw new TaskSpecValidationError("execution", "Execution exceeds task resource or timeout budget");
     return new TaskSpec({
+      execution,
       task_id: taskId,
       tenant_id: tenantId,
       priority: priorityNum as TaskPriority,

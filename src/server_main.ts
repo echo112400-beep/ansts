@@ -88,6 +88,7 @@ export interface AnstsServiceRuntimeOptions {
   seedGatewayUrls?: string[];
   region?: string;
   maxBodyBytes?: number;
+  celldWorkerUrl?: string;
 }
 
 function parseJsonEnvMap(raw: string | undefined): Record<string, string> {
@@ -178,8 +179,12 @@ export class AnstsLocalAndComposeServer {
   private readonly defaultDashboardPort: number;
   private readonly tickIntervalMs: number;
   private draining = false;
+  private readonly celldWorkerUrl: string | null;
 
   constructor(options: AnstsServiceRuntimeOptions = {}) {
+    const workerUrl = options.celldWorkerUrl?.trim();
+    if (workerUrl && !["http:", "https:"].includes(new URL(workerUrl).protocol)) throw new Error("INVALID_CELLD_WORKER_URL");
+    this.celldWorkerUrl = workerUrl ? new URL(workerUrl).origin : null;
     this.host = options.host ?? process.env.ANSTS_HOST ?? "0.0.0.0";
     this.defaultApiPort = options.apiPort ?? Number(process.env.ANSTS_LISTEN_PORT ?? process.env.ANSTS_PORT ?? 8080);
     this.defaultDashboardPort = options.dashboardPort ?? Number(process.env.ANSTS_DASHBOARD_PORT ?? 0);
@@ -777,6 +782,45 @@ export class AnstsLocalAndComposeServer {
     }
     const urlObj = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = urlObj.pathname;
+    const isControlPath = pathname === "/v1/tasks" || pathname.startsWith("/v1/tasks/") ||
+      pathname.startsWith("/v1/auth/") || pathname.startsWith("/v1/admin/") ||
+      pathname.startsWith("/v1/console/") || pathname.startsWith("/v1beta1/");
+    if (this.celldWorkerUrl && isControlPath) {
+      try {
+        const chunks: Buffer[] = []; let size = 0;
+        for await (const chunk of req) {
+          const bytes = Buffer.from(chunk); size += bytes.length;
+          if (size > this.maxBodyBytes) { res.writeHead(413); res.end(); return; }
+          chunks.push(bytes);
+        }
+        const headers = new Headers();
+        for (const key of ["authorization", "cookie", "origin", "content-type", "accept", "idempotency-key", "last-event-id"]) {
+          const value = req.headers[key]; if (typeof value === "string") headers.set(key, value);
+        }
+        const response = await fetch(this.celldWorkerUrl + pathname + urlObj.search, {
+          method, headers, redirect: "manual", signal: AbortSignal.timeout(30000),
+          body: method === "GET" || method === "HEAD" ? undefined : Buffer.concat(chunks),
+        });
+        res.statusCode = response.status;
+        const cookieHeaders=response.headers as Headers & {getSetCookie?:()=>string[]};
+        const cookies=cookieHeaders.getSetCookie?.() ?? (response.headers.get("set-cookie")?[response.headers.get("set-cookie")!]:[]);
+        if (cookies.length) res.setHeader("set-cookie",cookies);
+        for (const key of ["content-type", "cache-control", "location", "retry-after", "x-ansts-operation-id"]) {
+          const value = response.headers.get(key); if (value) res.setHeader(key, value);
+        }
+        if (response.body) {
+          const reader = response.body.getReader();
+          try { for (;;) { const item = await reader.read(); if (item.done) break;
+            if (!res.write(item.value)) await new Promise<void>(resolve => res.once("drain", resolve));
+          } } finally { reader.releaseLock(); }
+        }
+        res.end();
+      } catch {
+        if (!res.headersSent) res.writeHead(503, {"content-type":"application/json"});
+        res.end(JSON.stringify({error:"CELLD_WORKER_UNREACHABLE"}));
+      }
+      return;
+    }
 
     if (
       method === "GET" &&
@@ -794,6 +838,8 @@ export class AnstsLocalAndComposeServer {
       res.end(
         JSON.stringify({
           status: "ok",
+          controlPlane: "legacy-node-host",
+          celldWorkerUrl: this.celldWorkerUrl,
           healthy: true,
           nodeId: this.nodeId,
           nodeRole: this.nodeRole,

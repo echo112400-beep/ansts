@@ -1,3 +1,4 @@
+import { ExecutionSpec, normalizeExecutionSpec } from "./execution_spec.js";
 /**
  * @fileoverview Core Domain Models, TaskSpec v1beta1, 5D Resource Profiles, Monotonic Lease Fencing & LlmEndpointMetrics.
  */
@@ -16,6 +17,7 @@ export enum TaskState {
   RUNNING_ACT = "RUNNING_ACT",
   WAITING_SUB_AGENT = "WAITING_SUB_AGENT",
   SUSPENDED_APPROVAL = "SUSPENDED_APPROVAL",
+  SUSPENDED_RECONCILIATION = "SUSPENDED_RECONCILIATION",
   PREEMPTING = "PREEMPTING",
   COMPLETED = "COMPLETED",
   SUCCEEDED = "COMPLETED",
@@ -99,6 +101,10 @@ export class TurnWalFrame {
   public readonly sqliteWalPages: number;
   public readonly crc32Hex: string;
   public readonly createdAtMs: number;
+  /** Serialized stream payload carried alongside the on-disk diff, so a WAL replay can re-emit the event. */
+  public readonly diffSnapshot: string;
+  /** Task state at the moment the turn was written; lets a replay reconstruct the lifecycle view. */
+  public readonly state: TaskState;
 
   constructor(params: {
     frameId: string;
@@ -109,6 +115,8 @@ export class TurnWalFrame {
     sqliteWalPages: number;
     crc32Hex?: string;
     createdAtMs?: number;
+    diffSnapshot?: string;
+    state?: TaskState;
   }) {
     this.frameId = params.frameId;
     this.taskId = params.taskId;
@@ -117,9 +125,43 @@ export class TurnWalFrame {
     this.changedFiles = [...params.changedFiles];
     this.sqliteWalPages = params.sqliteWalPages;
     this.createdAtMs = params.createdAtMs ?? Date.now();
+    this.diffSnapshot = params.diffSnapshot ?? "";
+    this.state = params.state ?? TaskState.SUBMITTED;
     this.crc32Hex =
       params.crc32Hex ??
       TurnWalFrame.computeCrc32Hex(this.taskId, this.turnIndex, this.fence, this.changedFiles);
+  }
+
+  /**
+   * Builds a frame from whatever the caller knows; unspecified fields are derived.
+   * Stream publishers do not invent frame ids, so they can hand over the fence and payload only.
+   */
+  public static fromPartial(params: {
+    taskId: string;
+    fence: FenceToken;
+    frameId?: string;
+    turnIndex?: number;
+    changedFiles?: string[];
+    sqliteWalPages?: number;
+    crc32Hex?: string;
+    timestampMs?: number;
+    createdAtMs?: number;
+    diffSnapshot?: string;
+    state?: TaskState;
+  }): TurnWalFrame {
+    const turnIndex = params.turnIndex ?? params.fence.turnSeq;
+    return new TurnWalFrame({
+      frameId: params.frameId ?? `frame-${params.taskId}-t${turnIndex}-e${params.fence.epoch}`,
+      taskId: params.taskId,
+      turnIndex,
+      fence: params.fence,
+      changedFiles: params.changedFiles ?? [],
+      sqliteWalPages: params.sqliteWalPages ?? 0,
+      crc32Hex: params.crc32Hex,
+      createdAtMs: params.createdAtMs ?? params.timestampMs,
+      diffSnapshot: params.diffSnapshot,
+      state: params.state,
+    });
   }
 
   public static computeCrc32Hex(
@@ -161,6 +203,7 @@ export interface TaskSpecInit {
   task_id: string;
   tenant_id: string;
   priority?: TaskPriority;
+  execution?: ExecutionSpec;
   prompt?: string;
   max_turns?: number;
   timeout_seconds?: number;
@@ -180,6 +223,10 @@ export class TaskSpec {
   public task_id: string;
   public tenant_id: string;
   public priority: TaskPriority;
+  public execution?: ExecutionSpec;
+  public cancel_requested?: { actor: string; reason: string; requested_at: number };
+  public execution_outcome?: "SUCCEEDED" | "FAILED" | "TIMED_OUT" | "CANCELLED";
+  public resume_node_id?: string;
   public prompt: string;
   public max_turns: number;
   public current_turn = 0;
@@ -207,6 +254,7 @@ export class TaskSpec {
     this.task_id = init.task_id;
     this.tenant_id = init.tenant_id;
     this.priority = init.priority ?? TaskPriority.P2_STANDARD;
+    this.execution = normalizeExecutionSpec(init.execution);
     this.prompt = init.prompt ?? "";
     this.max_turns = init.max_turns ?? 30;
     this.timeout_seconds = init.timeout_seconds ?? 1800;
@@ -241,6 +289,7 @@ export interface NodeHeartbeatInit {
   free_memory_mb?: number;
   warm_pool_ready?: number;
   psi_memory_some_avg10?: number;
+  execution_slots?: number;
   running_tasks?: number;
   healthy?: boolean;
   cached_images?: Iterable<string>;
@@ -255,6 +304,7 @@ export class NodeHeartbeat {
   public free_memory_mb: number;
   public warm_pool_ready: number;
   public psi_memory_some_avg10: number;
+  public execution_slots?: number;
   public running_tasks: number;
   public healthy: boolean;
   public cached_images: Set<string>;
@@ -268,6 +318,8 @@ export class NodeHeartbeat {
     this.free_memory_mb = init.free_memory_mb ?? this.total_memory_mb;
     this.warm_pool_ready = init.warm_pool_ready ?? 8;
     this.psi_memory_some_avg10 = init.psi_memory_some_avg10 ?? 1.5;
+    if (init.execution_slots !== undefined && (!Number.isSafeInteger(init.execution_slots) || init.execution_slots < 1 || init.execution_slots > 256)) throw new Error("INVALID_EXECUTION_SLOTS");
+    this.execution_slots = init.execution_slots;
     this.running_tasks = init.running_tasks ?? 0;
     this.healthy = init.healthy ?? true;
     this.cached_images = new Set(init.cached_images ?? []);
@@ -350,30 +402,4 @@ export interface ToolExecutionLog {
   result_payload: Record<string, unknown>;
   compensation_tool?: string;
   executed_at: number;
-}
-
-// [M94] Unified main (M1-M15) + feat/celld-v25 (M16-M94) contract compatibility aliases
-export type AgentTaskInit = ConstructorParameters<typeof TaskSpec>[0];
-export const AgentTask = TaskSpec;
-export type AgentTask = TaskSpec;
-export type ResourceVector5D = ResourceProfile;
-export const ToolEffectClass = ToolCallEffectClass;
-export type ToolEffectClass = ToolCallEffectClass;
-export type SandboxPhase = "THINK" | "ACT" | "HIBERNATED";
-export type IsolationDriver = "microvm" | "gvisor" | "kata" | "bwrap";
-export type HibernationReason = "IDLE_TIMEOUT" | "APPROVAL_WAIT" | "QUOTA_PREEMPTED" | "MEMORY_PRESSURE";
-export type ReasoningEffort = "low" | "medium" | "high";
-export const EFFORT_MULTIPLIERS: Record<ReasoningEffort, number> = { low: 0.6, medium: 1.0, high: 1.6 };
-export type ModelPoolName = "DEEPSEEK_R1_POOL" | "QWEN_CODER_POOL" | "CLAUDE_SONNET_POOL" | string;
-export interface EscrowVoucher {
-  voucherId: string;
-  parentTaskId: string;
-  reservedTokens: number;
-  reservedSubAgentSlots: number;
-}
-export interface EphemeralHeavyExecutorSpec {
-  executorId: string;
-  taskId: string;
-  cpuCores: number;
-  memoryMb: number;
 }

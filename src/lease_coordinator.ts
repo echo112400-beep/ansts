@@ -64,6 +64,14 @@ export class LeaseCoordinator {
     }
   }
 
+  /** Restore persisted deadlines without extending a lease on restart. */
+  public restoreLease(record: LeaseRecord): boolean {
+    if (!record.task_id || !record.node_id || !Number.isSafeInteger(record.fencing_token) || record.fencing_token < 1 || !Number.isFinite(record.acquired_at) || !Number.isFinite(record.expires_at) || record.expires_at < record.acquired_at) return false;
+    if ((this.highestTokenByTask.get(record.task_id) ?? 0) > record.fencing_token) return false;
+    this.seedHighestFencingToken(record.task_id, record.fencing_token);
+    this.activeLeases.set(record.task_id, { ...record });
+    return true;
+  }
   public acquireLease(taskId: string, nodeId: string, nowSec = Date.now() / 1000): LeaseRecord {
     const prevDual = this.dualTupleFencesByTask.get(taskId);
     const prevToken = Math.max(this.highestTokenByTask.get(taskId) ?? 0, prevDual?.epoch ?? 0);
@@ -132,7 +140,7 @@ export class LeaseCoordinator {
   public renewLease(taskId: string, nodeId: string, fencingToken: number, nowSec = Date.now() / 1000): boolean {
     const lease = this.activeLeases.get(taskId);
     if (!lease) return false;
-    if (lease.node_id !== nodeId || lease.fencing_token !== fencingToken) {
+    if (nowSec >= lease.expires_at || lease.node_id !== nodeId || lease.fencing_token !== fencingToken) {
       return false;
     }
     lease.expires_at = nowSec + this.leaseTtlSeconds;

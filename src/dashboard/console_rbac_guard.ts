@@ -7,6 +7,7 @@
  * - Cryptographically chained audit log hashes (`prevHash -> entryHash`) so audit tampering is immediately detectable.
  */
 import * as crypto from "node:crypto";
+import type { ConsoleIdentityProfile } from "./console_identity_profile.js";
 
 export type ConsoleRole = "SRE_ADMIN" | "OPERATOR" | "VIEWER";
 
@@ -17,6 +18,7 @@ export interface ConsoleJwtClaims {
   scopeTenant: string;
   iat: number;
   exp: number;
+  profile?: ConsoleIdentityProfile;
 }
 
 export interface ChainedAuditEntry {
@@ -83,6 +85,7 @@ export class ConsoleRbacAuthGuard {
     scopeTenant?: string;
     ttlSec?: number;
     nowSec?: number;
+    profile?: ConsoleIdentityProfile;
   }): string {
     const nowSec = params.nowSec ?? Math.floor(Date.now() / 1000);
     const ttlSec = params.ttlSec ?? 86400 * 365;
@@ -94,6 +97,7 @@ export class ConsoleRbacAuthGuard {
       scopeTenant: params.scopeTenant ?? "all",
       iat: nowSec,
       exp: nowSec + ttlSec,
+      ...(params.profile ? { profile: params.profile } : {}),
     };
 
     const encodedHeader = this.base64UrlEncode(JSON.stringify(header));

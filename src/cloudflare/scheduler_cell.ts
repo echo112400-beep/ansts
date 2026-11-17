@@ -5,7 +5,7 @@
  */
 import { DurableObjectStateLike } from "./env.js";
 import { CoreScheduler5D } from "../scheduler.js";
-import { NodeHeartbeat, ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { NodeHeartbeat, LeaseRecord, ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
 
 const ACTIVE_FINGERPRINT_STATES = new Set<TaskState>([
   TaskState.SUBMITTED,
@@ -34,6 +34,9 @@ export class AnstsSchedulerCell {
     );
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS ansts_nodes (node_id TEXT PRIMARY KEY, heartbeat_json TEXT, updated_at INTEGER)"
+    );
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS ansts_claims (task_id TEXT PRIMARY KEY, holder_id TEXT, claimed_at INTEGER)"
     );
   }
 
@@ -78,7 +81,8 @@ export class AnstsSchedulerCell {
             free_memory_mb: Number(parsedHb.free_memory_mb ?? 65536),
             warm_pool_ready: Number(parsedHb.warm_pool_ready ?? 8),
             psi_memory_some_avg10: Number(parsedHb.psi_memory_some_avg10 ?? 1.5),
-            running_tasks: Number(parsedHb.running_tasks ?? 0),
+            execution_slots: parsedHb.execution_slots === undefined ? undefined : Number(parsedHb.execution_slots),
+              running_tasks: Number(parsedHb.running_tasks ?? 0),
             healthy: Boolean(parsedHb.healthy ?? true),
           })
         );
@@ -102,6 +106,7 @@ export class AnstsSchedulerCell {
         task_id: String(r.task_id),
         tenant_id: String(r.tenant_id),
         priority: Number(r.priority ?? TaskPriority.P2_STANDARD) as TaskPriority,
+        execution: parsed.execution as TaskSpec["execution"],
         prompt: String(parsed.prompt ?? ""),
         max_turns: Number(parsed.max_turns ?? 30),
         timeout_seconds: Number(parsed.timeout_seconds ?? 1800),
@@ -132,6 +137,9 @@ export class AnstsSchedulerCell {
         spec.created_at = Number(parsed.created_at);
       }
       spec.state = (r.state as TaskState) ?? TaskState.QUEUED;
+      spec.cancel_requested = parsed.cancel_requested as TaskSpec["cancel_requested"];
+      spec.execution_outcome = parsed.execution_outcome as TaskSpec["execution_outcome"];
+      spec.resume_node_id = typeof parsed.resume_node_id === "string" ? parsed.resume_node_id : undefined;
       spec.lease_fencing_token = Number(r.fencing_token ?? 0);
       spec.retry_count = Number(parsed.retry_count ?? 0);
       spec.preempted_count = Number(parsed.preempted_count ?? 0);
@@ -145,6 +153,10 @@ export class AnstsSchedulerCell {
         this.scheduler.leaseCoordinator.seedHighestFencingToken(spec.task_id, spec.lease_fencing_token);
       }
 
+      const savedLease = parsed.execution_lease as LeaseRecord | undefined;
+      if ([TaskState.LEASED, TaskState.RUNNING_THINK, TaskState.RUNNING_ACT].includes(spec.state) && savedLease && savedLease.task_id === spec.task_id && savedLease.node_id === spec.assigned_node_id && savedLease.fencing_token === spec.lease_fencing_token) {
+        this.scheduler.leaseCoordinator.restoreLease(savedLease);
+      }
       if (
         spec.state === TaskState.LEASED ||
         spec.state === TaskState.RUNNING_THINK ||
@@ -209,6 +221,11 @@ export class AnstsSchedulerCell {
       task.lease_fencing_token,
       task.assigned_node_id ?? "",
       JSON.stringify({
+        execution_lease: this.scheduler.leaseCoordinator.getLease(task.task_id),
+        execution: task.execution,
+        cancel_requested: task.cancel_requested,
+        execution_outcome: task.execution_outcome,
+        resume_node_id: task.resume_node_id,
         prompt: task.prompt,
         max_turns: task.max_turns,
         current_turn: task.current_turn,
@@ -287,6 +304,7 @@ export class AnstsSchedulerCell {
         task_id: String(body.task_id ?? `task-${Date.now()}`),
         tenant_id: String(body.tenant_id ?? "default"),
         priority: Number(body.priority ?? TaskPriority.P2_STANDARD) as TaskPriority,
+        execution: body.execution as TaskSpec["execution"],
         prompt: String(body.prompt ?? ""),
         max_turns: body.max_turns !== undefined ? Number(body.max_turns) : undefined,
         timeout_seconds: body.timeout_seconds !== undefined ? Number(body.timeout_seconds) : undefined,
@@ -329,12 +347,128 @@ export class AnstsSchedulerCell {
         free_memory_mb: Number(body.free_memory_mb ?? 65536),
         warm_pool_ready: Number(body.warm_pool_ready ?? 8),
         psi_memory_some_avg10: Number(body.psi_memory_some_avg10 ?? 1.0),
-        running_tasks: Number(body.running_tasks ?? 0),
+        execution_slots: body.execution_slots === undefined ? undefined : Number(body.execution_slots),
+          running_tasks: Number(body.running_tasks ?? 0),
         healthy: body.healthy !== undefined ? Boolean(body.healthy) : true,
       });
       this.registerNode(hb);
       return new Response(JSON.stringify({ registered: true, node_id: hb.node_id }), {
         status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (request.method === "POST" && normalizedPath === "/claim") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const taskId = String(body.task_id ?? "");
+      const holderId = String(body.holder_id ?? "");
+      const task = this.scheduler.allTasks.get(taskId);
+      if (!task) {
+        return new Response(JSON.stringify({ claimed: false, reason: "TASK_NOT_FOUND" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      // The cell is a single-threaded Durable Object, so this check-then-insert is the atomic arbiter that
+      // makes exactly one gateway execute a placed task even when several gateways poll the same cell.
+      const existingRow = this.ctx.storage.sql
+        .exec<Record<string, unknown>>("SELECT holder_id FROM ansts_claims WHERE task_id = ?", taskId)
+        .toArray()[0];
+      const existingHolder = existingRow ? String(existingRow.holder_id) : null;
+      if (existingHolder && existingHolder !== holderId) {
+        return new Response(JSON.stringify({ claimed: false, holder_id: existingHolder, state: task.state }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (!existingHolder) {
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO ansts_claims (task_id, holder_id, claimed_at) VALUES (?, ?, ?)",
+          taskId,
+          holderId,
+          Date.now()
+        );
+      }
+      return new Response(JSON.stringify({ claimed: true, holder_id: holderId, state: task.state }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (request.method === "POST" && normalizedPath === "/lease-renew") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const taskId = String(body.task_id ?? "");
+      const nodeId = String(body.node_id ?? "");
+      const fencingToken = Number(body.fencing_token ?? 0);
+      const task = this.scheduler.allTasks.get(taskId);
+      if (!task) {
+        return new Response(JSON.stringify({ renewed: false, reason: "TASK_NOT_FOUND" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const renewed = this.scheduler.leaseCoordinator.renewLease(taskId, nodeId, fencingToken);
+      if (renewed) this.persistTask(task);
+      return new Response(JSON.stringify({ renewed, task_id: taskId, state: task.state, lease_expires_at: this.scheduler.leaseCoordinator.getLease(taskId)?.expires_at, cancel_requested: task.cancel_requested, resume_node_id: task.resume_node_id }), {
+        status: renewed ? 200 : 409,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (request.method === "POST" && normalizedPath === "/cancel") {
+      const body = await request.json() as Record<string, unknown>;
+      const task = this.scheduler.allTasks.get(String(body.task_id));
+      if (!task || task.tenant_id !== body.tenant_id) return Response.json({ error: "TASK_NOT_FOUND" }, { status: 404 });
+      if (typeof body.actor !== "string" || !body.actor.trim() || body.actor.length > 256 || typeof body.reason !== "string" || body.reason.length > 1024) return Response.json({ error: "INVALID_CANCEL_REQUEST" }, { status: 400 });
+      const cancelled = this.scheduler.requestCancellation(task.task_id, task.tenant_id, body.actor, body.reason);
+      if (cancelled) for (const changed of this.scheduler.allTasks.values()) this.persistTask(changed);
+      return Response.json({ cancelled, state: task.state, cancel_requested: task.cancel_requested, execution_outcome: task.execution_outcome }, { status: cancelled ? 200 : 409 });
+    }
+    if (request.method === "POST" && normalizedPath === "/resolve-uncertain") {
+      const body = await request.json() as Record<string, unknown>;
+      const resolved = this.scheduler.resolveReconciliation(String(body.task_id), String(body.tenant_id), Number(body.fencing_token), body.retry === true);
+      const task = this.scheduler.allTasks.get(String(body.task_id));
+      if (resolved && task) { if (typeof body.resume_node_id === "string") task.resume_node_id = body.resume_node_id; this.persistTask(task); }
+      return Response.json({ resolved }, { status: resolved ? 200 : 409 });
+    }
+    if (request.method === "POST" && normalizedPath === "/suspend-uncertain") {
+      const body = await request.json() as Record<string, unknown>;
+      const taskId = String(body.task_id ?? "");
+      const suspended = this.scheduler.suspendForReconciliation(taskId, String(body.node_id ?? ""), Number(body.fencing_token));
+      const task = this.scheduler.allTasks.get(taskId);
+      if (suspended && task) this.persistTask(task);
+      return Response.json({ suspended, task_id: taskId }, { status: suspended ? 200 : 409 });
+    }
+    if (request.method === "POST" && normalizedPath === "/complete") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const taskId = String(body.task_id ?? "");
+      const existing = this.scheduler.allTasks.get(taskId);
+      const outcome = body.execution_outcome;
+      if (outcome !== undefined && !["SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"].includes(String(outcome))) return Response.json({ error: "INVALID_EXECUTION_OUTCOME" }, { status: 400 });
+      if (existing && existing.assigned_node_id === body.node_id && existing.lease_fencing_token === Number(body.fencing_token) && [TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED].includes(existing.state) && existing.execution_outcome === outcome) return Response.json({ completed: true, task_id: taskId });
+      const completed = this.scheduler.completeTaskExecution(
+        taskId,
+        String(body.node_id ?? ""),
+        Number(body.fencing_token ?? 0),
+        Number(body.observed_peak_cpu ?? 1.0),
+        Number(body.observed_peak_memory_mb ?? 1024)
+      );
+      if (completed) {
+        const task = this.scheduler.allTasks.get(taskId);
+        if (task) {
+          task.execution_outcome = outcome as TaskSpec["execution_outcome"];
+          if (outcome === "FAILED" || outcome === "TIMED_OUT" || outcome === "CANCELLED") {
+            task.state = outcome === "CANCELLED" ? TaskState.CANCELLED : TaskState.FAILED;
+            this.scheduler.completedIds.delete(taskId);
+            task.dead_letter_reason = String(outcome);
+            this.scheduler.cascadeDeadLetterToDependents(taskId);
+          }
+          for (const changed of this.scheduler.allTasks.values()) this.persistTask(changed);
+        }
+        this.ctx.storage.sql.exec("DELETE FROM ansts_claims WHERE task_id = ?", taskId);
+      }
+      return new Response(JSON.stringify({ completed, task_id: taskId }), {
+        status: completed ? 200 : 409,
         headers: { "content-type": "application/json" },
       });
     }
@@ -345,6 +479,40 @@ export class AnstsSchedulerCell {
         status: 200,
         headers: { "content-type": "application/json" },
       });
+    }
+
+    if (request.method === "POST" && normalizedPath === "/purge") {
+      const body = (await request.json()) as Record<string, unknown>;
+      const states = Array.isArray(body.states)
+        ? body.states.map((state) => String(state) as TaskState)
+        : undefined;
+      const olderThanMs =
+        body.older_than_ms === undefined ? undefined : Number(body.older_than_ms);
+      const dryRun = body.dry_run === true;
+      let result: { purged: string[]; remaining: number };
+      try {
+        result = this.scheduler.purgeTerminalTasks({ states, olderThanMs, dryRun });
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: "PURGE_REJECTED", message: (err as Error).message }),
+          { status: 400, headers: { "content-type": "application/json" } }
+        );
+      }
+      if (!dryRun) {
+        for (const taskId of result.purged) {
+          this.ctx.storage.sql.exec("DELETE FROM ansts_tasks WHERE task_id = ?", taskId);
+          this.ctx.storage.sql.exec("DELETE FROM ansts_claims WHERE task_id = ?", taskId);
+        }
+      }
+      return new Response(
+        JSON.stringify({
+          purged: result.purged.length,
+          task_ids: result.purged,
+          remaining: result.remaining,
+          dry_run: dryRun,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
     }
 
     if (request.method === "GET" && normalizedPath === "/tasks") {

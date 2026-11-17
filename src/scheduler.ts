@@ -34,6 +34,16 @@ const LEASED_OR_RUNNING_STATES = new Set<TaskState>([
   TaskState.SUSPENDED_APPROVAL,
 ]);
 
+/**
+ * States a purge may remove: the task is over, nothing will execute it again. `QUEUED` and every leased or
+ * running state are deliberately absent.
+ */
+const PURGEABLE_STATES = new Set<TaskState>([
+  TaskState.COMPLETED,
+  TaskState.FAILED,
+  TaskState.DEAD_LETTER,
+]);
+
 export class CoreScheduler5D {
   public readonly queueManager: HierarchicalQueueManager;
   public readonly leaseCoordinator: LeaseCoordinator;
@@ -74,11 +84,11 @@ export class CoreScheduler5D {
    * so identical concurrent submissions can be inspected and merged into an existing in-flight task.
    */
   public static computeTaskContentFingerprint(
-    task: Pick<TaskSpec, "tenant_id" | "prompt" | "dependencies" | "parent_task_id">
+    task: Pick<TaskSpec, "tenant_id" | "prompt" | "dependencies" | "parent_task_id"> & Partial<Pick<TaskSpec, "execution">>
   ): string {
     const sortedDeps = [...(task.dependencies ?? [])].sort().join(",");
     const canonical = `${task.tenant_id}::${task.parent_task_id ?? ""}::${sortedDeps}::${(task.prompt ?? "").trim()}`;
-    return crypto.createHash("sha256").update(canonical, "utf-8").digest("hex");
+    return crypto.createHash("sha256").update(task.execution ? canonical + "::" + JSON.stringify(task.execution) : canonical, "utf-8").digest("hex");
   }
 
   private releaseContentFingerprintIfOwned(task: TaskSpec): void {
@@ -88,6 +98,48 @@ export class CoreScheduler5D {
     ) {
       this.contentFingerprintIndex.delete(task.content_fingerprint);
     }
+  }
+
+  /**
+   * Drops finished tasks from every index the scheduler keeps for them.
+   *
+   * Only terminal states are purgeable; an in-flight task (`QUEUED`, `LEASED`, `RUNNING_*`, ...) can never be
+   * removed by a purge request, because deleting the record of a task a body is about to execute would let the
+   * cell place it again. Age is measured from `created_at`, the only timestamp a `TaskSpec` carries.
+   */
+  public purgeTerminalTasks(options: {
+    states?: TaskState[];
+    olderThanMs?: number;
+    dryRun?: boolean;
+    nowMs?: number;
+  } = {}): { purged: string[]; remaining: number } {
+    const requested = options.states && options.states.length > 0 ? options.states : [...PURGEABLE_STATES];
+    for (const state of requested) {
+      if (!PURGEABLE_STATES.has(state)) {
+        throw new Error(`PURGE_REJECTED_STATE: ${state} is not terminal and cannot be purged`);
+      }
+    }
+    const targets = new Set(requested);
+    const nowMs = options.nowMs ?? Date.now();
+    const candidates: TaskSpec[] = [];
+    for (const task of this.allTasks.values()) {
+      if (!targets.has(task.state)) continue;
+      if (options.olderThanMs !== undefined) {
+        const ageMs = nowMs - task.created_at * 1000;
+        if (ageMs < options.olderThanMs) continue;
+      }
+      candidates.push(task);
+    }
+    if (!options.dryRun) {
+      for (const task of candidates) {
+        this.allTasks.delete(task.task_id);
+        this.releaseContentFingerprintIfOwned(task);
+        for (const [key, taskId] of this.idempotencyIndex) {
+          if (taskId === task.task_id) this.idempotencyIndex.delete(key);
+        }
+      }
+    }
+    return { purged: candidates.map((task) => task.task_id), remaining: this.allTasks.size };
   }
 
   public resolveTaskByIdempotencyKey(tenantId: string, idempotencyKey: string): TaskSpec | undefined {
@@ -215,7 +267,7 @@ export class CoreScheduler5D {
       return inspection.canonicalTask;
     }
 
-    task.resource_profile = this.profiler.recommendProfile(task);
+    if (!task.execution) task.resource_profile = this.profiler.recommendProfile(task);
     this.allTasks.set(task.task_id, task);
     if (task.idempotency_key) {
       const scopedKey = CoreScheduler5D.scopeIdempotencyKey(task.tenant_id, task.idempotency_key);
@@ -260,10 +312,12 @@ export class CoreScheduler5D {
     if (!node.healthy || node.psi_memory_some_avg10 > 60.0) {
       return -1.0;
     }
+    if (task.resume_node_id && task.resume_node_id !== node.node_id) return -1.0;
     // [M51-1 / Stale-1 Fix] Reject nodes with stale heartbeat timestamps
     if (nowSec - node.timestamp > heartbeatTtlSeconds) {
       return -1.0;
     }
+    if (node.execution_slots !== undefined && node.running_tasks >= node.execution_slots) return -1.0;
     const reqCpu = task.resource_profile.think_cpu_cores;
     const reqMem = task.resource_profile.act_memory_mb;
     if (node.free_cpu_cores < reqCpu || node.free_memory_mb < reqMem) {
@@ -337,6 +391,7 @@ export class CoreScheduler5D {
     let bestNode: NodeHeartbeat | null = null;
     let bestScore = -1.0;
     for (const node of this.nodes.values()) {
+      if (node.execution_slots !== undefined && [...this.allTasks.values()].filter(candidate => candidate.assigned_node_id === node.node_id && [TaskState.LEASED, TaskState.PREEMPTING, TaskState.RUNNING_THINK, TaskState.RUNNING_ACT].includes(candidate.state)).length >= node.execution_slots) continue;
       const s = CoreScheduler5D.scoreNodeForTask(task, node, nowSec, this.nodeHeartbeatTtlSeconds);
       if (s > bestScore) {
         bestScore = s;
@@ -400,6 +455,64 @@ export class CoreScheduler5D {
     return true;
   }
 
+  public resolveReconciliation(taskId: string, tenantId: string, fencingToken: number, retry: boolean): boolean {
+    const task = this.allTasks.get(taskId);
+    if (!task || task.tenant_id !== tenantId || task.lease_fencing_token !== fencingToken) return false;
+    if ((!retry && task.state === TaskState.COMPLETED) || (retry && task.state === TaskState.QUEUED)) return true;
+    if (task.state !== TaskState.SUSPENDED_RECONCILIATION) return false;
+    if (retry) {
+      task.state = TaskState.QUEUED;
+      task.assigned_node_id = undefined;
+      this.queueManager.enqueue(task);
+    } else {
+      task.state = TaskState.COMPLETED;
+      this.completedIds.add(taskId);
+      this.releaseContentFingerprintIfOwned(task);
+      for (const candidate of this.allTasks.values()) {
+        if (candidate.state === TaskState.SUBMITTED && this.dependenciesSatisfied(candidate)) {
+          candidate.state = TaskState.QUEUED;
+          this.queueManager.enqueue(candidate);
+        }
+      }
+    }
+    return true;
+  }
+
+  public suspendForReconciliation(taskId: string, nodeId: string, fencingToken: number): boolean {
+    const task = this.allTasks.get(taskId);
+    if (!task || task.assigned_node_id !== nodeId || task.lease_fencing_token !== fencingToken) return false;
+    if (task.state === TaskState.SUSPENDED_RECONCILIATION) return true;
+    if (!this.leaseCoordinator.validateFencingToken(taskId, fencingToken)) return false;
+    this.leaseCoordinator.revokeLease(taskId);
+    this.queueManager.completeTask(task);
+    const node = this.nodes.get(nodeId);
+    if (node) {
+      node.free_cpu_cores = Math.min(node.total_cpu_cores, node.free_cpu_cores + task.resource_profile.think_cpu_cores);
+      node.free_memory_mb = Math.min(node.total_memory_mb, node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25));
+      node.running_tasks = Math.max(0, node.running_tasks - 1);
+    }
+    task.state = TaskState.SUSPENDED_RECONCILIATION;
+    return true;
+  }
+
+  /** Leased attempts retain their reservation until the executor reports confirmed exit. */
+  public requestCancellation(taskId: string, tenantId: string, actor: string, reason: string): boolean {
+    const task = this.allTasks.get(taskId);
+    if (!task || task.tenant_id !== tenantId || !actor.trim() || reason.length > 1024) return false;
+    if (task.cancel_requested) return true;
+    if (![TaskState.SUBMITTED, TaskState.QUEUED, TaskState.LEASED, TaskState.RUNNING_THINK, TaskState.RUNNING_ACT].includes(task.state)) return false;
+    task.cancel_requested = { actor, reason, requested_at: Date.now() };
+    if ([TaskState.SUBMITTED, TaskState.QUEUED].includes(task.state)) {
+      this.queueManager.removeQueuedTask(taskId);
+      task.state = TaskState.CANCELLED;
+      task.execution_outcome = "CANCELLED";
+      task.dead_letter_reason = "USER_CANCELLED";
+      this.releaseContentFingerprintIfOwned(task);
+      this.cascadeDeadLetterToDependents(taskId);
+    }
+    return true;
+  }
+
   public completeTaskExecution(
     taskId: string,
     nodeId: string,
@@ -407,7 +520,7 @@ export class CoreScheduler5D {
     observedPeakCpu = 1.0,
     observedPeakMemoryMb = 1024
   ): boolean {
-    if (!this.leaseCoordinator.validateFencingToken(taskId, fencingToken)) {
+    if (this.allTasks.get(taskId)?.assigned_node_id !== nodeId || !this.leaseCoordinator.validateFencingToken(taskId, fencingToken)) {
       return false;
     }
     const task = this.allTasks.get(taskId);
