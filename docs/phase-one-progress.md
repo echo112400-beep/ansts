@@ -1,0 +1,59 @@
+# 第一阶段推进记录
+
+日期：2026-11-13。范围：N1/N2 第一批协议与执行入口改造；第一阶段尚未全部完成。
+
+已实现：
+
+- 执行记录包含租户、任务、尝试、宿主机、fence、输入摘要、结果摘要和单调版本。
+- 状态转换为 `ADMITTED → RUNNING → RESULT_PENDING → COMPLETED`；结果不确定时进入 `UNCERTAIN`。
+- 完成结果不可覆盖；重复 finish 按规范化 JSON 摘要返回同一结果；陈旧版本和错误所有者被拒绝。
+- 旧记录缺少身份/输入证据时迁移为 `UNCERTAIN`，保留历史结果用于后续核对，不直接放行执行。
+- Body Worker 路由拒绝未知方法、未知路径、无效 JSON 和过大请求。
+- 开发环境使用每宿主机独立服务凭据；本地执行校验宿主机身份、共享准入、输入摘要和 Scheduler 租约。
+- 续租覆盖 HTTP 结果读取；代理仅以共享执行记录判断恢复，不再以旧 host receipt 绕过准入。
+
+开发环境先运行 `python3 scripts/prepare_body_dev_credentials.py`，再运行 Compose。启动脚本已调用该步骤。密钥和 Body 凭据保存在忽略的 `.dev-secrets/`，不会打印值或提交。部署脚本将签名密钥注入暂存 Worker 配置；这是开发配置，不能替代生产 secret 分发与轮换。
+
+待完成：
+
+- N1：旧记录缺失租户/输入证据时的管理员身份补录；更完整的容器崩溃矩阵。
+- N2：生产 IdP/OIDC 接入、服务根密钥滚动轮换和多管理员身份。开发 Gateway 用户授权与用户签名密钥轮换已接入。
+- N3：进程重启/网络故障下的更完整故障覆盖，以及容量上报扣账契约验证。
+- N4：自动化长任务和进程/网络故障验收。
+
+新任务使用租户与任务复合存储标识，支持跨租户同名任务独立运行；原始 ID 保留为公开 ID。旧记录按原存储 ID 保守读取。
+
+验证：TypeScript 构建通过；17 项相关测试通过。`scripts/verify_body_attempt_protocol.mjs` 在已部署容器中通过，任务执行记录达到 `COMPLETED / version=4`，Gateway 租约为 `RELEASED`；匿名状态读取和本地执行请求返回 401。完整崩溃矩阵尚未运行。
+
+第二批进展：核对 API 已加入开发环境独立管理员凭据、版本/所有者/证据校验、哈希链审计和相同请求重试。支持确认完成、确认未开始后创建替代尝试、继续阻塞；Scheduler 以显式待核对状态停放任务，核对后完成或重新排队。跨 Cell 更新失败返回 503 并要求重试原请求。
+
+原生执行改为独立进程组，停止时等待进程退出，取消后不发布子进程的部分分支。结果通过 fsync outbox 回报，保留重试次数及退避时间；本地日志保存完整响应以保持重试结果摘要一致。
+
+第二批已通过 26 项相关测试。容器执行中重启验证已确认禁止自动重放、Scheduler 显式暂停待核对任务、拒绝宿主机权限提升、拒绝陈旧核对并保留审计。验证脚本：`python3 scripts/verify_body_restart_reconciliation.py`，脚本最终恢复正常 Body 配置。正常任务端到端验证仍通过。
+
+第三批进展：Gateway、Scheduler 提交、Body、日志与 outbox 使用复合任务标识；公开 API 返回原 taskId 和 executionTaskId，歧义读取要求 tenantId。start 返回 30 秒执行凭证，绑定租户/任务/尝试/宿主机/fence/输入摘要；本地执行通过控制面验证并持久消费 nonce，防止重放。Scheduler 注册、续租、完成、tick 接口加入服务鉴权，Gateway 使用独立服务凭据。
+
+第三批验证：30 项相关测试通过，1 项独立 celld 进程检查因无测试二进制而跳过。真实开发集群的正常任务和跨租户同名任务验证通过；容器重启核对验证通过。存储命名空间隔离不等于用户访问授权，后者仍待完成。
+
+第四批进展：Gateway 用户 JWT 与 VIEWER/OPERATOR/SRE_ADMIN 权限接入，租户范围覆盖提交、查询、状态/总览和租约管理。后台 Scheduler/Harness/Tunnel/旧 Brain 路径要求服务凭据，用户不能经后台端口绕过授权。用户签名密钥支持开发环境轮换，旧凭据保留 15 分钟只读宽限。
+
+部署验证通过：匿名拒绝、跨租户拒绝、VIEWER 写入拒绝、正常任务完成，以及旧凭据只读/新凭据写入。开发控制台登录交互、生产身份提供方与服务根密钥轮换仍在后续范围。
+
+第五批进展：开发控制台登录、退出和过期处理已接入，移除默认入口中的演示身份和固定 JWT。默认工作区只显示实际授权任务并提供真实提交入口；旧管理渲染器归档等待 API 迁移。DOM 会话/竞态测试和部署 HTTP 验证通过；浏览器宿主不可用，截图与真实浏览器交互验证未完成。生产 OIDC 等待身份提供方配置。
+
+2026-11-14：下一里程碑 M1.1 进行中。Daemon 在远程准入前同步预留执行槽，默认单槽，满载返回 429，健康响应显示槽位。Body agent 明确仅支持单槽并关闭虚构 warm pool；Scheduler 心跳保存 execution_slots，分配时同时核对已分配任务，空闲心跳不能清空预留。运行时 CPU 可用并行度和内存约束用于上报预算，可通过 ANSTS_BODY_CPU_CORES / ANSTS_BODY_MEMORY_MB 降低预算。此检测不保证覆盖所有 cgroup CPU quota 配置，尚未实现沙箱强制限额、多槽并发或完整的崩溃恢复资源账本。本批尚未部署。
+M1.1 后续：增加标准 cgroup v2 与 v1 挂载位置的 CPU quota 和内存 limit 检测，支持分数 CPU。非标准挂载及祖先配额遍历尚未覆盖。构建及 7 项相关测试通过，两个 Daemon 镜像已重建部署，执行协议端到端任务达到 COMPLETED。Scheduler 恢复仍依赖原有租约重建/重新排队语义；不能将当前槽位检查视为完整持久资源账本。
+
+M1.1 恢复改造：活动租约与任务同一条 SQL 记录保存，续租同步持久化；Scheduler 重建恢复原 node/fence/acquired_at/expires_at，不因重启延长期限。新增过期续租拒绝，保留 fence 水位防止恢复旧租约覆盖新租约。跨重建测试验证活动槽位不被释放、原执行可以续租和完成。Body/Scheduler 共 28 项回归通过，已发布开发 Worker 并验证任务 COMPLETED。旧记录缺少租约快照时仍沿用保守准入保护；CPU/内存的持久预留账本及完整过期恢复矩阵仍待实现。
+
+M1.2 第一批：新增独立 ContainerSandbox Engine adapter，仅接受固定摘要镜像和结构化 argv/资源限额。配置非 root、只读根文件系统、禁网、drop all capabilities、no-new-privileges、PID/CPU/内存限额、限额 tmpfs 和轮转日志；不挂载宿主目录、凭据或 Docker socket。结果返回退出码与有界日志；超时或取消后强制移除容器，无法确认清理时报 BODY_STOP_UNCONFIRMED。现有原生子进程也改用最小环境变量，停止继承服务密钥。
+
+真实 Docker 测试通过：rootfs 不可写、workspace 可写、UID 65534、无父进程测试密钥、无 Engine socket、仅 loopback 网络、退出码 7、超时终止。Engine API 按 Docker 官方文档与 Context7 /docker/docs 核对。此 adapter 尚未接入 Gateway/Body 任务协议，未给开发 Daemon 挂载 Engine socket；结构化命令与执行摘要绑定、工作区产物导出、孤儿容器恢复及任务日志 API 仍待实现。当前不能宣称完成 M1.2 或支持敌对多租户负载。
+M1.2 第二批：结构化 execution（kind/container、image 摘要、argv、timeoutMs、cpu、memoryMb）接入 Gateway 验证、TaskSpec、Scheduler 存储、代理和 Daemon。限制规范大小及未知字段，执行预算不得超过任务声明。所有执行字段加入输入摘要，旧 trace 摘要保持兼容；内容去重包含执行规范。独立 Body Worker 在 acquire/start 时对容器任务核对 Scheduler 规范摘要。Daemon 使用绑定该摘要的单次凭证，容器退出结果写入原有 journal/outbox 路径，返回 exitCode、有界日志及截断信息；COMPLETED 表示执行尝试完成，业务成功需检查 exitCode。
+
+Gateway 与 Daemon 必须显式设置相同 ANSTS_SANDBOX_IMAGE 才接受该镜像；当前开发集群尚未开启，也未给 Daemon 挂载 Engine socket。32 项相关测试全部通过，真实 Engine 集成覆盖 argv 篡改被拒绝、原规范可执行并返回日志与退出码。部署启用、任务侧日志查询、产物导出、Daemon 崩溃后的孤儿容器回收和状态细化仍待交付。
+M1.2 第三批：增加按 Daemon owner 标签的启动前孤儿容器回收、Gateway 已授权任务 includeResult 查询、显式 sandbox Compose override。开发部署已启用，真实 Gateway→Scheduler→Body→Engine 任务达到 COMPLETED，退出码和日志可读，匿名及跨租户查询被拒绝。真实残留 fixture 回收通过且无剩余测试沙箱。维护命令与限制见 container-execution-development.md。未完成清理失败后的持久资源占用、产物导出及实时日志，不宣称 M1.2 全部交付。
+
+M1.2/M1.3 安全恢复补充：容器执行前增加 fsync cleanup-ledger；清理不确认时保留槽位和持久记录，阻止新执行，readiness 返回 503，代理停止调度领取。启动前 Engine 回收成功才清除阻塞；未配置 Engine 且存在记录时拒绝启动。新增失败注入与跨重建验证，31 项相关回归通过，两个开发 Daemon 已更新。取消/drain、产物导出及响应丢失矩阵仍待完成。
+
+2026-11-14 后续交付：持久 drain、具名取消、明确执行结果、CPU/内存资源账本、有界产物与运行日志、十分钟断网执行、三轮故障矩阵、共享 Gateway/Body fleet 状态、隔离快照恢复、GitHub OAuth、服务密钥轮换支持及真实 DeepSeek 工具循环已实现。实测 DeepSeek 修改与原测试通过；共享状态迁移、首入口故障后的真实任务、Daemon SIGKILL 后保守阻塞及孤儿回收均已验证。当前状态、完整命令、基线失败和生产验证边界见 remaining-work-delivery.md；不要再根据前文历史“待实现”判断本轮交付。

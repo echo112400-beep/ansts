@@ -1,0 +1,58 @@
+{
+  "date": "2026-11-14",
+  "supportedRuntime": "Node 22",
+  "focusedTests": {
+    "total": 46,
+    "passed": 45,
+    "failed": 0,
+    "skipped": 1
+  },
+  "fullSuite": {
+    "total": 314,
+    "passed": 264,
+    "failed": 46,
+    "skipped": 4,
+    "newFailedTestNames": []
+  },
+  "baseline": {
+    "commit": "4ac7022",
+    "total": 297,
+    "passed": 249,
+    "failed": 46,
+    "skipped": 2
+  },
+  "faultMatrix": {
+    "consecutiveRounds": 3,
+    "commands": 15,
+    "allPassed": true
+  },
+  "longTask": {
+    "seconds": 600,
+    "networkOutageSeconds": 4,
+    "outcome": "SUCCEEDED"
+  },
+  "realDeepSeek": {
+    "deepseekAgent": "passed",
+    "taskId": "deepseek-agent-1794671550434058715",
+    "turns": 4,
+    "realModel": true,
+    "realContainerTest": true,
+    "originalTestPreserved": true,
+    "artifacts": [
+      "sum.js",
+      "test.js"
+    ]
+  },
+  "bodyMigration": {
+    "verifiedCells": 50
+  },
+  "isolatedRestore": {
+    "verifiedCells": 65
+  },
+  "github": {
+    "localOrigin": "http://127.0.0.1:8088",
+    "callback": "http://127.0.0.1:8088/auth/callback/github",
+    "startRedirect": "verified",
+    "userAuthorization": "requires user callback registration and consent"
+  }
+}

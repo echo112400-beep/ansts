@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "QF-02 internal shadow admission protocol",
+  "status": "automatic-shadow-delivery-deployed-and-native-cold-live-recovery-verified-enforcement-not-connected",
+  "exposure": "Fleet internal service only; no public Gateway management proxy",
+  "authentication": "Independent ANSTS_ADMISSION_SERVICE_TOKEN; actor comes from trusted coordinator, not browser claims",
+  "credentialPurpose": "ansts-admission-shadow-v1",
+  "mode": "SHADOW",
+  "enforcement": "NOT_CONNECTED",
+  "operations": [
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-read",
+      "fields": [
+        "actor",
+        "tenantId",
+        "reservationId"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-prepare",
+      "fields": [
+        "actor",
+        "tenantId",
+        "idempotencyKey",
+        "input"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-transition",
+      "fields": [
+        "actor",
+        "tenantId",
+        "idempotencyKey",
+        "input"
+      ],
+      "allowedPhases": [
+        "RESERVED",
+        "START_AUTHORIZED",
+        "UNCERTAIN",
+        "CANCELLED"
+      ],
+      "deniedUntilTrustedAdapter": [
+        "RUNNING",
+        "SETTLING",
+        "SETTLED",
+        "evidence"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-credential",
+      "fields": [
+        "actor",
+        "tenantId",
+        "reservationId"
+      ],
+      "roles": [
+        "OPERATOR",
+        "SRE_ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-verify",
+      "fields": [
+        "actor",
+        "tenantId",
+        "reservationId",
+        "credential",
+        "target"
+      ],
+      "roles": [
+        "OPERATOR",
+        "SRE_ADMIN"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-outbox",
+      "fields": [
+        "actor",
+        "tenantId",
+        "limit"
+      ],
+      "roles": [
+        "VIEWER",
+        "OPERATOR",
+        "SRE_ADMIN"
+      ],
+      "response": "Up to 100 pending/in-flight/quarantined messages in authorized historical region; default limit 25"
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-dispatch",
+      "fields": [
+        "actor",
+        "tenantId"
+      ],
+      "roles": [
+        "OPERATOR",
+        "SRE_ADMIN"
+      ],
+      "response": "One leased shadow message delivered to an independent durable mailbox; recording acknowledgement never changes execution or quota state"
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-delivery-status",
+      "fields": [
+        "actor",
+        "tenantId"
+      ],
+      "roles": [
+        "VIEWER",
+        "OPERATOR",
+        "SRE_ADMIN"
+      ],
+      "response": "Current persisted controller configuration/runtime and native alarmAt; null delivery means not initialized"
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-delivery-control",
+      "fields": [
+        "actor",
+        "tenantId",
+        "control"
+      ],
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "controlFields": [
+        "expectedVersion",
+        "enabled",
+        "reason",
+        "idempotencyKey"
+      ],
+      "response": "Immutable configuration receipt and current configuration/runtime; replay never overwrites a later pause"
+    },
+    {
+      "method": "POST",
+      "path": "/internal/v1/tenant-control/admission-observe-execution",
+      "fields": [
+        "actor",
+        "tenantId",
+        "reservationId",
+        "proof"
+      ],
+      "roles": [
+        "OPERATOR",
+        "SRE_ADMIN"
+      ],
+      "response": "Authenticated Host observation applied idempotently; sourceVerified=true does not authorize execution or provide price/cost evidence"
+    }
+  ],
+  "$defs": {
+    "PrepareAdmission": {
+      "type": "object",
+      "required": [
+        "reservationId",
+        "taskId",
+        "attemptId",
+        "fencing",
+        "expectedPolicyVersion",
+        "resources",
+        "estimatedCreditUnits",
+        "expiresAt"
+      ],
+      "properties": {
+        "reservationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "taskId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "attemptId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "fencing": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "expectedPolicyVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "resources": {
+          "$ref": "contracts.schema.json#/$defs/ResourceQuota"
+        },
+        "estimatedCreditUnits": {
+          "$ref": "contracts.schema.json#/$defs/CreditUnits"
+        },
+        "expiresAt": {
+          "type": "integer",
+          "description": "Server-checked epoch milliseconds, after now and within five minutes"
+        },
+        "executionInputDigest": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "Optional pinned task input. Required for authenticated Body observations; legacy unpinned reservations cannot consume evidence."
+        }
+      }
+    }
+  },
+  "notes": [
+    "Each execution reservation requires concurrentAttempts=1 and queuedTasks=0. Queue admission is not integrated.",
+    "Tokens authenticate exact canonical claims and target; verification also requires current authoritative reservation state. Offline signature alone cannot prove revocation.",
+    "The shadow credential is not a Body execution grant and is never sent to Engine.",
+    "Capacity receipts are unverified shadow adapter inputs. Runtime and settlement transitions stay closed until authenticated adapters exist.",
+    "There is no fee snapshot, trusted provider-cost bound, usage ledger, trusted runtime compensation, or real enforcement yet.",
+    "Outbox intent, reservation, audit and idempotency receipt commit atomically. Events have stable IDs; replay never recreates acknowledged events.",
+    "Dispatch uses a 10-second durable lease, a 3-second transport deadline, and 1-to-60-second retry backoff. No pending message, deduplication receipt, or revocation tombstone is TTL-deleted.",
+    "Receiver records shadow observations and generation/version tombstones only. Same event ID with changed content is quarantined; duplicate identical input returns the immutable original receipt.",
+    "Claiming recovers legacy states by deterministic event IDs. Expired acquisition intents and acquisition for disabled tenants are quarantined without releasing occupancy.",
+    "A new admission mutation initializes RUNNING automatic shadow delivery after native alarm registration. Legacy records require explicit enable; PAUSED remains paused on later mutations.",
+    "RUNNING keeps a 60-second durable heartbeat, including idle queues. Due work is processed in batches of at most four, with a persisted watchdog registered before network I/O.",
+    "Directory/controller failures reschedule with a 30-second floor; transport retries retain their existing bounded backoff. No callback failure clears occupancy.",
+    "Pause controls automatic message delivery only; an already claimed message may finish and explicit authorized dispatch remains available. It does not stop Engine or enable/disable real admission enforcement.",
+    "New pinned-input reservations use an unpredictable server challenge in requestDigest; evidence cannot be prepared before reservation creation.",
+    "admission-observe-execution validates Host HMAC facts against pinned identity/input/resources. RUNNING/NOT_STARTED/TERMINATED raw transition requests remain closed.",
+    "Verified termination moves to SETTLING, frees resource quota and retains unpriced budget. BodyAgent automatic context/evidence delivery and real execution admission are not connected yet."
+  ]
+}

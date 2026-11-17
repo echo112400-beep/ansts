@@ -1,0 +1,557 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ANSTS M0 request schema catalog",
+  "contractVersion": 1,
+  "status": "implemented-m0-baseline",
+  "description": "Select a definition using operation.requestRef. Unknown body properties are ignored by the server; actor and authorization always come from verified claims. Future module APIs are excluded.",
+  "$defs": {
+    "TenantCreate": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "costCenter": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "status": {
+          "enum": [
+            "ACTIVE",
+            "DISABLED"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "region",
+        "costCenter",
+        "status",
+        "reason"
+      ],
+      "additionalProperties": true
+    },
+    "TenantUpdate": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "costCenter": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "status": {
+          "enum": [
+            "ACTIVE",
+            "DISABLED"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "expectedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "name",
+        "region",
+        "costCenter",
+        "status",
+        "reason",
+        "expectedVersion"
+      ],
+      "additionalProperties": true
+    },
+    "CostCenterCreate": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "status": {
+          "enum": [
+            "ACTIVE",
+            "DISABLED"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "status",
+        "reason"
+      ],
+      "additionalProperties": true
+    },
+    "CostCenterUpdate": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "status": {
+          "enum": [
+            "ACTIVE",
+            "DISABLED"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        },
+        "expectedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "name",
+        "status",
+        "reason",
+        "expectedVersion"
+      ],
+      "additionalProperties": true
+    },
+    "ArchiveCreate": {
+      "type": "object",
+      "properties": {
+        "expectedVersion": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "pattern": "\\S",
+          "not": {
+            "pattern": "[\\u0000-\\u001f]"
+          }
+        }
+      },
+      "required": [
+        "expectedVersion",
+        "reason"
+      ],
+      "additionalProperties": true
+    },
+    "ControlActor": {
+      "type": "object",
+      "properties": {
+        "sub": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "role": {
+          "enum": [
+            "VIEWER",
+            "OPERATOR",
+            "SRE_ADMIN"
+          ]
+        },
+        "scopeTenant": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "scopeRegion": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sub",
+        "role",
+        "scopeTenant",
+        "scopeRegion"
+      ],
+      "additionalProperties": true
+    },
+    "ResourceQuota": {
+      "type": "object",
+      "properties": {
+        "concurrentAttempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "cpuMilliCores": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "memoryMiB": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "queuedTasks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "concurrentAttempts",
+        "cpuMilliCores",
+        "memoryMiB",
+        "queuedTasks"
+      ],
+      "additionalProperties": true
+    },
+    "CreditUnits": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,77})$"
+    },
+    "ExecutionIdentity": {
+      "type": "object",
+      "properties": {
+        "tenant_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S"
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S"
+        },
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S"
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S"
+        },
+        "input_digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S"
+        },
+        "fencing_token": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "tenant_id",
+        "task_id",
+        "attempt_id",
+        "node_id",
+        "input_digest",
+        "fencing_token"
+      ],
+      "additionalProperties": true
+    },
+    "ControlError": {
+      "type": "object",
+      "anyOf": [
+        {
+          "required": [
+            "code"
+          ]
+        },
+        {
+          "required": [
+            "error"
+          ]
+        }
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "operations": [
+    {
+      "method": "GET",
+      "path": "/v1/admin/tenants",
+      "roles": [
+        "VIEWER",
+        "OPERATOR",
+        "SRE_ADMIN"
+      ],
+      "scope": "authorized tenant and region"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/admin/tenants",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "authorized tenant and region",
+      "requestRef": "#/$defs/TenantCreate",
+      "headers": {
+        "Idempotency-Key": {
+          "required": true,
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/admin/tenants/{id}",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "authorized tenant and region",
+      "requestRef": "#/$defs/TenantUpdate",
+      "headers": {
+        "Idempotency-Key": {
+          "required": true,
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/admin/cost-centers",
+      "roles": [
+        "VIEWER",
+        "OPERATOR",
+        "SRE_ADMIN"
+      ],
+      "scope": "authorized tenant and region"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/admin/cost-centers",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "global tenant and global region",
+      "requestRef": "#/$defs/CostCenterCreate",
+      "headers": {
+        "Idempotency-Key": {
+          "required": true,
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/admin/cost-centers/{id}",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "global tenant and global region",
+      "requestRef": "#/$defs/CostCenterUpdate",
+      "headers": {
+        "Idempotency-Key": {
+          "required": true,
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/admin/audit",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "authorized tenant and region"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/admin/operations/{id}",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "authorized tenant and region"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/admin/archives",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "global tenant and global region"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/admin/archives",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "global tenant and global region",
+      "requestRef": "#/$defs/ArchiveCreate",
+      "headers": {
+        "Idempotency-Key": {
+          "required": true,
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/v1/admin/archives/{id}",
+      "roles": [
+        "SRE_ADMIN"
+      ],
+      "scope": "global tenant and global region"
+    }
+  ],
+  "pagination": {
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 50
+    },
+    "cursor": "opaque, bound to identity/scope/filter/snapshot; stale cursor returns 409"
+  },
+  "units": {
+    "cpuMilliCores": "1/1000 CPU core",
+    "memoryMiB": "1048576 bytes",
+    "creditUnits": "integer internal credit subunits, decimal string transport",
+    "timestamps": "UTC ISO8601 for management audit; epoch milliseconds for ExecutionAttempt.updated_at",
+    "fencing_token": "positive safe integer; never a clock"
+  },
+  "errorStatus": {
+    "401": "authentication required",
+    "403": "role or scope denied",
+    "404": "unknown/invisible operation or archive",
+    "409": "CAS, idempotency or stale cursor conflict",
+    "422": "invalid control policy/input",
+    "503": "authority, integrity or capacity unavailable"
+  },
+  "identityNotes": [
+    "Directory tenant IDs have a 128 character bound. ExecutionIdentity uses the existing 512 character control-cell bound; daemon transport additionally accepts identity strings up to 2048 characters before lease validation.",
+    "Actor display names and GitHub profile fields never select tenant, region or role.",
+    "Idempotency replay retains the original operation result across UTC boundaries; different payload under the same key returns 409.",
+    "Control errors use code; legacy Gateway authentication uses error. Not every legacy failure includes requestId; audit and committed operations retain it."
+  ]
+}

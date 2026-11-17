@@ -1,0 +1,45 @@
+body{margin:0;background:#f3f4f6;color:#17191d;font:14px/1.6 system-ui,sans-serif}
+.skip{position:absolute;left:12px;top:8px;transform:translateY(-150%);padding:8px 12px;background:#fff;color:#17191d;z-index:10}.skip:focus{transform:none}
+html[data-auth-state="locked"] .rail,html[data-auth-state="locked"] .shell,html[data-auth-state="locked"] .skip{visibility:hidden;pointer-events:none}
+#console-login{box-sizing:border-box;width:min(480px,calc(100% - 32px));padding:28px;border:1px solid #dedfe1;border-radius:12px;background:#fff;color:#17191d;font:14px/1.6 system-ui,sans-serif;box-shadow:none}
+#console-login::backdrop{background:#f3f4f6}
+#console-login h1{font-size:24px;line-height:1.3;margin:0 0 12px;font-weight:600}
+#console-login p{color:#52565e;margin:0 0 22px}
+#console-login label{display:block;font-weight:500;margin-bottom:8px}
+#console-login input{box-sizing:border-box;width:100%;min-height:44px;border:1px solid #a4a8af;border-radius:6px;padding:10px;font:14px system-ui;background:#fff;color:#17191d}
+#console-login input:focus-visible,#console-login button:focus-visible,.auth-session-bar button:focus-visible{outline:2px solid #303741;outline-offset:3px}
+#console-login footer{display:flex;gap:12px;margin-top:20px;justify-content:flex-end}
+#console-login button,.auth-session-bar button{min-height:44px;padding:8px 16px;border:1px solid #c9cbd0;border-radius:6px;background:#fff;color:#17191d;font:14px system-ui;cursor:pointer}
+#console-login button[type="submit"]{background:#17191d;color:#fff;border-color:#17191d}
+#console-login button:disabled{opacity:.6;cursor:wait}
+#console-login-error{min-height:24px;color:#a01a26;margin-top:12px;overflow-wrap:anywhere}
+.auth-session-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:8px 20px;border-bottom:1px solid #dedfe1;background:#fff;color:#343840;font-size:13px}
+.auth-session-bar span{overflow-wrap:anywhere}
+@media(max-width:600px){#console-login{padding:22px}.auth-session-bar{padding:8px 16px;font-size:12px;gap:8px}}
+.rail{display:none!important}
+.shell{margin-left:0!important;grid-column:1/-1;min-width:0}
+.shell>:not(.auth-session-bar):not(#console-live-workspace){display:none!important}
+#console-live-workspace{box-sizing:border-box;max-width:1152px;margin:24px auto;padding:24px;background:#fff;border:1px solid #e7e8ea;border-radius:12px;color:#17191d;font:14px/1.6 system-ui,sans-serif}
+#console-live-workspace>header{display:flex;justify-content:space-between;align-items:center;gap:20px}
+.console-wordmark{font-weight:600;font-size:14px;color:#454a52}
+#console-live-workspace h1{font-size:24px;font-weight:600;margin:8px 0}
+#console-live-workspace h2{font-size:16px;font-weight:600;margin:0 0 16px}
+#console-live-workspace p{margin:4px 0;color:#52565e}
+#console-live-workspace section{padding:24px 0;border-top:1px solid #e7e8ea;margin-top:24px}
+#console-live-workspace section[aria-label]{display:flex;align-items:center;gap:40px}
+.console-total{display:flex;flex-direction:column;min-width:96px}.console-total strong{font-weight:500;font-size:30px;font-variant-numeric:tabular-nums}
+#console-live-workspace small{font-size:12px;color:#626872}
+#console-live-create{padding:20px;background:#f7f8fa;border-radius:10px}
+#console-live-create[hidden]{display:none!important}
+.console-fields{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+#console-live-workspace label{display:flex;flex-direction:column;gap:8px;margin-bottom:16px}
+#console-live-workspace input,#console-live-workspace textarea{box-sizing:border-box;width:100%;min-height:44px;padding:10px;border:1px solid #b9bec6;border-radius:6px;background:#fff;color:#17191d;font:14px system-ui,sans-serif}
+#console-live-workspace button{min-height:44px;padding:8px 16px;border:1px solid #b9bec6;background:#fff;border-radius:6px;color:#17191d;font:14px system-ui,sans-serif;cursor:pointer}
+#console-live-create button[type="submit"]{background:#17191d;color:#fff;border-color:#17191d}
+#console-live-workspace button:disabled{opacity:.6;cursor:wait}
+#console-live-workspace :is(button,input,textarea):focus-visible{outline:2px solid #303741;outline-offset:3px}
+.console-table-wrap{max-width:100%;overflow:auto}
+#console-live-workspace table{border-collapse:collapse;width:100%;min-width:600px;text-align:left}
+#console-live-workspace th{font-weight:500;font-size:12px;color:#626872;text-align:left}
+#console-live-workspace th,#console-live-workspace td{padding:12px 16px 12px 0;border-bottom:1px solid #e7e8ea;overflow-wrap:anywhere;max-width:340px}
+@media(max-width:768px){#console-live-workspace{margin:12px;padding:20px}.console-fields{grid-template-columns:1fr;gap:0}#console-live-workspace>header{align-items:flex-start}#console-live-workspace section[aria-label]{gap:20px}}
