@@ -1,0 +1,15 @@
+services:
+  rivet:
+    image: rivetdev/engine:3.1.1
+    environment:
+      RIVET__AUTH__ADMIN_TOKEN: "${ANSTS_RIVET_ADMIN_TOKEN:?Set ANSTS_RIVET_ADMIN_TOKEN}"
+    ports:
+      - "127.0.0.1:${ANSTS_RIVET_PORT:-6420}:6420"
+    volumes:
+      - ./rivet.json:/etc/rivet/config.json:ro
+      - engine-log:/var/lib/rivet/log
+      - engine-objects:/var/lib/rivet/objects
+
+volumes:
+  engine-log:
+  engine-objects:

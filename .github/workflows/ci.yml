@@ -2,7 +2,7 @@ name: ANSTS CI
 
 on:
   push:
-    branches: ["main", "master", "release/**"]
+    branches: ["main", "master", "release/**", "rivet"]
   pull_request:
     branches: ["main", "master", "release/**"]
   workflow_dispatch:
@@ -36,6 +36,26 @@ jobs:
         run: npm run typecheck --prefix ui/console
       - name: Console production build
         run: npm run build --prefix ui/console
+
+  open-orange-compatibility:
+    name: OpenOrange compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+      - run: npm ci
+      - run: npm install --global open-orange@1.0.3
+      - name: Check deployment Worker bindings
+        run: |
+          node scripts/check_open_orange.mjs scheduler
+          node scripts/check_open_orange.mjs gateway
+          node scripts/check_open_orange.mjs body
+      - name: Verify self-hosted Worker startup and Scheduler RPC
+        run: python3 -u scripts/verify_open_orange.py
 
   lint-build-and-test:
     name: Integration tests (Node ${{ matrix.node-version }})
