@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "nodes": [
+    {
+      "id": "ingress",
+      "label": "Nginx 入口",
+      "kind": "http",
+      "plane": "ingress",
+      "description": "同源 API 代理和 OAuth 回调",
+      "url": "http://tanstack-console:80",
+      "healthPath": "/"
+    },
+    {
+      "id": "console",
+      "label": "Next.js Console",
+      "kind": "http",
+      "plane": "ingress",
+      "description": "控制台页面与 GitHub 头像优化，不持有模型/身份服务密钥",
+      "url": "http://dev-server:3000",
+      "healthPath": "/api/health"
+    },
+    {
+      "id": "gateway",
+      "label": "OpenOrange Gateway",
+      "kind": "gateway",
+      "plane": "gateway",
+      "description": "身份验证、租户权限和任务入口",
+      "url": "http://gateway:8080",
+      "healthPath": "/readyz"
+    },
+    {
+      "id": "scheduler",
+      "label": "OpenOrange Scheduler",
+      "kind": "http",
+      "plane": "control",
+      "description": "调度、租户控制与容量状态",
+      "url": "http://scheduler:8080",
+      "healthPath": "/readyz"
+    },
+    {
+      "id": "body-worker",
+      "label": "OpenOrange Body Worker",
+      "kind": "http",
+      "plane": "control",
+      "description": "执行授权、结果和核对状态",
+      "url": "http://body:8080",
+      "healthPath": "/readyz"
+    },
+    {
+      "id": "rivet",
+      "label": "Rivet Engine",
+      "kind": "http",
+      "plane": "storage",
+      "description": "为 OpenOrange 持久化 Durable Objects",
+      "url": "http://rivet:6420",
+      "healthPath": "/health"
+    },
+    {
+      "id": "body-1",
+      "label": "body-host-01",
+      "kind": "daemon",
+      "plane": "execution",
+      "description": "原生执行器；维护准入、资源预留、清理账本、Journal 和结果 Outbox",
+      "url": "http://body-daemon-01:9501",
+      "healthPath": "/readyz"
+    },
+    {
+      "id": "body-2",
+      "label": "body-host-02",
+      "kind": "daemon",
+      "plane": "execution",
+      "description": "原生执行器；维护准入、资源预留、清理账本、Journal 和结果 Outbox",
+      "url": "http://body-daemon-02:9502",
+      "healthPath": "/readyz"
+    },
+    {
+      "id": "rustfs",
+      "label": "RustFS",
+      "kind": "storage",
+      "plane": "storage",
+      "description": "为原生执行器提供 S3 工作区存储",
+      "url": "http://rustfs:9000",
+      "healthPath": "/health/ready"
+    },
+    {
+      "id": "prometheus",
+      "label": "Prometheus",
+      "kind": "prometheus",
+      "plane": "observability",
+      "description": "采集 Gateway 与 Daemon；探测服务响应及每个抓取目标",
+      "url": "http://prometheus:9090",
+      "healthPath": "/api/v1/targets",
+      "critical": false
+    },
+    {
+      "id": "grafana",
+      "label": "Grafana",
+      "kind": "grafana",
+      "plane": "observability",
+      "description": "观测看板与 Grafana 数据库健康",
+      "url": "http://grafana:3000",
+      "healthPath": "/api/health",
+      "critical": false
+    },
+    {
+      "id": "github",
+      "label": "GitHub OAuth",
+      "kind": "external",
+      "plane": "external",
+      "description": "外部身份服务；显示授权配置"
+    },
+    {
+      "id": "deepseek",
+      "label": "DeepSeek",
+      "kind": "external",
+      "plane": "external",
+      "description": "由 Daemon 按需调用模型；不在拓扑探测中消费模型请求"
+    },
+    {
+      "id": "engine",
+      "label": "Docker Engine",
+      "kind": "logical",
+      "plane": "execution",
+      "description": "每台 Daemon 本地独立 Engine；未提供独立 Engine 健康探针"
+    }
+  ],
+  "edges": [
+    {
+      "source": "ingress",
+      "target": "console",
+      "label": "页面",
+      "kind": "request"
+    },
+    {
+      "source": "ingress",
+      "target": "gateway",
+      "label": "API / OAuth",
+      "kind": "request"
+    },
+    {
+      "source": "gateway",
+      "target": "scheduler",
+      "label": "任务与租户控制",
+      "kind": "state"
+    },
+    {
+      "source": "scheduler",
+      "target": "body-worker",
+      "label": "执行结果",
+      "kind": "state"
+    },
+    {
+      "source": "body-worker",
+      "target": "scheduler",
+      "label": "续租与用量绑定",
+      "kind": "state"
+    },
+    {
+      "source": "scheduler",
+      "target": "rivet",
+      "label": "持久化调度状态",
+      "kind": "storage"
+    },
+    {
+      "source": "body-worker",
+      "target": "rivet",
+      "label": "持久化执行状态",
+      "kind": "storage"
+    },
+    {
+      "source": "body-1",
+      "target": "body-worker",
+      "label": "执行授权与结果",
+      "kind": "execution"
+    },
+    {
+      "source": "body-2",
+      "target": "body-worker",
+      "label": "执行授权与结果",
+      "kind": "execution"
+    },
+    {
+      "source": "body-1",
+      "target": "engine",
+      "label": "本地沙箱",
+      "kind": "execution"
+    },
+    {
+      "source": "body-2",
+      "target": "engine",
+      "label": "本地沙箱",
+      "kind": "execution"
+    },
+    {
+      "source": "prometheus",
+      "target": "gateway",
+      "label": "抓取指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "prometheus",
+      "target": "body-1",
+      "label": "抓取指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "prometheus",
+      "target": "body-2",
+      "label": "抓取指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "grafana",
+      "target": "prometheus",
+      "label": "查询指标",
+      "kind": "telemetry"
+    },
+    {
+      "source": "gateway",
+      "target": "github",
+      "label": "OAuth / PKCE",
+      "kind": "provider"
+    }
+  ]
+}

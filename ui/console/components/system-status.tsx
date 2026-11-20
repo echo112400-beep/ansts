@@ -339,14 +339,16 @@ function Topology({ api }: { api: Api }) {
               </strong>
               <p>就绪检查与功能信号分别判断</p>
             </div>
-            <div>
-              <span>Fleet 实例</span>
-              <strong>
-                {snapshot.summary.fleetReady}
-                <small>/ {snapshot.summary.fleetTotal} 就绪</small>
-              </strong>
-              <p>共同承载持久状态对象</p>
-            </div>
+            {snapshot.summary.fleetTotal > 0 && (
+              <div>
+                <span>Fleet 实例</span>
+                <strong>
+                  {snapshot.summary.fleetReady}
+                  <small>/ {snapshot.summary.fleetTotal} 就绪</small>
+                </strong>
+                <p>共同承载持久状态对象</p>
+              </div>
+            )}
             <div>
               <span>可准入执行槽位</span>
               <strong>
@@ -449,7 +451,7 @@ function Topology({ api }: { api: Api }) {
                               <span>Body</span>
                               <span>Harness</span>
                               <span>Tunnel</span>
-                              <small>Fleet 内持久对象 · 未逐对象探测</small>
+                              <small>持久状态对象 · 未逐对象探测</small>
                             </div>
                           )}
                           {plane === "execution" &&
@@ -689,7 +691,7 @@ function Topology({ api }: { api: Api }) {
             <section>
               <h2>
                 <Layers size={16} />
-                Fleet 内的状态权威
+                持久状态对象
               </h2>
               <p>以下是逻辑对象类型，并非额外的独立服务器。</p>
               {snapshot.logicalServices.map((service) => (

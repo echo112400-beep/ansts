@@ -35,7 +35,12 @@ try {
   const configPath = join(directory, "wrangler.json");
   writeFileSync(configPath, JSON.stringify(config));
   const configArgs = ["--config", configPath, "--port", port];
-  const options = { cwd: root, stdio: "inherit" };
+  const env = { ...process.env };
+  if (serve && role === "gateway" && env.ANSTS_SYSTEM_TOPOLOGY_FILE) {
+    env.ANSTS_SYSTEM_TOPOLOGY_JSON = readFileSync(env.ANSTS_SYSTEM_TOPOLOGY_FILE, "utf8");
+    env.ORANGE_WORKER_VARS = [env.ORANGE_WORKER_VARS, "ANSTS_SYSTEM_TOPOLOGY_JSON"].filter(Boolean).join(",");
+  }
+  const options = { cwd: root, env, stdio: "inherit" };
   if (serve) {
     const child = spawn("orange", ["serve", ...configArgs, "--ip", process.env.ANSTS_ORANGE_LISTEN_HOST ?? "127.0.0.1"], options);
     const stop = (signal) => child.kill(signal);

@@ -1,4 +1,12 @@
 services:
+  gateway:
+    environment:
+      ANSTS_SYSTEM_TOPOLOGY_FILE: /etc/ansts/system-topology.json
+    volumes:
+      - ./system-topology.json:/etc/ansts/system-topology.json:ro
+    networks:
+      - default
+      - development-console
   console:
     image: nginx:1.27-alpine
     environment:
