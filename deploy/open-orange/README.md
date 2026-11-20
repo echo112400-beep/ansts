@@ -22,6 +22,8 @@ Supply `ANSTS_RIVET_ADMIN_TOKEN`, `ANSTS_BODY_AUTH_SECRET`, `ANSTS_USER_AUTH_SEC
 
 The services communicate over the Compose network. The Engine and Worker ports bind to host loopback. Existing default pool configuration is preserved. The Engine uses named volumes for durable state. When adding the overlay to an existing Engine deployment, keep the same Compose project name to reuse its volumes.
 
+For the development cutover, use the existing user signing key and optional rotation key and expiry. The Gateway uses remote state on the Scheduler and can reuse the existing console RBAC secret, GitHub or OIDC configuration, and monitoring token. Pass `ANSTS_ADMISSION_ESTIMATED_CREDIT_UNITS` alongside the existing admission credentials when the source policy uses an estimate. Keep the current identity and monitoring settings when changing the client routes.
+
 The Compose file starts Rivet Engine 3.1.1 with persistent log and object volumes and a loopback API. Supply `ANSTS_RIVET_ADMIN_TOKEN` through the environment before starting it.
 
 ```sh
