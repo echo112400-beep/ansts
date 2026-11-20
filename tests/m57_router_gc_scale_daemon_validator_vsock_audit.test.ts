@@ -169,12 +169,12 @@ describe("M57: Router Half-Open/Cooldown & Quota Guard, Leaf-First CAS GC & Bise
       max_turns: 3,
     });
     sched.submitTask(task);
-    sched.scheduleTick(1000);
+    sched.scheduleTick(Date.now() / 1000);
     // Execute turn 1 on daemonA
     const step1 = daemonA.executeAgentStep(sched, saga, task, "noop", {});
     assert.equal(step1.turn, 1);
     // Simulate task migration to daemonB (which has empty local checkpointStore for task-m57-daemon)
-    const newLease = sched.leaseCoordinator.acquireLease(task.task_id, "node-b", 2000);
+    const newLease = sched.leaseCoordinator.acquireLease(task.task_id, "node-b");
     task.lease_fencing_token = newLease.fencing_token;
     const step2 = daemonB.executeAgentStep(sched, saga, task, "noop", {});
     assert.equal(step2.turn, 2);

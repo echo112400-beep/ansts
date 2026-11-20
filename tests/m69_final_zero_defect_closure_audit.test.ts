@@ -129,9 +129,17 @@ describe("M69 Final Deep Edge-Case Sweep & Zero-Residual-Defect Closure Suite", 
     assert.equal(cell1.scheduler.nodes.get("body-m69-01")?.running_tasks, 1);
     assert.equal(cell1.scheduler.nodes.get("body-m69-01")?.free_cpu_cores, 6);
 
-    // Cold-start cell2 over the same SQLite: t-m69-leased is reset to QUEUED, so body-m69-01 must have its 2 CPU cores & running_tasks refunded!
+    // Restart preserves the active lease and releases its resources when it expires.
     const cell2 = new AnstsSchedulerCell(makeCellState());
     const rehydratedNode = cell2.scheduler.nodes.get("body-m69-01")!;
+    const restoredLease = cell2.scheduler.leaseCoordinator.getLease(t2.task_id);
+    assert.ok(restoredLease);
+    assert.equal(restoredLease.fencing_token, t2.lease_fencing_token);
+    assert.equal(rehydratedNode.running_tasks, 1);
+    assert.equal(rehydratedNode.free_cpu_cores, 6);
+    assert.deepEqual(cell2.scheduler.reconcileOrphanedLeases(restoredLease.expires_at - 0.001), []);
+    assert.deepEqual(cell2.scheduler.reconcileOrphanedLeases(restoredLease.expires_at), [t2.task_id]);
+    assert.equal(cell2.scheduler.allTasks.get(t2.task_id)?.state, TaskState.QUEUED);
     assert.equal(rehydratedNode.running_tasks, 0);
     assert.equal(rehydratedNode.free_cpu_cores, 8);
     // And contentFingerprintIndex must point to active t-m69-leased (never completed t-m69-done)

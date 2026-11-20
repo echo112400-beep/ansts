@@ -32,6 +32,7 @@ describe("M52 Comprehensive System-Wide Stale, Deadlock, Starvation & State-Cons
       const body = JSON.parse(cliRes.stdout) as {
         cellStale1: {
           activeLeaseAlarmRenewed: boolean;
+          activeLeasePreserved: boolean;
           interruptedLeaseConvertedToQueued: boolean;
           monotonicFencePreservedAcrossColdStart: boolean;
           fenceBeforeRestart: number;
@@ -57,6 +58,7 @@ describe("M52 Comprehensive System-Wide Stale, Deadlock, Starvation & State-Cons
       };
 
       assert.equal(body.cellStale1.activeLeaseAlarmRenewed, true);
+      assert.equal(body.cellStale1.activeLeasePreserved, true);
       assert.equal(body.cellStale1.interruptedLeaseConvertedToQueued, true);
       assert.equal(body.cellStale1.monotonicFencePreservedAcrossColdStart, true);
       assert.ok(body.cellStale1.fenceAfterRestart > body.cellStale1.fenceBeforeRestart);

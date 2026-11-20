@@ -13,6 +13,8 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { bodyServiceToken } from "../src/cloudflare/body_auth.js";
+import { taskStorageId } from "../src/cloudflare/task_identity.js";
 import workerDefault, { AnstsSchedulerCell, AgentTaskHarnessCell } from "../src/cloudflare/worker.js";
 import {
   CloudflareCelldEnv,
@@ -43,7 +45,10 @@ describe("M64 End-to-End Implementation Consistency & Authentic Feature Wiring S
     const r2 = new InMemoryR2Bucket();
     const harnessCell = new AgentTaskHarnessCell(harnessState, r2, "task-h-01");
 
+    const serviceKey = "a".repeat(64);
+    const authorization = `Gateway ${bodyServiceToken(serviceKey, "gateway:control")}`;
     const env: CloudflareCelldEnv = {
+      ANSTS_BODY_AUTH_SECRET: serviceKey,
       CELLD_REGION: "us-west-2",
       ANSTS_SCHEDULER_CELL: {
         idFromName: (name: string) => ({ toString: () => name }),
@@ -63,7 +68,7 @@ describe("M64 End-to-End Implementation Consistency & Authentic Feature Wiring S
     const submitResp = await workerDefault.fetch(
       new Request("https://edge.ansts.io/v1/scheduler/submit", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization },
         body: JSON.stringify({
           task_id: "task-worker-http-01",
           tenant_id: "Northstar",
@@ -75,8 +80,8 @@ describe("M64 End-to-End Implementation Consistency & Authentic Feature Wiring S
     );
     assert.equal(submitResp.status, 202);
     const submitData = (await submitResp.json()) as { task_id: string; state: string };
-    assert.equal(submitData.task_id, "task-worker-http-01");
-    assert.equal(schedCell.scheduler.allTasks.has("task-worker-http-01"), true);
+    assert.equal(submitData.task_id, taskStorageId("Northstar", "task-worker-http-01"));
+    assert.equal(schedCell.scheduler.allTasks.has(taskStorageId("Northstar", "task-worker-http-01")), true);
 
     // 2. Dispatch queue batch via Worker `queue(batch, env)`
     let acked = 0;
@@ -104,13 +109,13 @@ describe("M64 End-to-End Implementation Consistency & Authentic Feature Wiring S
       env
     );
     assert.equal(acked, 1);
-    assert.equal(schedCell.scheduler.allTasks.has("task-worker-queue-02"), true);
+    assert.equal(schedCell.scheduler.allTasks.has(taskStorageId("Northstar", "task-worker-queue-02")), true);
 
     // 3. Execute turn via Worker `/v1/harness/execute-turn`
     const harnessResp = await workerDefault.fetch(
       new Request("https://edge.ansts.io/v1/harness/execute-turn?taskId=task-h-01", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization },
         body: JSON.stringify({
           turnIndex: 1,
           fencingToken: 5,

@@ -7,7 +7,7 @@
  *   on the backend (`sanitizeHtmlString`) and frontend renders via `esc()`.
  * - [P0-3] Live `ConsoleRbacAuthGuard` (HMAC-SHA256 JWT + Role Matrix + Cryptographic Audit Chain):
  *   rejects missing/forged credentials with 401, blocks VIEWER mutations with 403, and verifies chained audit hashes.
- * - [P1-4 & P1-5] Nginx SPA fallback (`try_files $uri $uri/ /index.html;`), `/v1/` proxy, unbuffered SSE proxy (`proxy_buffering off`),
+ * - [P1-4 & P1-5] Next.js console proxy, `/v1/` proxy, unbuffered SSE proxy (`proxy_buffering off`),
  *   and frontend `EventSource` + `setInterval` auto-refresh.
  * - [P1-6] Strict 400 validation on empty POST `{}` across `shards/rebalance`, `nodes/batch`, `tasks/cancel`, `nodes/scale`, and `capacity/action`.
  * - [P2] Single canonical `docs/index.html` (duplicate `docs/ansts_console_live.html` removed) and cached single-flight peer Brain task fan-out.
@@ -63,12 +63,12 @@ describe("M76 TanStack Console & BFF Deep Security, Zero-Fake-State, RBAC & Ngin
     }
   });
 
-  it("[M76-P1-4 & P1-5] Nginx config uses try_files /index.html (no hanging =200), proxies /v1/, and disables buffering for SSE streams", () => {
+  it("[M76-P1-4 & P1-5] Nginx config forwards console routes to Next.js, proxies /v1/, and disables buffering for SSE streams", () => {
     const nginxConfPath = path.resolve(process.cwd(), "deploy", "dev-cluster", "nginx-tanstack-console.conf");
     const conf = fs.readFileSync(nginxConfPath, "utf-8");
 
     assert.equal(conf.includes("=200"), false, "nginx try_files must not use hanging =200");
-    assert.equal(conf.includes("try_files $uri $uri/ /index.html;"), true);
+    assert.match(conf, /location \/ \{[^}]*proxy_pass \$next_console;/s);
     assert.equal(conf.includes("location /v1/"), true);
     assert.equal(conf.includes("proxy_buffering off;"), true);
     assert.equal(conf.includes("proxy_read_timeout 1h;"), true);

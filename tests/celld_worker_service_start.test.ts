@@ -43,6 +43,12 @@ describe("celld-loaded worker service start", () => {
         ["ANSTS_TUNNEL_CELL", "TunnelGatewayCell"],
         ["ANSTS_BODY_CELL", "AnstsBodyCell"],
         ["ANSTS_GATEWAY_CELL", "AnstsGatewayCell"],
+        ["ANSTS_TENANT_DIRECTORY_CELL", "TenantDirectoryCell"],
+        ["ANSTS_TENANT_CONTROL_CELL", "TenantControlCell"],
+        ["ANSTS_ADMISSION_MAILBOX", "AdmissionShadowMailboxCell"],
+        ["ANSTS_REGION_CATALOG_CELL", "RegionCatalogCell"],
+        ["ANSTS_CAPACITY_INVENTORY_CELL", "CapacityInventoryCell"],
+        ["ANSTS_CONFIG_RELEASE_CELL", "ConfigReleaseCell"],
       ]
     );
     assert.equal(bindings.some((binding) => binding.class_name === "AnstsGatewayCell"), true);

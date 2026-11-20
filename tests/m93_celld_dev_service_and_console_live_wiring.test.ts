@@ -148,7 +148,7 @@ describe("M93 celld Dev Service Live Boot & Console Live Backend Wiring Suite", 
       "utf-8"
     );
     assert.ok(nginxConf.includes(".well-known/celld/health"));
-    assert.ok(nginxConf.includes("Access-Control-Allow-Origin"));
+    assert.match(nginxConf, /location ~ [^\n]*celld\/health[^\n]*\{[^}]*proxy_pass http:\/\/ansts_gateways;/s);
 
     for (const rel of ["docs/index.html", "docs/console-management/prototype.js"]) {
       const content = fs.readFileSync(path.resolve(process.cwd(), rel), "utf-8");

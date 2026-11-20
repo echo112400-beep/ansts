@@ -184,7 +184,7 @@ describe("M77 Console Zero-Stub Refactoring, Real Backend System Management & Pr
       // 2. Verify live persistent SSE stream (`GET /v1beta1/management/events/stream?live=1`) pushes real-time events
       const sseAbort = new AbortController();
       const liveSseResp = await fetch(`${baseUrl}/v1beta1/management/events/stream?live=1`, {
-        signal: sseAbort.signal,
+        signal: AbortSignal.any([sseAbort.signal, AbortSignal.timeout(5000)]),
       });
       assert.equal(liveSseResp.status, 200);
       assert.equal(liveSseResp.headers.get("x-accel-buffering"), "no");
@@ -202,7 +202,7 @@ describe("M77 Console Zero-Stub Refactoring, Real Backend System Management & Pr
       // Trigger a live management action while the SSE stream is open
       const guard = new ConsoleRbacAuthGuard();
       const adminToken = guard.issuePrincipalToken("chen");
-      await fetch(`${baseUrl}/v1beta1/management/canary`, {
+      const promoteResponse = await fetch(`${baseUrl}/v1beta1/management/canary`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -211,11 +211,13 @@ describe("M77 Console Zero-Stub Refactoring, Real Backend System Management & Pr
         body: JSON.stringify({ action: "promote_step" }),
       });
 
-      // Read next live-pushed chunk from the open SSE connection
-      const liveChunk = await reader.read();
-      accumulatedSse += decoder.decode(liveChunk.value);
-      assert.ok(accumulatedSse.includes("event: management.audit"));
-      assert.ok(accumulatedSse.includes("promote_step"));
+      assert.equal(promoteResponse.status, 200);
+      const isPromotion = (frame: string) => frame.includes("event: management.audit") && frame.includes("promote_step");
+      while (!accumulatedSse.split("\n\n").slice(0, -1).some(isPromotion)) {
+        const chunk = await reader.read();
+        assert.equal(chunk.done, false, "SSE closed before the promotion audit event");
+        accumulatedSse += decoder.decode(chunk.value, { stream: true });
+      }
 
       sseAbort.abort();
 

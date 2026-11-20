@@ -9226,7 +9226,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
 
     // 1. [Cell-Stale-1] Verify AnstsSchedulerCell cold-start rehydration of LEASED task + fencing watermark + alarm renewal on active leases
     let alarmScheduledAt: number | null = null;
-    const cellSql = this.deps.v25Store.sql;
+    const cellSql = new InMemoryCellSqlStorage();
     const cell1 = new AnstsSchedulerCell({
       id: { toString: () => "AnstsSchedulerCell:m52-audit" },
       storage: {
@@ -9250,7 +9250,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
 
     // Simulate cold-start restart of AnstsSchedulerCell over the same SQLite storage
     const cell2 = new AnstsSchedulerCell({
-      id: { toString: () => "AnstsSchedulerCell:m52-audit-restarted" },
+      id: { toString: () => "AnstsSchedulerCell:m52-audit" },
       storage: {
         ...new MockDurableObjectState().storage,
         sql: cellSql,
@@ -9263,7 +9263,12 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
     });
     const rehydratedTask = cell2.scheduler.allTasks.get("task-cell-m52-1");
-    const interruptedLeaseConvertedToQueued = rehydratedTask?.state === TaskState.QUEUED;
+    const restoredLease = cell2.scheduler.leaseCoordinator.getLease(leasedTask.task_id);
+    const activeLeasePreserved = rehydratedTask?.state === TaskState.LEASED &&
+      restoredLease?.fencing_token === fenceBeforeRestart;
+    const recoveredIds = restoredLease ? cell2.scheduler.reconcileOrphanedLeases(restoredLease.expires_at) : [];
+    const interruptedLeaseConvertedToQueued = recoveredIds.includes(leasedTask.task_id) &&
+      rehydratedTask?.state === TaskState.QUEUED;
     const tick2 = await cell2.scheduleTickRpc();
     const fenceAfterRestart = tick2.placements.find((p) => p[0] === "task-cell-m52-1")?.[2] ?? 0;
     const monotonicFencePreservedAcrossColdStart = fenceAfterRestart > fenceBeforeRestart;
@@ -9347,6 +9352,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
 
     const allM52RectificationsVerified =
       activeLeaseAlarmRenewed &&
+      activeLeasePreserved &&
       interruptedLeaseConvertedToQueued &&
       monotonicFencePreservedAcrossColdStart &&
       fallbackIncrementedActiveRequests &&
@@ -9370,6 +9376,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       body: {
         cellStale1: {
           activeLeaseAlarmRenewed,
+          activeLeasePreserved,
           interruptedLeaseConvertedToQueued,
           monotonicFencePreservedAcrossColdStart,
           fenceBeforeRestart,
@@ -10404,9 +10411,9 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     saga.registerTool("ping", ToolCallEffectClass.READ_ONLY, () => ({ pong: true }));
     const tSpec = new TaskSpec({ task_id: "task-m57-audit", tenant_id: "Northstar", priority: TaskPriority.P1_HIGH, max_turns: 4 });
     sched.submitTask(tSpec);
-    sched.scheduleTick(1000);
+    sched.scheduleTick(Date.now() / 1000);
     const turn1 = d1.executeAgentStep(sched, saga, tSpec, "ping", {});
-    const lease2 = sched.leaseCoordinator.acquireLease(tSpec.task_id, "node-audit-2", 2000);
+    const lease2 = sched.leaseCoordinator.acquireLease(tSpec.task_id, "node-audit-2");
     tSpec.lease_fencing_token = lease2.fencing_token;
     const turn2 = d2.executeAgentStep(sched, saga, tSpec, "ping", {});
     const nodeDaemonTurnMonotonicityVerified = turn1.turn === 1 && turn2.turn === 2;
@@ -12688,7 +12695,15 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     cell1.registerNode(cell1.scheduler.nodes.get("node-m69")!);
     const cell2 = new AnstsSchedulerCell(mkState());
     const nodeAfterRestart = cell2.scheduler.nodes.get("node-m69")!;
+    const restoredLease = cell2.scheduler.leaseCoordinator.getLease(tLeased.task_id);
+    const runningTasksAfterColdStart = nodeAfterRestart.running_tasks;
+    const freeCpuAfterColdStart = nodeAfterRestart.free_cpu_cores;
+    const activeLeasePreserved = restoredLease?.fencing_token === tLeased.lease_fencing_token &&
+      runningTasksAfterColdStart === 1;
+    const recoveredIds = restoredLease ? cell2.scheduler.reconcileOrphanedLeases(restoredLease.expires_at) : [];
     const coldStartNodeAndFingerprintVerified =
+      activeLeasePreserved &&
+      recoveredIds.includes(tLeased.task_id) &&
       nodeAfterRestart.running_tasks === 0 &&
       nodeAfterRestart.free_cpu_cores === 8 &&
       cell2.scheduler.contentFingerprintIndex.get(tLeased.content_fingerprint) === "t-m69-active";
@@ -12778,8 +12793,10 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           routerHalfOpenAndPrefixBoundVerified,
         },
         coldStartNodeAndFingerprint2: {
-          runningTasksAfterColdStart: nodeAfterRestart.running_tasks,
-          freeCpuAfterColdStart: nodeAfterRestart.free_cpu_cores,
+          runningTasksAfterColdStart,
+          freeCpuAfterColdStart,
+          runningTasksAfterLeaseExpiry: nodeAfterRestart.running_tasks,
+          freeCpuAfterLeaseExpiry: nodeAfterRestart.free_cpu_cores,
           coldStartNodeAndFingerprintVerified,
         },
         escrowTerminalGuard3: {
@@ -15076,9 +15093,9 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       serverMain.includes("MISSING_REQUIRED_PARAMETERS") &&
       !nginxConf.includes("=200");
 
-    // Gate 5: Nginx SPA Fallback, /v1/ Proxy & Unbuffered Live SSE
+    // Gate 5: Next.js Console Proxy, /v1/ Proxy & Unbuffered Live SSE
     const nginxAndLiveSseVerified =
-      nginxConf.includes("try_files $uri $uri/ /index.html;") &&
+      /location \/ \{[^}]*proxy_pass \$next_console;/s.test(nginxConf) &&
       nginxConf.includes("location /v1/") &&
       nginxConf.includes("proxy_buffering off;") &&
       nginxConf.includes("proxy_read_timeout 1h;") &&
@@ -15127,7 +15144,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       },
       {
         id: "GATE-05",
-        name: "Nginx SPA Fallback, /v1/ Proxy & Unbuffered Live SSE",
+        name: "Next.js Console Proxy, /v1/ Proxy & Unbuffered Live SSE",
         passed: nginxAndLiveSseVerified,
       },
       {

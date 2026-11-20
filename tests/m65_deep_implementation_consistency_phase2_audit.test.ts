@@ -12,6 +12,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { bodyServiceToken } from "../src/cloudflare/body_auth.js";
 import workerDefault, {
   AnstsSchedulerCell,
   AgentTaskHarnessCell,
@@ -121,7 +122,10 @@ describe("M65 Deep Implementation Consistency Phase II Suite", () => {
     );
     const tunnelCell = new TunnelGatewayCell(new MockDurableObjectState("body-host-01"));
 
+    const serviceKey = "a".repeat(64);
+    const authorization = `Gateway ${bodyServiceToken(serviceKey, "gateway:control")}`;
     const env: CloudflareCelldEnv = {
+      ANSTS_BODY_AUTH_SECRET: serviceKey,
       CELLD_REGION: "eu-central-1",
       ANSTS_SCHEDULER_CELL: {
         idFromName: (n: string) => ({ toString: () => n }),
@@ -144,7 +148,7 @@ describe("M65 Deep Implementation Consistency Phase II Suite", () => {
     const regResp = await workerDefault.fetch(
       new Request("https://edge.ansts.io/v1/tunnel/register?hostId=body-host-01", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization },
         body: JSON.stringify({
           hostId: "body-host-01",
           gatewayId: "celld-gw-01",
@@ -159,7 +163,7 @@ describe("M65 Deep Implementation Consistency Phase II Suite", () => {
 
     const enq = tunnelCell.enqueueCommandForHost("body-host-01", { action: "ping" }, 5000);
     const pollResp = await workerDefault.fetch(
-      new Request("https://edge.ansts.io/v1/tunnel/poll?hostId=body-host-01"),
+      new Request("https://edge.ansts.io/v1/tunnel/poll?hostId=body-host-01", { headers: { authorization } }),
       env
     );
     const pollData = (await pollResp.json()) as { commands: Array<{ commandId: string }> };
@@ -168,7 +172,7 @@ describe("M65 Deep Implementation Consistency Phase II Suite", () => {
     const ackResp = await workerDefault.fetch(
       new Request("https://edge.ansts.io/v1/tunnel/ack?hostId=body-host-01", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", authorization },
         body: JSON.stringify({
           commandId: pollData.commands[0].commandId,
           result: { pong: true },

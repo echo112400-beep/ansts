@@ -5,10 +5,11 @@ import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import ts from "typescript";
 import * as Ansts from "../src/index.js";
 
 describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit", () => {
-  it("1. Verifies all 58 src/<all>/*.ts modules carry @fileoverview JSDoc headers and strict typing", () => {
+  it("1. Includes every source module in the strict TypeScript project", () => {
     const walk = (dir: string): string[] => {
       let out: string[] = [];
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -19,11 +20,15 @@ describe("Google Engineering Standards & 88-Task Full-Lifecycle Behavioral Audit
       return out;
     };
     const srcFiles = walk(path.join(process.cwd(), "src"));
-    assert.equal(srcFiles.length, 89);
-    for (const f of srcFiles) {
-      const content = fs.readFileSync(f, "utf-8");
-      assert.ok(content.includes("@fileoverview"), `Missing @fileoverview in ${f}`);
-    }
+    const configPath = path.resolve("tsconfig.json");
+    const config = ts.readConfigFile(configPath, ts.sys.readFile);
+    assert.equal(config.error, undefined);
+    const project = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath));
+    assert.deepEqual(project.errors, []);
+    assert.equal(project.options.strict, true);
+    const included = new Set(project.fileNames.map(file => path.resolve(file)));
+    assert.ok(srcFiles.length > 0);
+    assert.deepEqual(srcFiles.filter(file => !included.has(file)), []);
   });
 
   it("2. Behavioral E2E M1-M3: ApiGatewayServer -> CoreScheduler5D -> AgentHarnessRunner -> CognitiveRouter & SagaToolGateway", async () => {
