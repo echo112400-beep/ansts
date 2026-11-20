@@ -1,4 +1,5 @@
 import {test} from 'node:test';
+import {createServer} from 'node:http';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
 import {join} from 'node:path';
@@ -35,4 +36,38 @@ test('meter ingress rejects forged identity and requires real Body authorization
   const page=await handleDirectoryApi(new Request('https://gateway/v1/admin/tenants/tenant/usage?limit=1'),s.env,viewer);assert.equal(page.status,200);const data=await page.json();assert.equal(data.events[0].context.costCenter,'eng');assert.equal(data.events[0].context.rateCardVersion,null);
   assert.equal((await handleDirectoryApi(new Request('https://gateway/v1/admin/tenants/tenant/usage'),s.env,{...viewer,scopeTenant:'other'})).status,404);
  }finally{s.db.close();}
+});
+
+test('meter binding uses the configured Body Worker and checks the remote execution owner',async()=>{
+ const s=fixture();
+ let nodeId='other-body', status=200, requests=0;
+ const server=createServer((request,response)=>{
+  requests++;
+  assert.equal(request.url,'/v1/body/state?taskId=task');
+  assert.equal(request.headers.authorization,'Body '+key);
+  assert.equal(request.headers['x-ansts-body-id'],'body-1');
+  response.writeHead(status,{'content-type':'application/json'});
+  response.end(JSON.stringify({execution:{phase:'RUNNING',node_id:nodeId,tenant_id:'tenant',task_id:'task',
+   attempt_id:'attempt',fencing_token:7,input_digest:identity.executionInputDigest}}));
+ });
+ await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try {
+  const address=server.address();
+  assert.ok(address&&typeof address!=='string');
+  s.env.ANSTS_BODY_WORKER_URL='http://127.0.0.1:'+address.port;
+  s.setPhase('RUNNING');
+  const bind=()=>handleBodyUsageIngress(s.request('body-usage-binding',{identity,resources}),s.env);
+  assert.equal((await bind()).status,409);
+  status=503;
+  assert.equal((await bind()).status,503);
+  nodeId='body-1';
+  status=200;
+  assert.equal((await bind()).status,200);
+  assert.equal(s.reads(),0);
+  assert.equal(requests,3);
+ }finally{
+  server.closeAllConnections();
+  await new Promise<void>(resolve=>server.close(()=>resolve()));
+  s.db.close();
+ }
 });

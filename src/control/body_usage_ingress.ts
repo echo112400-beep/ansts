@@ -25,9 +25,20 @@ export async function handleBodyUsageIngress(request:Request,env:CloudflareCelld
   const existing=await control('admission-usage-binding',{identity});if(!existing.ok)return existing;const binding=(await existing.json() as {binding:{resources:UsageResources}|null}).binding;
   if(binding&&JSON.stringify(canonicalUsageResources(binding.resources))!==JSON.stringify(resources))return reply({code:'USAGE_STREAM_BINDING_CONFLICT'},409);
   if(!binding){
-   if(!env.ANSTS_BODY_CELL)return reply({code:'USAGE_EXECUTION_AUTHORITY_UNAVAILABLE'},503);
-   const bodies=env.ANSTS_BODY_CELL,id=bodies.idFromName((env.ANSTS_BODY_NAMESPACE_PREFIX??'')+'execution:'+identity.taskId);
-   const current=await bodies.get(id).fetch(new Request('https://body.internal/v1/body/state'));if(!current.ok)return reply({code:'USAGE_EXECUTION_AUTHORITY_UNAVAILABLE'},503);
+   let current:Response;
+   if(env.ANSTS_BODY_WORKER_URL){
+    const target=new URL('/v1/body/state',env.ANSTS_BODY_WORKER_URL);
+    target.searchParams.set('taskId',identity.taskId);
+    try {
+     current=await fetch(target,{headers:{authorization:request.headers.get('authorization')!,'x-ansts-body-id':host},redirect:'error',signal:AbortSignal.timeout(5000)});
+    } catch {return reply({code:'USAGE_EXECUTION_AUTHORITY_UNAVAILABLE'},503);}
+   }else{
+    const bodies=env.ANSTS_BODY_CELL;
+    if(!bodies)return reply({code:'USAGE_EXECUTION_AUTHORITY_UNAVAILABLE'},503);
+    const id=bodies.idFromName((env.ANSTS_BODY_NAMESPACE_PREFIX??'')+'execution:'+identity.taskId);
+    current=await bodies.get(id).fetch(new Request('https://body.internal/v1/body/state'));
+   }
+   if(!current.ok){await current.body?.cancel();return reply({code:'USAGE_EXECUTION_AUTHORITY_UNAVAILABLE'},503);}
    const {execution}=await current.json() as {execution?:Record<string,unknown>};
    if(!execution||execution.node_id!==host||execution.task_id!==identity.taskId||execution.tenant_id!==tenantId||execution.attempt_id!==identity.attemptId||execution.fencing_token!==identity.fencing||execution.input_digest!==identity.executionInputDigest||!['RUNNING','UNCERTAIN','RESULT_PENDING','COMPLETED'].includes(String(execution.phase)))return reply({code:'USAGE_EXECUTION_BINDING_REQUIRED'},409);
    const pinned=await control('admission-usage-bind',{identity,resources,priceEligible:bindingRoute&&execution.phase==='RUNNING'});if(!pinned.ok)return pinned;await pinned.body?.cancel();

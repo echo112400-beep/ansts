@@ -144,6 +144,8 @@ A writable follow-up submitted a new tenant task through the normal Gateway. The
 
 The same recovered stack subsequently ran a new Gateway submission through the repository's native Body Agent and Docker Engine. The task remained queued while no fresh host was registered. After the isolated host joined, Scheduler and Body both reached COMPLETED with matching fencing, Gateway returned the expected output, and the host result outbox drained. All 121 pre-existing task states remained identical. The task used a resource profile sized for the isolated host. This execution ran with usage metering disabled and the observation binding deferred, so it verifies execution and result delivery only.
 
+A metered repeat used the active tenant from the restored directory and ran native Body usage in shadow mode. Usage binding now checks the configured remote Body Worker when Scheduler and Body run separately. It forwards the authenticated host identity and requires the same execution owner, attempt, fence and input digest before creating the binding. The isolated task completed, the host drained result and usage outboxes, and the tenant usage page contained three new events for that task. A regression check rejects an owner mismatch and an unavailable remote authority without falling back to Scheduler-local state. This run verified recorded quantities; it did not settle a priced enforced reservation.
+
 The inputs came from separate reads of isolated copies of the development bucket. This establishes that the restored data can coexist behind the normal Worker routes. It leaves a common fenced source checkpoint, workflow resumption and coordinated reverse transfer to be verified.
 
 ## State and cutover
