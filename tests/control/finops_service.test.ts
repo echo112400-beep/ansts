@@ -1,5 +1,5 @@
 import {createHmac} from 'node:crypto';
-import {verifyAuthorityArchive,restoreIntoEmptyOfflineDatabase,type AuthorityArchive} from '../../src/finops/authority_archive.js';
+import {verifyAuthorityArchive,restoreIntoEmptyOfflineDatabase,restoreIntoFreshCelldObject,type AuthorityArchive} from '../../src/finops/authority_archive.js';
 import {rateHash} from '../../src/finops/rate_cards.js';
 import {UsageCostLedger} from '../../src/finops/usage_cost_ledger.js';
 import {handleDirectoryApi} from '../../src/control/admin_directory_api.js';
@@ -214,6 +214,30 @@ test('directory authority archive authenticates, keeps receipts/audit and restor
   const response=await restored.fetch(new Request('https://directory/rate-list',{method:'POST',headers:{authorization:'Bearer '+directory},body:JSON.stringify({actor:admin,page:{limit:1}})}));assert.equal(response.status,200);assert.equal((await response.json()).items[0].version,1);
   assert.throws(()=>restoreIntoEmptyOfflineDatabase(target.storage,archive,directory,{kind:'DIRECTORY',tenantId:null}),{code:'FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE'});
   assert.throws(()=>verifyAuthorityArchive(archive,'a'.repeat(64)),{code:'FINOPS_ARCHIVE_AUTH_REQUIRED'});
+ }finally{target.db.close();f.close();}
+});
+test('celld archive recovery accepts only empty runtime state and known engine tables',async()=>{
+ const f=fixture(),target=offline();try{
+  await f.setup();
+  const {archive}=await backup(f,'/v1/admin/finops/archives');
+  const scope={kind:'DIRECTORY',tenantId:null} as const;
+  target.db.exec("CREATE TABLE _cf_METADATA (value TEXT); INSERT INTO _cf_METADATA VALUES ('engine'); CREATE TABLE _cf_ALARM (value INTEGER)");
+  assert.throws(()=>restoreIntoEmptyOfflineDatabase(target.storage,archive,directory,scope),{code:'FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE'});
+  let alarm:number|null=1;
+  let values=new Map<string,unknown>();
+  const storage={...target.storage,getAlarm:async()=>alarm,list:async()=>values};
+  const restore=()=>restoreIntoFreshCelldObject(storage,archive,directory,scope);
+  await assert.rejects(restore,{code:'FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE'});
+  alarm=null;
+  values.set('existing',1);
+  await assert.rejects(restore,{code:'FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE'});
+  values.clear();
+  target.db.exec('CREATE TABLE sqliteXbusiness (value TEXT)');
+  await assert.rejects(restore,{code:'FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE'});
+  target.db.exec('DROP TABLE sqliteXbusiness');
+  assert.equal((await restore()).operationalResume,'DISABLED');
+  assert.equal(target.storage.sql.exec<{value:string}>('SELECT value FROM _cf_METADATA').toArray()[0].value,'engine');
+  await assert.rejects(restore,{code:'FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE'});
  }finally{target.db.close();f.close();}
 });
 test('tenant backup restores exact source/price/derived entries and UNCERTAIN reservations with pending delivery receipts',async()=>{

@@ -145,11 +145,45 @@ export class AuthorityArchiveStore {
   });
  }
 }
-/** Offline-only primitive. The caller must create an exclusive new file; no runtime resume is supported. */
-export function restoreIntoEmptyOfflineDatabase(storage:DirectoryStorage,archive:AuthorityArchive,key:string,expected:{kind:ArchiveKind;tenantId:string|null}){
- verifyAuthorityArchive(archive,key);if(archive.manifest.kind!==expected.kind||archive.manifest.tenantId!==expected.tenantId)throw new ControlError('FINOPS_RESTORE_SCOPE_CONFLICT',409);
+const celldReservedTables = new Set<string>([
+ '_litestream_seq', '_litestream_lock', '_cf_METADATA', '_cf_KV', '_cf_ALARM', '_cf_FACETS', '_cf_WAKE',
+]);
+
+const celldAlarmTriggers = new Set(['_cf_WAKE_insert', '_cf_WAKE_update', '_cf_WAKE_delete']);
+
+type RestoreScope = {kind:ArchiveKind;tenantId:string|null};
+
+/** Offline-only primitive. The caller must provide an exclusive new file. */
+export function restoreIntoEmptyOfflineDatabase(storage:DirectoryStorage,archive:AuthorityArchive,key:string,expected:RestoreScope){
+ verifyRestoreScope(archive,key,expected);
+ return restoreArchive(storage,archive,false);
+}
+
+/** Invoke only in a dedicated, fenced celld import object before serving application traffic. */
+export async function restoreIntoFreshCelldObject(
+ storage:DirectoryStorage & {getAlarm():Promise<number|null>;list(options:{limit:number}):Promise<ReadonlyMap<string,unknown>>},
+ archive:AuthorityArchive,key:string,expected:RestoreScope,
+){
+ verifyRestoreScope(archive,key,expected);
+ if(await storage.getAlarm()!==null||(await storage.list({limit:1})).size)
+  throw new ControlError('FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE',409);
+ return restoreArchive(storage,archive,true);
+}
+
+function verifyRestoreScope(archive:AuthorityArchive,key:string,expected:RestoreScope){
+ verifyAuthorityArchive(archive,key);
+ if(archive.manifest.kind!==expected.kind||archive.manifest.tenantId!==expected.tenantId)
+  throw new ControlError('FINOPS_RESTORE_SCOPE_CONFLICT',409);
+}
+
+function restoreArchive(storage:DirectoryStorage,archive:AuthorityArchive,celld:boolean){
  const joined=joinedTransactions(storage);return joined.transactionSync(()=>{
-  if(joined.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").toArray().length)throw new ControlError('FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE',409);
+  const objects=joined.sql.exec<{name:string;type:string;tbl_name:string}>("SELECT name, type, tbl_name FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'").toArray();
+  const containsApplicationSchema=objects.some(({name,type,tbl_name})=>!celld||!(
+   (type==='table'&&celldReservedTables.has(name))||
+   (type==='trigger'&&tbl_name==='_cf_ALARM'&&celldAlarmTriggers.has(name))
+  ));
+  if(containsApplicationSchema)throw new ControlError('FINOPS_RESTORE_REQUIRES_EMPTY_DATABASE',409);
   for(const table of archive.snapshot.tables){joined.sql.exec(`CREATE TABLE ${table.name} (${schemas[table.name]})`);for(const row of table.rows)joined.sql.exec(`INSERT INTO ${table.name} (${columns(table.name).join(', ')}) VALUES (${row.map(()=>'?').join(', ')})`,...row);}
   validate(joined,archive.snapshot.kind,archive.snapshot.tenant,archive.snapshot.schemaVersion);if(rateHash(capture(joined,archive.snapshot.kind,archive.snapshot.schemaVersion))!==archive.manifest.sourceRevision)throw new ControlError('FINOPS_RESTORE_READBACK_MISMATCH',503);
   return {kind:archive.manifest.kind,tenantId:archive.manifest.tenantId,digest:archive.manifest.digest,sourceRevision:archive.manifest.sourceRevision,tableCounts:archive.manifest.tableCounts,operationalResume:'DISABLED' as const};
