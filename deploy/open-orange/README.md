@@ -136,6 +136,12 @@ An authenticated, read-only RustFS S3 listing paged through the development flee
 
 The celld v0.6.3 implementation stores R2 Worker blobs under `r2/<bucket_name>/` and uses reserved cell classes for KV, D1, and Queues. Exact-prefix S3 queries for `r2/ansts-fleet/`, `cells/__KvNamespace:`, `cells/__D1Database:`, and `cells/__Queue:` each returned zero keys. Read-only inspection of the three stopped Scheduler node volumes also found no directories for those reserved classes. The development source was inspected without starting the nodes or invoking a queue consumer. Repeat these binding and producer checks against the intended cutover source while writes are fenced.
 
+## Combined Rivet target rehearsal
+
+A single fresh Rivet Engine received the development Scheduler checkpoint, all 17 signed authority archives, 22 Body attempt snapshots and both Body host snapshots. The normal Scheduler, Gateway and Body Workers then ran together against that Engine. An authenticated Scheduler read matched all 121 restored task states. The Gateway looked up each of the 22 tasks through Scheduler and returned its restored Body result, including the 12 UNCERTAIN attempts. The normal Scheduler also returned the same directory and task-tenant cost responses as the source archive rehearsal.
+
+The inputs came from separate reads of isolated copies of the development bucket. This establishes that the restored data can coexist behind the normal Worker routes. It leaves a common fenced source checkpoint, workflow resumption and coordinated reverse transfer to be verified.
+
 ## State and cutover
 
 The current source is celld. [OpenOrange's built-in migration](https://openorange.dev/docs/migrate/) expects a Cloudflare source Worker and Cloudflare D1 export APIs. Use a separate celld export and Orange import rehearsal before routing any shared traffic. An isolated environment with newly created state can exercise the runtime while that transfer is developed.
