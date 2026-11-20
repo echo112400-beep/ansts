@@ -19,6 +19,7 @@ import { bodyResourceBudget, cgroupResourceLimits } from "../src/runtime/body_re
 import { AnstsSchedulerCell } from "../src/cloudflare/scheduler_cell.js";
 import { MockDurableObjectState } from "../src/cloudflare/env.js";
 import { NodeDaemon } from "../src/node_daemon.js";
+import { NodeHeartbeat, TaskSpec } from "../src/models.js";
 it("bounds configured budgets by runtime limits and rejects invalid budgets", () => {
   assert.deepEqual(bodyResourceBudget(2, 4096, "32", "65536"), { cpu: 2, memoryMb: 4096 });
   assert.deepEqual(bodyResourceBudget(8, 8192, "1.5", "2048"), { cpu: 1.5, memoryMb: 2048 });
@@ -64,6 +65,23 @@ it("restores the exact active lease across Scheduler reconstruction without free
   assert.equal((await post("lease-renew", { task_id, node_id, fencing_token })).status, 200);
   assert.equal((await post("complete", { task_id, node_id, fencing_token })).status, 200);
   assert.equal((await (await post("schedule-tick", {})).json()).placements.length, 1);
+});
+it("does not schedule on a stale heartbeat after Scheduler reconstruction", async () => {
+  const storage = new MockDurableObjectState("stale-heartbeats");
+  const original = new AnstsSchedulerCell(storage);
+  const old = Date.now() / 1000 - 3600;
+  original.registerNode(new NodeHeartbeat({ node_id: "previous-host", timestamp: old }));
+  storage.storage.sql.exec(
+    "INSERT OR REPLACE INTO ansts_nodes (node_id, heartbeat_json, updated_at) VALUES (?, ?, ?)",
+    "legacy-host", JSON.stringify({ node_id: "legacy-host" }), old * 1000,
+  );
+  const restored = new AnstsSchedulerCell(storage);
+  assert.equal(restored.scheduler.nodes.get("previous-host")?.timestamp, old);
+  assert.equal(restored.scheduler.nodes.get("legacy-host")?.timestamp, old);
+  await restored.submitTaskRpc(new TaskSpec({ task_id: "new", tenant_id: "tenant", prompt: "work" }));
+  assert.deepEqual((await restored.scheduleTickRpc()).placements, []);
+  restored.registerNode(new NodeHeartbeat({ node_id: "previous-host" }));
+  assert.equal((await restored.scheduleTickRpc()).placements[0]?.[1], "previous-host");
 });
 import { LeaseCoordinator } from "../src/lease_coordinator.js";
 it("does not resurrect expired persisted leases or roll back a fencing watermark", () => {

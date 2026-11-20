@@ -140,6 +140,8 @@ The celld v0.6.3 implementation stores R2 Worker blobs under `r2/<bucket_name>/`
 
 A single fresh Rivet Engine received the development Scheduler checkpoint, all 17 signed authority archives, 22 Body attempt snapshots and both Body host snapshots. The normal Scheduler, Gateway and Body Workers then ran together against that Engine. An authenticated Scheduler read matched all 121 restored task states. The Gateway looked up each of the 22 tasks through Scheduler and returned its restored Body result, including the 12 UNCERTAIN attempts. The normal Scheduler also returned the same directory and task-tenant cost responses as the source archive rehearsal.
 
+A writable follow-up submitted a new tenant task through the normal Gateway. The first run immediately leased it to a previously registered host whose restored heartbeat had been given a new timestamp, even though no host was connected. Scheduler now restores the original heartbeat timestamp, with the persisted row time as a fallback for older data. After the change, the new task stayed queued across a Scheduler restart, all 121 prior task states remained identical, and a cross-tenant Gateway read was denied. A regression test also verified that a fresh heartbeat restores eligibility.
+
 The inputs came from separate reads of isolated copies of the development bucket. This establishes that the restored data can coexist behind the normal Worker routes. It leaves a common fenced source checkpoint, workflow resumption and coordinated reverse transfer to be verified.
 
 ## State and cutover

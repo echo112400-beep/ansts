@@ -107,6 +107,9 @@ export class AnstsSchedulerCell {
             execution_slots: parsedHb.execution_slots === undefined ? undefined : Number(parsedHb.execution_slots),
               running_tasks: Number(parsedHb.running_tasks ?? 0),
             healthy: Boolean(parsedHb.healthy ?? true),
+            timestamp: typeof parsedHb.timestamp === "number" && Number.isFinite(parsedHb.timestamp)
+              ? parsedHb.timestamp
+              : (Number(nr.updated_at) || 0) / 1000,
           })
         );
       } catch {
