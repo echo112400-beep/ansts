@@ -1,3 +1,4 @@
+import { readBoundedJson } from "./migration_request.js";
 import type { DurableObjectNamespaceLike, DurableObjectStateLike } from "./env.js";
 import { equalBodyToken } from "./body_auth.js";
 import { ControlError } from "../control/contracts.js";
@@ -46,32 +47,6 @@ function reject(error: unknown) {
     : Response.json({ code: "AUTHORITY_IMPORT_FAILED" }, { status: 500 });
 }
 
-async function readArchive(request: Request): Promise<AuthorityArchive> {
-  const reader = request.body?.getReader();
-  if (!reader) throw new ControlError("FINOPS_ARCHIVE_INVALID", 422);
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > maxBytes) {
-        await reader.cancel();
-        throw new ControlError("PAYLOAD_TOO_LARGE", 413);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as AuthorityArchive;
-  } catch {
-    throw new ControlError("FINOPS_ARCHIVE_INVALID", 422);
-  }
-}
-
 class AuthorityImportCell {
   constructor(private readonly ctx: ImportState, private readonly env: RestoreEnvironment) {}
 
@@ -80,7 +55,7 @@ class AuthorityImportCell {
       const { key, runtime } = authorize(request, this.env);
       const expected = scope(request);
       if (!expected || request.method !== "POST") return new Response(null, { status: 404 });
-      const archive = await readArchive(request);
+      const archive = await readBoundedJson<AuthorityArchive>(request, maxBytes, "FINOPS_ARCHIVE_INVALID");
       const storage = this.ctx.storage;
       if (typeof storage.transactionSync !== "function") {
         throw new ControlError("DURABLE_TRANSACTION_REQUIRED", 503);
