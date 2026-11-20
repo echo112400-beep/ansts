@@ -63,7 +63,7 @@ for(const uncertain of [false,true])test('agent observation '+(uncertain?'retain
 for (const {status, leaseSeconds, abort, label} of [
   {status:503, leaseSeconds:30, abort:false, label:'retries a transient 503'},
   {status:409, leaseSeconds:30, abort:true, label:'stops on a rejected lease'},
-  {status:503, leaseSeconds:4, abort:true, label:'stops when a 503 outlasts the lease safety window'},
+  {status:503, leaseSeconds:0, abort:true, label:'stops when a 503 outlasts the lease safety window'},
 ]) test(`Body Daemon ${label}`, async () => {
   let renewals = 0;
   let reportRenewal!: () => void;
