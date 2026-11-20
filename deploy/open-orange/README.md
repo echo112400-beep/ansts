@@ -160,6 +160,8 @@ A clean celld destination imported all three components. The Scheduler rows and 
 
 A repeat included the capacity authority. After the native host stopped, the rehearsal paused allocation, queued one new request, and captured the ten capacity tables alongside Scheduler, Body and FinOps. The clean celld destination matched every capacity row, including pool, host, report, request and grant records. The normal celld Worker returned the same request view, kept allocation paused at version 1, and left the new request queued. Task states, fencing tokens, the Rivet-only Body result and the settlement receipt still matched. The capacity adapter captured the alarm timestamp but did not rearm it or resume allocation. Source reports were historical observations at the restored destination.
 
+A separate rollback run enabled allocation through the normal celld Worker at expected version 1, advancing it to version 2. Replaying the archived signed-report payload returned REPLAY and left the request queued with NO_HEALTHY_HOST. A newly signed report with the same daemon identity and a higher epoch was accepted; the production capacity alarm granted the original queued request without a manual issue call. The previously settled task still returned the identical settlement receipt. This used a synthetic signed report and exercised capacity alarm resumption only.
+
 ## State and cutover
 
 The current source is celld. [OpenOrange's built-in migration](https://openorange.dev/docs/migrate/) expects a Cloudflare source Worker and Cloudflare D1 export APIs. Use a separate celld export and Orange import rehearsal before routing any shared traffic. An isolated environment with newly created state can exercise the runtime while that transfer is developed.
