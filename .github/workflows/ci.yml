@@ -1,39 +1,57 @@
-name: ANSTS v2.2 TypeScript & celld HA CI Pipeline
+name: ANSTS CI
 
 on:
   push:
     branches: ["main", "master", "release/**"]
   pull_request:
-    branches: ["main", "master"]
+    branches: ["main", "master", "release/**"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  lint-build-and-test:
-    name: "Verify TypeScript AST, Build & 55 Integration/Chaos Tests (Node ${{ matrix.node-version }})"
+  code-quality:
+    name: Code quality
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/console/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix ui/console
+      - name: Repository lint
+        run: npm run lint
+      - name: TypeScript type check
+        run: npm run typecheck
+      - name: Control plane verification
+        run: npm run test:control
+      - name: Console type check
+        run: npm run typecheck --prefix ui/console
+      - name: Console production build
+        run: npm run build --prefix ui/console
+
+  lint-build-and-test:
+    name: Integration tests (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         node-version: ["18.x", "20.x", "22.x"]
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-
-      - name: Install dependencies (tolerant of missing lockfile)
-        run: npm install --no-audit --no-fund || true
-
-      - name: Stage 1 — TypeScript AST, Google Style & Schema Lint
-        run: npm run lint
-
-      - name: Stage 2 — Compile 66 TypeScript Modules to CommonJS (dist/)
-        run: npm run build
-
-      - name: Stage 3 — Execute Full 55-Test Integration, Chaos & celld HA Suite
-        run: npm test
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
