@@ -1,0 +1,24 @@
+# Apply to the existing development project after restoring the Rivet checkpoint.
+x-rivet-body: &rivet-body
+  depends_on: !reset {}
+  environment:
+    ANSTS_BODY_CELL_URL: http://body:8080
+    ANSTS_BODY_CELL_URLS: http://body:8080
+    ANSTS_SCHEDULER_URL: http://scheduler:8080
+    ANSTS_SCHEDULER_URLS: http://scheduler:8080
+    ANSTS_PRIMARY_GATEWAY_URL: http://gateway:8080
+    ANSTS_SECONDARY_GATEWAY_URL: ""
+  networks:
+    - ansts_mesh_net
+    - rivet-workers
+
+services:
+  body-daemon-01:
+    <<: *rivet-body
+  body-daemon-02:
+    <<: *rivet-body
+
+networks:
+  rivet-workers:
+    external: true
+    name: "${ANSTS_RIVET_WORKERS_NETWORK:?Set ANSTS_RIVET_WORKERS_NETWORK to the target Compose network}"

@@ -54,6 +54,14 @@ docker compose -f deploy/open-orange/compose.yml -f deploy/open-orange/compose.w
 
 The preview listens on `127.0.0.1:18088` by default. It serves the existing Next.js console from the development network and directs the Gateway API, authentication callback and SSE routes to OpenOrange. Set `ANSTS_ORANGE_CONSOLE_PORT` to change the port, and `ANSTS_DEV_CONSOLE_NETWORK` if the Next.js service uses a different Docker network. The existing celld console can stay on port 8088 during preview.
 
+### Native Body cutover
+
+Add `deploy/dev-cluster/docker-compose.rivet-body.yml` last in the development project's existing Compose file list. Set `ANSTS_RIVET_WORKERS_NETWORK` to the target Rivet Compose project's default network and keep the same development project name and volume definitions. The overlay preserves both daemon IDs and ledger mounts. It sends Body, Scheduler, and Gateway requests to the Rivet Workers and removes the celld startup dependency. The development network still serves the native daemon's other dependencies, including object storage.
+
+Apply the overlay to `body-daemon-01` and `body-daemon-02` during the fenced cutover, after validating the restored target and before resuming admission. Verify the existing Body host tokens against the target `ANSTS_BODY_AUTH_SECRET` and probe both daemon readiness routes before allowing writes. The original development Compose files retain the celld routes for rollback.
+
+In an isolated target, both development daemon images ran with the resolved overlay routes and temporary ledger volumes. Authenticated Body exports contained a heartbeat for each daemon. The rendered development configuration retained both original ledger mounts and daemon IDs.
+
 ## Verified in isolation
 
 The Compose overlay passed an isolated startup check using the locked dependencies from a local npm cache. All three Workers returned HTTP 200 from both health routes, and an authenticated Scheduler request created and read back a task, which remained available after stopping and restarting the entire stack.
