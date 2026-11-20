@@ -56,6 +56,8 @@ jobs:
           node scripts/check_open_orange.mjs body
       - name: Verify self-hosted Worker startup and Scheduler RPC
         run: python3 -u scripts/verify_open_orange.py
+      - name: Verify Scheduler state round trip
+        run: python3 -u scripts/verify_open_orange_scheduler.py
 
   lint-build-and-test:
     name: Integration tests (Node ${{ matrix.node-version }})

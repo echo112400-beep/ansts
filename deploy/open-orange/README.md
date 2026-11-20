@@ -84,6 +84,8 @@ In a separate Scheduler rehearsal, OpenOrange accepted a target-only task throug
 
 A follow-up Scheduler fixture included the claim, admission intent, and acceptance tables and captured the pending alarm timestamp. The original claimant still received HTTP 200 and a different claimant received HTTP 409 on both the forward and reverse targets. The production expiry check recognized the expired, unaccepted intent and continued to reject expiry for an accepted task whose task row had already been purged. The forward target stored the original alarm timestamp. After a new target checkpoint, both OpenOrange and the clean rollback celld instance invoked the production Scheduler alarm handler at or after the restored timestamp. The fixture seeded the admission records in SQLite and rearmed the alarm after the SQL transaction. Synchronized cross-plane rollback and an operational importer remain open.
 
+Run the Scheduler round-trip fixture with `python3 -u scripts/verify_open_orange_scheduler.py`. The same command runs in the OpenOrange compatibility CI job. It creates and removes its own celld and Rivet test containers.
+
 ## Pilot enforcement rehearsal
 
 The existing capacity acceptance fixture ran on OpenOrange and a dedicated self-hosted Rivet Engine. Scheduler object IDs resolved after string reconstruction. The graceful-restart run verified one winner for two Gateway submissions against one slot, no admission while the control plane was unavailable, replay after lost bind and start authorization responses, and no budget or slot release on an expired Body start check. It used two Gateway objects in one Worker and synthetic signed host reports.
