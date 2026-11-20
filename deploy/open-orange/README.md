@@ -42,6 +42,8 @@ An isolated celld 0.6.3 Body Worker recorded a completed execution, then exporte
 
 This transfer covers the Body state rows for one terminal attempt. Body import records the execution as an inventory baseline, so historical coverage remains unproven. The full cutover remains open.
 
+A separate data rehearsal exported ten terminal attempts from the restored development celld fleet using the native Body operator route. The repository Body launcher on an isolated self-hosted Rivet Engine imported all ten. Authenticated exports and Gateway result payloads matched the source for each task, both before and after a Body Worker restart. The target rejected unauthenticated imports and cross-tenant result reads. Replays left the original imported state intact. This sample covered completed tasks and did not transfer nonterminal execution or host-level grant objects.
+
 ## Financial archive rehearsal
 
 An isolated celld fleet generated a signed tenant archive with a nonzero priced ledger and an outstanding admission reservation. A dedicated verification Worker on OpenOrange and self-hosted Rivet restored it into an empty SQLite Durable Object with the existing offline restore primitive. It returned the exact source revision, cost summary and reservation. Missing authorization and an altered signature returned HTTP 401. Replaying the archive into the same database returned HTTP 409 and retained the restored state. The verification object did not host tenant control routes or alarms, and the restore returned `operationalResume: DISABLED`.
