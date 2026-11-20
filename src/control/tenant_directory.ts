@@ -120,9 +120,15 @@ export class TenantDirectory {
     const next=offset+items.length;
     return {items,version,nextCursor:next<rows.length?Buffer.from(JSON.stringify({scope,version,offset:next})).toString('base64url'):null};
   }
-  listPage(actor: ControlActor, options: {limit?:number;cursor?:string} = {}) {
+  listPage(actor: ControlActor, options: {limit?:number;cursor?:string;region?:string;tenantId?:string} = {}) {
+    const {region,tenantId}=options;
+    if (region!==undefined && !bounded(region,128)) throw new ControlError('INVALID_REGION',422);
+    if (tenantId!==undefined && (typeof tenantId!=='string'||!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(tenantId))) throw new ControlError('INVALID_TENANT_ID',422);
     const listed=this.list(actor);
-    return this.page(actor,listed.tenants.sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0),listed.version,options,'tenants');
+    const regions=[...new Set(listed.tenants.map(tenant=>tenant.region))].sort();
+    const rows=listed.tenants.filter(tenant=>(!region||tenant.region===region)&&(!tenantId||tenant.id===tenantId));
+    const kind=region||tenantId?JSON.stringify(['tenants',region??null,tenantId??null]):'tenants';
+    return {...this.page(actor,rows.sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0),listed.version,options,kind),regions};
   }
   auditPage(actor: ControlActor, options: {limit?:number;cursor?:string} = {}) {
     const state=this.load();

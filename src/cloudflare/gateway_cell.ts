@@ -319,7 +319,30 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
   if (request.method === "GET" && url.pathname === "/v1/console/management" && principal) {
     const listed = await listSchedulerTasks(env);
     if (listed.failure) return listed.failure;
-    const tasks = listed.tasks.filter(t=>tenantAllowed(principal,t.tenant_id)).sort((a,b)=>Number(b.created_at??0)-Number(a.created_at??0));
+    const tenantId=url.searchParams.get("tenantId");
+    const region=url.searchParams.get("region");
+    if(tenantId!==null&&!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(tenantId))return json({error:"INVALID_TENANT_ID"},422);
+    if(region!==null&&(!region.trim()||region.length>128))return json({error:"INVALID_REGION"},422);
+    let allowedTenants:Set<string>|undefined;
+    if(region!==null||principal.scopeRegion!=="all"){
+      allowedTenants=new Set();
+      let cursor:string|null=null;
+      do {
+        const directory=new URL("/v1/admin/tenants",url);
+        directory.searchParams.set("limit","100");
+        if(region!==null)directory.searchParams.set("region",region);
+        if(tenantId!==null)directory.searchParams.set("tenantId",tenantId);
+        if(cursor)directory.searchParams.set("cursor",cursor);
+        const page=await handleDirectoryApi(new Request(directory),env,principal);
+        if(!page.ok)return page;
+        const data=await page.json() as {items:{id:string}[];nextCursor:string|null};
+        for(const record of data.items)allowedTenants.add(record.id);
+        cursor=data.nextCursor;
+      } while(cursor);
+    }
+    const tasks = listed.tasks
+      .filter(t=>tenantAllowed(principal,t.tenant_id)&&(!tenantId||t.tenant_id===tenantId)&&(!allowedTenants||allowedTenants.has(String(t.tenant_id))))
+      .sort((a,b)=>Number(b.created_at??0)-Number(a.created_at??0));
     const category=(t:Record<string,unknown>)=>t.execution_outcome==="CANCELLED"?"cancelled":t.state==="SUSPENDED_RECONCILIATION"?"uncertain":["COMPLETED","SUCCEEDED"].includes(String(t.state))?"completed":["FAILED","DEAD_LETTER"].includes(String(t.state))?"failed":["SUBMITTED","PENDING","QUEUED","CREATED"].includes(String(t.state))?"queued":"active";
     const counts:Record<string,number>={total:tasks.length,active:0,queued:0,completed:0,failed:0,cancelled:0,uncertain:0};
     const tenants:Record<string,{tenant:string;total:number;active:number;failed:number;uncertain:number}>=Object.create(null);

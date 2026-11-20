@@ -59,6 +59,8 @@ function Workspace({
   navigate: (view: string) => void;
 }) {
   const [message, setMessage] = useState("");
+  const [region, setRegion] = useState("");
+  const [regions, setRegions] = useState<string[]>([]);
   const [data, setData] = useState<any>(null),
     [system, setSystem] = useState<any>(null),
     [error, setError] = useState(""),
@@ -67,15 +69,15 @@ function Workspace({
     [filter, setFilter] = useState("all"),
     [review, setReview] = useState<Task | null>(null);
   const active = useRef(true),
-    loading = useRef(false);
+    requestId = useRef(0);
   const info = ADMIN_MODULES.find((m) => m.id === module)!;
   const load = useCallback(async () => {
-    if (loading.current) return;
-    loading.current = true;
+    const id = ++requestId.current;
     setBusy(true);
     try {
-      const result = await api("/v1/console/management");
-      if (active.current) {
+      const query = region ? "?" + new URLSearchParams({ region }) : "";
+      const result = await api("/v1/console/management" + query);
+      if (active.current && id === requestId.current) {
         setData(result);
         setError("");
       }
@@ -84,20 +86,24 @@ function Workspace({
         ["observability", "federation"].includes(module)
       ) {
         const s = await api("/v1/console/system");
-        if (active.current) setSystem(s);
+        if (active.current && id === requestId.current) setSystem(s);
       }
     } catch (e) {
-      if (active.current) setError((e as Error).message);
+      if (active.current && id === requestId.current) setError((e as Error).message);
     } finally {
-      loading.current = false;
-      if (active.current) setBusy(false);
+      if (active.current && id === requestId.current) setBusy(false);
     }
-  }, [api, module, user.role]);
+  }, [api, module, region, user.role]);
+  useEffect(() => {
+    if (!["queues", "approvals", "runtime", "swarm"].includes(module)) return;
+    let active = true;
+    void api("/v1/admin/tenants?limit=1").then(result => {
+      if (active) setRegions(result.regions ?? []);
+    }).catch(() => { if (active) setRegions([]); });
+    return () => { active = false; };
+  }, [api, module]);
   useEffect(() => {
     active.current = true;
-    setQuery("");
-    setFilter("all");
-    setSystem(null);
     void load();
     const poll = setInterval(() => void load(), 15000);
     return () => {
@@ -105,6 +111,12 @@ function Workspace({
       clearInterval(poll);
     };
   }, [load]);
+  useEffect(() => {
+    setQuery("");
+    setFilter("all");
+    setRegion("");
+    setSystem(null);
+  }, [module]);
   const tasks: any[] = data?.tasks ?? [];
   const target = tasks.filter(
     (t) =>
@@ -281,6 +293,15 @@ function Workspace({
                 </span>
               </div>
               <div className="admin-filters">
+                {regions.length > 0 && (
+                  <select aria-label="筛选任务归属区域" value={region} onChange={event => {
+                    setData(null);
+                    setRegion(event.target.value);
+                  }}>
+                    <option value="">全部授权区域</option>
+                    {regions.map(value => <option key={value}>{value}</option>)}
+                  </select>
+                )}
                 <label>
                   <Search size={15} />
                   <input

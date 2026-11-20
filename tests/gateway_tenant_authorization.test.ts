@@ -26,9 +26,18 @@ it("rejects anonymous, expired, viewer writes and cross-tenant operations; filte
   const guard = new ConsoleRbacAuthGuard(secret);
   const gateway = new AnstsGatewayCell(new MockDurableObjectState("gateway"));
   const scheduler = new AnstsSchedulerCell(new MockDurableObjectState("scheduler"));
-  const env = { ANSTS_USER_AUTH_SECRET: secret, ANSTS_SCHEDULER_URL: "https://scheduler", ANSTS_GATEWAY_CELL: { idFromName: (name: string) => ({ toString: () => name }), get: () => gateway } } as never;
+  const env = { ANSTS_DIRECTORY_URL: "https://directory", ANSTS_DIRECTORY_SERVICE_TOKEN: "d".repeat(64), ANSTS_USER_AUTH_SECRET: secret, ANSTS_SCHEDULER_URL: "https://scheduler", ANSTS_GATEWAY_CELL: { idFromName: (name: string) => ({ toString: () => name }), get: () => gateway } } as never;
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input, init) => scheduler.fetch(new Request(input, init));
+  globalThis.fetch = async (input, init) => {
+    const rpc = new Request(input, init);
+    if (new URL(rpc.url).hostname !== "directory") return scheduler.fetch(rpc);
+    const { actor, page } = await rpc.json() as { actor: {scopeTenant:string;scopeRegion:string}; page: {region?:string;tenantId?:string} };
+    const items = [{id:"a",region:"west"},{id:"b",region:"east"}].filter(row =>
+      (actor.scopeTenant === "all" || actor.scopeTenant === row.id) &&
+      (actor.scopeRegion === "all" || actor.scopeRegion === row.region) &&
+      (!page.region || page.region === row.region) && (!page.tenantId || page.tenantId === row.id));
+    return Response.json({items,nextCursor:null});
+  };
   const token = (tenant: string, role: ConsoleRole) => `Bearer ${guard.issueToken({ sub: "test-user", role, scopeTenant: tenant, ttlSec: 900 })}`;
   const request = (route: string, auth?: string, body?: unknown) => gatewayWorker.fetch(new Request(`https://gateway${route}`, { method: body ? "POST" : "GET", headers: auth ? { authorization: auth } : {}, body: body ? JSON.stringify(body) : undefined }), env);
   try {
@@ -53,6 +62,14 @@ it("rejects anonymous, expired, viewer writes and cross-tenant operations; filte
     assert.equal(management.tasks[0].task_id, "same-name");
     assert.equal(management.configuration.ANSTS_USER_AUTH_SECRET, undefined);
     assert.equal((await request("/v1/console/management")).status, 401);
+    const west = `Bearer ${guard.issueToken({sub:"test-user",role:"VIEWER",scopeTenant:"all",scopeRegion:"west",ttlSec:900})}`;
+    const scoped = await (await request("/v1/console/management", west)).json();
+    assert.deepEqual(scoped.tasks.map((task: {tenant_id:string})=>task.tenant_id),["a"]);
+    const east = await (await request("/v1/console/management?region=east", token("all", "SRE_ADMIN"))).json();
+    assert.deepEqual(east.tasks.map((task: {tenant_id:string})=>task.tenant_id),["b"]);
+    const hidden = await (await request("/v1/console/management?region=east&tenantId=b", west)).json();
+    assert.equal(hidden.total,0);
+
 
     assert.equal(consoleTasks.counts.total, 1);
     assert.equal(Object.entries(consoleTasks.counts).filter(([key]) => key !== "total").reduce((sum, [, count]) => sum + Number(count), 0), 1);

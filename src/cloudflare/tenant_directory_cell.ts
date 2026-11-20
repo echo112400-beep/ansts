@@ -25,7 +25,7 @@ export class TenantDirectoryCell {
     try {
       const raw=await request.text();
       if(raw.length>65536) return respond({code:'PAYLOAD_TOO_LARGE'},413);
-      const body=JSON.parse(raw) as {actor:ControlActor;input:unknown;page?:{limit?:number;cursor?:string;domain?:string};operationId?:string;archiveId?:string;tenantId?:string;rateCardVersion?:number};
+      const body=JSON.parse(raw) as {actor:ControlActor;input:unknown;page?:{limit?:number;cursor?:string;domain?:string;region?:string;tenantId?:string};operationId?:string;archiveId?:string;tenantId?:string;rateCardVersion?:number};
       if(!body?.actor || !['VIEWER','OPERATOR','SRE_ADMIN'].includes(body.actor.role) || typeof body.actor.sub!=='string' || !body.actor.sub.trim()) return respond({code:'INVALID_ACTOR'},403);
       const path=new URL(request.url).pathname;
       if(path==='/finops-archive-status')return respond(this.archives!.status(body.actor,null),200);

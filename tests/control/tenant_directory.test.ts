@@ -72,6 +72,24 @@ test('pagination is scoped, bounded, and rejects a changed snapshot',()=>{
     assert.throws(()=>s.directory.listPage(admin,{cursor:first.nextCursor!}),{code:'CURSOR_STALE'});
   } finally {s.db.close();}
 });
+test('regional filters and cursors stay within the authorized tenant directory',()=>{
+  const s=open(':memory:');
+  try {
+    for (const [id,region] of [['a','west'],['b','west'],['c','east']]) {
+      s.directory.mutate(admin,{...input,id,region,idempotencyKey:id});
+    }
+    const west=s.directory.listPage(admin,{region:'west',limit:1});
+    assert.deepEqual(west.regions,['east','west']);
+    assert.deepEqual(west.items.map(t=>t.id),['a']);
+    assert.equal(s.directory.listPage(admin,{region:'west',cursor:west.nextCursor!}).items[0].id,'b');
+    assert.throws(()=>s.directory.listPage(admin,{region:'east',cursor:west.nextCursor!}),{code:'CURSOR_STALE'});
+    assert.throws(()=>s.directory.listPage(admin,{region:'west',tenantId:'a',cursor:west.nextCursor!}),{code:'CURSOR_STALE'});
+    const scoped={...admin,scopeRegion:'west'};
+    assert.deepEqual(s.directory.listPage(scoped,{tenantId:'c'}).items,[]);
+    assert.deepEqual(s.directory.listPage(scoped,{region:'east'}).regions,['west']);
+    assert.deepEqual(s.directory.listPage({...admin,scopeTenant:'c'}).regions,['east']);
+  } finally {s.db.close();}
+});
 test('cost center reassignment retains history and audit diff through disable',()=>{
   const s=open(':memory:');
   try {

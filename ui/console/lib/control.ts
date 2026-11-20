@@ -142,11 +142,13 @@ export function controlClient(fetcher:typeof fetch=fetch) {
       return request<CostCenter>('/v1/admin/cost-centers'+(create?'':'/'+encodeURIComponent(id)),{method:create?'POST':'PUT',
         headers:{'content-type':'application/json','idempotency-key':idempotencyKey},body:JSON.stringify({id,...input})});
     },
-    tenants(options:{cursor?:string;limit?:number;signal?:AbortSignal}={}) {
+    tenants(options:{cursor?:string;limit?:number;region?:string;tenantId?:string;signal?:AbortSignal}={}) {
       const query=new URLSearchParams();
       if(options.cursor) query.set('cursor',options.cursor);
       if(options.limit!==undefined) query.set('limit',String(options.limit));
-      return request<ControlPage<DirectoryTenant>>('/v1/admin/tenants'+(query.size?'?'+query:''),{signal:options.signal});
+      if(options.region) query.set('region',options.region);
+      if(options.tenantId) query.set('tenantId',options.tenantId);
+      return request<ControlPage<DirectoryTenant>&{regions:string[]}>('/v1/admin/tenants'+(query.size?'?'+query:''),{signal:options.signal});
     },
     createTenant(id:string,input:Omit<TenantEdit,'expectedVersion'>,idempotencyKey:string,signal?:AbortSignal) {
       if(!id || !idempotencyKey) throw new ControlApiError('INVALID_MUTATION',422);

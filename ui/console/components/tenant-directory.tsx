@@ -12,7 +12,9 @@ export default function TenantDirectory({user,fetcher=fetch}:{user:User;fetcher?
   const client=useMemo(()=>controlClient(fetcher),[fetcher]);
   const [quotaTenant,setQuotaTenant]=useState<DirectoryTenant|null>(null);
   const [centers,setCenters]=useState<CostCenter[]>([]);
-  const [page,setPage]=useState<ControlPage<DirectoryTenant>|null>(null);
+  const [page,setPage]=useState<(ControlPage<DirectoryTenant>&{regions:string[]})|null>(null);
+  const [region,setRegion]=useState(''),[tenantId,setTenantId]=useState('');
+  const [filters,setFilters]=useState({region:'',tenantId:''});
   const [busy,setBusy]=useState(false),[saving,setSaving]=useState(false);
   const [error,setError]=useState(''),[notice,setNotice]=useState('');
   const [loadedAt,setLoadedAt]=useState('');
@@ -24,7 +26,7 @@ export default function TenantDirectory({user,fetcher=fetch}:{user:User;fetcher?
   const load=useCallback(async(cursor?:string,signal?:AbortSignal)=>{
     const request=++serial.current;setBusy(true);setError('');
     try {
-      const [next,firstCenters]=await Promise.all([client.tenants({cursor,limit:25,signal}),client.costCenters({limit:100,signal})]);
+      const [next,firstCenters]=await Promise.all([client.tenants({...filters,cursor,limit:25,signal}),client.costCenters({limit:100,signal})]);
       const collected=[...firstCenters.items];let remaining=firstCenters.nextCursor;let pages=1;
       while(remaining){if(pages++>=100)throw new ControlApiError('DIRECTORY_TOO_LARGE',503);const extra=await client.costCenters({cursor:remaining,limit:100,signal});collected.push(...extra.items);remaining=extra.nextCursor;}
 
@@ -33,12 +35,12 @@ export default function TenantDirectory({user,fetcher=fetch}:{user:User;fetcher?
       if(alive.current&&request===serial.current&&!(e instanceof Error&&e.name==='AbortError'))
         setError(e instanceof ControlApiError&&e.unavailable?'租户目录服务尚未接入或暂不可用。':e instanceof ControlApiError&&e.conflict?'目录已变化，请从首页重新加载。':'目录读取失败，请重试。');
     } finally {if(alive.current&&request===serial.current)setBusy(false);}
-  },[client]);
+  },[client,filters]);
   useEffect(()=>{alive.current=true;const abort=new AbortController();void load(undefined,abort.signal);return()=>{alive.current=false;abort.abort();};},[load]);
   function edit(tenant?:DirectoryTenant) {
     opener.current=document.activeElement as HTMLElement;receipt.current=null;setNotice('');
     requestAnimationFrame(()=>form.current?.querySelector<HTMLInputElement>('input:not(:disabled)')?.focus());
-    setEditor({id:tenant?.id??(user.scopeTenant==='all'?'':user.scopeTenant),create:!tenant,input:{region:tenant?.region??'',name:tenant?.name??'',costCenter:tenant?.costCenter??centers.find(c=>c.status==='ACTIVE')?.id??'',status:tenant?.status??'ACTIVE',expectedVersion:tenant?.version??0,reason:''}});
+    setEditor({id:tenant?.id??(user.scopeTenant==='all'?'':user.scopeTenant),create:!tenant,input:{region:tenant?.region??(filters.region||(!user.scopeRegion||user.scopeRegion==='all'?'':user.scopeRegion)),name:tenant?.name??'',costCenter:tenant?.costCenter??centers.find(c=>c.status==='ACTIVE')?.id??'',status:tenant?.status??'ACTIVE',expectedVersion:tenant?.version??0,reason:''}});
   }
   function closeEditor(){setEditor(null);requestAnimationFrame(()=>{if(opener.current?.isConnected)opener.current.focus();});}
   function field<K extends keyof TenantEdit>(key:K,value:TenantEdit[K]) {
@@ -63,10 +65,23 @@ export default function TenantDirectory({user,fetcher=fetch}:{user:User;fetcher?
   }
   return <><CostCenterDirectory client={client} user={user} onChanged={load}/><section className="admin-panel management-directory-panel" aria-labelledby="tenant-directory-title">
     <div className="admin-panel-heading"><h2 id="tenant-directory-title">租户目录</h2><span>{loadedAt?`最近读取 ${loadedAt}`:'持久化目录'}</span></div>
+    <form className="directory-actions" onSubmit={event=>{
+      event.preventDefault();
+      if(busy||saving||editor)return;
+      setQuotaTenant(null);
+      setFilters({region,tenantId:tenantId.trim()});
+    }}>
+      <label>区域 <select value={region} onChange={event=>setRegion(event.target.value)}>
+        <option value="">全部授权区域</option>
+        {[...new Set([...(page?.regions??[]),...(region?[region]:[])])].map(value=><option key={value}>{value}</option>)}
+      </select></label>
+      <label>租户 ID <input value={tenantId} maxLength={128} onChange={event=>setTenantId(event.target.value)}/></label>
+      <button className="secondary" disabled={busy||saving||!!editor}>筛选租户</button>
+    </form>
     <div className="directory-actions">
       <button className="secondary" disabled={busy} onClick={()=>void load()}>刷新首页</button>
       {editable&&<button className="primary" disabled={!page||busy||!!error||saving||!centers.some(c=>c.status==='ACTIVE')} onClick={()=>edit()}>登记租户</button>}
-      {page?.nextCursor&&<button className="secondary" disabled={busy} onClick={()=>void load(page.nextCursor!)}>下一页</button>}
+      {page?.nextCursor&&!error&&<button className="secondary" disabled={busy} onClick={()=>void load(page.nextCursor!)}>下一页</button>}
       {busy&&<span role="status">正在读取…</span>}
     </div>
     {error&&<div className="banner error" role="alert">{error}{page&&' 下方保留上次读取的数据。'}</div>}
@@ -77,7 +92,7 @@ export default function TenantDirectory({user,fetcher=fetch}:{user:User;fetcher?
         <button className="secondary" onClick={()=>setQuotaTenant(tenant)}>查看配额策略</button>
         {editable&&<button className="secondary" disabled={saving||!!error} onClick={()=>edit(tenant)}>载入版本编辑</button>}
         <details><summary>归属历史</summary><ul>{tenant.costCenterHistory?.map(entry=><li key={entry.version}>{entry.costCenter} · v{entry.version} · {entry.timestamp?new Date(entry.timestamp).toLocaleString('zh-CN'):'时间未知'}</li>)}</ul></details>
-      </td></tr>)}</tbody></table>{!page.items.length&&<div className="admin-empty">当前授权范围没有已登记租户。</div>}</div>}
+      </td></tr>)}</tbody></table>{!page.items.length&&<div className="admin-empty">当前筛选条件下没有可见租户。</div>}</div>}
     {editor&&<form ref={form} className="create-form directory-editor" onSubmit={save}>
       <h3>{editor.create?'登记租户':`编辑 ${editor.id} · 基于版本 ${editor.input.expectedVersion}`}</h3>
       <label>租户 ID<input required maxLength={128} pattern="[a-zA-Z0-9][a-zA-Z0-9_.:\-]*" disabled={!editor.create||saving} value={editor.id} onChange={e=>setEditor({...editor,id:e.target.value})}/></label>
