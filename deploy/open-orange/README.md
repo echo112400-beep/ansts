@@ -143,3 +143,6 @@ The development check found all three celld Scheduler endpoints, both Gateway en
 
 
 The original three development Scheduler containers exited with code 3 after the celld node lease watchdog reported missed renewal within TTL. Docker recorded no OOM kill. To exercise source recovery, an isolated clone used a read-only copy of the RustFS fleet volume and three fresh Scheduler node volumes. An authenticated client inside the clone network read 121 persisted tasks through each Scheduler node, matching the previous restart report count. This establishes object-store recovery for the observed task listing. It does not verify a common revision across Scheduler, Body and FinOps or the completeness of local node logs. The original services and volumes were left in place.
+
+
+A second isolated recovery compared every task ID, tenant ID, and canonical execution digest across all three Scheduler nodes and against the predeployment QF-02 inventory. All 121 entries matched, with zero missing, extra, or changed entries. The reconciliation inventory was saved under the ignored development secrets directory. These comparisons cover the task identity and execution specification fields. Lifecycle state, active leases and accounting are outside this comparison.
