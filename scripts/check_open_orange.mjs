@@ -6,23 +6,27 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const workers = {
-  scheduler: "wrangler.celld.json",
-  gateway: "wrangler.gateway.json",
-  body: "wrangler.body.json",
+  scheduler: { manifest: "deploy/celld/wrangler.celld.json", port: "8788" },
+  gateway: { manifest: "deploy/celld/wrangler.gateway.json", port: "8789" },
+  body: { manifest: "deploy/celld/wrangler.body.json", port: "8791" },
+  checkpoint: { manifest: "deploy/open-orange/wrangler.control-checkpoint.json", base: "deploy/open-orange", port: "8792" },
+  authority: { manifest: "deploy/open-orange/wrangler.authority-import.json", base: "deploy/open-orange", port: "8793" },
 };
-const ports = { scheduler: "8788", gateway: "8789", body: "8791" };
 const args = process.argv.slice(2);
 const serve = args[0] === "--serve";
 if (serve) args.shift();
-const [role = "scheduler", port = ports[role]] = args;
-if (!Object.hasOwn(workers, role) || args.length > 2 || !/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
-  throw new Error("Usage: node scripts/check_open_orange.mjs [--serve] [scheduler|gateway|body] [port]");
+const [role = "scheduler", inputPort] = args;
+const worker = Object.hasOwn(workers, role) ? workers[role] : undefined;
+const port = inputPort ?? worker?.port;
+if (!worker || args.length > 2 || !/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+  throw new Error("Usage: node scripts/check_open_orange.mjs [--serve] [scheduler|gateway|body|checkpoint|authority] [port]");
 }
 
-const config = JSON.parse(readFileSync(join(root, "deploy/celld", workers[role]), "utf8"));
-config.main = resolve(root, config.main);
+const config = JSON.parse(readFileSync(join(root, worker.manifest), "utf8"));
+const manifestBase = resolve(root, worker.base ?? ".");
+config.main = resolve(manifestBase, config.main);
 for (const database of config.d1_databases ?? []) {
-  if (database.migrations_dir) database.migrations_dir = resolve(root, database.migrations_dir);
+  if (database.migrations_dir) database.migrations_dir = resolve(manifestBase, database.migrations_dir);
 }
 delete config.$schema;
 

@@ -54,7 +54,8 @@ jobs:
           node scripts/check_open_orange.mjs scheduler
           node scripts/check_open_orange.mjs gateway
           node scripts/check_open_orange.mjs body
-          orange doctor --config deploy/open-orange/wrangler.control-checkpoint.json --port 8792 --json
+          node scripts/check_open_orange.mjs checkpoint
+          node scripts/check_open_orange.mjs authority
       - name: Verify self-hosted Worker startup and Scheduler RPC
         run: python3 -u scripts/verify_open_orange.py
       - name: Verify Scheduler state round trip

@@ -90,3 +90,33 @@ services:
       ANSTS_BODY_AUTH_SECRET: "${ANSTS_BODY_AUTH_SECRET:?Set ANSTS_BODY_AUTH_SECRET}"
     ports:
       - "127.0.0.1:${ANSTS_ORANGE_BODY_PORT:-8791}:8080"
+  checkpoint:
+    <<: *worker
+    profiles: ["migration"]
+    command: ["checkpoint", "8080"]
+    environment:
+      <<: *runner
+      ORANGE_WORKER_VARS: ANSTS_CONTROL_CHECKPOINT_MODE
+      ORANGE_WORKER_SECRETS: ANSTS_CONTROL_CHECKPOINT_TOKEN,ANSTS_CONTROL_CHECKPOINT_KEY
+      ANSTS_CONTROL_CHECKPOINT_MODE: "${ANSTS_CONTROL_CHECKPOINT_MODE:-}"
+      ANSTS_CONTROL_CHECKPOINT_TOKEN: "${ANSTS_CONTROL_CHECKPOINT_TOKEN:-}"
+      ANSTS_CONTROL_CHECKPOINT_KEY: "${ANSTS_CONTROL_CHECKPOINT_KEY:-}"
+    ports:
+      - "127.0.0.1:${ANSTS_ORANGE_CHECKPOINT_PORT:-8792}:8080"
+    healthcheck:
+      disable: true
+  authority:
+    <<: *worker
+    profiles: ["migration"]
+    command: ["authority", "8080"]
+    environment:
+      <<: *runner
+      ORANGE_WORKER_VARS: ANSTS_AUTHORITY_IMPORT_RUNTIME
+      ORANGE_WORKER_SECRETS: ANSTS_AUTHORITY_IMPORT_TOKEN,ANSTS_AUTHORITY_ARCHIVE_KEY
+      ANSTS_AUTHORITY_IMPORT_RUNTIME: open-orange
+      ANSTS_AUTHORITY_IMPORT_TOKEN: "${ANSTS_AUTHORITY_IMPORT_TOKEN:-}"
+      ANSTS_AUTHORITY_ARCHIVE_KEY: "${ANSTS_AUTHORITY_ARCHIVE_KEY:-}"
+    ports:
+      - "127.0.0.1:${ANSTS_ORANGE_AUTHORITY_PORT:-8793}:8080"
+    healthcheck:
+      disable: true

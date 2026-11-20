@@ -7,5 +7,6 @@ RUN npm ci --prefix /opt/orange --omit=dev --no-audit --no-fund && ln -s /opt/or
 COPY src ./src
 COPY migrations ./migrations
 COPY deploy/celld ./deploy/celld
+COPY deploy/open-orange/wrangler.*.json ./deploy/open-orange/
 COPY scripts/check_open_orange.mjs scripts/init_open_orange_pool.mjs ./scripts/
 ENTRYPOINT ["node", "scripts/check_open_orange.mjs", "--serve"]

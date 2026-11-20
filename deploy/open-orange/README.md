@@ -44,6 +44,16 @@ Set `RIVET_ENDPOINT`, `RIVET_TOKEN`, and `RIVET_NAMESPACE` in each process envir
 
 Run `python3 -u scripts/verify_open_orange.py` to exercise all three roles with Docker and the pinned Orange CLI on PATH. The verifier supplies temporary credentials and a dedicated Rivet Engine, checks both health routes per role, and verifies authenticated task submission and readback. The OpenOrange compatibility job in ANSTS CI runs all three doctor checks and this smoke test.
 
+### Migration Workers
+
+The `checkpoint` and `authority` services use the target Engine and named volumes from the same Compose project. They are opt-in and publish only to loopback. Start them explicitly while the normal Scheduler is stopped and client writes are fenced:
+
+```sh
+docker compose -f deploy/open-orange/compose.yml -f deploy/open-orange/compose.workers.yml up --build -d checkpoint authority
+```
+
+For a target import set `ANSTS_CONTROL_CHECKPOINT_MODE=import`, `ANSTS_CONTROL_CHECKPOINT_TOKEN`, `ANSTS_CONTROL_CHECKPOINT_KEY`, `ANSTS_AUTHORITY_IMPORT_TOKEN`, and `ANSTS_AUTHORITY_ARCHIVE_KEY` in the project environment or private env file. The endpoints default to ports 8792 and 8793. Stop both migration services after import and readback, then start the normal Workers in the same project.
+
 ### Console preview
 
 With the development Next.js `dev-server` running, add the console overlay to the same Compose project as the Rivet Workers:
