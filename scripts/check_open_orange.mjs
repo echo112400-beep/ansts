@@ -33,7 +33,7 @@ try {
   const configArgs = ["--config", configPath, "--port", port];
   const options = { cwd: root, stdio: "inherit" };
   if (serve) {
-    const child = spawn("orange", ["serve", ...configArgs, "--ip", "127.0.0.1"], options);
+    const child = spawn("orange", ["serve", ...configArgs, "--ip", process.env.ANSTS_ORANGE_LISTEN_HOST ?? "127.0.0.1"], options);
     const stop = (signal) => child.kill(signal);
     process.on("SIGTERM", stop);
     process.on("SIGINT", stop);

@@ -12,6 +12,16 @@ The diagnostics read the current binding and migration definitions and rebase en
 
 ## Self-hosted Rivet
 
+Start Rivet Engine, initialize the default runner pool, and start all three Workers with the Compose overlay:
+
+```sh
+docker compose -f deploy/open-orange/compose.yml -f deploy/open-orange/compose.workers.yml up --build -d --wait
+```
+
+Supply `ANSTS_RIVET_ADMIN_TOKEN`, `ANSTS_BODY_AUTH_SECRET`, `ANSTS_USER_AUTH_SECRET`, and `ANSTS_SCHEDULER_SERVICE_TOKEN` through the environment or an ignored environment file passed to Compose with `--env-file`. The Scheduler service token is the hex HMAC-SHA256 of `ansts-body-v1:gateway:control` keyed by `ANSTS_BODY_AUTH_SECRET`. Set `ANSTS_RIVET_WORKER_TOKEN` to supply a separate Engine token for the Workers. If omitted, the Workers use the admin token.
+
+The services communicate over the Compose network. The Engine and Worker ports bind to host loopback. Existing default pool configuration is preserved. The Engine uses named volumes for durable state. When adding the overlay to an existing Engine deployment, keep the same Compose project name to reuse its volumes.
+
 The Compose file starts Rivet Engine 3.1.1 with persistent log and object volumes and a loopback API. Supply `ANSTS_RIVET_ADMIN_TOKEN` through the environment before starting it.
 
 ```sh
@@ -33,6 +43,8 @@ Set `RIVET_ENDPOINT`, `RIVET_TOKEN`, and `RIVET_NAMESPACE` in each process envir
 Run `python3 -u scripts/verify_open_orange.py` to exercise all three roles with Docker and the pinned Orange CLI on PATH. The verifier supplies temporary credentials and a dedicated Rivet Engine, checks both health routes per role, and verifies authenticated task submission and readback. The OpenOrange compatibility job in ANSTS CI runs all three doctor checks and this smoke test.
 
 ## Verified in isolation
+
+The Compose overlay passed an isolated startup check using the locked dependencies from a local npm cache. All three Workers returned HTTP 200 from both health routes, and an authenticated Scheduler request created and read back a task, which remained available after stopping and restarting the entire stack.
 
 OpenOrange 1.0.3 passed `doctor` for Scheduler, Gateway, and Body. Each Worker generated a deployment build context in a dry run. Against a dedicated self-hosted Rivet Engine 3.1.1 container, all three Workers returned HTTP 200 from `/healthz` and `/readyz`, and the Scheduler accepted and read back a task with an isolated service identity. An independent `orange dev` restart test read back the same task after restart.
 

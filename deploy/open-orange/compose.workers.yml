@@ -1,0 +1,77 @@
+x-worker: &worker
+  image: ansts-open-orange:1.0.3
+  build:
+    context: ../..
+    dockerfile: deploy/open-orange/Dockerfile
+  init: true
+  depends_on:
+    rivet-pool:
+      condition: service_completed_successfully
+  environment: &runner
+    RIVET_ENDPOINT: http://rivet:6420
+    RIVET_TOKEN: "${ANSTS_RIVET_WORKER_TOKEN:-${ANSTS_RIVET_ADMIN_TOKEN}}"
+    RIVET_NAMESPACE: default
+    RIVET_POOL: default
+    ANSTS_ORANGE_LISTEN_HOST: 0.0.0.0
+  healthcheck:
+    test:
+      - CMD
+      - node
+      - -e
+      - "fetch('http://127.0.0.1:8080/readyz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+    interval: 5s
+    timeout: 4s
+    retries: 12
+
+services:
+  rivet-pool:
+    <<: *worker
+    entrypoint: ["node", "scripts/init_open_orange_pool.mjs"]
+    depends_on:
+      rivet:
+        condition: service_started
+    environment:
+      <<: *runner
+      RIVET_TOKEN: "${ANSTS_RIVET_ADMIN_TOKEN}"
+    healthcheck:
+      disable: true
+  scheduler:
+    <<: *worker
+    command: ["scheduler", "8080"]
+    environment:
+      <<: *runner
+      ORANGE_WORKER_VARS: ANSTS_BODY_WORKER_URL
+      ORANGE_WORKER_SECRETS: ANSTS_BODY_AUTH_SECRET,ANSTS_DIRECTORY_SERVICE_TOKEN,ANSTS_ADMISSION_SERVICE_TOKEN,ANSTS_ADMISSION_SIGNING_KEY
+      ANSTS_DIRECTORY_SERVICE_TOKEN: "${ANSTS_DIRECTORY_SERVICE_TOKEN:-}"
+      ANSTS_ADMISSION_SERVICE_TOKEN: "${ANSTS_ADMISSION_SERVICE_TOKEN:-}"
+      ANSTS_ADMISSION_SIGNING_KEY: "${ANSTS_ADMISSION_SIGNING_KEY:-}"
+      ANSTS_BODY_WORKER_URL: http://body:8080
+      ANSTS_BODY_AUTH_SECRET: "${ANSTS_BODY_AUTH_SECRET:?Set ANSTS_BODY_AUTH_SECRET}"
+    ports:
+      - "127.0.0.1:${ANSTS_ORANGE_SCHEDULER_PORT:-8788}:8080"
+  gateway:
+    <<: *worker
+    command: ["gateway", "8080"]
+    environment:
+      <<: *runner
+      ORANGE_WORKER_VARS: ANSTS_SCHEDULER_URL,ANSTS_DIRECTORY_URL,ANSTS_SANDBOX_IMAGE
+      ORANGE_WORKER_SECRETS: ANSTS_USER_AUTH_SECRET,ANSTS_SCHEDULER_SERVICE_TOKEN,ANSTS_DIRECTORY_SERVICE_TOKEN
+      ANSTS_DIRECTORY_SERVICE_TOKEN: "${ANSTS_DIRECTORY_SERVICE_TOKEN:-}"
+      ANSTS_SANDBOX_IMAGE: "${ANSTS_SANDBOX_IMAGE:-}"
+      ANSTS_SCHEDULER_URL: http://scheduler:8080
+      ANSTS_DIRECTORY_URL: http://scheduler:8080
+      ANSTS_USER_AUTH_SECRET: "${ANSTS_USER_AUTH_SECRET:?Set ANSTS_USER_AUTH_SECRET}"
+      ANSTS_SCHEDULER_SERVICE_TOKEN: "${ANSTS_SCHEDULER_SERVICE_TOKEN:?Set ANSTS_SCHEDULER_SERVICE_TOKEN}"
+    ports:
+      - "127.0.0.1:${ANSTS_ORANGE_GATEWAY_PORT:-8789}:8080"
+  body:
+    <<: *worker
+    command: ["body", "8080"]
+    environment:
+      <<: *runner
+      ORANGE_WORKER_VARS: ANSTS_SCHEDULER_URL
+      ORANGE_WORKER_SECRETS: ANSTS_BODY_AUTH_SECRET
+      ANSTS_SCHEDULER_URL: http://scheduler:8080
+      ANSTS_BODY_AUTH_SECRET: "${ANSTS_BODY_AUTH_SECRET:?Set ANSTS_BODY_AUTH_SECRET}"
+    ports:
+      - "127.0.0.1:${ANSTS_ORANGE_BODY_PORT:-8791}:8080"

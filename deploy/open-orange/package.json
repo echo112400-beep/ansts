@@ -1,0 +1,7 @@
+{
+  "name": "ansts-open-orange",
+  "private": true,
+  "dependencies": {
+    "open-orange": "1.0.3"
+  }
+}
