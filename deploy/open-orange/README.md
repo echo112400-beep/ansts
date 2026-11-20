@@ -80,6 +80,8 @@ The development cutover restored the latest stopped-source checkpoint before ope
 
 A live validation task exposed a missing usage-binding route in the split Body Worker. The Worker now forwards the route with Body service authentication. The regression test requires HTTP 401 without credentials and checks that authenticated requests receive the same response as the Scheduler. A second live task still entered reconciliation before completing execution. The ingress remains on Rivet and both native daemons are drained pending investigation of that failure.
 
+The follow-up probe identified the disabled tenant as the cause of the live usage-binding rejection. The metering endpoint correctly returned `TENANT_DISABLED`, and the execution never started. With an active tenant in the configured metering scope, each native daemon completed one sandbox task through port 8088. Both results and resource open, segment, and close events were read back from Rivet. The second daemon retained an open usage stream and resource reservation after completion. A controlled restart confirmed there were no remaining containers, closed the stream, and released the reservation through the existing recovery flow. Both daemons resumed admission, and all 121 pre-cutover task identities and execution specifications still matched. Automatic closure on the second daemon remains under investigation.
+
 ## Verified in isolation
 
 The Compose overlay passed an isolated startup check using the locked dependencies from a local npm cache. All three Workers returned HTTP 200 from both health routes, and an authenticated Scheduler request created and read back a task, which remained available after stopping and restarting the entire stack.
