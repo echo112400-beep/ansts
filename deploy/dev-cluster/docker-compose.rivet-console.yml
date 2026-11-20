@@ -1,0 +1,22 @@
+# Keep the existing console port and Next.js service during the Rivet cutover.
+services:
+  tanstack-console:
+    environment:
+      ANSTS_NGINX_GATEWAY_SERVERS: "server gateway:8080 resolve;"
+    depends_on: !override
+      dev-server:
+        condition: service_healthy
+    networks:
+      - ansts_mesh_net
+      - rivet-workers
+  prometheus:
+    volumes:
+      - ./prometheus.rivet.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - ansts_mesh_net
+      - rivet-workers
+
+networks:
+  rivet-workers:
+    external: true
+    name: "${ANSTS_RIVET_WORKERS_NETWORK:?Set ANSTS_RIVET_WORKERS_NETWORK to the target Compose network}"

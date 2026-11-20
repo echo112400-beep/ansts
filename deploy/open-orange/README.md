@@ -72,6 +72,14 @@ Apply the overlay to `body-daemon-01` and `body-daemon-02` during the fenced cut
 
 In an isolated target, both development daemon images ran with the resolved overlay routes and temporary ledger volumes. Authenticated Body exports contained a heartbeat for each daemon. The rendered development configuration retained both original ledger mounts and daemon IDs.
 
+### Development cutover
+
+Apply both `docker-compose.rivet-body.yml` and `docker-compose.rivet-console.yml` after the existing development overlays. The latter retains console port 8088 and sends its Gateway and Prometheus traffic to the network selected by `ANSTS_RIVET_WORKERS_NETWORK`. Keep the old Scheduler, Gateway, and Body Worker containers stopped after enabling writes on Rivet. The `rivet-cutover-active.json` marker in the private redeployment directory prevents the legacy restart command from restarting celld after cutover. Use the Rivet and development Compose project configurations for service maintenance.
+
+The development cutover restored the latest stopped-source checkpoint before opening the existing ingress. The original console endpoint returned 121 authenticated tasks and redirected GitHub sign-in to the existing callback URI. Both native Body daemons retained their volumes and identities, published fresh healthy heartbeats to Rivet, and resumed their previous admission state. Prometheus reported the Rivet Gateway and both native daemons up. The celld Worker containers and source volumes remain available for recovery.
+
+A live validation task exposed a missing usage-binding route in the split Body Worker. The Worker now forwards the route with Body service authentication. The regression test requires HTTP 401 without credentials and checks that authenticated requests receive the same response as the Scheduler. A second live task still entered reconciliation before completing execution. The ingress remains on Rivet and both native daemons are drained pending investigation of that failure.
+
 ## Verified in isolation
 
 The Compose overlay passed an isolated startup check using the locked dependencies from a local npm cache. All three Workers returned HTTP 200 from both health routes, and an authenticated Scheduler request created and read back a task, which remained available after stopping and restarting the entire stack.

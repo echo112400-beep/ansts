@@ -64,6 +64,12 @@ it("runs Body control independently, preserves native results on restart, and st
     return { lease, payload: { taskId, tenantId: "tenant", attemptId: lease.attempt_id, fencingToken: fence, promptText: "work", execution, executionToken: started.execution_token } };
   }
   try {
+    const usageBinding = "/internal/v1/body-usage-binding";
+    assert.equal((await rpc(control.url, usageBinding, {}, { "content-type": "application/json" })).status, 401);
+    const directBinding = await rpc(brain.url, usageBinding, {});
+    const forwardedBinding = await rpc(control.url, usageBinding, {});
+    assert.equal(forwardedBinding.status, directBinding.status);
+    assert.deepEqual(await forwardedBinding.json(), await directBinding.json());
     assert.equal((await (await rpc(daemonUrl(), "/health")).json()).runtime, "native-body-daemon");
     assert.equal((await rpc(daemonUrl(), "/v1beta1/management/state")).status, 404);
     assert.equal((await rpc(daemonUrl(), "/v1/scheduler/tasks")).status, 404);

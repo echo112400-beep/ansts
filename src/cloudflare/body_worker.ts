@@ -5,7 +5,7 @@ import { controlPlaneFetch } from "./control_plane_fetch.js";
 import {bodyInventoryIngress} from '../control/execution_inventory_ingress.js';
 export { AnstsBodyCell } from "./body_cell.js";
 
-const SCHEDULER_ROUTES = new Set(["/v1/scheduler/register-node", "/v1/scheduler/schedule-tick", "/v1/scheduler/tasks", "/v1/scheduler/lease-renew", "/v1/scheduler/complete", "/v1/scheduler/suspend-uncertain"]);
+const SCHEDULER_ROUTES = new Set(["/v1/scheduler/register-node", "/v1/scheduler/schedule-tick", "/v1/scheduler/tasks", "/v1/scheduler/lease-renew", "/v1/scheduler/complete", "/v1/scheduler/suspend-uncertain", "/internal/v1/body-usage-binding"]);
 export default {
   async fetch(request: Request, env: BodyWorkerEnv): Promise<Response> {
     const url = new URL(request.url);

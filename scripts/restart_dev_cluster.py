@@ -123,6 +123,8 @@ def main():
     parser.add_argument('--stop-only', action='store_true')
     parser.add_argument('--verify-retired-m3-shard', action='store_true')
     args = parser.parse_args()
+    if (PRIVATE / 'rivet-cutover-active.json').exists() and not args.check_only:
+        raise RuntimeError('Development traffic uses Rivet. Use the cutover Compose configuration to maintain the fleet.')
     compose = compose_args()
     run(compose, ['config', '--quiet'], '校验完整 Compose 配置')
     resolved = json.loads(subprocess.check_output([*compose, 'config', '--format', 'json'], cwd=ROOT))
