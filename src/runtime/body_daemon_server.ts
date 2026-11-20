@@ -277,6 +277,15 @@ export class BodyDaemonServer {
       }
       let leaseDeadline = (leaseState.lease_expires_at ?? Date.now() / 1000 + 12) * 1000;
       const journalKey = JSON.stringify([tenantId, taskId, attemptId]);
+      const publishResult = (result: Record<string, unknown>) => {
+        this.journal.complete(journalKey, result);
+        if (usageIdentity) {
+          // Persist the resource close before acknowledging execution to the Scheduler.
+          this.usage!.finish(usageIdentity);
+          usageIdentity = undefined;
+        }
+        this.json(response, 200, result);
+      };
       const admission = this.journal.admit(journalKey);
       if (!admission.admitted&&observation){const existing=this.evidence.read(String(tenantId),String(taskId),String(attemptId));if(!existing||existing.reservationId!==observation.reservationId||existing.requestDigest!==observation.requestDigest||existing.generation!==observation.generation||existing.executionInputDigest!==observation.executionInputDigest){this.json(response,409,{error:'EXECUTION_OBSERVATION_UNAVAILABLE'});return;}}
       if (!admission.admitted) { this.json(response, admission.result ? 200 : 409, admission.result ?? { error: "EXECUTION_OUTCOME_UNCERTAIN" }); return; }
@@ -292,7 +301,7 @@ export class BodyDaemonServer {
       if (leaseState.cancel_requested || sandbox.cancelRequested) {
         if(observation)this.evidence.advance(observation,"NOT_STARTED");
         const result = { executedByBodyId: this.options.nodeId, taskId, status: "COMPLETED", executionOutcome: "CANCELLED", exitCode: 137, logs: "", neverStarted: true };
-        this.journal.complete(journalKey, result); this.json(response, 200, result); return;
+        publishResult(result); return;
       }
       sandbox.executionStarted = true;
       let renewing = false;
@@ -328,8 +337,7 @@ export class BodyDaemonServer {
         }
         this.cleanup.confirmRemoved(key);
         const result = { executedByBodyId: this.options.nodeId, taskId, status: "COMPLETED", executionKind: execution.kind, ...outcome };
-        this.journal.complete(journalKey, result);
-        this.json(response, 200, result); return;
+        publishResult(result); return;
       }
       const branchName = `body-${key.slice(0, 32)}`;
       const snapshot = path.join(this.options.storageDir, "workspaces", `${key}.json`);
@@ -343,7 +351,7 @@ export class BodyDaemonServer {
       catch (error) {
         if (!String(error).includes("BODY_STOP_UNCONFIRMED") && ["BODY_CANCELLED", "BODY_TIMED_OUT"].includes(String(controller.signal.reason))) {
           const result = { executedByBodyId: this.options.nodeId, taskId, status: "COMPLETED", executionOutcome: controller.signal.reason === "BODY_CANCELLED" ? "CANCELLED" : "TIMED_OUT", exitCode: controller.signal.reason === "BODY_CANCELLED" ? 137 : 124 };
-          this.journal.complete(journalKey, result); this.json(response, 200, result); return;
+          publishResult(result); return;
         }
         throw error;
       }
@@ -355,8 +363,7 @@ export class BodyDaemonServer {
       const s3Synced = this.options.s3Endpoint ? await driver.pushBranchToRemoteS3(branchName, this.options.s3Endpoint, controller.signal) : false;
       if (controller.signal.aborted) throw new Error("BODY_EXECUTION_STOPPED");
       const result = { executedByBodyId: this.options.nodeId, taskId, branchName, commitHash: output.result.commitId, commitId: output.result.commitId, committedNewSnapshot: output.result.committedNewSnapshot, mountLatencyMs: output.result.mountLatencyMs, s3Synced, status: "COMPLETED" };
-      this.journal.complete(journalKey, result);
-      this.json(response, 200, result);
+      publishResult(result);
     } catch (error) {
       sandbox.stopConfirmed = !String(error).includes("BODY_STOP_UNCONFIRMED");
       if(observation){const saved=this.evidence.read(observation.tenantId,observation.taskId,observation.attemptId);if(saved&&!['NOT_STARTED','TERMINATED'].includes(saved.phase))this.evidence.advance(saved,'UNCERTAIN');}

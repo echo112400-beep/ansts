@@ -101,6 +101,34 @@ test('unconfirmed Engine stop leaves source allocation open until positive Host 
  }finally{await daemon.stop();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));j.close();}
 });
 
+test('metered execution does not report success before resource closure is durable',async()=>{
+ const {createServer}=await import('node:http'),{BodyDaemonServer}=await import('../../src/runtime/body_daemon_server.js');
+ const server=createServer(async(request,response)=>{for await(const _ of request){}response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify(request.url==='/internal/v1/body-usage-binding'?{bound:true}:{lease_expires_at:Date.now()/1000+30}));});
+ await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));const j=journal(),key='b'.repeat(64),image='node@sha256:'+'a'.repeat(64);
+ const execution={kind:'container',image,argv:['true'],cpu:.25,memoryMb:128,timeoutMs:10000};
+ const {taskInputDigest}=await import('../../src/cloudflare/execution_attempt.js');
+ const bound={...identity,executionInputDigest:taskInputDigest(identity.tenantId,identity.taskId,'work',execution)};
+ const temporary=join(j.dir,'usage-outbox',usageStreamId(bound)+'.json.tmp');
+ let executions=0;
+ const options={usageMetering:true,nodeId:identity.producerId,token:key,storageDir:j.dir,bodyWorkerUrl:'http://127.0.0.1:'+(server.address() as {port:number}).port,host:'127.0.0.1',port:0,sandboxImage:image,containerRuntime:{recoverOrphans:async()=>0,execute:async()=>{
+  executions++;
+  mkdirSync(temporary);
+  return {executionOutcome:'SUCCEEDED' as const,exitCode:0,logs:'',logsTruncated:false,artifacts:[],artifactsTruncated:false};
+ }}};
+ let daemon=new BodyDaemonServer(options);
+ try{
+  const {port}=await daemon.start();
+  const run=(port:number)=>fetch('http://127.0.0.1:'+port+'/v1/sandboxes/execute',{method:'POST',headers:{authorization:'Body '+key,'x-ansts-body-id':identity.producerId,'content-type':'application/json'},body:JSON.stringify({tenantId:identity.tenantId,taskId:identity.taskId,attemptId:identity.attemptId,fencingToken:identity.fencing,promptText:'work',execution})});
+  const response=await run(port);assert.equal(response.status,503);
+  const source=new BodyUsageJournal(join(j.dir,'usage-outbox'));
+  assert.ok(!source.events(bound).some(e=>e.kind==='RESOURCE_CLOSE'));
+  rmSync(temporary,{recursive:true});await daemon.stop();daemon=new BodyDaemonServer(options);
+  const recovered=await daemon.start();assert.equal(source.events(bound).at(-1)!.kind,'RESOURCE_CLOSE');
+  const replay=await run(recovered.port);assert.equal(replay.status,200);
+  assert.equal((await replay.json()).executionOutcome,'SUCCEEDED');assert.equal(executions,1);
+ }finally{await daemon.stop();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));j.close();}
+});
+
 test('sub-millicore Engine allocation is preserved in nano-core milliseconds without rounded-up billing',()=>{
  const j=journal();try{const precise={...resources,cpuNanoCores:333333334,cpuMilliCores:334};j.source.begin(identity,precise,1000);j.source.finish(identity,1010);const segment=j.source.events(identity).find(e=>e.kind==='RESOURCE_SEGMENT')!;
   assert.equal(segment.allocation!.cpuNanoCoreMilliseconds,'3333333340');assert.equal(segment.resources.cpuMilliCores,334);
