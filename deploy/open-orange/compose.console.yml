@@ -1,0 +1,26 @@
+services:
+  console:
+    image: nginx:1.27-alpine
+    environment:
+      NGINX_ENVSUBST_FILTER: "^ANSTS_NGINX_GATEWAY_SERVERS$"
+      ANSTS_NGINX_GATEWAY_SERVERS: "server gateway:8080 resolve;"
+    ports:
+      - "127.0.0.1:${ANSTS_ORANGE_CONSOLE_PORT:-18088}:80"
+    volumes:
+      - ../dev-cluster/nginx-tanstack-console.conf:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - default
+      - development-console
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1/readyz"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+
+networks:
+  development-console:
+    external: true
+    name: "${ANSTS_DEV_CONSOLE_NETWORK:-ansts-v25-dev-cluster_ansts_mesh_net}"

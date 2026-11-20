@@ -44,6 +44,16 @@ Set `RIVET_ENDPOINT`, `RIVET_TOKEN`, and `RIVET_NAMESPACE` in each process envir
 
 Run `python3 -u scripts/verify_open_orange.py` to exercise all three roles with Docker and the pinned Orange CLI on PATH. The verifier supplies temporary credentials and a dedicated Rivet Engine, checks both health routes per role, and verifies authenticated task submission and readback. The OpenOrange compatibility job in ANSTS CI runs all three doctor checks and this smoke test.
 
+### Console preview
+
+With the development Next.js `dev-server` running, add the console overlay to the same Compose project as the Rivet Workers:
+
+```sh
+docker compose -f deploy/open-orange/compose.yml -f deploy/open-orange/compose.workers.yml -f deploy/open-orange/compose.console.yml up -d --wait
+```
+
+The preview listens on `127.0.0.1:18088` by default. It serves the existing Next.js console from the development network and directs the Gateway API, authentication callback and SSE routes to OpenOrange. Set `ANSTS_ORANGE_CONSOLE_PORT` to change the port, and `ANSTS_DEV_CONSOLE_NETWORK` if the Next.js service uses a different Docker network. The existing celld console can stay on port 8088 during preview.
+
 ## Verified in isolation
 
 The Compose overlay passed an isolated startup check using the locked dependencies from a local npm cache. All three Workers returned HTTP 200 from both health routes, and an authenticated Scheduler request created and read back a task, which remained available after stopping and restarting the entire stack.
