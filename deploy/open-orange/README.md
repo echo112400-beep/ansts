@@ -146,6 +146,8 @@ The same recovered stack subsequently ran a new Gateway submission through the r
 
 A metered repeat used the active tenant from the restored directory and ran native Body usage in shadow mode. Usage binding now checks the configured remote Body Worker when Scheduler and Body run separately. It forwards the authenticated host identity and requires the same execution owner, attempt, fence and input digest before creating the binding. The isolated task completed, the host drained result and usage outboxes, and the tenant usage page contained three new events for that task. A regression check rejects an owner mismatch and an unavailable remote authority without falling back to Scheduler-local state. This run verified recorded quantities; it did not settle a priced enforced reservation.
 
+A pricing repeat used the active tenant's restored rate activation without creating a replacement rate card. The new task generated three usage events and three immutable cost entries. The entries pinned the active rate before execution, the resource lines had exact prices with no pending reason, and at least one line had a positive exact charge. Every earlier entry matched the pre-run read, and the complete entry list matched after a Scheduler restart. This run checked ledger projection for a task without an enforced reservation. Budget replacement and a settlement receipt are still open for the combined stack.
+
 The inputs came from separate reads of isolated copies of the development bucket. This establishes that the restored data can coexist behind the normal Worker routes. It leaves a common fenced source checkpoint, workflow resumption and coordinated reverse transfer to be verified.
 
 ## State and cutover
