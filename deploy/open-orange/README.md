@@ -142,6 +142,8 @@ A single fresh Rivet Engine received the development Scheduler checkpoint, all 1
 
 A writable follow-up submitted a new tenant task through the normal Gateway. The first run immediately leased it to a previously registered host whose restored heartbeat had been given a new timestamp, even though no host was connected. Scheduler now restores the original heartbeat timestamp, with the persisted row time as a fallback for older data. After the change, the new task stayed queued across a Scheduler restart, all 121 prior task states remained identical, and a cross-tenant Gateway read was denied. A regression test also verified that a fresh heartbeat restores eligibility.
 
+The same recovered stack subsequently ran a new Gateway submission through the repository's native Body Agent and Docker Engine. The task remained queued while no fresh host was registered. After the isolated host joined, Scheduler and Body both reached COMPLETED with matching fencing, Gateway returned the expected output, and the host result outbox drained. All 121 pre-existing task states remained identical. The task used a resource profile sized for the isolated host. This execution ran with usage metering disabled and the observation binding deferred, so it verifies execution and result delivery only.
+
 The inputs came from separate reads of isolated copies of the development bucket. This establishes that the restored data can coexist behind the normal Worker routes. It leaves a common fenced source checkpoint, workflow resumption and coordinated reverse transfer to be verified.
 
 ## State and cutover
