@@ -301,7 +301,9 @@ export class BodyDaemonServer {
         if (renewing) return; renewing = true;
         try {
           const renewed = await this.rpc("/v1/scheduler/lease-renew", lease, AbortSignal.any([controller.signal, AbortSignal.timeout(2500)]));
-          if (!renewed.ok) controller.abort();
+          if (renewed.status >= 500) {
+            if (Date.now() >= leaseDeadline - 3000) controller.abort();
+          } else if (!renewed.ok) controller.abort();
           else {
             const state = await renewed.json() as { cancel_requested?: unknown; lease_expires_at?: number };
             leaseDeadline = (state.lease_expires_at ?? Date.now() / 1000 + 12) * 1000;

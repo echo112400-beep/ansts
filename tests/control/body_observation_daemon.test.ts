@@ -8,7 +8,7 @@ import {BodyDaemonServer} from '../../src/runtime/body_daemon_server.js';
 import {taskInputDigest} from '../../src/cloudflare/execution_attempt.js';
 import {verifyBodyEvidence,type BodyObservationBinding} from '../../src/control/body_execution_evidence.js';
 const image='node@sha256:'+'f'.repeat(64),token='a'.repeat(64),hostId='evidence-test';
-async function upstream(cancel=false){const server=http.createServer(async(request,response)=>{for await(const _ of request){}response.writeHead(200,{'content-type':'application/json'});response.end(JSON.stringify({cancel_requested:cancel,lease_expires_at:Date.now()/1000+30}));});await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));return {url:'http://127.0.0.1:'+(server.address() as {port:number}).port,async close(){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}};}
+async function upstream(cancel=false, status=(_path:string|undefined)=>200,leaseSeconds=30){const server=http.createServer(async(request,response)=>{for await(const _ of request){}response.writeHead(status(request.url),{'content-type':'application/json'});response.end(JSON.stringify({cancel_requested:cancel,lease_expires_at:Date.now()/1000+leaseSeconds}));});await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));return {url:'http://127.0.0.1:'+(server.address() as {port:number}).port,async close(){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));}};}
 const execution={kind:'container',image,argv:['true'],cpu:.25,memoryMb:128,timeoutMs:10000};
 function payload(){const inputDigest=taskInputDigest('tenant','task','work',execution);const binding:BodyObservationBinding={reservationId:'r1',generation:1,policyVersion:1,tenantVersion:1,requestDigest:'b'.repeat(64),executionInputDigest:inputDigest};return {tenantId:'tenant',taskId:'task',attemptId:'attempt',fencingToken:7,promptText:'work',execution,tenantAdmissionObservation:binding};}
 async function call(base:string,path:string,body:unknown,auth=true){return fetch(base+path,{method:'POST',headers:{'content-type':'application/json',...(auth?{authorization:'Body '+token,'x-ansts-body-id':hostId}:{})},body:JSON.stringify(body)});}
@@ -58,4 +58,48 @@ for(const uncertain of [false,true])test('agent observation '+(uncertain?'retain
   assert.equal(final.phase,uncertain?'UNCERTAIN':'TERMINATED');assert.equal(final.executionObserved,true);
   assert.equal((await (await fetch(base+'/health')).json()).recoveryRequired,uncertain);
  }finally{release();await daemon.stop();await control.close();rmSync(directory,{recursive:true,force:true});}
+});
+
+for (const {status, leaseSeconds, abort, label} of [
+  {status:503, leaseSeconds:30, abort:false, label:'retries a transient 503'},
+  {status:409, leaseSeconds:30, abort:true, label:'stops on a rejected lease'},
+  {status:503, leaseSeconds:4, abort:true, label:'stops when a 503 outlasts the lease safety window'},
+]) test(`Body Daemon ${label}`, async () => {
+  let renewals = 0;
+  let reportRenewal!: () => void;
+  const nextRenewal = new Promise<void>(resolve => { reportRenewal = resolve; });
+  const control = await upstream(false, path => {
+    if (path !== '/v1/scheduler/lease-renew' || ++renewals === 1) return 200;
+    if (renewals === 2) return status;
+    reportRenewal();
+    return 200;
+  }, leaseSeconds);
+  const directory = mkdtempSync(join(tmpdir(), 'ansts-body-renewal-'));
+  const daemon = new BodyDaemonServer({
+    nodeId: hostId, token, bodyWorkerUrl: control.url, storageDir: directory,
+    host: '127.0.0.1', port: 0, sandboxImage: image,
+    containerRuntime: {
+      recoverOrphans: async () => 0,
+      execute: async (_execution, signal, _output, lifecycle) => {
+        lifecycle?.started?.();
+        const stopped = await Promise.race([
+          nextRenewal.then(() => false),
+          new Promise<boolean>(resolve => signal.addEventListener('abort', () => resolve(true), {once:true})),
+        ]);
+        assert.equal(stopped, abort);
+        lifecycle?.stopped?.();
+        return {exitCode:0,executionOutcome:'SUCCEEDED',logs:'',logsTruncated:false,logsTailLimited:false,artifacts:[],artifactsTruncated:false};
+      },
+    },
+  });
+  try {
+    const {port} = await daemon.start();
+    const response = await call('http://127.0.0.1:' + port, '/v1/sandboxes/execute', payload());
+    assert.equal(response.status, 200);
+    assert.equal(renewals, abort ? 2 : 3);
+  } finally {
+    await daemon.stop();
+    await control.close();
+    rmSync(directory, {recursive:true,force:true});
+  }
 });
