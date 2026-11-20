@@ -1,11 +1,12 @@
-import { UffdLazyPageRestorer } from "../runtime/uffd_lazy_restorer";
-import { EbpfLsmRingBufferBridge } from "../runtime/ebpf_lsm_bridge";
+import { UffdLazyPageFaultRestorer } from "../runtime/uffd_lazy_restorer.js";
+import { EbpfLsmSecurityBridge } from "../runtime/ebpf_lsm_bridge.js";
 import { ConsoleSsePushGateway } from "./console_sse_push";
 import { ConsoleRbacAuthGuard, ConsoleRole, ConsolePermission } from "./console_rbac_guard";
 import { SpeculativeReadOnlyPrefetcher } from "../harness/speculative_prefetcher";
 import { CrossTenantAstRepairCache } from "../harness/ast_repair_cache";
 import { A2aWaitForGraphDeadlockDetector } from "../a2a/deadlock_detector";
-import { DistributedOrphanGcSweeper } from "../storage/distributed_gc_sweeper";
+import { DistributedCasGcSweeper } from "../storage/distributed_gc_sweeper.js";
+import { LayerFsWorkspaceDriver } from "../runtime/layerfs_workspace_driver.js";
 /**
  * @fileoverview TASK-88, M31, M34 & M35 (`TASK-142` ~ `TASK-147`):
  * Ultimate TanStack Enterprise Management Console BFF API Controller (`ConsoleBffController`).
@@ -32,6 +33,8 @@ import { DistributedOrphanGcSweeper } from "../storage/distributed_gc_sweeper";
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { tmpdir } from "node:os";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 /** Resolve the shipped version from the nearest package.json (repo root in dev, /app in a container). */
 function resolvePackageVersion(): string {
@@ -61,17 +64,16 @@ const ANSTS_PACKAGE_VERSION = resolvePackageVersion();
 import { ShadowTrafficReplayLab } from "./shadow_eval_lab";
 import { CapacitySlaEnforcer } from "../cluster/capacity_sla_enforcer";
 import { MultiRegionGeoRouter } from "../cluster/geo_routing";
-import { CanaryRolloutController } from "../cluster/canary_rollout_controller";
-import { ProductionChaosDrillRunner } from "../cluster/chaos_drill_runner";
+import type { SlotCanaryRolloutPlanner } from "../cluster/slot_canary_rollout_planner.js";
+import { LocalReliabilityDrillRunner } from "../cluster/local_reliability_drills.js";
 import { GeoSovereigntySlotPinningManager, SovereigntyComplianceRegime } from "../cluster/cross_region_replicator";
-import { HaPartitionedSchedulerMeshCoordinator } from "../cloudflare/ha_scheduler_shard_coordinator";
+import type { LocalSchedulerMesh } from "../cloudflare/local_scheduler_mesh.js";
 import { AgentStreamQueuePublisher } from "../gateway/stream_queue_publisher";
-import { EdgeTunnelHaDynamicRouter } from "../runtime/edge_tunnel_ha_router";
-import { ProductionPreflightGate } from "../runtime/preflight_gate";
+import { EdgeTunnelRoutePlanner } from "../runtime/edge_tunnel_ha_router.js";
+import { SandboxPreflightReadinessGate } from "../runtime/preflight_gate.js";
 import { SandboxBranchForker } from "../runtime/sandbox_branch_forker";
-import { SpotHostEvacuationArbiter, SpotEvacuationReport } from "../runtime/predictive_prewarmer";
-import { ZeroTrustSecurityGuard } from "../runtime/zero_trust_security_guard";
-import { SandboxProvenanceAttestor, SlsaProvenanceAttestation } from "../runtime/slsa_provenance_attestor";
+import { LocalSpotEvacuation, type SpotEvacuationReport } from "../runtime/local_spot_evacuation.js";
+import { SlsaProvenanceAttestor, type SlsaProvenanceStatement } from "../runtime/slsa_provenance_attestor.js";
 import { WarmLspDaemonPool } from "../saga/mcp_streamable_hub";
 import { StagingCommitAndApprovalGate } from "../saga/staging";
 import { DeterministicTimeTravelReplayer } from "../checkpoint/time_travel";
@@ -125,17 +127,16 @@ export interface VirtualSlotHeatmapCell {
 export class ConsoleBffController {
   public readonly slaEnforcer = new CapacitySlaEnforcer();
   public readonly shadowLab = new ShadowTrafficReplayLab();
-  public readonly preflightGate = new ProductionPreflightGate();
+  public readonly preflightGate = new SandboxPreflightReadinessGate();
   public readonly liveHarnessCells = new Map<string, LiveHarnessCellTelemetry>();
-  public readonly branchForkerProbe = new SandboxBranchForker("/tmp/ansts_bff_cow_probe");
-  public readonly chaosRunner = new ProductionChaosDrillRunner();
+  public readonly branchForkerProbe = new SandboxBranchForker();
+  public readonly chaosRunner = new LocalReliabilityDrillRunner();
   public readonly sovereigntyPinMgr = new GeoSovereigntySlotPinningManager();
   public readonly stagingGate = new StagingCommitAndApprovalGate();
   public readonly timeTravelReplayer = new DeterministicTimeTravelReplayer();
   public readonly continuousProfiler = new OnlineContinuousProfiler("/tmp/ansts_bff_profiles");
-  public readonly spotArbiter = new SpotHostEvacuationArbiter("/tmp/ansts_bff_spot_evac");
-  public readonly securityGuard = new ZeroTrustSecurityGuard("/tmp/ansts_bff_cgroup_sec");
-  public readonly slsaAttestor = new SandboxProvenanceAttestor();
+  public readonly spotArbiter: LocalSpotEvacuation;
+  public readonly slsaAttestor = new SlsaProvenanceAttestor();
   public readonly lspPool = new WarmLspDaemonPool();
   public readonly gitArbiter = new GitConflictArbiterCell();
   public readonly a2aBus = new A2aBlackboardBus();
@@ -144,12 +145,12 @@ export class ConsoleBffController {
   public readonly affinityRouter = new PrefixCacheAffinityRouter();
   public readonly ssePushGateway = new ConsoleSsePushGateway();
   public readonly rbacGuard = new ConsoleRbacAuthGuard();
-  public readonly uffdRestorer = new UffdLazyPageRestorer();
-  public readonly ebpfBridge: EbpfLsmRingBufferBridge;
+  public readonly uffdRestorer = new UffdLazyPageFaultRestorer();
+  public readonly ebpfBridge = new EbpfLsmSecurityBridge();
   public readonly speculativePrefetcher = new SpeculativeReadOnlyPrefetcher();
   public readonly astRepairCache = new CrossTenantAstRepairCache();
   public readonly deadlockDetector = new A2aWaitForGraphDeadlockDetector();
-  public readonly gcSweeper = new DistributedOrphanGcSweeper("/tmp/ansts_bff_gc_sandboxes", "/tmp/ansts_bff_gc_ltx");
+  public readonly gcSweeper = new DistributedCasGcSweeper();
 
   public readonly taskRegistry = new Map<string, AgentTask>();
   public readonly attestedBranches: Array<{
@@ -160,21 +161,22 @@ export class ConsoleBffController {
     lspLookupLatencyMs: number;
     lspDiagnosticsCount: number;
     slsaVerified: boolean;
-    attestation: SlsaProvenanceAttestation;
+    attestation: SlsaProvenanceStatement;
   }> = [];
   public lastSpotEvacuationReport: SpotEvacuationReport | null = null;
   public s3CasGeneration = 1;
   public lastMeasuredCowForkMs = 0;
-  public lastMeasuredMtlsRttMs = 0;
+  public lastMeasuredMtlsRttMs: number | null = null;
 
   constructor(
-    public readonly tunnelRouter: EdgeTunnelHaDynamicRouter,
+    public readonly tunnelRouter: EdgeTunnelRoutePlanner,
     public readonly geoRouter: MultiRegionGeoRouter,
     public readonly streamPublisher: AgentStreamQueuePublisher,
-    public readonly schedulerMesh?: HaPartitionedSchedulerMeshCoordinator,
-    public readonly canaryController?: CanaryRolloutController,
+    public readonly schedulerMesh?: LocalSchedulerMesh,
+    public readonly canaryController?: SlotCanaryRolloutPlanner,
+    spotEvacuation?: LocalSpotEvacuation,
   ) {
-    this.ebpfBridge = new EbpfLsmRingBufferBridge(this.securityGuard);
+    this.spotArbiter = spotEvacuation ?? new LocalSpotEvacuation(fs.mkdtempSync(path.join(tmpdir(), "ansts-console-spot-")));
     // Demo seeds are opt-in: a real deployment fills the roster from actual registrations.
     if (process.env.ANSTS_CONSOLE_SEED_DEMO === "1") {
       this.ensureDefaultConsoleSeedData();
@@ -184,27 +186,16 @@ export class ConsoleBffController {
   public recordLiveTaskExecution(entry: LiveHarnessCellTelemetry): void {
     this.liveHarnessCells.set(entry.taskId, entry);
     if (!this.taskRegistry.has(entry.taskId)) {
-      this.taskRegistry.set(
-        entry.taskId,
-        new AgentTask({
-          taskId: entry.taskId,
-          tenantId: entry.tenantId,
-          state: TaskState.RUNNING,
-        }),
-      );
+      const task = new AgentTask({ task_id: entry.taskId, tenant_id: entry.tenantId });
+      task.state = entry.phase === "EXECUTION_8C" ? TaskState.RUNNING_ACT : TaskState.RUNNING_THINK;
+      this.taskRegistry.set(entry.taskId, task);
     }
     this.s3CasGeneration += 1;
     this.ssePushGateway.broadcastDeltaEvent("TASK_DISPATCHED", `v1-gen-${this.s3CasGeneration}`, { taskId: entry.taskId });
   }
 
   public countPersistedWalFilesOnDisk(): number {
-    const dir = this.streamPublisher.walEngine.walDir;
-    if (!fs.existsSync(dir)) return 0;
-    try {
-      return fs.readdirSync(dir).filter((f) => f.endsWith(".wal")).length;
-    } catch {
-      return 0;
-    }
+    return this.streamPublisher.walEngine.countPersistedStreamFrames();
   }
 
   public measureLiveCowForkLatencyMs(): number {
@@ -215,23 +206,6 @@ export class ConsoleBffController {
     const brn = this.branchForkerProbe.forkBranch("sbx-bff-probe", chk.checkpointId);
     this.lastMeasuredCowForkMs = brn.forkLatencyMs;
     return this.lastMeasuredCowForkMs;
-  }
-
-  public measureLiveTunnelRttMs(): number {
-    if (this.lastMeasuredMtlsRttMs > 0) return this.lastMeasuredMtlsRttMs;
-    const firstHost = Array.from(this.tunnelRouter.routeTable.keys())[0];
-    if (!firstHost) return 0.1;
-    const res = this.tunnelRouter.dispatchCommandToDaemon({
-      commandId: `rtt-probe-${Date.now()}`,
-      taskId: "task-prod-101",
-      sandboxId: "sbx-probe-01",
-      targetBodyHostId: firstHost,
-      fence: { epoch: 3, turnSeq: 1 },
-      action: "CGROUP_THROTTLE_0_1C",
-      payload: {},
-    });
-    this.lastMeasuredMtlsRttMs = res.response.latencyMs;
-    return this.lastMeasuredMtlsRttMs;
   }
 
   public ensureDefaultConsoleSeedData(): void {
@@ -330,27 +304,16 @@ export class ConsoleBffController {
         phase: "EXECUTION_8C",
       });
 
-      // Seed FinOps budget & real turn spend
-      this.finOpsController.registerTenantBudget("fin-enterprise", 50.0, 0.8);
-      this.finOpsController.registerTenantBudget("quant-alpha", 30.0, 0.8);
+      for (const [tenantId, dailyBudgetUsd] of [["fin-enterprise", 50], ["quant-alpha", 30]] as const) {
+        this.finOpsController.configureTenant({
+          tenantId, dailyBudgetUsd, softDowngradeThresholdRatio: 0.8,
+          preferredModel: "DeepSeek", fallbackEconomyModel: "Qwen-3.8",
+        });
+      }
       const t1 = this.taskRegistry.get("task-prod-101")!;
-      this.finOpsController.recordTurnSpend({
-        task: t1,
-        pool: "DeepSeek",
-        inputTokens: 4200,
-        reasoningTokens: 1800,
-        outputTokens: 950,
-        activeCpuCoreSeconds: 12.5,
-      });
-
-      // Stage 1 initial STAGED_COMMIT high-risk approval request so the Top Navbar Bell is active
-      this.stagingGate.stageWrite(
-        t1,
-        new FenceToken(3, 14, "task-prod-101"),
-        "k8s_prod_ConfigMap_apply",
-        JSON.stringify({ namespace: "prod-trading", maxLeverage: 5, dryRun: false }),
-        true,
-      );
+      const demoArgs = { namespace: "demo", maxLeverage: 5, dryRun: true };
+      this.stagingGate.stageEffect({ effectId: "demo-approval", taskId: t1.task_id, turnIndex: 14, toolName: "k8s_configmap_preview", args: demoArgs });
+      this.stagingGate.requestHumanApproval(t1, "k8s_configmap_preview", demoArgs);
 
       // Pre-warm LSP index & 1 initial attested CoW branch
       this.lspPool.prewarmWorkspaceLspIndex("sbx-bff-probe", "typescript", {
@@ -430,10 +393,7 @@ export class ConsoleBffController {
       },
     );
 
-    let pendingHitlCount = 0;
-    for (const list of this.stagingGate.stagedItems.values()) {
-      pendingHitlCount += list.filter((it) => it.requireHumanApproval && !it.approved).length;
-    }
+    const pendingHitlCount = this.stagingGate.listApprovalTickets().filter(ticket => ticket.status === "PENDING").length;
 
     return {
       version: ANSTS_PACKAGE_VERSION,
@@ -445,7 +405,7 @@ export class ConsoleBffController {
       activeSessionsCount: this.liveHarnessCells.size,
       pendingHitlApprovalsCount: pendingHitlCount,
       globalUptimePct: brainVerdict.allowed && rustFsVerdict.rpoZeroGuaranteed ? 100.0 : 99.5,
-      averageMtlsRttMs: this.measureLiveTunnelRttMs(),
+      averageMtlsRttMs: this.lastMeasuredMtlsRttMs,
       turnWalCheckpointsCount: this.countPersistedWalFilesOnDisk() + (params.extraTurnWalCheckpoints ?? 0),
       sandboxes: {
         active: params.activeSandboxes,
@@ -462,9 +422,7 @@ export class ConsoleBffController {
    * 2. Body Fleet & Zero-Trust / Spot Evacuation Tab BFF Endpoint (`GET /v1beta1/console/fleet`)
    */
   public getFleetStatus() {
-    const preflight = this.preflightGate.runPreflightChecks({
-      ANSTS_RUNTIME_PROFILE: "test",
-    });
+    const preflight = this.preflightGate.probeLiveHostReadiness();
 
     const hosts: BodyHostFleetRow[] = Array.from(this.tunnelRouter.routeTable.values()).map(
       (rt, idx) => {
@@ -499,16 +457,11 @@ export class ConsoleBffController {
         cowForkSlaMs: this.measureLiveCowForkLatencyMs(),
       },
       preflightChecks: [
-        { check: "ANSTS_RUNTIME_PROFILE=production", passed: true },
-        { check: "Cgroups v2 unified hierarchy mounted (cpu.max, memory.high, cgroup.freeze)", passed: true },
-        { check: "RustFS S3 EC:4 quorum verified (12/12 drives healthy, Tol: 4)", passed: true },
-        { check: "TLS 1.3 SPIFFE X.509 SVID cert bundle loaded", passed: preflight.passed },
+        { check: "Local host disk and memory", passed: preflight.ready },
+        { check: "Local cgroup v2 controller availability", passed: fs.existsSync("/sys/fs/cgroup/cgroup.controllers") },
+        { check: "Local shared memory mount", passed: preflight.devShmAvailable },
       ],
-      zeroTrustStatus: {
-        frozenSandboxes: Array.from(this.securityGuard.frozenSandboxes),
-        issuedEphemeralTokensCount: this.securityGuard.issuedTokens.size,
-        recentAuditEvents: this.securityGuard.securityAuditLog.slice(-8),
-      },
+      zeroTrustStatus: this.ebpfBridge.inspectHostKernelSecurityPosture(),
       lastSpotEvacuationReport: this.lastSpotEvacuationReport,
       hosts,
     };
@@ -518,19 +471,6 @@ export class ConsoleBffController {
    * Triggers Spot Host Termination 2-Minute Warning Live Evacuation (`POST /v1beta1/console/spot/evacuate`)
    */
   public triggerSpotHostEvacuation(spotHostId: string): SpotEvacuationReport {
-    const hostNode = this.spotArbiter.bodyHosts.get(spotHostId);
-    if (hostNode && hostNode.activeSandboxes.size === 0) {
-      // Ensure at least 1 active sandbox is present on the Spot host before evacuating if re-triggered
-      hostNode.healthy = true;
-      hostNode.cordoned = false;
-      this.spotArbiter.placeSandboxOnCostOptimalHost({
-        taskId: "task-prod-101",
-        sandboxId: `sbx-spot-${Date.now()}`,
-        fence: new FenceToken(3, 15, "task-prod-101"),
-        allowSpotInstance: true,
-        initialFiles: { "src/hotfix.ts": "export const hotfix = true;" },
-      });
-    }
     const report = this.spotArbiter.evacuateSpotHostOnTerminationNotice(spotHostId);
     this.lastSpotEvacuationReport = report;
     this.s3CasGeneration += 1;
@@ -542,14 +482,14 @@ export class ConsoleBffController {
    */
   public getHarnessAndShardsStatus(heapUsedMb: number) {
     const shards = this.schedulerMesh
-      ? Array.from(this.schedulerMesh.shardCells.values()).map((s, idx) => {
-          const p2cShard = this.schedulerMesh!.p2cRouter.shards.get(s.shardId);
+      ? Array.from(this.schedulerMesh.shardCells.values()).map((s) => {
+          const slots = [...this.schedulerMesh!.slotRing.slots].filter(([, slot]) => slot.ownerShardId === s.shardId).map(([index]) => index);
           return {
             shardId: s.shardId,
             hostBrainNodeId: s.hostBrainNodeId,
-            assignedSlots: `${idx * 85}..${Math.min(255, (idx + 1) * 85 - 1)}`,
+            assignedSlots: slots.join(","),
             inFlightRequests: s.queuedTaskIds.size,
-            ewmaLatencyMs: Number((p2cShard?.ewmaLatencyMs ?? 0.45).toFixed(2)),
+            ewmaLatencyMs: null,
             status: s.healthy ? ("STEADY" as const) : ("DRAINING" as const),
             epoch: this.schedulerMesh!.slotRing.generation,
           };
@@ -632,14 +572,13 @@ export class ConsoleBffController {
     if (!this.schedulerMesh) {
       throw new Error("SchedulerMeshNotInitialized");
     }
-    const nextGen = this.schedulerMesh.slotRing.generation + 1;
-    const res = this.schedulerMesh.migrateSlotOnlineAndFlushBuffer(slotIndex, targetShardId, nextGen);
+    const res = this.schedulerMesh.migrateSlotOnlineAndFlushBuffer(slotIndex, targetShardId);
     this.s3CasGeneration += 1;
     return {
       slotIndex,
       targetShardId,
       newEpoch: res.newEpoch,
-      flushedCount: res.flushedRequests.length,
+      flushedCount: res.flushedEnvelopes.length,
       s3CasGeneration: `v1-gen-${this.s3CasGeneration}`,
     };
   }
@@ -663,7 +602,7 @@ export class ConsoleBffController {
    * 3e. Interactive Production Chaos Engineering Drill Runner (`POST /v1beta1/console/chaos/run`)
    */
   public runChaosEngineeringDrills() {
-    const summary = this.chaosRunner.runAllProductionDrills();
+    const summary = this.chaosRunner.run();
     this.s3CasGeneration += 1;
     return {
       ...summary,
@@ -708,14 +647,6 @@ export class ConsoleBffController {
 
     const notices = this.tunnelRouter.initiateMakeBeforeBreakDrain(gatewayId, gracePeriodMs);
 
-    if (routeByHost && routeByHost.secondaryGatewayId) {
-      const oldPrimary = routeByHost.primaryGatewayId;
-      routeByHost.primaryGatewayId = routeByHost.secondaryGatewayId;
-      routeByHost.secondaryGatewayId = oldPrimary;
-      routeByHost.connGeneration += 1;
-      routeByHost.updatedAtMs = Date.now();
-    }
-
     this.s3CasGeneration += 1;
     return {
       requestedTargetId: targetId,
@@ -748,19 +679,19 @@ export class ConsoleBffController {
         {
           seq: 14,
           eventType: "REASONING_CHUNK",
-          state: TaskState.THINKING_GEN,
+          state: TaskState.RUNNING_THINK,
           payload: { action: "REASONING_CHUNK", tokens: 96, model: "DeepSeek" },
         },
         {
           seq: 15,
           eventType: "REASONING_CHUNK",
-          state: TaskState.THINKING_GEN,
+          state: TaskState.RUNNING_THINK,
           payload: { action: "REASONING_CHUNK", tokens: 128, model: "DeepSeek" },
         },
         {
           seq: 16,
           eventType: "TOOL_EXEC_PULSE",
-          state: TaskState.TOOL_EXEC,
+          state: TaskState.RUNNING_ACT,
           payload: { action: "TOOL_EXEC_PULSE", sandbox: "sbx-01", cpuBurst: "8.0C" },
         },
         {
@@ -799,42 +730,19 @@ export class ConsoleBffController {
    * 5b. HITL `STAGED_COMMIT` Queue & Time-Travel Timeline (`GET /v1beta1/console/hitl-timetravel`)
    */
   public getHitlAndTimeTravelState(taskId: string = "task-prod-101") {
-    this.replayMissedWalFrames("console-operator-client", taskId, 17);
     const frames = this.streamPublisher.walEngine.listTaskFrames(taskId);
-    const pendingStaged: Array<{
-      taskId: string;
-      toolName: string;
-      payload: string;
-      epoch: number;
-      turnSeq: number;
-      approved: boolean;
-    }> = [];
-
-    for (const [tId, items] of this.stagingGate.stagedItems.entries()) {
-      for (const it of items) {
-        pendingStaged.push({
-          taskId: tId,
-          toolName: it.toolName,
-          payload: it.payload,
-          epoch: it.fence.epoch,
-          turnSeq: it.fence.turnSeq,
-          approved: it.approved,
-        });
-      }
-    }
-
+    const effects = this.stagingGate.getStagedEffects(taskId);
+    const pendingStaged = this.stagingGate.listApprovalTickets(taskId).filter(ticket => ticket.status === "PENDING");
+    const committedLedger = effects.filter(effect => effect.committed);
     return {
       taskId,
       pendingStagedItems: pendingStaged,
-      committedLedgerCount: this.stagingGate.committedProductionLedger.length,
-      committedLedger: this.stagingGate.committedProductionLedger.slice(-10),
+      committedLedgerCount: committedLedger.length,
+      committedLedger: committedLedger.slice(-10),
       walTimeline: frames.map((f) => ({
         turnSeq: f.fence.turnSeq,
         epoch: f.fence.epoch,
         state: f.state,
-        routedModel: f.routedModel,
-        tokensUsed: f.tokensUsed,
-        workspaceMerkleHash: f.workspaceMerkleHash,
         diffSnapshot: f.diffSnapshot,
       })),
     };
@@ -846,59 +754,43 @@ export class ConsoleBffController {
   public decideHitlStagedCommit(params: {
     taskId: string;
     decision: "approve" | "reject" | "stage_new";
+    operatorToken: string;
+    ticketId?: string;
     toolName?: string;
     payload?: string;
   }) {
-    let task = this.taskRegistry.get(params.taskId);
-    if (!task) {
-      task = new AgentTask({ taskId: params.taskId, tenantId: "fin-enterprise" });
-      this.taskRegistry.set(params.taskId, task);
-    }
+    const { claims } = this.rbacGuard.verifyAndAuthorizeAction(params.operatorToken, "hitl:approve");
+    const task = this.taskRegistry.get(params.taskId);
+    if (!task) throw new Error("TASK_NOT_FOUND");
 
     if (params.decision === "stage_new") {
-      const staged = this.stagingGate.stageWrite(
-        task,
-        new FenceToken(3, 18, params.taskId),
-        params.toolName ?? "db_prod_schema_migration",
-        params.payload ?? JSON.stringify({ alterTable: "orders", dropColumn: "legacy_flag" }),
-        true,
-      );
+      const toolName = params.toolName?.trim();
+      const args: unknown = JSON.parse(params.payload ?? "{}");
+      if (!toolName || !args || typeof args !== "object" || Array.isArray(args)) throw new Error("INVALID_STAGED_TOOL");
+      const effectArgs = { ...args };
+      const staged = this.stagingGate.stageEffect({ effectId: randomUUID(), taskId: task.task_id, turnIndex: task.current_turn, toolName, args: effectArgs });
+      const ticket = this.stagingGate.requestHumanApproval(task, toolName, effectArgs);
       this.s3CasGeneration += 1;
-      return { action: "STAGED", staged, taskState: task.state };
+      return { action: "STAGED", staged, ticket, taskState: task.state };
     }
 
-    if (params.decision === "approve") {
-      const approvedCount = this.stagingGate.approveAndResume(task);
-      const flushedCount = this.stagingGate.atomicFlush(params.taskId);
-      this.s3CasGeneration += 1;
-      return {
-        action: "APPROVED_AND_COMMITTED",
-        approvedCount,
-        flushedCount,
-        taskState: task.state,
-        committedLedgerCount: this.stagingGate.committedProductionLedger.length,
-      };
-    }
-
-    // Reject & discard staged buffer
-    const discarded = (this.stagingGate.stagedItems.get(params.taskId) ?? []).length;
-    this.stagingGate.stagedItems.delete(params.taskId);
-    task.state = TaskState.RUNNING;
+    const ticket = this.stagingGate.listApprovalTickets(task.task_id).find(value => value.ticketId === params.ticketId);
+    if (!ticket) throw new Error("APPROVAL_TICKET_NOT_FOUND");
+    const approved = params.decision === "approve";
+    const decision = this.stagingGate.resolveApproval(ticket.ticketId, approved, claims.sub, task);
     this.s3CasGeneration += 1;
-    return {
-      action: "REJECTED_AND_ROLLED_BACK",
-      discardedCount: discarded,
-      taskState: task.state,
-    };
+    return { action: approved ? "APPROVED" : "REJECTED", ticket: decision, taskState: task.state };
   }
 
   /**
    * 5d. Zero-Token Time-Travel Replay & CoW Branch Fork from Turn #N (`POST /v1beta1/console/timetravel/fork`)
    */
   public forkFromHistoricalTurn(taskId: string, targetTurnSeq: number) {
-    this.replayMissedWalFrames("console-operator-client", taskId, 17);
-    const frames = this.streamPublisher.walEngine.listTaskFrames(taskId);
-    const replay = this.timeTravelReplayer.replayToTurn(taskId, frames, targetTurnSeq);
+    const task = this.taskRegistry.get(taskId);
+    if (!task) throw new Error("TASK_NOT_FOUND");
+    const walEntries = this.streamPublisher.walEngine.getTaskWalEntries(taskId);
+    const forkedTaskId = `${taskId}-fork-t${targetTurnSeq}`;
+    const replay = this.timeTravelReplayer.forkTaskAtTurn(task, walEntries, targetTurnSeq, forkedTaskId);
 
     const chk = this.branchForkerProbe.createCheckpoint(
       `sbx-${taskId}`,
@@ -906,12 +798,11 @@ export class ConsoleBffController {
       { "restored_state.json": JSON.stringify(replay) },
     );
     const forkedBranch = this.branchForkerProbe.forkBranch(`sbx-${taskId}`, chk.checkpointId);
-    const forkedTaskId = `${taskId}-fork-t${targetTurnSeq}`;
 
     this.recordLiveTaskExecution({
       cellId: `AgentTaskHarnessCell_#${forkedTaskId}`,
       taskId: forkedTaskId,
-      tenantId: "fin-enterprise",
+      tenantId: task.tenant_id,
       ownerBrainNode: "brain-node-02",
       heapUsedMb: Number((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1)),
       heapLimitMb: 128,
@@ -926,9 +817,9 @@ export class ConsoleBffController {
     return {
       sourceTaskId: taskId,
       forkedTaskId,
-      replayedUpToTurn: replay.replayedUpToTurn,
-      tokensBilledDuringReplay: replay.tokensBilledDuringReplay,
-      restoredWorkspaceHash: replay.restoredWorkspaceHash,
+      replayedUpToTurn: replay.restoredTurnIndex,
+      tokensBilledDuringReplay: 0,
+      inheritedFiles: replay.inheritedFiles,
       forkedBranchId: forkedBranch.branchId,
       forkLatencyMs: forkedBranch.forkLatencyMs,
     };
@@ -1025,16 +916,14 @@ export class ConsoleBffController {
       [patchFile]: patchContent,
     });
 
-    const attestation = this.slsaAttestor.generateBranchAttestation({
-      sandboxId,
-      branchId: branch.branchId,
-      artifactName: patchFile,
-      patchContent,
-      baseCheckpointMerkleRoot: chk.merkleRootSha256,
-      turnWalDiffSnapshots: [patchContent],
-      securityGuard: this.securityGuard,
+    const attestation = this.slsaAttestor.createSignedProvenanceStatement({
+      builderId: "ansts-console-layerfs-preview",
+      imageReference: "local/sandbox-branch-patch",
+      sha256Digest: createHash("sha256").update(patchContent, "utf8").digest("hex"),
+      commitId: chk.checkpointId,
+      fileCount: 1,
     });
-    const verifyRes = this.slsaAttestor.verifyAttestationForMergeGate(attestation, patchContent);
+    const slsaVerified = this.slsaAttestor.verifyProvenanceStatement(attestation);
 
     const record = {
       branchId: branch.branchId,
@@ -1043,7 +932,7 @@ export class ConsoleBffController {
       forkLatencyMs: branch.forkLatencyMs,
       lspLookupLatencyMs: lspDiag.lookupLatencyMs,
       lspDiagnosticsCount: lspDiag.branchDiagnostics.length,
-      slsaVerified: verifyRes.verified,
+      slsaVerified,
       attestation,
     };
     this.attestedBranches.unshift(record);
@@ -1055,9 +944,9 @@ export class ConsoleBffController {
    * 8. 5D W-DRF Quota Radar, FinOps Burn-Rate & KV-Cache Savings (`GET /v1beta1/console/finops-wdrf`)
    */
   public getFinOpsAndWdrfRadar() {
-    const tenantBudgets = Array.from(this.finOpsController.budgets.values()).map((b) => {
-      const totalSpent = Number((b.spentModelUsd + b.spentSandboxUsd).toFixed(4));
-      const utilizationPct = Number(((totalSpent / Math.max(0.01, b.dailyHardCapUsd)) * 100).toFixed(1));
+    const tenantBudgets = this.finOpsController.listBudgetUsage().map((b) => {
+      const totalSpent = Number(b.spentUsd.toFixed(4));
+      const utilizationPct = Number(((totalSpent / Math.max(0.01, b.dailyBudgetUsd)) * 100).toFixed(1));
       return {
         ...b,
         totalSpentUsd: totalSpent,
@@ -1119,23 +1008,14 @@ export class ConsoleBffController {
   }
 
   public runV27DeepTechSuiteProbe() {
-    // 1. TASK-148: UFFD Lazy MicroVM Snapshot Restore (<10ms hot working-set pread + demand page fault)
-    const snap = this.uffdRestorer.createMemorySnapshot({
-      snapshotId: "snap-microvm-v27",
-      totalPages: 32,
-      hotPageIndices: [0, 1, 2, 3],
-    });
-    const vm = this.uffdRestorer.restoreMicroVmWithUffd("vm-uffd-01", snap.snapshotId);
-    const faultRes = this.uffdRestorer.handleUffdPageFault("vm-uffd-01", 15);
-
-    // 2. TASK-149: eBPF LSM RingBuffer Zero-Copy Violation Probe (<1ms Cgroup Freeze)
-    this.ebpfBridge.emitKernelLsmEvent({
-      pid: 4192,
-      sandboxId: "sbx-ebpf-rogue-01",
-      hook: "lsm/file_open",
-      targetResource: "/etc/shadow",
-    });
-    const ebpfRes = this.ebpfBridge.consumeAndEnforceRingBuffer();
+    this.uffdRestorer.stageBufferInto4KiBPages(new Uint8Array(32 * 4096));
+    const prefetchStarted = performance.now();
+    for (const page of [0, 1, 2, 3]) this.uffdRestorer.handlePageFault(page);
+    const hotPrefetchLatencyMs = performance.now() - prefetchStarted;
+    const demandStarted = performance.now();
+    this.uffdRestorer.handlePageFault(15);
+    const demandFaultLatencyMs = performance.now() - demandStarted;
+    const ebpfRes = this.ebpfBridge.checkFileOpenHook("/etc/shadow");
 
     // 3. TASK-152: Speculative Read-Only Tool Prefetch during THINKING_GEN (0ms perceived hit)
     const wsFile = `${this.speculativePrefetcher.workspaceRootDir}/src_config.ts`;
@@ -1155,30 +1035,20 @@ export class ConsoleBffController {
     );
 
     // 5. TASK-154: Multi-Agent A2A Wait-For Graph Tarjan SCC Deadlock Detector (<50ms)
-    this.deadlockDetector.addWaitDependency({
-      waiterTaskId: "agent-alpha",
-      blockerTaskId: "agent-beta",
-      resourceTopic: "db_schema_lock",
-      waiterPriorityWeight: 10,
-      registeredAtMs: Date.now(),
-    });
-    this.deadlockDetector.addWaitDependency({
-      waiterTaskId: "agent-beta",
-      blockerTaskId: "agent-alpha",
-      resourceTopic: "api_contract_lock",
-      waiterPriorityWeight: 5,
-      registeredAtMs: Date.now(),
-    });
-    const deadlockRes = this.deadlockDetector.detectAndBreakDeadlockCycles();
+    this.deadlockDetector.addWaitEdge("agent-alpha", "agent-beta");
+    this.deadlockDetector.addWaitEdge("agent-beta", "agent-alpha");
+    const detectionStarted = performance.now();
+    const resolution = this.deadlockDetector.resolveCycleWithLowestPriorityVictim({ "agent-alpha": 10, "agent-beta": 5 });
+    const deadlockRes = {
+      deadlockDetected: resolution.cyclePath.length > 0,
+      cycles: resolution.cyclePath.length ? [resolution.cyclePath] : [],
+      preemptedVictimTaskIds: resolution.evictedVictims,
+      detectionLatencyMs: performance.now() - detectionStarted,
+    };
 
-    // 6. TASK-155: Distributed Orphan Sandbox & Expired LTX Garbage Collector
-    const orphanDir = `${this.gcSweeper.sandboxRootDir}/sbx-orphan-terminated-99`;
-    fs.mkdirSync(orphanDir, { recursive: true });
-    fs.writeFileSync(`${orphanDir}/block.img`, Buffer.alloc(8192, 1));
-    const gcRes = this.gcSweeper.runOrphanAndLtxSweep({
-      activeSandboxAndCellIds: new Set(["task-prod-101", "sbx-bff-probe"]),
-      retentionWindowMs: 0,
-    });
+    const gcWorkspace = new LayerFsWorkspaceDriver();
+    gcWorkspace.storeEngine.putFileObject("orphan.blob", randomBytes(16_384).toString("base64"));
+    const gcRes = this.gcSweeper.sweepLayerFsWorkspaceStore(gcWorkspace);
 
     this.s3CasGeneration += 1;
     this.ssePushGateway.broadcastDeltaEvent(
@@ -1189,16 +1059,11 @@ export class ConsoleBffController {
 
     return {
       uffd: {
-        vmId: vm.vmId,
-        hotPrefetchLatencyMs: vm.hotPrefetchLatencyMs,
-        demandFaultLatencyMs: faultRes.faultServiceLatencyMs,
-        residentPagesCount: faultRes.residentPageCount,
+        hotPrefetchLatencyMs,
+        demandFaultLatencyMs,
+        residentPagesCount: this.uffdRestorer.getStats().faultedPagesCount,
       },
-      ebpfLsm: {
-        processedCount: ebpfRes.processedCount,
-        frozenSandboxes: ebpfRes.frozenSandboxes,
-        processingLatencyMs: ebpfRes.processingLatencyMs,
-      },
+      ebpfLsm: ebpfRes,
       speculativePrefetch: {
         speculativeCacheHit: prefetchExec.speculativeCacheHit,
         perceivedExecutionLatencyMs: prefetchExec.perceivedExecutionLatencyMs,

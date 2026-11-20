@@ -7,9 +7,31 @@
  * - Cryptographically chained audit log hashes (`prevHash -> entryHash`) so audit tampering is immediately detectable.
  */
 import * as crypto from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
 import type { ConsoleIdentityProfile } from "./console_identity_profile.js";
 
 export type ConsoleRole = "SRE_ADMIN" | "OPERATOR" | "VIEWER";
+const actionRules = {
+  "console:read": "read",
+  "tasks:dispatch": "write",
+  "hitl:approve": "write",
+  "tunnels:drain": "write",
+  "slots:migrate": "admin",
+  "canary:rollback": "admin",
+  "spot:evacuate": "admin",
+  "chaos:run": "admin",
+  "gc:sweep": "admin",
+} as const;
+
+export type ConsolePermission = keyof typeof actionRules;
+
+export class ConsoleRbacForbiddenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConsoleRbacForbiddenError";
+  }
+}
 
 export interface ConsoleJwtClaims {
   sub: string; // actor ID (e.g. "chen", "zhou", "lin", "xu")
@@ -51,11 +73,55 @@ export class ConsoleRbacAuthGuard {
     xu: { sub: "xu", role: "VIEWER", scopeRegion: "us-west-2", scopeTenant: "Northstar" },
   };
 
-  constructor(signingSecret = ConsoleRbacAuthGuard.DEFAULT_SECRET) {
+  constructor(signingSecret = ConsoleRbacAuthGuard.DEFAULT_SECRET, private readonly auditFilePath?: string) {
     this.signingSecret =
       typeof signingSecret === "string" && signingSecret.trim().length >= 16
         ? signingSecret.trim()
         : ConsoleRbacAuthGuard.DEFAULT_SECRET;
+    if (this.auditFilePath && existsSync(this.auditFilePath)) {
+      const lines = readFileSync(this.auditFilePath, "utf8").trim().split("\n").filter(Boolean);
+      for (const [index, line] of lines.entries()) {
+        const entry = JSON.parse(line) as ChainedAuditEntry;
+        if (!entry || entry.seq !== index + 1) throw new Error("INVALID_CONSOLE_AUDIT_SEQUENCE");
+        this.auditChain.push(entry);
+      }
+      this.lastChainHashHex = this.auditChain.at(-1)?.entryHashHex ?? this.lastChainHashHex;
+      if (!this.verifyAuditChainIntegrity().valid) throw new Error("INVALID_CONSOLE_AUDIT_CHAIN");
+    }
+  }
+
+  public issueOperatorJwt(params: { operatorId: string; role: ConsoleRole }): string {
+    return this.issueToken({ sub: params.operatorId, role: params.role, ttlSec: 900 });
+  }
+
+  public verifyAndAuthorizeAction(token: string, permission: ConsolePermission): {
+    claims: ConsoleJwtClaims;
+    auditEntry: ChainedAuditEntry & { allowed: boolean };
+  } {
+    const authentication = this.verifyAuthorizationHeader(`Bearer ${token}`);
+    const claims = authentication.claims;
+    if (!authentication.authenticated || !claims || !claims.sub.trim() || !Number.isSafeInteger(claims.exp) ||
+      typeof claims.scopeTenant !== "string" || typeof claims.scopeRegion !== "string" ||
+      !["VIEWER", "OPERATOR", "SRE_ADMIN"].includes(claims.role)) {
+      throw new ConsoleRbacForbiddenError("Invalid console credentials");
+    }
+    const rule = Object.hasOwn(actionRules, permission) ? actionRules[permission] : undefined;
+    const allowed = rule !== undefined && this.checkPermission({
+      role: claims.role,
+      isWriteMutation: rule !== "read",
+      requireAdminOnly: rule === "admin",
+    }).allowed && (rule === "read" || (claims.scopeRegion === "all" && claims.scopeTenant === "all"));
+    const audit = this.appendChainedAudit({
+      auditId: crypto.randomUUID(),
+      actor: claims.sub,
+      role: claims.role,
+      action: permission,
+      scope: `${claims.scopeRegion}/${claims.scopeTenant}`,
+      outcome: allowed ? "ALLOWED" : "DENIED",
+      timestampUtc: new Date().toISOString(),
+    });
+    if (!allowed) throw new ConsoleRbacForbiddenError("Console permission denied");
+    return { claims, auditEntry: { ...audit, allowed } };
   }
 
   private base64UrlEncode(input: string | Buffer): string {
@@ -333,6 +399,10 @@ export class ConsoleRbacAuthGuard {
       prevHashHex,
       entryHashHex,
     };
+    if (this.auditFilePath) {
+      mkdirSync(dirname(this.auditFilePath), { recursive: true, mode: 0o700 });
+      appendFileSync(this.auditFilePath, JSON.stringify(entry) + "\n", { encoding: "utf8", mode: 0o600 });
+    }
     this.auditChain.push(entry);
     this.lastChainHashHex = entryHashHex;
     return entry;

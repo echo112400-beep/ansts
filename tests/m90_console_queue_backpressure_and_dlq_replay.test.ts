@@ -31,7 +31,7 @@ test("M90: Queue Backpressure Matrix, Priority Load-Shedding Simulator & DLQ Rep
     });
     dlqTask.state = TaskState.DEAD_LETTER;
     dlqTask.retry_count = 4;
-    srv.managementPlane.deps.scheduler.allTasks.set(dlqTask.task_id, dlqTask);
+    srv.scheduler.allTasks.set(dlqTask.task_id, dlqTask);
 
     srv.managementPlane.executeQueueManagementAction({
       action: "enqueue_task",

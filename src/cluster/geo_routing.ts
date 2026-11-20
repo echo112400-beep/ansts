@@ -11,6 +11,44 @@ export interface GeoRegionNode {
   capacityAvailable: boolean;
 }
 
+export interface GeoAnycastRegion {
+  regionId: string;
+  gatewayEndpoint: string;
+  pingEwmaMs: number;
+  healthy: boolean;
+  activeSessions: number;
+}
+
+export class MultiRegionGeoRouter {
+  private readonly regions = new Map<string, GeoAnycastRegion>();
+
+  constructor(public currentPrimaryRegion: string) {}
+
+  public registerRegion(node: GeoAnycastRegion): void {
+    if (!node.regionId || !Number.isFinite(node.pingEwmaMs) || node.pingEwmaMs < 0) throw new RangeError("INVALID_REGION_METRICS");
+    this.regions.set(node.regionId, { ...node });
+  }
+
+  public updateRegionMetrics(regionId: string, pingMs: number, healthy: boolean): void {
+    const region = this.regions.get(regionId);
+    if (!region) return;
+    region.healthy = healthy && Number.isFinite(pingMs) && pingMs >= 0;
+    if (region.healthy) region.pingEwmaMs = region.pingEwmaMs * 0.8 + pingMs * 0.2;
+  }
+
+  public routeRequest(clientRegion: string): { selectedRegion: string | null; isFailover: boolean } {
+    const preferred = this.regions.get(clientRegion);
+    if (preferred?.healthy && preferred.pingEwmaMs < 250) return { selectedRegion: clientRegion, isFailover: false };
+    const fallback = [...this.regions.values()].filter(region => region.healthy).sort((left, right) =>
+      left.pingEwmaMs - right.pingEwmaMs || Number(right.regionId === this.currentPrimaryRegion) -
+      Number(left.regionId === this.currentPrimaryRegion) || left.regionId.localeCompare(right.regionId)
+    )[0];
+    if (!fallback) return { selectedRegion: null, isFailover: false };
+    this.currentPrimaryRegion = fallback.regionId;
+    return { selectedRegion: fallback.regionId, isFailover: fallback.regionId !== clientRegion };
+  }
+}
+
 export class GeoSovereigntyAndLatencyRouter {
   private readonly regions: GeoRegionNode[] = [];
   private sql?: SqlStorageLike;

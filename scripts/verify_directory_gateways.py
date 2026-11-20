@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Three isolated celld processes exercise the real Gateway and Fleet entries."""
 import base64
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
@@ -20,6 +21,10 @@ SERVICE = 'isolated-service-token-no-production-value-12345678'
 USER = 'isolated-user-signing-key-no-production-value-12345'
 COORDINATOR = 'isolated-admission-coordinator-no-production-value-12345'
 ADMISSION_KEY = 'a' * 64
+BODY_SECRET = 'f' * 64
+SCHEDULER_AUTH = 'Gateway ' + hmac.new(BODY_SECRET.encode(), b'ansts-body-v1:gateway:control', hashlib.sha256).hexdigest()
+TARGET_TOKEN = 'isolated-scheduler-target-token-no-production-value-12345'
+CONFIG_TOKEN = 'isolated-config-service-token-no-production-value-12345'
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 CONTAINERS = []
 
@@ -51,31 +56,66 @@ def ready(name):
         time.sleep(.25)
     raise RuntimeError(name + ' readiness timeout')
 
-def token(role='SRE_ADMIN', tenant='all'):
+def token(role='SRE_ADMIN', tenant='all', subject='github:1'):
     def enc(value):
         return base64.urlsafe_b64encode(json.dumps(value, separators=(',', ':')).encode()).rstrip(b'=').decode()
     now = int(time.time())
-    text = enc({'alg': 'HS256', 'typ': 'JWT'}) + '.' + enc({'sub': 'github:1', 'role': role,
+    text = enc({'alg': 'HS256', 'typ': 'JWT'}) + '.' + enc({'sub': subject, 'role': role,
         'scopeTenant': tenant, 'scopeRegion': 'all', 'iat': now, 'exp': now + 300})
     return text + '.' + base64.urlsafe_b64encode(hmac.new(USER.encode(), text.encode(), hashlib.sha256).digest()).rstrip(b'=').decode()
 
 with tempfile.TemporaryDirectory(prefix=PREFIX) as scratch:
     cmd('docker', 'network', 'create', PREFIX)
     try:
-        for label, entry in [('authority', 'worker.ts'), ('gateway-a', 'gateway_worker.ts'), ('gateway-b', 'gateway_worker.ts')]:
+        verify_rollout = os.environ.get('ANSTS_VERIFY_CONFIG_ROLLOUT')=='true'
+        global_targets=['fleet','fleet-secondary'] if verify_rollout else ['fleet']
+        processes=[('authority','worker.ts'),('gateway-a','gateway_worker.ts'),('gateway-b','gateway_worker.ts')]
+        if verify_rollout: processes.insert(1,('target-2','worker.ts'))
+        secondary=PREFIX+'-target-2'
+        secondary_origin='http://'+secondary+':8080'
+        for label, entry in processes:
             project = Path(scratch) / label
             project.mkdir()
-            subprocess.run([str(ROOT / 'node_modules/.bin/esbuild'), str(ROOT / 'src/cloudflare' / entry),
+            source = ROOT / 'src/cloudflare' / entry
+            if label == 'authority':
+                fixture = json.dumps(str(ROOT / 'scripts/period_native_fixture.ts'))
+                worker = json.dumps(str(source))
+                source = project / 'entry.ts'
+                source.write_text(f"""
+import worker from {worker};
+export * from {worker};
+export {{FixtureSettlementScheduler as AnstsSchedulerCell}} from {fixture};
+export default {{fetch(request, env) {{
+    if (new URL(request.url).pathname !== '/fixture/close-coverage') return worker.fetch(request, env);
+    const ns = env.ANSTS_SCHEDULER_CELL;
+    return ns.get(ns.idFromName('global-shard-0')).fetch(new Request('https://fixture/fixture-inventory-close-coverage', request));
+}}}};
+""")
+            subprocess.run([str(ROOT / 'node_modules/.bin/esbuild'), str(source),
                 '--bundle', '--format=esm', '--platform=neutral', '--external:node:*', '--outfile=' + str(project / 'worker.js')], check=True)
             config = {'name': PREFIX + '-' + label, 'main': 'worker.js', 'compatibility_date': '2025-08-15',
                 'compatibility_flags': ['nodejs_compat'], 'vars': {'ANSTS_DIRECTORY_SERVICE_TOKEN': SERVICE}}
             if label == 'authority':
-                config['vars'].update({'ANSTS_ADMISSION_SERVICE_TOKEN':COORDINATOR,'ANSTS_ADMISSION_SIGNING_KEY':ADMISSION_KEY})
-                config.update({'durable_objects': {'bindings': [{'name': 'ANSTS_TENANT_DIRECTORY_CELL', 'class_name': 'TenantDirectoryCell'}, {'name':'ANSTS_TENANT_CONTROL_CELL','class_name':'TenantControlCell'},{'name':'ANSTS_ADMISSION_MAILBOX','class_name':'AdmissionShadowMailboxCell'}]},
-                    'migrations': [{'tag': 'v1', 'new_sqlite_classes': ['TenantDirectoryCell','TenantControlCell','AdmissionShadowMailboxCell']}]})
+                config['vars'].update({'ANSTS_ADMISSION_SERVICE_TOKEN':COORDINATOR,'ANSTS_ADMISSION_SIGNING_KEY':ADMISSION_KEY,'ANSTS_CONFIG_SERVICE_TOKEN':CONFIG_TOKEN,'ANSTS_CONFIG_TARGET_TOKEN':TARGET_TOKEN,'ANSTS_BODY_AUTH_SECRET':BODY_SECRET,'ANSTS_CONFIG_SECRET_REFS':'provider/default','ANSTS_CONFIG_SCOPE_TARGETS_JSON':json.dumps({'global':global_targets}),'ANSTS_GITHUB_IDENTITIES_JSON':json.dumps({'1':{'role':'SRE_ADMIN','scopeTenant':'all'},'2':{'role':'SRE_ADMIN','scopeTenant':'all'}})})
+                config['vars']['ANSTS_CONFIG_TARGET_ORIGINS_JSON']=json.dumps({'fleet':'http://'+PREFIX+'-authority:8080','fleet-secondary':secondary_origin})
+                config.update({'durable_objects': {'bindings': [{'name': 'ANSTS_TENANT_DIRECTORY_CELL', 'class_name': 'TenantDirectoryCell'}, {'name':'ANSTS_TENANT_CONTROL_CELL','class_name':'TenantControlCell'},{'name':'ANSTS_ADMISSION_MAILBOX','class_name':'AdmissionShadowMailboxCell'},{'name':'ANSTS_SCHEDULER_CELL','class_name':'AnstsSchedulerCell'},{'name':'ANSTS_CONFIG_RELEASE_CELL','class_name':'ConfigReleaseCell'}]},
+                    'migrations': [{'tag': 'v1', 'new_sqlite_classes': ['TenantDirectoryCell','TenantControlCell','AdmissionShadowMailboxCell','AnstsSchedulerCell','ConfigReleaseCell']}]})
+            elif label=='target-2':
+                config['vars'].update({'ANSTS_CONFIG_TARGET_TOKEN':TARGET_TOKEN,'ANSTS_BODY_AUTH_SECRET':BODY_SECRET})
+                config.update({'durable_objects':{'bindings':[{'name':'ANSTS_SCHEDULER_CELL','class_name':'AnstsSchedulerCell'}]},
+                    'migrations':[{'tag':'v1','new_sqlite_classes':['AnstsSchedulerCell']}]})
             else:
                 config.update({'durable_objects': {'bindings': [{'name': 'ANSTS_GATEWAY_CELL', 'class_name': 'AnstsGatewayCell'}]}, 'migrations': [{'tag': 'v1', 'new_sqlite_classes': ['AnstsGatewayCell']}]})
                 config['vars'].update({'ANSTS_USER_AUTH_SECRET': USER, 'ANSTS_DIRECTORY_URL': 'http://' + PREFIX + '-authority:8080'})
+                origin = config['vars']['ANSTS_DIRECTORY_URL']
+                config['vars'].update({'ANSTS_SCHEDULER_URL':origin,'ANSTS_SCHEDULER_SERVICE_TOKEN':SCHEDULER_AUTH.split(' ',1)[1]})
+                config['vars'].update({'ANSTS_CONFIG_SERVICE_TOKEN': CONFIG_TOKEN,
+                    'ANSTS_CONFIG_SCOPE_TARGETS_JSON': json.dumps({'global':global_targets if label=='gateway-a' else ['fleet-alt'], 'regional':['missing-fleet']}),
+                    'ANSTS_SYSTEM_TOPOLOGY_JSON': json.dumps({'schemaVersion':1, 'edges':[], 'nodes':[
+                        {'id':'fleet','kind':'fleet','plane':'control','label':'Native Fleet','description':'isolated preflight','url':origin},
+                        {'id':'fleet-alt','kind':'fleet','plane':'control','label':'Alternate Fleet target','description':'isolated preflight','url':origin}
+                    ]+([{'id':'fleet-secondary','kind':'fleet','plane':'control','label':'Secondary Scheduler','description':'isolated rollout','url':secondary_origin}] if verify_rollout else [])})})
+
             (project / 'wrangler.json').write_text(json.dumps(config))
             name = PREFIX + '-' + label
             cmd('docker', 'run', '-d', '--user', str(os.getuid()) + ':' + str(os.getgid()), '--name', name,
@@ -226,6 +266,190 @@ with tempfile.TemporaryDirectory(prefix=PREFIX) as scratch:
         assert recovered_auto[1]['delivery']['runtime']['lastError'] is None,recovered_auto
         assert automatic('outbox')[1]['messages']==[]
         assert automatic('read',{'reservationId':'auto-r1'})==cancelled_auto
+        prior_month = (datetime.now(timezone.utc).replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
+        period = '/v1/admin/tenants/automatic/settlements/' + prior_month
+        close_headers = {**headers, 'Idempotency-Key': 'period-close'}
+        preview_status, preview = call(a, period + '/preview', headers=headers)
+        assert preview_status == 200 and not preview['complete'], preview
+        close_body = {'reason':'Cross-process close acceptance', 'expectedRevision':preview['revision']}
+        refused = call(b, period + '/close', close_body, close_headers)
+        assert refused == (409, {'code':'PERIOD_INCOMPLETE'}), refused
+        injection = call(authority, '/fixture/close-coverage', {}, {'x-fixture-key':'isolated-period-fixture-only'})
+        assert injection[0] == 200, injection
+        preview_status, preview = call(a, period + '/preview', headers=headers)
+        assert preview_status == 200 and preview['complete'], preview
+        close_body['expectedRevision'] = preview['revision']
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda gateway: call(gateway, period + '/close', close_body, close_headers), [a, b]))
+        assert results[0] == results[1] and results[0][0] == 200 and results[0][1]['final'], results
+        cmd('docker','restart',authority);ready(authority)
+        assert call(b, period + '/close', close_body, close_headers) == results[0]
+        config_actor = {'sub':'github:1','role':'SRE_ADMIN','scopeTenant':'all','scopeRegion':'all'}
+        config_headers = {'Authorization':'Bearer ' + CONFIG_TOKEN}
+        def config(scope, action, values, headers=config_headers):
+            return call(authority, '/internal/v1/config-versions/' + scope + '/' + action,
+                {'actor':config_actor,**values}, headers)
+        payload = {'schemaVersion':1,'baseRevision':0,'content':{'defaultTaskTimeoutSeconds':90}}
+        assert config('global','create',payload,{'Authorization':'Bearer ' + SERVICE})[0] == 401
+        assert config('global','create',{**payload,'actor':{**config_actor,'role':'VIEWER'}})[0] == 403
+        assert config('global','create',{**payload,'content':{'modelCredentialRef':'literal-secret'}})[0] == 422
+        assert config('global','create',{**payload,'content':{'databaseUrl':'internal'}})[0] == 422
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writes = list(pool.map(lambda _: config('global','create',payload), range(2)))
+        assert sorted(result[0] for result in writes) == [201,409], writes
+        first = next(result[1] for result in writes if result[0]==201)
+        assert config('other','create',payload)[1]['contentDigest'] == first['contentDigest']
+        credential={**payload,'content':{**payload['content'],'modelCredentialRef':'provider/default'}}
+        assert config('regional','create',credential)[1]['content']['modelCredentialRef']=='provider/default'
+        second = config('global','create',{**payload,'baseRevision':1,'content':{**payload['content'],'unhealthyNodeThresholdBps':500}})
+        assert second[0]==201 and second[1]['baseRevision']==1
+        cmd('docker','restart',authority);ready(authority)
+        assert config('global','read',{'revision':1}) == (200,first)
+        assert config('global','read',{}) == (200,second[1])
+        validate = '/v1/admin/config-bundles/global/validate'
+        assert call(a,validate,{'revision':2})[0] == 401
+        assert call(a,validate,{'revision':2},{'Authorization':'Bearer '+token('VIEWER')})[0] == 403
+        assert call(a,validate,{'revision':2,'observations':[{'targetId':'fleet','healthy':True}]},headers)[0] == 422
+        live = call(a,validate,{'revision':2},headers)
+        assert live[0]==200 and live[1]['eligible'] and live[1]['contentDigest']==second[1]['contentDigest'], live
+        assert live[1]['changes'][0]['targetIds']==global_targets and live[1]['changes'][0]['effect']=='HOT_RELOAD', live
+        offline = call(b,validate.replace('/global/','/regional/'),{'revision':1},headers)
+        assert offline[0]==200 and not offline[1]['eligible'], offline
+        assert {item['code'] for item in offline[1]['blockers']}=={'CONFIG_RESTART_UNSUPPORTED','CONFIG_OBSERVATION_MISSING'}, offline
+        submit = validate.replace('/validate','/submit')
+        approvals = validate.replace('/validate','/approvals')
+        approver_headers = {'Authorization':'Bearer '+token(subject='github:2')}
+        submitted = call(a,submit,{'revision':2},headers)
+        assert submitted[0]==200 and submitted[1]['requestedBy']=='github:1', submitted
+        decision = {'revision':2,'sequence':submitted[1]['sequence'],'approved':True}
+        assert call(a,approvals,decision,headers)==(403,{'code':'INDEPENDENT_APPROVER_REQUIRED'})
+        assert call(a,approvals,{**decision,'approvedBy':'github:2'},approver_headers)[0]==422
+        assert call(b,approvals,decision,approver_headers)==(409,{'code':'CONFIG_APPROVAL_STALE'})
+        approved = call(a,approvals,decision,approver_headers)
+        assert approved[0]==200 and approved[1]['status']=='APPROVED' and approved[1]['decidedBy']=='github:2', approved
+        cmd('docker','restart',authority);ready(authority)
+        assert call(a,approvals,decision,approver_headers)==approved
+        public_draft=validate.replace('/validate','/draft')
+        assert call(a,public_draft,headers=headers)==(200,second[1])
+        assert call(a,approvals+'/status',headers=approver_headers)==approved
+        assert call(a,public_draft,{'baseRevision':0,'content':{'defaultTaskTimeoutSeconds':91}},headers)==(409,{'code':'VERSION_CONFLICT'})
+        assert call(a,public_draft.replace('/global/','/console-draft/'),{'baseRevision':0,'content':{'defaultTaskTimeoutSeconds':91}},headers)[0]==201
+        if verify_rollout:
+            release=validate.replace('/validate','/releases')
+            heartbeat={'Authorization':SCHEDULER_AUTH}
+            assert call(authority,'/v1/scheduler/register-node',{'node_id':'rollout-healthy','healthy':True},heartbeat)[0]==200
+            started=call(a,release,{'revision':2,'releaseId':'native-rollout','batchSize':1,'healthWindowMs':1200},headers)
+            assert started[0]==200 and started[1]['status']=='APPLYING' and 'targetOrigins' not in started[1]['plan'],started
+            def wait_rollout(expected):
+                deadline=time.monotonic()+30
+                while time.monotonic()<deadline:
+                    result=call(a,release+'/status',headers=headers)
+                    assert result[0]==200,result
+                    if result[1]['status']==expected:return result[1]
+                    time.sleep(.1)
+                raise AssertionError(result)
+            wait_rollout('VERIFYING')
+            cmd('docker','restart',authority);ready(authority)
+            paused=wait_rollout('PAUSED')
+            assert paused['batchIndex']==1 and len(paused['verifiedBatches'])==1,paused
+            assert paused['acknowledgements'][0]['targetId']=='fleet-secondary',paused
+            assert call(secondary,'/v1/scheduler/register-node',{'node_id':'rollout-recovered','healthy':True},heartbeat)[0]==200
+            resumed=call(a,release+'/resume',{'releaseId':'native-rollout','generation':paused['generation']},headers)
+            assert resumed[0]==200 and resumed[1]['status']=='VERIFYING',resumed
+            done=wait_rollout('SUCCEEDED')
+            assert [batch[0]['targetId'] for batch in done['verifiedBatches']]==global_targets,done
+            print('PASS: authenticated Gateway starts an automatic two-target rollout; Fleet restart, second-batch pause and resume preserve real ACKs.')
+        new_payload={**payload,'baseRevision':2,'content':{**payload['content'],'unhealthyNodeThresholdBps':600}}
+        assert config('global','create',new_payload)[0]==201
+        assert call(a,approvals,decision,approver_headers)==(409,{'code':'CONFIG_APPROVAL_STALE'})
+        new_submission=call(a,submit,{'revision':3},headers)
+        assert new_submission[0]==200 and new_submission[1]['status']=='SUBMITTED', new_submission
+        if verify_rollout:
+            next_decision={'revision':3,'sequence':new_submission[1]['sequence'],'approved':True}
+            assert call(a,approvals,next_decision,approver_headers)[0]==200
+            forward=call(a,release,{'revision':3,'releaseId':'native-forward','batchSize':1,'healthWindowMs':100},headers)
+            assert forward[0]==200,forward
+            forward_done=wait_rollout('SUCCEEDED')
+            previous_generation=forward_done['generation']
+            cmd('docker','stop','-t','0',secondary)
+            rollback_url=validate.replace('/validate','/rollback')
+            rollback_input={'sourceGeneration':done['generation'],'replacesGeneration':previous_generation,'baseRevision':3}
+            rollback=call(a,rollback_url,rollback_input,headers)
+            assert rollback[0]==201 and rollback[1]['revision']==4 and rollback[1]['contentDigest']==second[1]['contentDigest'],rollback
+            assert call(a,rollback_url,rollback_input,headers)==rollback
+            rollback_plan={'revision':4,'releaseId':'native-rollback','batchSize':1,'healthWindowMs':100}
+            assert call(a,release,rollback_plan,headers)==(409,{'code':'CONFIG_APPROVAL_REQUIRED'})
+            rollback_submission=call(a,submit,{'revision':4},headers)
+            assert rollback_submission[0]==200,rollback_submission
+            rollback_decision={'revision':4,'sequence':rollback_submission[1]['sequence'],'approved':True}
+            assert call(a,approvals,rollback_decision,headers)[0]==403
+            assert call(a,approvals,rollback_decision,approver_headers)[0]==200
+            assert call(a,release,rollback_plan,headers)[0]==200
+            partial=wait_rollout('PAUSED')
+            assert partial['pendingTargetIds']==['fleet-secondary'] and len(partial['verifiedBatches'])==1,partial
+            assert call(a,release+'/status?generation='+str(previous_generation),headers=headers)==(200,forward_done)
+            cmd('docker','start',secondary);ready(secondary)
+            for container,node in [(authority,'rollout-healthy'),(secondary,'rollout-recovered')]:
+                assert call(container,'/v1/scheduler/register-node',{'node_id':node,'healthy':True},heartbeat)[0]==200
+            assert call(a,release+'/resume',{'releaseId':'native-rollback','generation':partial['generation']},headers)[0]==200
+            restored=wait_rollout('SUCCEEDED')
+            assert restored['pendingTargetIds']==[] and restored['plan']['rollback']=={'sourceGeneration':done['generation'],'replacesGeneration':previous_generation},restored
+            assert call(a,release+'/status?generation='+str(previous_generation),headers=headers)==(200,forward_done)
+            print('PASS: forward rollback creates a new revision and approval; unavailable target remains pending until its verified recovery, preserving past evidence.')
+        print('PASS: native dual control verifies two numeric GitHub identities, rejects spoofed decisions and stale bases, and persists the decision across restart.')
+        print('PASS: real Gateway preflight loads immutable drafts and probes Fleet health; missing targets and restart requirements block approval input.')
+        if os.environ.get('ANSTS_VERIFY_CONFIG_ROLLOUT')!='true':
+            target_path='/internal/v1/config-target/scheduler/'
+            target_headers={'Authorization':'Bearer '+TARGET_TOKEN}
+            def target(action, values=None, auth=target_headers):
+                return call(authority,target_path+action,values,auth)
+            runtime_content={'defaultTaskTimeoutSeconds':90}
+            encoded=json.dumps({'schemaVersion':1,'content':runtime_content},separators=(',', ':')).encode()
+            command={'releaseId':'native-apply','generation':2,'content':runtime_content,'contentDigest':hashlib.sha256(encoded).hexdigest()}
+            assert target('apply',command,config_headers)[0]==401
+            def submit_runtime_task(task_id, **fields):
+                request={'task_id':task_id,'tenant_id':'shared','prompt':task_id,**fields}
+                result=call(authority,'/v1/scheduler/submit',request,{'Authorization':SCHEDULER_AUTH})
+                assert result[0]==202,result
+            submit_runtime_task('config-before')
+            dry=target('dry-run',command)
+            assert dry[0]==200 and dry[1]['actualDigest'] is None,dry
+            applied=target('apply',command)
+            assert applied==(200,{'releaseId':'native-apply','generation':2,'actualDigest':command['contentDigest']}),applied
+            public_task=call(a,'/v1/tasks',{'task_id':'config-default','tenant_id':'shared','prompt':'config-default'},headers)
+            assert public_task[0] in (200,202),public_task
+            submit_runtime_task('config-explicit',timeout_seconds=120)
+            cmd('docker','restart',authority);ready(authority)
+            assert target('apply',command)==applied
+            assert target('apply',{**command,'generation':1})==(409,{'code':'STALE_CONFIG_GENERATION'})
+            assert target('readback')==(200,{'generation':2,'actualDigest':command['contentDigest'],'verified':True})
+            submit_runtime_task('config-after-restart')
+            saved=call(authority,'/v1/scheduler/tasks',headers={'Authorization':SCHEDULER_AUTH})[1]['tasks']
+            effective={row['prompt']:row['timeout_seconds'] for row in saved if row['prompt'].startswith('config-')}
+            assert effective=={'config-before':1800,'config-default':90,'config-explicit':120,'config-after-restart':90},effective
+            heartbeat_headers={'Authorization':SCHEDULER_AUTH}
+            assert call(authority,'/v1/scheduler/register-node',{'node_id':'config-unhealthy','healthy':False},heartbeat_headers)[0]==200
+            def threshold_command(limit, generation):
+                content={**runtime_content,'unhealthyNodeThresholdBps':limit}
+                encoded=json.dumps({'schemaVersion':1,'content':content},separators=(',', ':')).encode()
+                return {'releaseId':'threshold-'+str(generation),'generation':generation,
+                    'content':content,'contentDigest':hashlib.sha256(encoded).hexdigest()}
+            strict=threshold_command(0,3)
+            assert target('dry-run',strict)[0]==200 and call(authority,'/readyz')[0]==200
+            assert target('apply',strict)[1]['actualDigest']==strict['contentDigest']
+            not_ready=call(authority,'/readyz')
+            assert not_ready[0]==503 and not_ready[1]['schedulerReadiness']['unhealthyNodeCount']==1,not_ready
+            assert call(authority,'/healthz')[0]==200
+            relaxed=threshold_command(10000,4)
+            assert target('apply',relaxed)[1]['actualDigest']==relaxed['contentDigest']
+            assert call(authority,'/readyz')[0]==200
+            cmd('docker','restart',authority);ready(authority)
+            assert target('readback')==(200,{'generation':4,'actualDigest':relaxed['contentDigest'],'verified':True})
+            actual_ready=call(authority,'/readyz')
+            assert actual_ready[0]==200 and actual_ready[1]['schedulerReadiness']['unhealthyNodeThresholdBps']==10000, actual_ready
+            print('PASS: native Scheduler ACKs real readback and applies the default only to new tasks; generation and behavior survive restart.')
+        print('PASS: native ConfigReleaseCell rejects unauthorized writes and unsafe configuration, isolates scopes, and preserves immutable revisions after restart.')
+        print('PASS: two distinct Gateway processes share one Fleet close receipt, including replay after Fleet restart.')
         print('PASS: automatic alarm delivery/pause/resume/cold-crash recovery and durable shadow cross-object protocol;  three native celld processes; shared authority, concurrent idempotency/CAS, tenant isolation, restart persistence and authority-offline fail-closed.')
     except Exception:
         for name in CONTAINERS:

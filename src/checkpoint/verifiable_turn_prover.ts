@@ -1,6 +1,12 @@
 /** @fileoverview Verifiable turn proofs: hash-chained attestations of a completed turn for replay audits. */
 import * as crypto from "node:crypto";
-import { TurnWalFrame } from "../models";
+import type { TurnWalFrame } from "../models.js";
+
+type TurnProofEvidence = Pick<TurnWalFrame, "taskId" | "diffSnapshot"> & {
+  fence: Pick<TurnWalFrame["fence"], "turnSeq">;
+  contextMessages: readonly unknown[];
+  workspaceMerkleHash: string;
+};
 export interface VerifiableTurnProofStatement {
   proofId: string;
   taskId: string;
@@ -17,7 +23,7 @@ export class VerifiableTurnExecutionProver {
   constructor(secret = "ansts_v28_zk_turn_prover_hmac_secret") {
     this.proverKey = Buffer.from(secret, "utf8");
   }
-  public generateTurnProof(frame: TurnWalFrame, inputPromptText: string): VerifiableTurnProofStatement {
+  public generateTurnProof(frame: TurnProofEvidence, inputPromptText: string): VerifiableTurnProofStatement {
     const inputPromptMerkleRoot = crypto.createHash("sha256").update(inputPromptText, "utf8").digest("hex");
     const reasoningCotOutputHash = crypto.createHash("sha256").update(frame.diffSnapshot ?? "", "utf8").digest("hex");
     const toolFootprintDigest = crypto.createHash("sha256").update(JSON.stringify(frame.contextMessages), "utf8").digest("hex");

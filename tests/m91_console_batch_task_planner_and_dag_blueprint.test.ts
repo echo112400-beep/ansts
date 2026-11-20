@@ -113,9 +113,9 @@ test("M91: Batch Task Planning, Kahn Topological Wave Derivation, DAG Cycle Guar
     };
     assert.equal(commitBody.valid, true);
     assert.equal(commitBody.dispatchedCount, 3);
-    assert.ok(srv.managementPlane.deps.scheduler.allTasks.has(commitBody.coordinatorTaskId));
+    assert.ok(srv.scheduler.allTasks.has(commitBody.coordinatorTaskId));
     for (const id of commitBody.dispatchedTaskIds) {
-      assert.ok(srv.managementPlane.deps.scheduler.allTasks.has(id), `Missing dispatched task ${id}`);
+      assert.ok(srv.scheduler.allTasks.has(id), `Missing dispatched task ${id}`);
     }
 
     // 5. CLI mgmt-task-blueprints & mgmt-task-batch-plan

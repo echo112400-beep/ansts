@@ -30,7 +30,7 @@ export async function handleBodyUsageIngress(request:Request,env:CloudflareCelld
    const current=await bodies.get(id).fetch(new Request('https://body.internal/v1/body/state'));if(!current.ok)return reply({code:'USAGE_EXECUTION_AUTHORITY_UNAVAILABLE'},503);
    const {execution}=await current.json() as {execution?:Record<string,unknown>};
    if(!execution||execution.node_id!==host||execution.task_id!==identity.taskId||execution.tenant_id!==tenantId||execution.attempt_id!==identity.attemptId||execution.fencing_token!==identity.fencing||execution.input_digest!==identity.executionInputDigest||!['RUNNING','UNCERTAIN','RESULT_PENDING','COMPLETED'].includes(String(execution.phase)))return reply({code:'USAGE_EXECUTION_BINDING_REQUIRED'},409);
-   const pinned=await control('admission-usage-bind',{identity,resources});if(!pinned.ok)return pinned;await pinned.body?.cancel();
+   const pinned=await control('admission-usage-bind',{identity,resources,priceEligible:bindingRoute&&execution.phase==='RUNNING'});if(!pinned.ok)return pinned;await pinned.body?.cancel();
   }
   if(bindingRoute)return reply({bound:true});
   return control('admission-usage-ingest',{proof:body.proof,identity});

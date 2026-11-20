@@ -1,6 +1,6 @@
 /** Single global Host ownership authority. Pool grant authorities must consume this directory. */
 import {createHash} from 'node:crypto';
-import {assertExpectedVersion,ControlError,type ControlActor} from '../control/contracts.js';
+import {assertControlAccess,assertExpectedVersion,ControlError,type ControlActor} from '../control/contracts.js';
 import {capacityId,capacityResources,canonicalCapacityReport,capacityReportDigest,CAPACITY_REPORT_TTL_MS,type CapacityReport,type CapacityResources} from '../control/capacity_report.js';
 import type {DirectoryStorage} from '../control/tenant_directory.js';
 export interface CapacityPool {id:string;name:string;region:string;status:'ACTIVE'|'DISABLED';limit:CapacityResources;version:number;}
@@ -69,7 +69,16 @@ export class CapacityInventory {
   });
  }
  snapshot(actor:ControlActor,now:number){
-  assertCapacityAdmin(actor);clock(now);const state=this.load();
+  assertCapacityAdmin(actor);return this.buildSnapshot(now);
+ }
+ listPools(actor:ControlActor,tenantId:string,now:number){
+  capacityId(tenantId);
+  assertControlAccess(actor,'read',tenantId,actor.scopeRegion);
+  const {asOf,pools}=this.buildSnapshot(now);
+  return {asOf,pools:pools.filter(pool=>actor.scopeRegion==='all'||pool.region===actor.scopeRegion)};
+ }
+ private buildSnapshot(now:number){
+  clock(now);const state=this.load();
   const hosts=state.hosts.map(host=>{
    const stored=host.daemonIds.map(id=>Object.hasOwn(state.reports,id)?state.reports[id]:undefined),reports=stored.filter((r):r is StoredReport=>!!r),reserved=zero(),capacity=reports.length?{...host.limit}:zero();
    for(const dimension of dimensions){for(const item of reports)reserved[dimension]+=item.report.reserved[dimension];for(const item of reports)capacity[dimension]=Math.min(capacity[dimension],item.report.total[dimension]);}
@@ -79,8 +88,17 @@ export class CapacityInventory {
    const available=zero();if(health==='HEALTHY')for(const dimension of dimensions)available[dimension]=Math.max(0,capacity[dimension]-reserved[dimension]);
    return {...host,health,lastKnownCapacity:capacity,retainedReserved:reserved,available,reports:host.daemonIds.map((daemonId,index)=>({daemonId,epoch:stored[index]?.report.epoch??null,sequence:stored[index]?.report.sequence??null,observedAt:stored[index]?.report.observedAt??null,receivedAt:stored[index]?.receivedAt??null,quarantined:stored[index]?.quarantined??false}))};
   });
-  const pools=state.pools.map(pool=>{const members=hosts.filter(h=>h.poolId===pool.id),capacity=zero(),reserved=zero(),available=zero();for(const d of dimensions){for(const h of members){capacity[d]+=h.lastKnownCapacity[d];reserved[d]+=h.retainedReserved[d];available[d]+=h.available[d];}capacity[d]=Math.min(pool.limit[d],capacity[d]);available[d]=pool.status==='ACTIVE'?Math.min(available[d],Math.max(0,capacity[d]-reserved[d])):0;}return {...pool,capacity,retainedReserved:reserved,available,hostCount:members.length,complete:members.every(h=>h.health==='HEALTHY')};});
+  const pools=state.pools.map(pool=>{const members=hosts.filter(h=>h.poolId===pool.id),capacity=zero(),reserved=zero(),available=zero();for(const d of dimensions){for(const h of members){capacity[d]+=h.lastKnownCapacity[d];reserved[d]+=h.retainedReserved[d];available[d]+=h.available[d];}capacity[d]=Math.min(pool.limit[d],capacity[d]);available[d]=pool.status==='ACTIVE'?Math.min(available[d],Math.max(0,capacity[d]-reserved[d])):0;}return {...pool,capacity,retainedReserved:reserved,available,hostCount:members.length,isolatedHostCount:members.filter(h=>['STALE','QUARANTINED','UNVERIFIED','OVERCOMMITTED'].includes(h.health)).length,complete:members.every(h=>h.health==='HEALTHY')};});
   return {schemaVersion:1,version:state.version,asOf:now,reportTtlMs:CAPACITY_REPORT_TTL_MS,pools,hosts,conflictCount:state.conflicts.length,allocation:'NOT_CONNECTED' as const};
+ }
+ getPool(id:string):CapacityPool {
+  capacityId(id);
+  const pool=this.load().pools.find(candidate=>candidate.id===id);
+  if(!pool)throw new ControlError('CAPACITY_POOL_NOT_FOUND',404);
+  return pool;
  }
  audit(actor:ControlActor){assertCapacityAdmin(actor);return this.load().audit;}
 }
+
+
+

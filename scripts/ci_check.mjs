@@ -99,7 +99,11 @@ function compileTsToCommonJs(code, filename) {
 
 function runLint() {
   console.log("===> [Stage 1/3: TYPESCRIPT AST LINT & SCHEMA CHECK]");
-  const tsFiles = [...walkTsFiles(path.join(ROOT_DIR, "src")), ...walkTsFiles(path.join(ROOT_DIR, "tests"))];
+  const tsFiles = [
+    ...walkTsFiles(path.join(ROOT_DIR, "src")),
+    ...walkTsFiles(path.join(ROOT_DIR, "tests")),
+    ...walkTsFiles(path.join(ROOT_DIR, "ui", "console", "lib")),
+  ];
   if (tsFiles.length === 0) {
     throw new Error("No TypeScript files found in src/ or tests/");
   }
@@ -133,9 +137,10 @@ function runLint() {
               for (const m of d.body.body) {
                 if (m.type === "ClassMethod" && m.kind === "constructor") {
                   let min = 0, max = m.params.length;
-                  for (const p of m.params) {
-                    if (p.type === "RestElement") max = Infinity;
-                    else if (p.type !== "AssignmentPattern" && !p.optional) min++;
+                  for (const [index, declared] of m.params.entries()) {
+                    const parameter = declared.type === "TSParameterProperty" ? declared.parameter : declared;
+                    if (parameter.type === "RestElement") max = Infinity;
+                    else if (parameter.type !== "AssignmentPattern" && !parameter.optional) min = index + 1;
                   }
                   ctor = { min, max };
                 }
@@ -169,8 +174,11 @@ function runLint() {
         if (node.type === "ImportDeclaration") {
           const src = node.source.value;
           if (src.startsWith(".")) {
-            const targetTs = path.resolve(path.dirname(f), src.replace(/\.js$/, ".ts"));
-            const targetExp = exportsByFile.get(targetTs);
+            const target = path.resolve(path.dirname(f), src);
+            const targetExp = (src.endsWith(".js") ? exportsByFile.get(target.replace(/\.js$/, ".ts")) : undefined)
+              ?? exportsByFile.get(target)
+              ?? exportsByFile.get(target + ".ts")
+              ?? exportsByFile.get(path.join(target, "index.ts"));
             if (!targetExp) {
               throw new Error(`[CROSS-FILE IMPORT ERROR] ${rel} imports from missing module ${src}`);
             }

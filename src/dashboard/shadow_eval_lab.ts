@@ -10,9 +10,17 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { ModelPoolName, TurnWalFrame } from "../models";
-import { PrefixCacheAffinityRouter } from "../router/prefix_cache_affinity";
+import { PrefixCacheAffinityRouter } from "../router/prefix_cache_affinity.js";
 import { SyntacticAndVelocityBreaker } from "../harness/velocity_breaker.js";
+
+type ModelPoolName = Parameters<PrefixCacheAffinityRouter["registerBackendNode"]>[0]["modelPool"];
+export interface ShadowReplayFrame {
+  taskId: string;
+  tokensUsed?: number;
+  passRate?: number;
+  errorCount?: number;
+  diffEntropy?: number;
+}
 
 export interface ShadowModelMetrics {
   modelPool: ModelPoolName | string;
@@ -78,22 +86,20 @@ export class ShadowTrafficReplayLab {
         candidatePool: "GLM-5.3",
         shadowTrafficSamplePct: 5.0,
         historicalFrames: [
-          TurnWalFrame.fromPartial({
+          {
             taskId: "task-prod-101",
-            fence: { epoch: 3, turnSeq: 1, taskId: "task-prod-101" } as any,
             tokensUsed: 1420,
             passRate: 0.65,
             errorCount: 2,
             diffEntropy: 0.55,
-          }),
-          TurnWalFrame.fromPartial({
+          },
+          {
             taskId: "task-prod-101",
-            fence: { epoch: 3, turnSeq: 2, taskId: "task-prod-101" } as any,
             tokensUsed: 1680,
             passRate: 0.92,
             errorCount: 0,
             diffEntropy: 0.68,
-          }),
+          },
         ],
       });
     }
@@ -102,7 +108,7 @@ export class ShadowTrafficReplayLab {
   private evaluatePoolOnTrajectory(
     poolName: string,
     sourceTaskId: string,
-    frames: TurnWalFrame[],
+    frames: readonly ShadowReplayFrame[],
     isCandidate: boolean,
     overrides?: Partial<ShadowModelMetrics>,
   ): ShadowModelMetrics {
@@ -175,7 +181,7 @@ export class ShadowTrafficReplayLab {
     baselinePool: ModelPoolName | string;
     candidatePool: ModelPoolName | string;
     shadowTrafficSamplePct?: number;
-    historicalFrames: TurnWalFrame[];
+    historicalFrames: readonly ShadowReplayFrame[];
     candidateSimOverrides?: Partial<ShadowModelMetrics>;
   }): ShadowEvalScorecard {
     const evalRunId = `eval_${crypto.randomBytes(5).toString("hex")}`;
@@ -183,14 +189,13 @@ export class ShadowTrafficReplayLab {
       params.historicalFrames.length > 0
         ? params.historicalFrames
         : [
-            TurnWalFrame.fromPartial({
+            {
               taskId: params.sourceTaskId,
-              fence: { epoch: 1, turnSeq: 1, taskId: params.sourceTaskId } as any,
               tokensUsed: 1200,
               passRate: 0.85,
               errorCount: 0,
               diffEntropy: 0.6,
-            }),
+            },
           ];
 
     const baseline = this.evaluatePoolOnTrajectory(

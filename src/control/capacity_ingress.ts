@@ -17,8 +17,11 @@ export async function handleCapacityIngress(request:Request,env:CloudflareCelldE
    let report;for(const key of serviceKeys(env))try{report=verifyCapacityReport(body.proof,bodyServiceToken(key,host!));break;}catch(error){if(!(error instanceof ControlError)||error.code!=='CAPACITY_REPORT_AUTH_REQUIRED')throw error;}
    if(!report)return reply({code:'CAPACITY_REPORT_AUTH_REQUIRED'},401);if(report.daemonId!==host)return reply({code:'CAPACITY_REPORT_SCOPE_FORBIDDEN'},403);
    body={daemonId:host,report};
-  }else if(!['snapshot','audit','pool-write','host-write'].includes(action))return reply({code:'NOT_FOUND'},404);
+  }else if(!['snapshot','audit','pool-write','host-write','pool-catalog','request-list','request-submit','request-cancel','queue-policy-read','queue-policy-write','allocation-control-read','allocation-control-write'].includes(action))return reply({code:'NOT_FOUND'},404);
   const ns=env.ANSTS_CAPACITY_INVENTORY_CELL;
   return ns.get(ns.idFromName('capacity-inventory-v1')).fetch(new Request('https://capacity.internal/'+action,{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify(body)}));
  }catch(error){return reply({code:error instanceof ControlError?error.code:error instanceof SyntaxError?'INVALID_JSON':'CAPACITY_UNAVAILABLE'},error instanceof ControlError?error.status:error instanceof SyntaxError?400:503);}
 }
+
+
+

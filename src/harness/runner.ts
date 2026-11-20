@@ -32,6 +32,10 @@ export class AgentHarnessRunner {
     this.breaker = breaker;
   }
 
+  public getRouter(): CognitiveRouter {
+    return this.router;
+  }
+
   public executeSingleTurn(
     task: TaskSpec,
     toolName: string,

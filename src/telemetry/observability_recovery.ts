@@ -13,8 +13,8 @@
  */
 
 import * as crypto from "node:crypto";
-import { CloudEventsBus } from "./cloudevents";
-import { OtelAndPrometheusExporter, OtelSpanRecord } from "./otel_prometheus";
+import { CloudEventsBus } from "./cloudevents.js";
+import { OtelAndPrometheusExporter, OtelSpanRecord } from "./otel_prometheus.js";
 
 export interface OtelSpanLink {
   linkedTraceId: string;
@@ -29,6 +29,8 @@ export interface OtelSpanLink {
 }
 
 export interface ContinuitySpanRecord extends OtelSpanRecord {
+  startTimeUnixNano: string;
+  endTimeUnixNano: string;
   traceparent: string;
   spanLinks: OtelSpanLink[];
 }
@@ -277,21 +279,19 @@ export class FaultTolerantObservabilityCoordinator {
       },
     });
 
-    this.otelExporter.exportedSpans.push(span);
+    this.otelExporter.recordSpan(span);
     this.spooler.enqueueSpan(span);
 
-    const cloudEvent = this.cloudEventsBus.emit(
-      params.cloudEventType,
-      params.taskId,
-      params.tenantId,
-      {
+    const cloudEvent = this.cloudEventsBus.emitEvent({
+      type: params.cloudEventType,
+      subject: params.taskId,
+      tenantId: params.tenantId,
+      traceparent: span.traceparent,
+      data: {
         ...params.data,
         span_links: span.spanLinks,
       },
-      { traceparent: span.traceparent },
-    );
-    // Override with dynamic W3C traceparent
-    cloudEvent.traceparent = span.traceparent;
+    });
     this.spooler.enqueueCloudEvent(cloudEvent);
 
     return { span, cloudEvent };

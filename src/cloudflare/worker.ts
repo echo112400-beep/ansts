@@ -1,4 +1,9 @@
+import {handleRegionCatalog,regionInternalPath} from '../control/admin_region_api.js';
+export {RegionCatalogCell} from './region_catalog_cell.js';
+import {handleConfigVersionRequest} from './config_release_cell.js';
+export {ConfigReleaseCell} from './config_release_cell.js';
 import {handleBodyUsageIngress} from '../control/body_usage_ingress.js';
+import {executionInventoryIngress,settlementCoverageIngress,bodyInventoryIngress} from '../control/execution_inventory_ingress.js';
 import {handleCapacityIngress} from '../control/capacity_ingress.js';
 export {CapacityInventoryCell} from './capacity_inventory_cell.js';
 /**
@@ -18,6 +23,42 @@ export { TunnelGatewayCell } from "./tunnel_gateway_cell.js";
 export { TenantControlCell } from "./tenant_control_cell.js";
 export { TenantDirectoryCell } from "./tenant_directory_cell.js";
 export { AnstsGatewayCell } from "./gateway_cell.js";
+
+async function checkPilotOccupancy(env:CloudflareCelldEnv,tenantId:string):Promise<Response> {
+  const shardRoster=(env.ANSTS_ADMISSION_SCHEDULER_SHARDS??"").split(",").filter(Boolean);
+  const token=env.ANSTS_DIRECTORY_SERVICE_TOKEN;
+  if(!env.ANSTS_SCHEDULER_CELL||!token||token.length<32||!shardRoster.includes("global-shard-0")||shardRoster.length>32)
+    return Response.json({code:"ADMISSION_FLEET_INVENTORY_UNAVAILABLE"},{status:503});
+  const states=await Promise.all(shardRoster.map(async (name,index)=>{
+    const unavailable=(reason:string,status?:number)=>{
+      console.warn("admission_fleet_occupancy_probe_failed",{index,reference:name.startsWith("id:")?"id":"name",reason,status});
+      return null;
+    };
+    let stage="construct-request";
+    try {
+      const target=new URL("https://scheduler.internal/pilot-occupancy");
+      target.searchParams.set("tenantId",tenantId);
+      const namespace=env.ANSTS_SCHEDULER_CELL!;
+      stage="resolve-object-id";
+      const objectId=name.startsWith("id:")?namespace.idFromString?.(name.slice(3)):namespace.idFromName(name);
+      if(!objectId)return unavailable("unsupported-object-reference");
+      stage="get-object-stub";
+      const stub=namespace.get(objectId);
+      stage="fetch-occupancy";
+      const response=await stub.fetch(
+        new Request(target,{headers:{authorization:"Bearer "+token},signal:AbortSignal.timeout(2000)}));
+      if(!response.ok)return unavailable("http-error",response.status);
+      stage="decode-occupancy";
+      const {occupied}=await response.json() as {occupied:unknown};
+      return typeof occupied==="boolean"?occupied:unavailable("invalid-response");
+    } catch(error) {
+      return unavailable(error instanceof Error && ["TimeoutError","AbortError"].includes(error.name)?stage+"-timeout":stage+"-error");
+    }
+  }));
+  if(states.includes(null))return Response.json({code:"ADMISSION_FLEET_INVENTORY_UNAVAILABLE"},{status:503});
+  if(states.includes(true))return Response.json({code:"ADMISSION_LEGACY_OCCUPANCY_PRESENT"},{status:409});
+  return Response.json({healthy:true,checked:states.length});
+}
 
 /** Reads the scheduler cell's task list; used by the brain read contract and by single-task lookups. */
 async function listCellTasks(env: CloudflareCelldEnv, shardName: string): Promise<Record<string, unknown>[]> {
@@ -83,7 +124,23 @@ export { AnstsBodyCell } from "./body_cell.js";
 export default {
   async fetch(request: Request, env: CloudflareCelldEnv): Promise<Response> {
     const url = new URL(request.url);
+    if(url.pathname==='/internal/v1/execution-inventory')return executionInventoryIngress(request,env);
+    if(url.pathname==='/internal/v1/execution-inventory/body')return bodyInventoryIngress(request,env);
+    if(url.pathname==='/internal/v1/settlement-coverage')return settlementCoverageIngress(request,env);
+    if(['/v1/scheduler/execution-inventory','/v1/scheduler/pilot-occupancy','/v1/scheduler/pilot-expiry-status'].includes(url.pathname))return Response.json({code:'INTERNAL_ROUTE'},{status:403});
     if(['/internal/v1/body-usage','/internal/v1/body-usage-binding'].includes(url.pathname))return handleBodyUsageIngress(request,env);
+    if(url.pathname.startsWith('/internal/v1/config-target/scheduler/')){
+      const token=env.ANSTS_CONFIG_TARGET_TOKEN;
+      if(!token||token.length<32||!equalBodyToken(request.headers.get('authorization')??'','Bearer '+token)){
+        return Response.json({code:'SERVICE_AUTH_REQUIRED'},{status:401});
+      }
+      const namespace=env.ANSTS_SCHEDULER_CELL;
+      if(!namespace)return Response.json({code:'CONFIG_TARGET_UNAVAILABLE'},{status:503});
+      const path=url.pathname.slice('/internal/v1/config-target/scheduler/'.length);
+      return namespace.get(namespace.idFromName('global-shard-0')).fetch(new Request('https://scheduler.internal/config-target/'+path,request));
+    }
+    if(url.pathname.startsWith('/internal/v1/config-versions/'))return handleConfigVersionRequest(request,env);
+    if(url.pathname.startsWith(regionInternalPath+'/'))return handleRegionCatalog(request,env);
     if(url.pathname.startsWith('/internal/v1/capacity/'))return handleCapacityIngress(request,env);
     if(url.pathname==='/internal/v1/body-observation-binding')return lookupBodyObservation(request,env);
     if(url.pathname==='/internal/v1/body-execution-evidence')return receiveBodyObservation(request,env);
@@ -93,12 +150,12 @@ export default {
       const token=admission?env.ANSTS_ADMISSION_SERVICE_TOKEN:env.ANSTS_DIRECTORY_SERVICE_TOKEN;
       if(!token||token.length<32||!equalBodyToken(request.headers.get('authorization')??'','Bearer '+token))return Response.json({code:'SERVICE_AUTH_REQUIRED'},{status:401});
       if(!env.ANSTS_TENANT_CONTROL_CELL||!env.ANSTS_TENANT_DIRECTORY_CELL)return Response.json({code:'TENANT_CONTROL_UNAVAILABLE'},{status:503});
-      if(request.method!=='POST'||!['policy-read','policy-write','admission-read','admission-prepare','admission-transition','admission-credential','admission-verify','admission-outbox','admission-dispatch','admission-delivery-status','admission-delivery-control','admission-observe-execution','admission-observation-binding','admission-usage-binding','admission-usage-bind','admission-usage-ingest','usage-read'].includes(action))return Response.json({code:'NOT_FOUND'},{status:404});
+      if(request.method!=='POST'||!['policy-read','policy-write','admission-read','admission-cost-preview','admission-settle-cost','admission-prepare','admission-transition','admission-credential','admission-verify','admission-outbox','admission-dispatch','admission-delivery-status','admission-delivery-control','admission-observe-execution','admission-observation-binding','admission-usage-binding','admission-usage-bind','admission-usage-ingest','usage-read','reservation-summary','rate-read','rate-activate','cost-read','cost-summary','cost-export-create','cost-export-run','cost-export-status','cost-export-download','rate-activation-audit','finops-archive-status','finops-archive-create','finops-archive-read','period-preview','period-close','period-adjustment'].includes(action))return Response.json({code:'NOT_FOUND'},{status:404});
       let raw:string,tenantId:unknown;try{raw=await request.text();if(raw.length>65536)return Response.json({code:'PAYLOAD_TOO_LARGE'},{status:413});tenantId=JSON.parse(raw).tenantId;}catch{return Response.json({code:'INVALID_JSON'},{status:400});}
       if(typeof tenantId!=='string'||tenantId.length>128||!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(tenantId))return Response.json({code:'INVALID_TENANT_ID'},{status:422});
       // Authorize the existing tenant before materializing a per-tenant control object.
       const parsed=JSON.parse(raw);
-      if(action==='policy-write'&&parsed.actor?.role!=='SRE_ADMIN')return Response.json({code:'CONTROL_FORBIDDEN'},{status:403});
+      if(['policy-write','rate-activate'].includes(action)&&parsed.actor?.role!=='SRE_ADMIN')return Response.json({code:'CONTROL_FORBIDDEN'},{status:403});
       const directoryToken=env.ANSTS_DIRECTORY_SERVICE_TOKEN;if(!directoryToken||directoryToken.length<32)return Response.json({code:'TENANT_CONTROL_UNAVAILABLE'},{status:503});
       const directories=env.ANSTS_TENANT_DIRECTORY_CELL;
       const checked=await directories.get(directories.idFromName('tenant-directory-v1')).fetch(new Request('https://directory.internal/tenant',{method:'POST',headers:{authorization:'Bearer '+directoryToken,'content-type':'application/json'},body:JSON.stringify({actor:parsed.actor,tenantId})}));
@@ -107,12 +164,21 @@ export default {
       const ns=env.ANSTS_TENANT_CONTROL_CELL;
       return ns.get(ns.idFromName('tenant-control-v1:'+tenantId)).fetch(new Request('https://tenant.internal/'+action,{method:'POST',headers:request.headers,body:raw}));
     }
+    if (url.pathname === "/internal/v1/admission/fleet-preflight" && request.method === "GET") {
+      const token=env.ANSTS_DIRECTORY_SERVICE_TOKEN;
+      if(!token||token.length<32||!equalBodyToken(request.headers.get("authorization")??"","Bearer "+token))
+        return Response.json({code:"SERVICE_AUTH_REQUIRED"},{status:401});
+      const tenantId=url.searchParams.get("tenantId");
+      if(!tenantId||!(env.ANSTS_ADMISSION_PILOT_TENANTS??"").split(",").includes(tenantId))
+        return Response.json({code:"PILOT_TENANT_REQUIRED"},{status:422});
+      return checkPilotOccupancy(env,tenantId);
+    }
     if (url.pathname.startsWith("/internal/v1/directory/")) {
       const token=env.ANSTS_DIRECTORY_SERVICE_TOKEN;
       if (!token || token.length<32 || !equalBodyToken(request.headers.get("authorization")??"", "Bearer "+token)) return Response.json({code:"SERVICE_AUTH_REQUIRED"},{status:401});
       if (!env.ANSTS_TENANT_DIRECTORY_CELL) return Response.json({code:"DIRECTORY_UNAVAILABLE"},{status:503});
       const action=url.pathname.slice("/internal/v1/directory/".length);
-      if (request.method!=="POST" || !["list","audit","mutate","cost-centers","cost-center-mutate","operation","archive-list","archive-create","archive-read"].includes(action)) return Response.json({code:"NOT_FOUND"},{status:404});
+      if (request.method!=="POST" || !["list","audit","mutate","cost-centers","cost-center-mutate","operation","archive-list","archive-create","archive-read","rate-create","rate-list","rate-audit","finops-archive-status","finops-archive-create","finops-archive-read"].includes(action)) return Response.json({code:"NOT_FOUND"},{status:404});
       const ns=env.ANSTS_TENANT_DIRECTORY_CELL;
       return ns.get(ns.idFromName("tenant-directory-v1")).fetch(new Request("https://directory.internal/"+action,request));
     }
@@ -126,18 +192,24 @@ export default {
       request.method === "GET" &&
       (url.pathname === "/health" || url.pathname === "/healthz" || url.pathname === "/readyz")
     ) {
+      const scheduler=url.pathname==='/readyz'?env.ANSTS_SCHEDULER_CELL:undefined;
+      const readiness=scheduler?await scheduler.get(scheduler.idFromName('global-shard-0'))
+        .fetch(new Request('https://scheduler.internal/config-readiness')):null;
+      const health=readiness?.status===200||readiness?.status===503?await readiness.json() as {healthy?:boolean}:null;
+      const healthy=health?.healthy??true;
       return new Response(
         JSON.stringify({
-          status: "ok",
-          healthy: true,
+          status: healthy?"ok":"degraded",
+          healthy,
           runtime: "denoland/celld-cloudflare-workers",
           region: env.CELLD_REGION ?? "local",
           controlPlane: "celld-scheduler",
           bodyAuthority: env.ANSTS_BODY_WORKER_URL ? "remote-worker" : "fleet",
           bodyNamespace: env.ANSTS_BODY_NAMESPACE_PREFIX ?? "",
           planes: { scheduler: "durable-object" },
+          ...(health?{schedulerReadiness:health}:{}),
         }),
-        { status: 200, headers: { "content-type": "application/json" } }
+        { status: healthy?200:503, headers: { "content-type": "application/json" } }
       );
     }
     if (url.pathname === "/internal/v1/body-legacy/export") {
@@ -225,6 +297,13 @@ export default {
       const stub = env.ANSTS_SCHEDULER_CELL.get(id);
       if (url.pathname === "/v1/scheduler/submit" && request.method === "POST") {
         const body = await request.json() as Record<string, unknown>;
+        const tenantId=String(body.tenant_id??"");
+        if(env.ANSTS_ADMISSION_MODE==="enforce" &&
+           (env.ANSTS_ADMISSION_PILOT_TENANTS??"").split(",").some(id=>id.trim()===tenantId)){
+          if(shardName!=="global-shard-0")return Response.json({code:"ADMISSION_PILOT_WRONG_SHARD"},{status:409});
+          const occupancy=await checkPilotOccupancy(env,tenantId);
+          if(!occupancy.ok)return occupancy;
+        }
         const tasks = (await (await stub.fetch(new Request("https://cell/v1/scheduler/tasks"))).json() as { tasks: Record<string, unknown>[] }).tasks;
         const legacy = tasks.find(task => task.task_id === body.task_id && task.tenant_id === body.tenant_id);
         if (!legacy) body.task_id = normalizeTaskStorageId(String(body.tenant_id ?? ""), String(body.task_id ?? ""));

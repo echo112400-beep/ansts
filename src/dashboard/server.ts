@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { CrossRegionErasureCodedWalManager } from "../checkpoint/erasure_coder.js";
 import { EbpfSocketNetworkTrackerAndBreaker } from "../runtime/ebpf_network_tracker.js";
 import { RustFsS3LtxDriver } from "../checkpoint/s3_ltx_driver.js";
-import { DurableDiskCellSqlStorage, InMemoryKvNamespace, InMemoryCellSqlStorage } from "../cloudflare/env.js";
+import { DurableDiskCellSqlStorage, InMemoryKvNamespace, InMemoryCellSqlStorage, MockDurableObjectState } from "../cloudflare/env.js";
 import { ZeroTrustSandboxSecurityGuard } from "../runtime/zero_trust_security_guard.js";
 import { LayerFsContentStoreEngine } from "../checkpoint/layerfs_store_engine.js";
 import * as crypto from "node:crypto";
@@ -150,7 +150,7 @@ import { LayerFsMultiAgentBranchCoordinator } from "../dag/layerfs_branch_coordi
 import { LinuxPsiMemoryGuard } from "../runtime/psi_guard.js";
 import { BidirectionalBackpressureController } from "../cluster/backpressure_loop.js";
 import { PartitionedSchedulerRouter, DynamicQueueAutoSharder, BrainBodyContainerPoolScaler } from "../cloudflare/horizontal_scaler.js";
-import { FenceToken, TaskPriority, TaskSpec, TaskState } from "../models.js";
+import { FenceToken, TaskPriority, TaskSpec, TaskState, TurnWalFrame } from "../models.js";
 import { ModelPoolClientAdapter } from "../router/pool_client.js";
 import { LiveOpenAiCompatibleSseAdapter } from "../router/live_llm_adapter.js";
 import { SlidingWindowTokenBucket, ThreeStateCircuitBreaker } from "../router/breaker_limiter.js";
@@ -453,6 +453,7 @@ export class PlatformManagementPlaneEngine {
     this.schedulerCell = new AnstsSchedulerCell({
       id: { toString: () => "AnstsSchedulerCell:shard-01" },
       storage: {
+        ...new MockDurableObjectState().storage,
         sql: deps.v25Store.sql,
         transactionSync: <T>(fn: () => T) => fn(),
         getAlarm: async () => null,
@@ -466,16 +467,16 @@ export class PlatformManagementPlaneEngine {
     this.fleetDurability = new FleetReplicatedDurabilityEngine("fleet", 4);
     if (deps.harnessRunner) {
       this.harnessRunner = deps.harnessRunner;
-      if (!this.harnessRunner.router.endpoints.has("ep-qwen-38")) {
-        this.harnessRunner.router.registerEndpoint(
+      if (!this.harnessRunner.getRouter().getEndpoint("ep-qwen-38")) {
+        this.harnessRunner.getRouter().registerEndpoint(
           new LlmEndpointMetrics({
             endpoint_id: "ep-qwen-38",
             provider: "qwen",
             model_name: "Qwen-3.8-Economy",
             ttft_ewma_ms: 95,
-            rpm_remaining: 1200,
-            tpm_remaining: 240000,
-          })
+            rpm_limit: 1200,
+            tpm_limit: 240000,
+          }), 1200, 240000
         );
       }
     } else {
@@ -489,9 +490,9 @@ export class PlatformManagementPlaneEngine {
           provider: "qwen",
           model_name: "Qwen-3.8-Economy",
           ttft_ewma_ms: 95,
-          rpm_remaining: 1200,
-          tpm_remaining: 240000,
-        })
+          rpm_limit: 1200,
+          tpm_limit: 240000,
+        }), 1200, 240000
       );
       deps.sagaGateway.registerTool(
         "shell_exec",
@@ -898,7 +899,7 @@ export class PlatformManagementPlaneEngine {
         {
           toolName: "mcp_pg_migration_apply",
           description: "Apply reversible schema migration with Saga LIFO rollback hook",
-          effectClass: ToolCallEffectClass.COMPENSATABLE_WRITE,
+          effectClass: ToolCallEffectClass.COMPENSATABLE,
           inputSchema: { type: "object", properties: { migrationId: { type: "string" } } },
         },
       ],
@@ -907,7 +908,7 @@ export class PlatformManagementPlaneEngine {
     );
     this.deps.sagaGateway.registerTool(
       "mcp_pg_migration_apply",
-      ToolCallEffectClass.COMPENSATABLE_WRITE,
+      ToolCallEffectClass.COMPENSATABLE,
       (args) => ({ jsonrpc: "2.0", tool: "mcp_pg_migration_apply", appliedMigration: args.migrationId ?? "0042_add_idx", status: "COMMITTED" }),
       (args) => ({ jsonrpc: "2.0", tool: "mcp_pg_migration_apply", revertedMigration: args.migrationId ?? "0042_add_idx", status: "ROLLED_BACK_LIFO" })
     );
@@ -971,9 +972,9 @@ export class PlatformManagementPlaneEngine {
         tenant_id: qt.tenant,
         priority: qt.priority,
         prompt: qt.prompt,
-        created_at: nowSec - qt.waitSec,
-        preempted_count: qt.preempted,
       });
+      qSpec.created_at = nowSec - qt.waitSec;
+      qSpec.preempted_count = qt.preempted;
       qSpec.state = TaskState.QUEUED;
       this.mgmtQueueManager.enqueue(qSpec);
     }
@@ -1529,7 +1530,7 @@ export class PlatformManagementPlaneEngine {
         warmPoolHitRatio,
         utilizationRatio,
         compliant: slaEvaluation.compliant,
-        breaches: slaEvaluation.breaches,
+        breaches: slaEvaluation.breachedMetrics,
       },
       canary: this.deps.canaryController ? this.deps.canaryController.getStatus() : { state: "CANARY_ACTIVE", trafficWeightPct: 5 },
       batchReport: this.lastBatchReport,
@@ -1588,8 +1589,8 @@ export class PlatformManagementPlaneEngine {
           nodeCount: regNodes.length,
           replicationLabel:
             reg.regionId === "eu-central-1"
-              ? `→ eu-west-1 (${reg.rttMs}ms)`
-              : `RPO=0 (${reg.rttMs}ms)`,
+              ? `→ eu-west-1 (${reg.latencyMs}ms)`
+              : `RPO=0 (${reg.latencyMs}ms)`,
           sloStatus,
         };
       }),
@@ -2736,7 +2737,7 @@ export class PlatformManagementPlaneEngine {
         task_id: fullTaskId,
         tenant_id: tenantId,
         parent_task_id: coordinatorTaskId,
-        depends_on: mappedDeps,
+        dependencies: mappedDeps,
         priority: st.priority as TaskPriority,
         prompt: `[${st.role}] ${st.prompt}`,
         resource_profile: {
@@ -2752,7 +2753,7 @@ export class PlatformManagementPlaneEngine {
       } else {
         childSpec.state = TaskState.RUNNING_ACT;
       }
-      this.deps.dagEscrow.registerChildSubAgent(parentTask, childSpec, mappedDeps);
+      this.deps.dagEscrow.registerChildSubAgent(parentTask, childSpec);
       this.deps.scheduler.allTasks.set(fullTaskId, childSpec);
       this.deps.v25Store.commitTaskSingleWritePath(childSpec, "body-host-01");
       dispatchedTaskIds.push(fullTaskId);
@@ -3322,7 +3323,7 @@ export class PlatformManagementPlaneEngine {
       totalEscrowsCount: dagSnap.totalEscrowsCount,
       totalEdgesCount: dagSnap.totalEdgesCount,
       escrows: enrichedEscrows,
-      cognitivePrefixIndexSize: this.harnessRunner.router.getPrefixIndexSize(),
+      cognitivePrefixIndexSize: this.harnessRunner.getRouter().getPrefixIndexSize(),
     };
   }
 
@@ -3385,7 +3386,7 @@ export class PlatformManagementPlaneEngine {
     if (params.action === "spawn_sub_agent") {
       const childId = sanitizeHtmlString(String(params.childTaskId ?? `${parentId}-sub${Date.now() % 1000}`).trim());
       parentTask.expected_SubAgent_count = Math.max(parentTask.expected_SubAgent_count + 1, 3);
-      if (parentTask.state === TaskState.COMPLETED || parentTask.state === TaskState.CANCELLED || parentTask.state === TaskState.DEAD_LETTER) {
+      if (parentTask.state === TaskState.COMPLETED || parentTask.state === TaskState.DEAD_LETTER) {
         return {
           status: 409,
           body: { error: "TERMINAL_PARENT_GUARD", message: `父任务 ${parentId} 已处于终态 (${parentTask.state})，禁止派生子任务` },
@@ -3546,7 +3547,7 @@ export class PlatformManagementPlaneEngine {
         teePlatform: "AMD_SEV_SNP",
         teePublicKeyDigest: this.teeBridge.publicKeyDerHex.slice(0, 32),
         ebpfLsmPosture: this.ebpfBridge.inspectHostKernelSecurityPosture(),
-        webhookKeyRotation: this.deps.outboxDispatcher.getKeyRotationStatus(),
+        webhookKeyRotation: this.outboxDispatcher.getKeyRotationStatus(),
       },
       releaseReadiness: this.evaluateReleaseReadinessSnapshot(),
       lastIntrusionProbe: this.lastIntrusionProbe,
@@ -3586,7 +3587,7 @@ export class PlatformManagementPlaneEngine {
     if (params.probeType === "lsm_proc_escape" || (params.probeType === "custom" && effectiveTarget.startsWith("/"))) {
       const res = this.ebpfBridge.checkFileOpenHook(effectiveTarget);
       blocked = !res.allowed;
-      reason = res.reason ?? (blocked ? "EBPF_LSM_DENIED" : "ALLOWED");
+      reason = blocked ? "EBPF_LSM_DENIED" : "ALLOWED";
     } else if (params.probeType === "vsock_cred_injection" || effectiveTarget.startsWith("http")) {
       const vsock = new ZeroTrustVsockBridge(["api.openai.com", "api.anthropic.com"]);
       try {
@@ -4457,7 +4458,7 @@ export class PlatformManagementPlaneEngine {
       actor: "chen",
       role: "SRE_ADMIN",
     }).body;
-    const outboxKeyRotation = this.deps.outboxDispatcher.getKeyRotationStatus();
+    const outboxKeyRotation = this.outboxDispatcher.getKeyRotationStatus();
 
     const runbookCatalog = [
       {
@@ -4622,8 +4623,8 @@ export class PlatformManagementPlaneEngine {
     }).body;
     const activeConfig = (cfgBody.activeConfig ?? {}) as Record<string, unknown>;
     const storageStats = this.deps.layerfs.storeEngine.getStorageStats();
-    const logicalBytes = Math.max(1, Number(storageStats.totalLogicalBytes ?? 1));
-    const compressedBytes = Number(storageStats.totalCompressedBytes ?? 0);
+    const logicalBytes = Math.max(1, storageStats.logicalTotalBytes);
+    const compressedBytes = storageStats.storedCompressedBytes;
     const compressionRatioPct = Number((((logicalBytes - compressedBytes) / logicalBytes) * 100).toFixed(1));
 
     const layerfsBranches = this.deps.layerfs.listBranchesSummary().map((b) => ({
@@ -4646,15 +4647,16 @@ export class PlatformManagementPlaneEngine {
     const psiFreezePct = Number(activeConfig.psiFullFreezePct ?? 70.0);
 
     const facets = this.facetSupervisor.listFacets();
-    const routerEndpoints = Array.from(this.harnessRunner.router.endpoints.values()).map((ep) => ({
+    const router = this.harnessRunner.getRouter();
+    const routerEndpoints = router.listEndpoints().map((ep) => ({
       endpointId: ep.endpoint_id,
       provider: ep.provider,
       modelName: ep.model_name,
       ttftEwmaMs: Number(ep.ttft_ewma_ms.toFixed(1)),
-      circuitState: ep.circuit_state,
-      rpmRemaining: ep.rpm_remaining,
+      circuitState: router.getEndpointBreaker(ep.endpoint_id)?.getState() ?? null,
+      rpmRemaining: Math.max(0, ep.rpm_limit - ep.rpm_used),
       tpmRemaining: ep.tpm_remaining,
-      healthy: String(ep.circuit_state) !== "OPEN",
+      healthy: ep.healthy && router.getEndpointBreaker(ep.endpoint_id)?.getState() !== "OPEN",
     }));
 
 
@@ -7261,7 +7263,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           {
             toolName,
             description,
-            effectClass: ToolCallEffectClass.COMPENSATABLE_WRITE,
+            effectClass: ToolCallEffectClass.COMPENSATABLE,
             inputSchema: { type: "object" },
           },
         ],
@@ -7270,7 +7272,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       );
       this.deps.sagaGateway.registerTool(
         toolName,
-        ToolCallEffectClass.COMPENSATABLE_WRITE,
+        ToolCallEffectClass.COMPENSATABLE,
         (args) => ({ jsonrpc: "2.0", serverName, toolName, executedArgs: args, status: "COMMITTED" }),
         (args) => ({ jsonrpc: "2.0", serverName, toolName, rolledBackArgs: args, status: "ROLLED_BACK_LIFO" })
       );
@@ -7914,8 +7916,6 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         provider: endpointId.includes("qwen") ? "qwen" : "deepseek",
         model_name: endpointId.includes("qwen") ? "Qwen-3.8" : "DeepSeek-R1",
         ttft_ewma_ms: 140,
-        tpot_ewma_ms: 12,
-        kv_cache_utilization: 0.58,
         healthy: true,
       });
       const infRes = this.poolClient.executeInference(
@@ -8312,6 +8312,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         {
           id: { toString: () => `cell-${taskId}` },
           storage: {
+            ...new MockDurableObjectState().storage,
             sql: this.deps.v25Store.sql,
             transactionSync: <T>(fn: () => T) => fn(),
             getAlarm: async () => null,
@@ -8724,11 +8725,11 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         new NodeHeartbeat({
           node_id: "body-us-west-01",
           total_cpu_cores: 64,
-          available_cpu_cores: 48,
+          free_cpu_cores: 48,
           total_memory_mb: 131072,
-          available_memory_mb: 98304,
-          warm_standby_count: 6,
-          psi_some_avg10: 4.2,
+          free_memory_mb: 98304,
+          warm_pool_ready: 6,
+          psi_memory_some_avg10: 4.2,
         })
       );
       const abortCtrl = new AbortController();
@@ -8854,7 +8855,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       this.appendAudit(
         params.actor,
         params.role,
-        `执行 L0→L1 LTX 压缩 (Merged=${l1Result.batchesMerged} batches, UFFD=${uffdRestore.restoredColdStartMs}ms) 并完成 LayerFS Rule D9 同步 (gen=${pushed.remoteGeneration})`,
+        `执行 L0→L1 LTX 压缩 (Merged=${l1Result.batchesMerged} batches, UFFD=${uffdRestore.resumeLatencyMs}ms) 并完成 LayerFS Rule D9 同步 (gen=${pushed.remoteGeneration})`,
         `Runtime / LTX-LayerFS`,
         `COMPACTED_AND_SYNCED (gen:${pushed.remoteGeneration})`
       );
@@ -9025,7 +9026,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
 
     this.lastSimulatedErrorRequests = 2;
     if (runbookId === "RB-CANARY-AND-BREAKER-RESET") {
-      this.canaryController.resetCanary();
+      this.deps.canaryController?.resetCanary();
     } else if (runbookId === "RB-HOT-CELL-SHARD-REBALANCE") {
       for (const bId of ["brain-node-01", "brain-node-02", "brain-node-03"]) {
         this.deps.shardCoordinator.registerBrainShardNode(bId);
@@ -9229,6 +9230,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const cell1 = new AnstsSchedulerCell({
       id: { toString: () => "AnstsSchedulerCell:m52-audit" },
       storage: {
+        ...new MockDurableObjectState().storage,
         sql: cellSql,
         transactionSync: <T>(fn: () => T) => fn(),
         getAlarm: async () => alarmScheduledAt,
@@ -9250,6 +9252,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const cell2 = new AnstsSchedulerCell({
       id: { toString: () => "AnstsSchedulerCell:m52-audit-restarted" },
       storage: {
+        ...new MockDurableObjectState().storage,
         sql: cellSql,
         transactionSync: <T>(fn: () => T) => fn(),
         getAlarm: async () => alarmScheduledAt,
@@ -9656,6 +9659,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const stateLike = {
       id: { toString: () => "AgentTaskHarnessCell:m54-audit" },
       storage: {
+        ...new MockDurableObjectState().storage,
         sql: cellSql,
         transactionSync: <T>(fn: () => T) => fn(),
         getAlarm: async () => null,
@@ -9981,10 +9985,10 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       "task-m55-tt-fork"
     );
     // Corrupt frame CRC32 and verify forkTaskAtTurn rejects it
-    validTurn1Epoch2.frame.crc32Hex = "00000000";
+    const corruptEntry = { ...validTurn1Epoch2, frame: new TurnWalFrame({ ...validTurn1Epoch2.frame, crc32Hex: "00000000" }) };
     let corruptedForkRejected = false;
     try {
-      replayer.forkTaskAtTurn(tFirst, [validTurn1Epoch2], 1, "task-m55-tt-bad");
+      replayer.forkTaskAtTurn(tFirst, [corruptEntry], 1, "task-m55-tt-bad");
     } catch {
       corruptedForkRejected = true;
     }
@@ -10992,7 +10996,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const breakpointRecoveryVerified =
       recovery.restoredTurnIndex === 1 &&
       recovery.nextTurnToExecute === 2 &&
-      uncommittedRolledBack === true &&
+      Boolean(uncommittedRolledBack) &&
       step2AfterRecovery.turn === 2 &&
       step2AfterRecovery.deduplicated === false;
 
@@ -11717,6 +11721,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const cellState = {
       id: { toString: () => "cell-m64-01" },
       storage: {
+        ...new MockDurableObjectState().storage,
         sql: new InMemoryCellSqlStorage(),
         transactionSync: <T>(fn: () => T) => fn(),
         getAlarm: async () => null,
@@ -12663,6 +12668,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const mkState = () => ({
       id: { toString: () => "cell-m69" },
       storage: {
+        ...new MockDurableObjectState().storage,
         sql: cSql,
         transactionSync: <T>(fn: () => T) => fn(),
         getAlarm: async () => null,
@@ -12721,6 +12727,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       {
         id: { toString: () => "h-m69" },
         storage: {
+          ...new MockDurableObjectState().storage,
           sql: hSql,
           transactionSync: <T>(fn: () => T) => fn(),
           getAlarm: async () => null,
@@ -12833,15 +12840,15 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
       this.deps.v25Store.commitTaskSingleWritePath(dlqTask, "body-host-01");
 
       const dlqMsgId = params.messageId ?? "outbox-dlq-9901";
-      this.deps.outboxDispatcher.enqueueOutbox(
+      this.outboxDispatcher.enqueueOutbox(
         dlqMsgId,
         dlqTaskId,
         "https://unreachable-webhook.internal/hook",
         { event: "io.ansts.task.dead_lettered", taskId: dlqTaskId },
         { resetIfDeadLettered: true }
       );
-      for (let i = 0; i < this.deps.outboxDispatcher.maxAttempts; i++) {
-        this.deps.outboxDispatcher.processPending(() => false);
+      for (let i = 0; i < this.outboxDispatcher.maxAttempts; i++) {
+        this.outboxDispatcher.processPending(() => false);
       }
     }
 
@@ -12882,14 +12889,14 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
 
     if (params.action === "replay_outbox_webhook") {
       const msgId = params.messageId ?? "outbox-dlq-9901";
-      const retried = this.deps.outboxDispatcher.retryDeadLetteredMessage(
+      const retried = this.outboxDispatcher.retryDeadLetteredMessage(
         msgId,
         params.newTargetUrl ?? "https://audit-sink.ansts.internal/webhook"
       );
       if (!retried) {
         return { status: 404, body: { error: "OUTBOX_MESSAGE_NOT_FOUND", messageId: msgId } };
       }
-      const delivery = this.deps.outboxDispatcher.processPending(() => true);
+      const delivery = this.outboxDispatcher.processPending(() => true);
       this.appendAudit(
         params.actor,
         params.role,
@@ -12920,7 +12927,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         deadLetterReason: t.dead_letter_reason ?? "FENCED_OR_EXCEEDED",
         fencingToken: t.lease_fencing_token,
       }));
-    const deadLetterWebhooks = this.deps.outboxDispatcher
+    const deadLetterWebhooks = this.outboxDispatcher
       .listMessages()
       .filter((m) => m.deadLettered)
       .map((m) => ({
@@ -13235,7 +13242,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         layer: "eBPF LSM file_open Hook",
         target: "/proc/42/environ",
         blocked: !lsmRes.allowed,
-        reason: lsmRes.reason ?? "PROC_PID_ESCAPE_BLOCKED",
+        reason: lsmRes.allowed ? "ALLOWED" : "PROC_PID_ESCAPE_BLOCKED",
         timestampUtc: nowUtc,
       });
 
@@ -13378,21 +13385,21 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     }
     const nowSec = Math.floor(Date.now() / 1000);
     const samplePayload = JSON.stringify({ event: "io.ansts.key_rotation.probe", ts: nowSec });
-    const inFlightOldSignature = this.deps.outboxDispatcher.signPayload(samplePayload, nowSec);
+    const inFlightOldSignature = this.outboxDispatcher.signPayload(samplePayload, nowSec);
     const newSecret = params.newWebhookSecret ?? `ansts-hmac-rot-${Date.now()}`;
-    const rotation = this.deps.outboxDispatcher.rotateSigningSecret(
+    const rotation = this.outboxDispatcher.rotateSigningSecret(
       newSecret,
       params.graceWindowSec ?? 3600,
       nowSec
     );
-    const newPrimarySignature = this.deps.outboxDispatcher.signPayload(samplePayload, nowSec);
-    const oldSignatureStillValidInGraceWindow = this.deps.outboxDispatcher.verifySignature(
+    const newPrimarySignature = this.outboxDispatcher.signPayload(samplePayload, nowSec);
+    const oldSignatureStillValidInGraceWindow = this.outboxDispatcher.verifySignature(
       samplePayload,
       inFlightOldSignature,
       nowSec + 10,
       300
     );
-    const newSignatureValid = this.deps.outboxDispatcher.verifySignature(
+    const newSignatureValid = this.outboxDispatcher.verifySignature(
       samplePayload,
       newPrimarySignature,
       nowSec + 10,
@@ -13444,7 +13451,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const runF1AdaptiveDagReplan = () => {
       const sql = new InMemoryCellSqlStorage();
       const escrow = new DagEscrowCoordinator(sql);
-      const sched = new CoreScheduler5D(this.deps.leaseCoordinator);
+      const sched = new CoreScheduler5D();
 
       const parent = new TaskSpec({
         task_id: params.parentTaskId ?? "task-m71-parent",
@@ -13534,7 +13541,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     };
 
     const runF2BestOfNSpeculative = () => {
-      const forker = new CoWSandboxBranchForker(this.deps.layerFsDriver);
+      const forker = new CoWSandboxBranchForker(this.deps.layerfs);
       const baseBranch = params.sourceBranch ?? "main";
       const specRes = forker.executeBestOfNSpeculativeVerifier({
         sourceBranch: baseBranch,
@@ -13819,7 +13826,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const action = params.action ?? "run_all_phase2_suite";
 
     const runF4EpisodicGoldenHatchery = () => {
-      const drv = this.deps.layerFsDriver ?? new LayerFsWorkspaceDriver();
+      const drv = this.deps.layerfs;
       drv.forkBranch("main", "m72-verified-prisma");
       drv.executeInProcessFileTool({
         branchName: "m72-verified-prisma",
@@ -14235,7 +14242,7 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
     const runF8SpotQuotaMarket = () => {
       const sql = new InMemoryCellSqlStorage();
       const sla = new CapacitySlaEnforcer(undefined, sql);
-      const sched = new CoreScheduler5D(this.deps.leaseCoordinator);
+      const sched = new CoreScheduler5D();
       const wal = new TurnWalEngine();
 
       const nowSec = Date.now() / 1000;
@@ -15212,8 +15219,8 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
         tenant_id: tenantId,
         priority: prioNum as TaskPriority,
         prompt,
-        created_at: nowSec - 10,
       });
+      spec.created_at = nowSec - 10;
       spec.state = TaskState.QUEUED;
       this.mgmtQueueManager.enqueue(spec);
       this.appendAudit(
@@ -15273,8 +15280,8 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
           tenant_id: b.tenant,
           priority: b.prio,
           prompt: b.prompt,
-          created_at: nowSec - b.wait,
         });
+        sp.created_at = nowSec - b.wait;
         sp.state = TaskState.QUEUED;
         this.mgmtQueueManager.enqueue(sp);
       }
@@ -15308,8 +15315,8 @@ export const crc32 = "${walEntry.frame.crc32Hex}";
             tenant_id: hit.tenantId,
             priority: newPrio,
             prompt: hit.prompt,
-            created_at: nowSec - hit.waitSeconds,
           });
+          foundSpec.created_at = nowSec - hit.waitSeconds;
           foundSpec.state = TaskState.QUEUED;
           break;
         }

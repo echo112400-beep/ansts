@@ -247,7 +247,7 @@ export class AnstsLocalAndComposeServer {
     this.teeBridge = new ConfidentialTeeAttestationBridge();
     this.securityGuard = new ZeroTrustSandboxSecurityGuard();
     this.mtlsBridge = new MtlsReverseTunnelBridge();
-    this.slaEnforcer = new CapacitySlaEnforcer({ sql: durableSql });
+    this.slaEnforcer = new CapacitySlaEnforcer(undefined, durableSql);
     this.loadShedder = new PriorityLoadShedder();
     this.canaryController = new CanaryRolloutController(durableSql);
     this.prewarmer = new PredictiveSandboxPrewarmer(0.4, durableSql);
@@ -859,7 +859,7 @@ export class AnstsLocalAndComposeServer {
         this.scheduler.nodes.size,
         Object.keys(this.peerBrainUrls).length + Object.keys(this.peerBodyUrls).length
       );
-      const isPressured = Boolean(heapEval.pressured);
+      const isPressured = heapEval.status !== "HEALTHY";
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
@@ -1988,7 +1988,7 @@ export class AnstsLocalAndComposeServer {
       const descriptors = rawTools.map((t) => ({
         toolName: String(t.toolName ?? "mcp_tool"),
         description: String(t.description ?? "MCP dynamic tool"),
-        effectClass: (t.effectClass as ToolCallEffectClass) ?? ToolCallEffectClass.COMPENSATABLE_WRITE,
+        effectClass: (t.effectClass as ToolCallEffectClass) ?? ToolCallEffectClass.COMPENSATABLE,
         inputSchema: (t.inputSchema as Record<string, unknown>) ?? {},
       }));
       const count = this.mcpRegistry.registerMcpServerTools(
@@ -2148,7 +2148,7 @@ export class AnstsLocalAndComposeServer {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ appended: true, entry }));
         } catch (err) {
-          if (err instanceof StaleFenceError || (err as Error).name === "StaleFenceError" || (err as Error).message.includes("Stale")) {
+          if (err instanceof Error && (err instanceof StaleFenceError || err.name === "StaleFenceError" || err.message.includes("Stale"))) {
             res.writeHead(409, { "content-type": "application/json" });
             res.end(JSON.stringify({ error: "STALE_FENCE_TOKEN", message: err.message }));
             return;
@@ -3205,7 +3205,7 @@ export class AnstsLocalAndComposeServer {
         nodeRole: this.nodeRole,
         peerBrainUrls: this.peerBrainUrls,
         peerBodyUrls: this.peerBodyUrls,
-        s3Endpoint: this.s3Endpoint,
+        s3Endpoint: this.s3Endpoint ?? undefined,
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(statusPayload));

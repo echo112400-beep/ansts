@@ -11,14 +11,14 @@ export { AnstsGatewayCell } from "./gateway_cell.js";
 const JSON_HEADERS = { "content-type": "application/json" };
 
 export default {
-  async fetch(request: Request, env: UnifiedGatewayEnv): Promise<Response> {
+  async fetch(request: Request, env: UnifiedGatewayEnv, context?:{waitUntil?(work:Promise<void>):void}): Promise<Response> {
     const path=new URL(request.url).pathname,started=Date.now();let status=500;
     try {
       if(request.method==='GET'&&path==='/metrics') {
         if(!monitoringAuthorized(request.headers.get('authorization')??undefined,env.ANSTS_MONITORING_TOKEN)) {status=401;return Response.json({error:'MONITORING_AUTH_REQUIRED'},{status});}
         status=200;return new Response(gatewayMetrics(),{headers:{'content-type':'text/plain; version=0.0.4; charset=utf-8','cache-control':'no-store'}});
       }
-      const handled=await handleUnifiedGatewayRequest(request,env);
+      const handled=await handleUnifiedGatewayRequest(request,env,context?.waitUntil?.bind(context));
       const response=handled??new Response(JSON.stringify({error:'NOT_FOUND',controlPlane:'celld-gateway'}),{status:404,headers:JSON_HEADERS});
       status=response.status;return response;
     } finally {recordGatewayRequest(path,request.method,status,Date.now()-started);}

@@ -12,7 +12,7 @@ import { SyntacticAndVelocityBreaker } from "../src/harness/velocity_breaker.js"
 import { TurnWalEngine } from "../src/checkpoint/wal_engine.js";
 import { DeterministicTimeTravelReplayer } from "../src/checkpoint/time_travel.js";
 import { RpoZeroDurabilityEngine, DurableWorkflowContext } from "../src/cloudflare/celld_ha_engine.js";
-import { TaskPriority, TaskSpec } from "../src/models.js";
+import { TaskPriority, TaskSpec, TurnWalFrame } from "../src/models.js";
 import { AnstsLocalAndComposeServer } from "../src/server_main.js";
 import { runAnstsCtlRemote } from "../src/cli/anstsctl.js";
 
@@ -131,9 +131,9 @@ describe("M55: Deep Persistence, Shard Last-Brain Survival Guard, LayerFS Pull-t
     assert.deepEqual(branch.inheritedFiles, ["new_attempt.ts"]);
     assert.equal(branch.inheritedFencingToken, 3);
 
-    latestEntry.frame.crc32Hex = "deadbeef";
+    const corruptEntry = { ...latestEntry, frame: new TurnWalFrame({ ...latestEntry.frame, crc32Hex: "deadbeef" }) };
     assert.throws(
-      () => replayer.forkTaskAtTurn(t1, [latestEntry], 1, "task-tt-corrupt"),
+      () => replayer.forkTaskAtTurn(t1, [corruptEntry], 1, "task-tt-corrupt"),
       /corrupted WAL frame/
     );
 

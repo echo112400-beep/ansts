@@ -1,11 +1,19 @@
+import {rejectUnavailableRegionPlacement} from '../control/region_placement_gate.js';
+import {createHash} from "node:crypto";
+import type {AdmissionReservation} from '../control/admission_reservations.js';
 /**
  * @fileoverview M7 TASK-26, M52-1, M60-1, M64-1/M64-2 & M69-2: AnstsSchedulerCell (Stateful Durable Object Control Plane with SQLite Backing,
  * Monotonic Fencing Watermark Rehydration, Tenant-Scoped Idempotency Index Restoration, Active-Only Content-Fingerprint Rehydration,
  * Interrupted-Lease Node Capacity Reclamation, 100% TaskSpec Field Fidelity, Alarm Renewal & Worker Prefix-Aware Route Matching).
  */
-import { DurableObjectStateLike } from "./env.js";
+import { SchedulerConfigTarget } from "./scheduler_config_target.js";
+import type { CloudflareCelldEnv, DurableObjectStateLike } from "./env.js";
+import { authenticateGatewayService, equalBodyToken, type BodyAuthConfiguration } from "./body_auth.js";
 import { CoreScheduler5D } from "../scheduler.js";
 import { NodeHeartbeat, LeaseRecord, ResourceProfile, TaskPriority, TaskSpec, TaskState } from "../models.js";
+import {ExecutionInventory, type InventoryObservation} from '../control/execution_inventory.js';
+import type {DirectoryStorage} from '../control/tenant_directory.js';
+import {taskInputDigest} from './execution_attempt.js';
 
 const ACTIVE_FINGERPRINT_STATES = new Set<TaskState>([
   TaskState.SUBMITTED,
@@ -20,15 +28,30 @@ const ACTIVE_FINGERPRINT_STATES = new Set<TaskState>([
 export class AnstsSchedulerCell {
   private readonly ctx: DurableObjectStateLike;
   public readonly scheduler: CoreScheduler5D;
+  private readonly configTarget:SchedulerConfigTarget|null;
+  private readonly inventory:ExecutionInventory|null;
 
-  constructor(ctx: DurableObjectStateLike) {
+  constructor(ctx: DurableObjectStateLike, private readonly env:Pick<CloudflareCelldEnv,'ANSTS_CONFIG_TARGET_TOKEN'|'ANSTS_DIRECTORY_SERVICE_TOKEN'|'ANSTS_CAPACITY_INVENTORY_CELL'|'ANSTS_TENANT_CONTROL_CELL'|'ANSTS_ADMISSION_SERVICE_TOKEN'|'ANSTS_ADMISSION_PILOT_POOL'|'ANSTS_ADMISSION_MODE'|'ANSTS_ADMISSION_PILOT_TENANTS'>&BodyAuthConfiguration={}) {
     this.ctx = ctx;
     this.scheduler = new CoreScheduler5D(15.0);
     this.initSchema();
+    const storage=ctx.storage as typeof ctx.storage & Partial<DirectoryStorage>;
+    this.configTarget=typeof storage.transactionSync==='function'?new SchedulerConfigTarget(storage as DirectoryStorage):null;
+    this.inventory=typeof storage.transactionSync==='function'?new ExecutionInventory(storage as DirectoryStorage,'SCHEDULER',ctx.id.toString(),()=>this.ctx.storage.sql.exec<{task_id:string;tenant_id:string;state:string;fencing_token:number;assigned_node_id:string;payload_json:string}>('SELECT * FROM ansts_tasks').toArray().map(row=>{
+      const payload=JSON.parse(row.payload_json);
+      return {tenantId:row.tenant_id,taskId:row.task_id,state:row.state,fencing:row.fencing_token??0,nodeId:row.assigned_node_id||null,attemptId:null,version:null,sourceAt:typeof payload.created_at==='number'?Math.round(payload.created_at*1000):null,inputDigest:taskInputDigest(row.tenant_id,row.task_id,payload.prompt,payload.execution)};
+    })):null;
     this.rehydrateFromSql();
   }
 
   private initSchema(): void {
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS ansts_pilot_submission_accepted (reservation_id TEXT PRIMARY KEY)"
+    );
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS ansts_pilot_submissions (reservation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, input_digest TEXT NOT NULL, expires_at INTEGER NOT NULL)"
+    );
+
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS ansts_tasks (task_id TEXT PRIMARY KEY, tenant_id TEXT, priority INTEGER, state TEXT, fencing_token INTEGER, assigned_node_id TEXT, payload_json TEXT)"
     );
@@ -140,6 +163,14 @@ export class AnstsSchedulerCell {
       spec.cancel_requested = parsed.cancel_requested as TaskSpec["cancel_requested"];
       spec.execution_outcome = parsed.execution_outcome as TaskSpec["execution_outcome"];
       spec.resume_node_id = typeof parsed.resume_node_id === "string" ? parsed.resume_node_id : undefined;
+      spec.capacity_target_node_id = typeof parsed.capacity_target_node_id === "string" ? parsed.capacity_target_node_id : undefined;
+      spec.capacity_fencing = typeof parsed.capacity_fencing === "number" ? parsed.capacity_fencing : undefined;
+      spec.capacity_expires_at = typeof parsed.capacity_expires_at === "number" ? parsed.capacity_expires_at : undefined;
+      spec.capacity_attempt_id = typeof parsed.capacity_attempt_id === "string" ? parsed.capacity_attempt_id : undefined;
+      spec.capacity_reservation_id = typeof parsed.capacity_reservation_id === "string" ? parsed.capacity_reservation_id : undefined;
+      spec.capacity_receipt = typeof parsed.capacity_receipt === "string" ? parsed.capacity_receipt : undefined;
+      spec.capacity_generation = typeof parsed.capacity_generation === "number" ? parsed.capacity_generation : undefined;
+      spec.capacity_start_checked = parsed.capacity_start_checked === true;
       spec.lease_fencing_token = Number(r.fencing_token ?? 0);
       spec.retry_count = Number(parsed.retry_count ?? 0);
       spec.preempted_count = Number(parsed.preempted_count ?? 0);
@@ -212,7 +243,14 @@ export class AnstsSchedulerCell {
   }
 
   private persistTask(task: TaskSpec): void {
-    this.ctx.storage.sql.exec(
+    const write=()=>{
+      if(task.capacity_reservation_id){
+        // Persist acceptance in the same inventory transaction as the task row.
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO ansts_pilot_submission_accepted VALUES (?)",task.capacity_reservation_id,
+        );
+      }
+      this.ctx.storage.sql.exec(
       "INSERT OR REPLACE INTO ansts_tasks (task_id, tenant_id, priority, state, fencing_token, assigned_node_id, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
       task.task_id,
       task.tenant_id,
@@ -222,6 +260,14 @@ export class AnstsSchedulerCell {
       task.assigned_node_id ?? "",
       JSON.stringify({
         execution_lease: this.scheduler.leaseCoordinator.getLease(task.task_id),
+        capacity_target_node_id: task.capacity_target_node_id,
+        capacity_attempt_id: task.capacity_attempt_id,
+        capacity_reservation_id: task.capacity_reservation_id,
+        capacity_receipt: task.capacity_receipt,
+        capacity_generation: task.capacity_generation,
+        capacity_fencing: task.capacity_fencing,
+        capacity_expires_at: task.capacity_expires_at,
+        capacity_start_checked: task.capacity_start_checked,
         execution: task.execution,
         cancel_requested: task.cancel_requested,
         execution_outcome: task.execution_outcome,
@@ -247,9 +293,114 @@ export class AnstsSchedulerCell {
         created_at: task.created_at,
       })
     );
+    };
+    const observation:InventoryObservation={tenantId:task.tenant_id,taskId:task.task_id,inputDigest:taskInputDigest(task.tenant_id,task.task_id,task.prompt,task.execution),state:task.state,fencing:task.lease_fencing_token,nodeId:task.assigned_node_id??null,attemptId:null,version:null,sourceAt:Math.round(task.created_at*1000)};
+    if(this.inventory)this.inventory.record(observation,write);else write();
   }
 
   public async submitTask(task: TaskSpec, options?: { mergeDuplicateInFlight?: boolean }): Promise<TaskSpec> {
+    const failure = this.checkAdmissionPilot(task.tenant_id, false);
+    if (failure) throw Object.assign(new Error(failure.code), failure);
+    return this.persistSubmission(task, options);
+  }
+
+  private hasLegacyOccupancy(tenantId: string): boolean {
+    return [...this.scheduler.allTasks.values()].some(task => task.tenant_id === tenantId &&
+      !task.capacity_reservation_id && ![TaskState.COMPLETED, TaskState.FAILED, TaskState.DEAD_LETTER].includes(task.state));
+  }
+
+  private checkAdmissionPilot(tenantId: string, hasReservation: boolean): {code: string; status: number} | null {
+    const mode = this.env.ANSTS_ADMISSION_MODE ?? "observe";
+    const pilots = (this.env.ANSTS_ADMISSION_PILOT_TENANTS ?? "").split(",").map(id => id.trim()).filter(Boolean);
+    if (!["observe", "shadow", "enforce"].includes(mode) || (mode === "enforce" && pilots.length === 0)) {
+      return {code: "ADMISSION_PILOT_MISCONFIGURED", status: 503};
+    }
+    if (!pilots.includes(tenantId) || hasReservation) return null;
+    if (mode === "enforce") return {code: "ADMISSION_RESERVATION_REQUIRED", status: 428};
+    return null;
+  }
+
+  private async observeShadowQuota(spec:TaskSpec):Promise<void> {
+    const tenantId=spec.tenant_id,execution=spec.execution,ns=this.env.ANSTS_TENANT_CONTROL_CELL;
+    const token=this.env.ANSTS_ADMISSION_SERVICE_TOKEN;
+    let code='ADMISSION_SHADOW_UNAVAILABLE';
+    if(execution&&ns&&token&&token.length>=32&&token!==this.env.ANSTS_DIRECTORY_SERVICE_TOKEN){
+      try {
+        const response=await ns.get(ns.idFromName('tenant-control-v1:'+tenantId)).fetch(new Request(
+          'https://tenant.internal/admission-shadow-preview',{
+            method:'POST',signal:AbortSignal.timeout(1000),headers:{authorization:'Bearer '+token,'content-type':'application/json'},
+            body:JSON.stringify({tenantId,actor:{sub:'system:scheduler',role:'OPERATOR',scopeTenant:tenantId,scopeRegion:'all'},
+              input:{resources:{concurrentAttempts:1,queuedTasks:0,cpuMilliCores:Math.ceil(execution.cpu*1000),memoryMiB:execution.memoryMb}}}),
+          },
+        ));
+        const result=await response.json() as {code?:string};
+        code=result.code??code;
+      } catch { /* A preview failure must not block shadow submissions. */ }
+    }
+    console.info('admission_shadow_quota',{tenantId,code});
+  }
+
+  private async preparePilotSubmission(spec: TaskSpec): Promise<string | Response> {
+    const tenantId=spec.tenant_id, execution=spec.execution;
+    const capacity=this.env.ANSTS_CAPACITY_INVENTORY_CELL, tenants=this.env.ANSTS_TENANT_CONTROL_CELL;
+    const poolId=this.env.ANSTS_ADMISSION_PILOT_POOL, directoryKey=this.env.ANSTS_DIRECTORY_SERVICE_TOKEN;
+    const admissionKey=this.env.ANSTS_ADMISSION_SERVICE_TOKEN;
+    const unavailable=()=>Response.json({code:'CAPACITY_UNAVAILABLE'},{status:503});
+    if(!capacity||!tenants||!poolId||!directoryKey||directoryKey.length<32||
+      !admissionKey||admissionKey.length<32||admissionKey===directoryKey)return unavailable();
+    if(!execution)return Response.json({code:'ADMISSION_EXECUTION_REQUIRED'},{status:422});
+    const actor={sub:'system:scheduler',role:'OPERATOR',scopeTenant:tenantId,scopeRegion:'all'};
+    const key=createHash('sha256').update(JSON.stringify([tenantId,spec.task_id])).digest('hex');
+    const digest=taskInputDigest(tenantId,spec.task_id,spec.prompt,execution);
+    const resources={cpuMilliCores:Math.ceil(execution.cpu*1000),memoryMiB:execution.memoryMb};
+    const call=(ns:typeof capacity,name:string,token:string,path:string,body:object)=>ns.get(ns.idFromName(name)).fetch(
+      new Request('https://control.internal/'+path,{method:'POST',signal:AbortSignal.timeout(3500),
+        headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify({actor,...body})}));
+    const cap=(path:string,requestInput:object)=>call(capacity,'capacity-inventory-v1',directoryKey,path,{requestInput});
+    const admit=(path:string,body:object)=>call(tenants,'tenant-control-v1:'+tenantId,admissionKey,path,{tenantId,...body});
+    try {
+      const requested=await cap('request-submit',{tenantId,poolId,key,resources:{...resources,slots:1}});
+      if(!requested.ok)return requested;
+      const {id,state}=await requested.json() as {id:string;state:string};
+      if(state==='QUEUED')return Response.json({code:'CAPACITY_PENDING'},{status:409,headers:{'retry-after':'1'}});
+      if(state!=='GRANTED')return Response.json({code:'CAPACITY_REQUEST_INACTIVE'},{status:409});
+      const granted=await cap('grant-read',{tenantId,poolId,id});
+      if(!granted.ok)return granted;
+      const {grant}=await granted.json() as {grant:{target:string;capacityReceipt:string}|null};
+      if(!grant)return Response.json({code:'CAPACITY_TARGET_UNAVAILABLE'},{status:409});
+      const prepared=await admit('admission-prepare-estimated',{idempotencyKey:'prepare-'+id,input:{
+        reservationId:id,attemptId:id,taskId:spec.task_id,fencing:1,executionInputDigest:digest,schedulerObjectId:this.ctx.id.toString(),
+        resources:{...resources,concurrentAttempts:1,queuedTasks:0},
+      }});
+      if(!prepared.ok)return prepared;
+      let {reservation}=await prepared.json() as {reservation:AdmissionReservation};
+      const transition=(to:string,fields:object={})=>admit('admission-transition',{idempotencyKey:to+'-'+id,
+        input:{reservationId:id,expectedVersion:reservation.version,generation:reservation.generation,
+          fencing:reservation.fencing,to,reason:'pilot task submission',...fields}});
+      if(reservation.phase==='PREPARING'){
+        const reserved=await transition('RESERVED',{target:grant.target,capacityReceipt:grant.capacityReceipt});
+        if(!reserved.ok)return reserved;
+        ({reservation}=await reserved.json() as {reservation:AdmissionReservation});
+      }
+      if(reservation.phase==='RESERVED'){
+        // Journal the submission before asking the tenant to authorize a start.
+        this.ctx.storage.sql.exec(
+          "INSERT OR IGNORE INTO ansts_pilot_submissions (reservation_id, task_id, input_digest, expires_at) VALUES (?, ?, ?, ?)",
+          id,spec.task_id,digest,reservation.expiresAt,
+        );
+
+        const authorized=await transition('START_AUTHORIZED');
+        if(!authorized.ok)return authorized;
+        ({reservation}=await authorized.json() as {reservation:AdmissionReservation});
+      }
+      if(reservation.phase!=='START_AUTHORIZED')return Response.json({code:'ADMISSION_RESERVATION_INACTIVE'},{status:409});
+      return id;
+    } catch {
+      return unavailable();
+    }
+  }
+
+  private async persistSubmission(task: TaskSpec, options?: { mergeDuplicateInFlight?: boolean }): Promise<TaskSpec> {
     const submitted = this.scheduler.submitTask(task, options);
     this.persistTask(submitted);
     const currentAlarm = await this.ctx.storage.getAlarm();
@@ -297,9 +448,98 @@ export class AnstsSchedulerCell {
   public async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const normalizedPath = url.pathname.replace(/^\/v1\/scheduler(?=\/|$)/, "") || "/";
+    if(normalizedPath==='/config-readiness'&&request.method==='GET'){
+      const threshold=this.configTarget?.unhealthyNodeThresholdBps;
+      if(threshold===undefined)return new Response(null,{status:204});
+      const nodes=[...this.scheduler.nodes.values()],now=Date.now()/1000;
+      const unhealthy=nodes.filter(node=>!node.healthy||now-node.timestamp>this.scheduler.nodeHeartbeatTtlSeconds).length;
+      const healthy=nodes.length>0&&unhealthy*10000<=threshold*nodes.length;
+      return Response.json({healthy,nodeCount:nodes.length,unhealthyNodeCount:unhealthy,unhealthyNodeThresholdBps:threshold},
+        {status:healthy?200:503});
+    }
+    if(normalizedPath.startsWith('/config-target/')){
+      return this.configTarget?.fetch(request,normalizedPath,this.env.ANSTS_CONFIG_TARGET_TOKEN)??
+        Response.json({code:'CONFIG_TARGET_UNAVAILABLE'},{status:503});
+    }
+    if(normalizedPath==='/capacity-grant'){
+      const token=this.env.ANSTS_DIRECTORY_SERVICE_TOKEN,ns=this.env.ANSTS_CAPACITY_INVENTORY_CELL;
+      if(request.method!=='POST')return Response.json({code:'METHOD_NOT_ALLOWED'},{status:405});
+      if(!token||token.length<32||!equalBodyToken(request.headers.get('authorization')??'','Bearer '+token)){
+        return Response.json({code:'SERVICE_AUTH_REQUIRED'},{status:401});
+      }
+      if(!ns)return Response.json({code:'CAPACITY_UNAVAILABLE'},{status:503});
+      try{
+        const raw=await request.text();
+        if(raw.length>4096)return Response.json({code:'PAYLOAD_TOO_LARGE'},{status:413});
+        const {poolId,tenantId,requestId,binding}=JSON.parse(raw) as {
+          poolId:string;tenantId:string;requestId:string;
+          binding?:{reservationId:string;attemptId:string;generation:number;fencing:number};
+        };
+        if(typeof poolId!=='string'||typeof tenantId!=='string'||typeof requestId!=='string'){
+          return Response.json({code:'INVALID_CAPACITY_INPUT'},{status:422});
+        }
+        const actor={sub:'system:scheduler',role:'OPERATOR',scopeTenant:tenantId,scopeRegion:'all'};
+        return await ns.get(ns.idFromName('capacity-inventory-v1')).fetch(new Request(
+          'https://capacity.internal/grant-read',{
+            method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},
+            body:JSON.stringify({actor,requestInput:{poolId,tenantId,id:requestId,binding}}),
+          },
+        ));
+      }catch(error){
+        return Response.json({code:error instanceof SyntaxError?'INVALID_JSON':'CAPACITY_UNAVAILABLE'},
+          {status:error instanceof SyntaxError?400:503});
+      }
+    }
+    if(normalizedPath==='/execution-inventory') {
+      if(request.method!=='GET'||request.headers.get('x-ansts-verified-inventory')!=='true')return Response.json({code:'INTERNAL_ROUTE'},{status:403});
+      if(!this.inventory)return Response.json({code:'EXECUTION_INVENTORY_UNAVAILABLE'},{status:503});
+      const tenantId=url.searchParams.get('tenantId')??'',after=url.searchParams.get('after');
+      if(after!==null&&!/^\d+$/.test(after))return Response.json({code:'INVALID_INVENTORY_SCOPE'},{status:422});
+      try {
+        const result=after===null?this.inventory.snapshot(tenantId):this.inventory.page(tenantId,Number(after));
+        return Response.json(result,{headers:{'cache-control':'no-store'}});
+      } catch(error) {
+        const failure=error as {code?:string;status?:number};
+        return Response.json({code:failure.code??'EXECUTION_INVENTORY_UNAVAILABLE'},{status:failure.status??503});
+      }
+    }
+
+    if (request.method === "POST" && normalizedPath === "/pilot-expiry-status") {
+      const token=this.env.ANSTS_ADMISSION_SERVICE_TOKEN;
+      if(!token||token.length<32||!equalBodyToken(request.headers.get("authorization")??"","Bearer "+token))
+        return Response.json({code:"SERVICE_AUTH_REQUIRED"},{status:401});
+      const {reservationId,taskId,inputDigest}=await request.json() as Record<string,unknown>;
+      if(typeof reservationId!=="string"||typeof taskId!=="string"||typeof inputDigest!=="string")
+        return Response.json({code:"INVALID_ADMISSION_INPUT"},{status:422});
+      const intent=this.ctx.storage.sql.exec<{expires_at:number}>(
+        "SELECT expires_at FROM ansts_pilot_submissions WHERE reservation_id=? AND task_id=? AND input_digest=?",
+        reservationId,taskId,inputDigest,
+      ).toArray()[0];
+      const accepted=this.ctx.storage.sql.exec(
+        "SELECT reservation_id FROM ansts_pilot_submission_accepted WHERE reservation_id=?",reservationId,
+      ).toArray().length>0;
+      return Response.json({expiredBeforeAcceptance:!!intent&&intent.expires_at<=Date.now()&&
+        !accepted&&!this.scheduler.allTasks.has(taskId)});
+    }
+
+    if (request.method === "GET" && normalizedPath === "/pilot-occupancy") {
+      const token=this.env.ANSTS_DIRECTORY_SERVICE_TOKEN;
+      if(!token||token.length<32||!equalBodyToken(request.headers.get("authorization")??"","Bearer "+token))
+        return Response.json({code:"SERVICE_AUTH_REQUIRED"},{status:401});
+      const tenantId=url.searchParams.get("tenantId");
+      if(!tenantId)return Response.json({code:"INVALID_TENANT"},{status:422});
+      return Response.json({occupied:this.hasLegacyOccupancy(tenantId)});
+    }
 
     if (request.method === "POST" && normalizedPath === "/submit") {
       const body = (await request.json()) as Record<string, unknown>;
+      const regionalDenial=rejectUnavailableRegionPlacement(body);
+      if(regionalDenial)return regionalDenial;
+      const defaultTimeout=this.configTarget?.defaultTaskTimeoutSeconds;
+      const execution=body.execution as TaskSpec["execution"];
+      if(body.timeout_seconds===undefined&&defaultTimeout!==undefined&&execution&&execution.timeoutMs>defaultTimeout*1000){
+        return Response.json({code:'EXECUTION_EXCEEDS_CONFIGURED_TIMEOUT'},{status:422});
+      }
       const spec = new TaskSpec({
         task_id: String(body.task_id ?? `task-${Date.now()}`),
         tenant_id: String(body.tenant_id ?? "default"),
@@ -307,7 +547,7 @@ export class AnstsSchedulerCell {
         execution: body.execution as TaskSpec["execution"],
         prompt: String(body.prompt ?? ""),
         max_turns: body.max_turns !== undefined ? Number(body.max_turns) : undefined,
-        timeout_seconds: body.timeout_seconds !== undefined ? Number(body.timeout_seconds) : undefined,
+        timeout_seconds: body.timeout_seconds !== undefined ? Number(body.timeout_seconds) : defaultTimeout,
         resource_profile:
           body.resource_profile && typeof body.resource_profile === "object"
             ? (body.resource_profile as Partial<ResourceProfile>)
@@ -319,8 +559,109 @@ export class AnstsSchedulerCell {
           body.expected_SubAgent_count !== undefined ? Number(body.expected_SubAgent_count) : undefined,
         prefix_Cache_hash: body.prefix_Cache_hash ? String(body.prefix_Cache_hash) : undefined,
       });
-      const submitted = await this.submitTask(spec, {
-        mergeDuplicateInFlight: Boolean(body.merge_duplicate ?? body.deduplicate_by_fingerprint ?? false),
+      const pilotFailure = this.checkAdmissionPilot(spec.tenant_id, body.capacity_reservation_id !== undefined);
+      if (this.env.ANSTS_ADMISSION_MODE === "enforce" &&
+          (this.env.ANSTS_ADMISSION_PILOT_TENANTS ?? "").split(",").some(id => id.trim() === spec.tenant_id) &&
+          this.hasLegacyOccupancy(spec.tenant_id)) {
+        return Response.json({code:"ADMISSION_LEGACY_OCCUPANCY_PRESENT"}, {status:409});
+      }
+
+      if (pilotFailure?.status === 428 && this.env.ANSTS_ADMISSION_PILOT_POOL && authenticateGatewayService(request,this.env)) {
+        const previous = this.scheduler.allTasks.get(spec.task_id);
+        if (previous && (!previous.capacity_reservation_id || previous.tenant_id !== spec.tenant_id ||
+           taskInputDigest(previous.tenant_id,previous.task_id,previous.prompt,previous.execution) !==
+             taskInputDigest(spec.tenant_id,spec.task_id,spec.prompt,spec.execution))) {
+          return Response.json({code:'CAPACITY_TASK_BINDING_CONFLICT'},{status:409});
+        }
+        if (previous) return Response.json({task_id:previous.task_id,tenant_id:previous.tenant_id,
+          state:previous.state,lease_fencing_token:previous.lease_fencing_token});
+        const prepared = await this.preparePilotSubmission(spec);
+        if (typeof prepared !== 'string') return prepared;
+        body.capacity_reservation_id = prepared;
+      } else if (pilotFailure) {
+        return Response.json({code: pilotFailure.code}, {status: pilotFailure.status});
+      }
+      if(this.env.ANSTS_ADMISSION_MODE==='shadow'&&body.capacity_reservation_id===undefined&&
+         (this.env.ANSTS_ADMISSION_PILOT_TENANTS??'').split(',').some(id=>id.trim()===spec.tenant_id)&&
+         authenticateGatewayService(request,this.env))await this.observeShadowQuota(spec);
+      if(body.capacity_reservation_id!==undefined){
+        const directoryToken=this.env.ANSTS_DIRECTORY_SERVICE_TOKEN;
+        const token=this.env.ANSTS_ADMISSION_SERVICE_TOKEN,ns=this.env.ANSTS_TENANT_CONTROL_CELL;
+        if(!directoryToken||directoryToken.length<32||
+          (!equalBodyToken(request.headers.get('authorization')??'','Bearer '+directoryToken)&&!authenticateGatewayService(request,this.env))){
+          return Response.json({code:'SERVICE_AUTH_REQUIRED'},{status:401});
+        }
+        if(!token||token===directoryToken||!ns)return Response.json({code:'CAPACITY_UNAVAILABLE'},{status:503});
+        if(typeof body.capacity_reservation_id!=='string'||!body.capacity_reservation_id)
+          return Response.json({code:'INVALID_CAPACITY_INPUT'},{status:422});
+        const tenantId=spec.tenant_id,actor={sub:'system:scheduler',role:'OPERATOR',scopeTenant:tenantId,scopeRegion:'all'};
+        const response=await ns.get(ns.idFromName('tenant-control-v1:'+tenantId)).fetch(new Request(
+          'https://tenant.internal/admission-read',{
+            method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},
+            body:JSON.stringify({actor,tenantId,reservationId:body.capacity_reservation_id}),
+          },
+        )).catch(() => null);
+        if (!response) return Response.json({code:"CAPACITY_UNAVAILABLE"}, {status:503});
+        if(!response.ok)return Response.json({code:'CAPACITY_RESERVATION_UNAVAILABLE'},{status:response.status});
+        const {reservation}=await response.json() as {reservation:AdmissionReservation};
+        if(!reservation||reservation.tenantId!==tenantId||reservation.taskId!==spec.task_id||
+          (reservation.schedulerObjectId!==undefined&&reservation.schedulerObjectId!==this.ctx.id.toString())||
+          reservation.phase!=='START_AUTHORIZED'||!reservation.startAuthorized||!reservation.target||
+          !/^capacity-grant:[a-f0-9]{64}$/.test(reservation.capacityReceipt??'')||reservation.expiresAt<=Date.now()||
+          !spec.execution||Math.ceil(spec.execution.cpu*1000)!==reservation.resources.cpuMilliCores||
+          spec.execution.memoryMb!==reservation.resources.memoryMiB||
+          reservation.executionInputDigest!==taskInputDigest(tenantId,spec.task_id,spec.prompt,spec.execution)){
+          return Response.json({code:'CAPACITY_RESERVATION_MISMATCH'},{status:409});
+        }
+        const capacity=this.env.ANSTS_CAPACITY_INVENTORY_CELL;
+        if(!capacity)return Response.json({code:'CAPACITY_UNAVAILABLE'},{status:503});
+        const checked=await capacity.get(capacity.idFromName('capacity-inventory-v1')).fetch(new Request(
+          'https://capacity.internal/grant-read',{
+            method:'POST',headers:{authorization:'Bearer '+directoryToken,'content-type':'application/json'},
+            body:JSON.stringify({actor,requestInput:{
+              tenantId,id:reservation.capacityReceipt!.slice('capacity-grant:'.length),
+              binding:{reservationId:reservation.id,attemptId:reservation.attemptId,
+                generation:reservation.generation,fencing:reservation.fencing},
+            }}),
+          },
+        )).catch(() => null);
+        if (!checked) return Response.json({code:"CAPACITY_UNAVAILABLE"}, {status:503});
+        if(!checked.ok){
+          await checked.body?.cancel();
+          return Response.json({code:'CAPACITY_UNAVAILABLE'},{status:503});
+        }
+        const {grant}=await checked.json() as {grant:{target:string;capacityReceipt:string}|null};
+        if(!grant||grant.target!==reservation.target||grant.capacityReceipt!==reservation.capacityReceipt){
+          return Response.json({code:'CAPACITY_TARGET_UNAVAILABLE'},{status:409});
+        }
+        if(reservation.expiresAt<=Date.now())return Response.json({code:'ADMISSION_EXPIRED'},{status:409});
+        // Capacity tasks use the same CPU and memory at placement and execution.
+        spec.resource_profile = {...spec.resource_profile,
+          think_cpu_cores:spec.execution.cpu,act_cpu_cores:spec.execution.cpu,act_memory_mb:spec.execution.memoryMb};
+        spec.capacity_target_node_id=reservation.target;
+        spec.capacity_attempt_id=reservation.attemptId;
+        spec.capacity_reservation_id=reservation.id;
+        spec.capacity_receipt=reservation.capacityReceipt!;
+        spec.capacity_generation=reservation.generation;
+        spec.capacity_fencing=reservation.fencing;
+        spec.capacity_expires_at=reservation.expiresAt;
+      }
+      const existing=this.scheduler.allTasks.get(spec.task_id);
+      const capacitySubmission=Boolean(spec.capacity_target_node_id);
+      if (capacitySubmission && spec.idempotency_key) {
+        return Response.json({code:'CAPACITY_TASK_ID_REQUIRED'},{status:422});
+      }
+      if (existing && (existing.capacity_target_node_id || capacitySubmission)) {
+        const sameBinding=capacitySubmission&&existing.tenant_id===spec.tenant_id&&
+          existing.capacity_reservation_id===spec.capacity_reservation_id&&existing.capacity_attempt_id===spec.capacity_attempt_id&&
+          existing.capacity_fencing===spec.capacity_fencing&&existing.capacity_generation===spec.capacity_generation&&
+          existing.capacity_receipt===spec.capacity_receipt&&existing.capacity_target_node_id===spec.capacity_target_node_id&&
+          taskInputDigest(existing.tenant_id,existing.task_id,existing.prompt,existing.execution)===
+            taskInputDigest(spec.tenant_id,spec.task_id,spec.prompt,spec.execution);
+        if (!sameBinding) return Response.json({code:'CAPACITY_TASK_BINDING_CONFLICT'},{status:409});
+      }
+      const submitted = existing && capacitySubmission ? existing : await this.persistSubmission(spec, {
+        mergeDuplicateInFlight: !capacitySubmission && Boolean(body.merge_duplicate ?? body.deduplicate_by_fingerprint ?? false),
       });
       return new Response(
         JSON.stringify({
@@ -407,9 +748,62 @@ export class AnstsSchedulerCell {
           headers: { "content-type": "application/json" },
         });
       }
+      if (task.capacity_target_node_id &&
+          (nodeId !== task.capacity_target_node_id || fencingToken !== task.capacity_fencing ||
+           !task.capacity_attempt_id || body.attempt_id !== task.capacity_attempt_id ||
+           body.tenant_id !== task.tenant_id ||
+           body.input_digest !== taskInputDigest(task.tenant_id,task.task_id,task.prompt,task.execution))) {
+        return Response.json({renewed:false,reason:"CAPACITY_LEASE_BINDING_MISMATCH"},{status:409});
+      }
+      if (task.capacity_target_node_id && (body.start_check === true || !task.capacity_start_checked)) {
+        const token=this.env.ANSTS_DIRECTORY_SERVICE_TOKEN,capacity=this.env.ANSTS_CAPACITY_INVENTORY_CELL;
+        if(!token||token.length<32||!capacity||!task.capacity_receipt||!task.capacity_reservation_id||
+           !task.capacity_generation||!task.capacity_expires_at||task.capacity_expires_at<=Date.now()){
+          return Response.json({renewed:false,reason:"CAPACITY_START_UNAVAILABLE"},{status:409});
+        }
+        const actor={sub:'system:scheduler',role:'OPERATOR',scopeTenant:task.tenant_id,scopeRegion:'all'};
+        const tenants=this.env.ANSTS_TENANT_CONTROL_CELL,admissionKey=this.env.ANSTS_ADMISSION_SERVICE_TOKEN;
+        const unavailable=(status:number)=>Response.json({renewed:false,reason:"CAPACITY_START_UNAVAILABLE"},{status});
+        if(!tenants||!admissionKey||admissionKey===token)return unavailable(503);
+        const authority=await tenants.get(tenants.idFromName('tenant-control-v1:'+task.tenant_id)).fetch(new Request(
+          'https://tenant.internal/admission-read',{
+            method:'POST',signal:AbortSignal.timeout(3500),
+            headers:{authorization:'Bearer '+admissionKey,'content-type':'application/json'},
+            body:JSON.stringify({actor,tenantId:task.tenant_id,reservationId:task.capacity_reservation_id}),
+          },
+        )).catch(()=>null);
+        if(!authority?.ok){await authority?.body?.cancel();return unavailable(503);}
+        const {reservation}=await authority.json() as {reservation:AdmissionReservation|null};
+        if(!reservation||reservation.phase!=='START_AUTHORIZED'||!reservation.startAuthorized||
+           reservation.id!==task.capacity_reservation_id||reservation.taskId!==taskId||
+           reservation.tenantId!==task.tenant_id||reservation.attemptId!==task.capacity_attempt_id||
+           reservation.target!==nodeId||reservation.generation!==task.capacity_generation||
+           reservation.fencing!==fencingToken||reservation.capacityReceipt!==task.capacity_receipt||
+           reservation.executionInputDigest!==body.input_digest||reservation.expiresAt!==task.capacity_expires_at)
+          return unavailable(409);
+        const result=await capacity.get(capacity.idFromName('capacity-inventory-v1')).fetch(new Request(
+          'https://capacity.internal/grant-read',{
+            method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},
+            body:JSON.stringify({actor,requestInput:{
+              tenantId:task.tenant_id,id:task.capacity_receipt.slice('capacity-grant:'.length),
+              binding:{reservationId:task.capacity_reservation_id,attemptId:task.capacity_attempt_id,
+                generation:task.capacity_generation,fencing:fencingToken},
+            }}),
+          },
+        ));
+        if(!result.ok)return Response.json({renewed:false,reason:"CAPACITY_START_UNAVAILABLE"},{status:503});
+        const {grant}=await result.json() as {grant:{target:string;capacityReceipt:string}|null};
+        if(grant?.target!==nodeId||grant?.capacityReceipt!==task.capacity_receipt||
+           task.capacity_expires_at<=Date.now()||task.cancel_requested){
+          return Response.json({renewed:false,reason:"CAPACITY_START_UNAVAILABLE"},{status:409});
+        }
+      }
       const renewed = this.scheduler.leaseCoordinator.renewLease(taskId, nodeId, fencingToken);
-      if (renewed) this.persistTask(task);
-      return new Response(JSON.stringify({ renewed, task_id: taskId, state: task.state, lease_expires_at: this.scheduler.leaseCoordinator.getLease(taskId)?.expires_at, cancel_requested: task.cancel_requested, resume_node_id: task.resume_node_id }), {
+      if (renewed) {
+        if(task.capacity_target_node_id)task.capacity_start_checked=true;
+        this.persistTask(task);
+      }
+      return new Response(JSON.stringify({ renewed, task_id: taskId, state: task.state, capacity_observation_required: Boolean(task.capacity_target_node_id), lease_expires_at: this.scheduler.leaseCoordinator.getLease(taskId)?.expires_at, cancel_requested: task.cancel_requested, resume_node_id: task.resume_node_id }), {
         status: renewed ? 200 : 409,
         headers: { "content-type": "application/json" },
       });
@@ -529,3 +923,14 @@ export class AnstsSchedulerCell {
     });
   }
 }
+
+
+
+
+
+
+
+
+
+
+

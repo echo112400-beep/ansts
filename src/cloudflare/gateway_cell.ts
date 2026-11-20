@@ -1,3 +1,7 @@
+import {rejectUnavailableRegionPlacement} from '../control/region_placement_gate.js';
+import {handleRegionCatalog,regionAdminPath,regionSimulationPath,regionProbePath,regionPlacementTrialPath,type RegionApiEnv} from '../control/admin_region_api.js';
+import {handleConfigPreflight,isConfigPreflightPath,type ConfigPreflightEnv} from './config_preflight_api.js';
+import {handleFinopsApi,isFinopsPath} from '../control/admin_finops_api.js';
 import {handleCapacityApi,type CapacityApiEnv} from '../control/admin_capacity_api.js';
 /**
  * @fileoverview Unified control-plane gateway on denoland/celld.
@@ -18,7 +22,7 @@ import { githubConfigured } from "./github_identity.js";
 import { githubProfileForSubject } from "./github_profile.js";
 import { applicationSession, githubAuthRequest, GithubConfiguration } from "./github_identity.js";
 
-export interface UnifiedGatewayEnv extends OidcConfiguration, GithubConfiguration, DirectoryApiEnv, CapacityApiEnv {
+export interface UnifiedGatewayEnv extends OidcConfiguration, GithubConfiguration, DirectoryApiEnv, CapacityApiEnv, ConfigPreflightEnv, RegionApiEnv {
   ANSTS_GATEWAY_CELL?: DurableObjectNamespaceLike;
   /** Base URL of the separate scheduler celld worker. Empty or unset fail-closes cross-worker calls. */
   ANSTS_SCHEDULER_URL?: string;
@@ -237,7 +241,9 @@ async function listSchedulerTasks(env: UnifiedGatewayEnv): Promise<{ tasks: Reco
 }
 
 function isGatewayPath(method: string, pathname: string): boolean {
-  if(/^\/v1\/admin\/tenants\/[^/]+\/usage$/.test(pathname))return true;
+  if((pathname===regionAdminPath||pathname===regionSimulationPath||pathname===regionProbePath||pathname===regionPlacementTrialPath))return true;
+  if(isFinopsPath(pathname)||isConfigPreflightPath(pathname))return true;
+  if(/^\/v1\/admin\/tenants\/[^/]+\/(usage|reservation-summary)$/.test(pathname))return true;
   if(pathname.startsWith("/v1/admin/capacity/"))return true;
   if (/^\/v1\/admin\/tenants\/[^/]+\/quota$/.test(pathname) || pathname === "/v1/admin/archives" || /^\/v1\/admin\/archives\/[^/]+$/.test(pathname) || /^\/v1\/admin\/operations\/[^/]+$/.test(pathname) || pathname === "/v1/admin/cost-centers" || /^\/v1\/admin\/cost-centers\/[^/]+$/.test(pathname) || pathname === "/v1/admin/tenants" || pathname === "/v1/admin/audit" || /^\/v1\/admin\/tenants\/[^/]+$/.test(pathname)) return true;
   if (method === "GET" && (pathname === "/v1/auth/me" || pathname === "/v1/auth/profile")) return true;
@@ -258,7 +264,7 @@ function isGatewayPath(method: string, pathname: string): boolean {
  * Gateway half of the celld worker fetch. Returns null when the path belongs to the scheduler,
  * harness, or tunnel routes.
  */
-export async function handleUnifiedGatewayRequest(request: Request, env: UnifiedGatewayEnv): Promise<Response | null> {
+export async function handleUnifiedGatewayRequest(request: Request, env: UnifiedGatewayEnv, background?:(work:Promise<void>)=>void): Promise<Response | null> {
   const url = new URL(request.url);
   const github = await githubAuthRequest(request, env);
   if (github) return github;
@@ -274,7 +280,13 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
     if (!principal) return json({ error: "USER_AUTH_REQUIRED" }, 401);
     const denied = gatewayAuthorizationError(request, principal);
     if (denied) return denied;
-    if (request.method === "POST" && url.pathname !== "/v1beta1/gateway/leases/release") {
+    const capacityTenantRoute = url.pathname === "/v1/admin/capacity/requests" ||
+      url.pathname === "/v1/admin/capacity/catalog";
+    if (capacityTenantRoute) {
+      const capacityDenied = gatewayAuthorizationError(request, principal, url.searchParams.get("tenantId"));
+      if (capacityDenied) return capacityDenied;
+    }
+    if (request.method === "POST" && !capacityTenantRoute && url.pathname !== "/v1beta1/gateway/leases/release") {
       let body: Record<string, unknown>;
       try {
         const raw = await request.clone().text();
@@ -287,6 +299,9 @@ export async function handleUnifiedGatewayRequest(request: Request, env: Unified
       if (tenantDenied) return tenantDenied;
     }
   }
+  if((url.pathname===regionAdminPath||url.pathname===regionSimulationPath||url.pathname===regionProbePath||url.pathname===regionPlacementTrialPath)&&principal)return handleRegionCatalog(request,env,principal);
+  if(isConfigPreflightPath(url.pathname)&&principal)return handleConfigPreflight(request,env,principal);
+  if(isFinopsPath(url.pathname)&&principal)return handleFinopsApi(request,env,principal,background);
   if(url.pathname.startsWith("/v1/admin/capacity/")&&principal)return handleCapacityApi(request,env,principal);
   if (url.pathname.startsWith("/v1/admin/") && principal) return handleDirectoryApi(request, env, principal);
   if (request.method === "GET" && url.pathname === "/v1/auth/me" && principal) {
@@ -463,6 +478,9 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
     }
     throw err;
   }
+  // A constrained request must never fall back to the local execution path.
+  const regionalDenial=rejectUnavailableRegionPlacement(body);
+  if(regionalDenial)return regionalDenial;
   spec.task_id = taskStorageId(tenantId, taskId);
   const existing = await listSchedulerTasks(env);
   if (existing.failure) return existing.failure;
@@ -472,22 +490,29 @@ async function submitThroughCells(request: Request, env: UnifiedGatewayEnv, disp
   if (!gateway) return json({ error: "GATEWAY_CELL_UNBOUND" }, 503);
   if (spec.execution && spec.execution.image !== env.ANSTS_SANDBOX_IMAGE) return json({ error: "SANDBOX_IMAGE_NOT_ENABLED" }, 503);
   if (spec.execution?.kind === "agent" && env.ANSTS_AGENT_ENABLED !== "true") return json({ error: "AGENT_EXECUTION_NOT_ENABLED" }, 503);
+  const capacityReservationId = body.capacity_reservation_id;
+  if (capacityReservationId !== undefined &&
+      (typeof capacityReservationId !== "string" || !capacityReservationId.trim() || capacityReservationId.length > 128)) {
+    return json({error:"INVALID_CAPACITY_INPUT"},422);
+  }
   const submitResp = await schedulerFetch(env, "/v1/scheduler/submit", {
     method: "POST",
     headers: JSON_HEADERS,
     body: JSON.stringify({
       task_id: spec.task_id,
+      capacity_reservation_id: capacityReservationId,
       tenant_id: spec.tenant_id,
       priority: spec.priority,
       execution: spec.execution,
       prompt: spec.prompt,
       max_turns: spec.max_turns,
-      timeout_seconds: spec.timeout_seconds,
+      timeout_seconds: body.timeout_seconds==null?undefined:spec.timeout_seconds,
       resource_profile: spec.resource_profile,
     }),
   });
   if (submitResp.headers.get("x-ansts-scheduler-client") === "gateway") return submitResp;
   if (!submitResp.ok) {
+    if (capacityReservationId !== undefined || submitResp.headers.get("content-type")?.startsWith("application/json")) return submitResp;
     return json({ error: "SCHEDULER_REJECTED", status: submitResp.status }, submitResp.status);
   }
   const submitted = (await submitResp.json()) as Record<string, unknown>;
@@ -639,3 +664,5 @@ async function releaseLease(request: Request, env: UnifiedGatewayEnv): Promise<R
   const releaseBody = (await releaseResp.json()) as Record<string, unknown>;
   return json({ ...releaseBody, subject: verified.claims.sub, schedulerCompleted: fencing > 0 && nodeId }, releaseResp.status);
 }
+
+

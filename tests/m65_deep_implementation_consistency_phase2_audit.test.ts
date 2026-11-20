@@ -125,15 +125,15 @@ describe("M65 Deep Implementation Consistency Phase II Suite", () => {
       CELLD_REGION: "eu-central-1",
       ANSTS_SCHEDULER_CELL: {
         idFromName: (n: string) => ({ toString: () => n }),
-        get: () => ({ fetch: (req: Request) => schedCell.fetch(req) }),
+        get: (id) => ({ id, fetch: (input, init) => schedCell.fetch(input instanceof Request ? input : new Request(input, init)) }),
       },
       ANSTS_HARNESS_CELL: {
         idFromName: (n: string) => ({ toString: () => n }),
-        get: () => ({ fetch: (req: Request) => harnessCell.fetch(req) }),
+        get: (id) => ({ id, fetch: (input, init) => harnessCell.fetch(input instanceof Request ? input : new Request(input, init)) }),
       },
       ANSTS_TUNNEL_CELL: {
         idFromName: (n: string) => ({ toString: () => n }),
-        get: () => ({ fetch: (req: Request) => tunnelCell.fetch(req) }),
+        get: (id) => ({ id, fetch: (input, init) => tunnelCell.fetch(input instanceof Request ? input : new Request(input, init)) }),
       },
       ANSTS_IDEMPOTENCY_KV: new InMemoryKvNamespace(),
       ANSTS_CHECKPOINT_BUCKET: new InMemoryR2Bucket(),

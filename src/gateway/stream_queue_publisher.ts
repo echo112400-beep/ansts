@@ -6,9 +6,9 @@
  * backpressure + `Last-Event-ID` / `turn_seq` zero-loss incremental catch-up).
  */
 
-import { TurnWalEngine } from "../checkpoint/wal_engine";
-import { FenceToken, TaskState, TurnWalFrame } from "../models";
-import { SseEventFrame, SseEventStreamGateway } from "./sse_stream";
+import { TurnWalEngine } from "../checkpoint/wal_engine.js";
+import { FenceToken, TaskState, TurnWalFrame } from "../models.js";
+import { SseEventFrame, SseEventStreamGateway } from "./sse_stream.js";
 
 export interface StreamPublishEventParams {
   clientId: string;
@@ -72,6 +72,7 @@ export class AgentStreamQueuePublisher {
       params.eventType,
       params.taskId,
       serializedPayload,
+      walFrame.turnIndex,
     );
 
     return { walObjectKey, sseFrames };
@@ -115,6 +116,7 @@ export class AgentStreamQueuePublisher {
         parsedEventType,
         params.taskId,
         frame.diffSnapshot,
+        frame.turnIndex,
       );
       dispatchedSseFrames.push(...emitted);
     }

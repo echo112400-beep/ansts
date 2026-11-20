@@ -157,6 +157,11 @@ describe("unified celld gateway and scheduler", () => {
     assert.equal(healthBody.planes.scheduler, "remote-http");
     assert.equal(healthBody.planes.bodyExecution, "external-node-process");
 
+    const constrained = await gatewayWorker.fetch(new Request("https://edge.ansts.io/v1/tasks", {
+      method:"POST",body:JSON.stringify({task_id:"region-only",tenant_id:"probe",prompt:"fixture",region_placement:{jurisdictions:["DE"]}}),
+    }),env as never);
+    assert.equal(constrained.status,409);
+    assert.deepEqual(await constrained.json(),{code:"REGION_PLACEMENT_NOT_ENABLED"});
     const submit = await gatewayWorker.fetch(
       new Request("https://edge.ansts.io/v1/tasks", {
         method: "POST",
@@ -342,3 +347,112 @@ describe("unified celld gateway and scheduler", () => {
     }
   });
 });
+
+it("scopes capacity requests to the query tenant before forwarding", async () => {
+  const forwarded: unknown[] = [];
+  const env = {
+    ...gatewayEnv(new AnstsGatewayCell(new MockDurableObjectState("capacity-gateway"))),
+    ANSTS_DIRECTORY_SERVICE_TOKEN: SERVICE_SECRET,
+    ANSTS_CAPACITY_INVENTORY_CELL: {
+      idFromName: (name: string) => ({ toString: () => name }),
+      get: () => ({ id: { toString: () => "capacity" }, async fetch(request: Request) {
+        forwarded.push(await request.json());
+        return Response.json({ accepted: true });
+      } }),
+    },
+  };
+  const bearer = new ConsoleRbacAuthGuard(SECRET).issueToken({
+    sub: "operator", role: "OPERATOR", scopeTenant: "team", scopeRegion: "dev", ttlSec: 900,
+  });
+  const submit = (tenantId: string, bodyTenant: string) => handleUnifiedGatewayRequest(
+    new Request("https://edge.ansts.io/v1/admin/capacity/requests?poolId=pool&tenantId="+tenantId, {
+      method: "POST",
+      headers: { authorization: "Bearer "+bearer, "idempotency-key": "request" },
+      body: JSON.stringify({ tenantId: bodyTenant, resources: { cpuMilliCores: 10, memoryMiB: 20, slots: 1 } }),
+    }), env,
+  );
+  assert.equal((await submit("other", "team"))?.status, 403);
+  assert.equal(forwarded.length, 0);
+  assert.equal((await submit("team", "other"))?.status, 200);
+  assert.deepEqual((forwarded[0] as { requestInput: { tenantId: string } }).requestInput.tenantId, "team");
+});
+
+it("admits capacity tasks only with a live matching reservation and preserves their binding on replay", async () => {
+  const {taskInputDigest}=await import("../src/cloudflare/execution_attempt.js");
+  const task = {
+    task_id:"capacity-task",tenant_id:"team",prompt:"capacity fixture",
+    execution:{kind:"container",image:"fixture@sha256:"+"a".repeat(64),argv:["true"],cpu:1,memoryMb:512,timeoutMs:10_000},
+
+  };
+  const capacityReceipt="capacity-grant:"+"a".repeat(64);
+  const reservation={
+    id:"reservation",tenantId:"team",taskId:task.task_id,attemptId:"attempt",target:"body-1",
+    capacityReceipt,generation:1,fencing:1,phase:"START_AUTHORIZED",startAuthorized:true,expiresAt:Date.now()+60_000,
+    executionInputDigest:taskInputDigest(task.tenant_id,task.task_id,task.prompt,task.execution),
+    resources:{cpuMilliCores:1000,memoryMiB:512,concurrentAttempts:1,queuedTasks:0},
+  };
+  let live=false;
+  const namespace=(handler:(request:Request)=>Promise<Response>)=>({
+    idFromName:(name:string)=>({toString:()=>name}),
+    get:()=>({id:{toString:()=>"test"},fetch:handler}),
+  });
+  const cell=new AnstsSchedulerCell(new MockDurableObjectState("capacity-submit"),{
+    ANSTS_DIRECTORY_SERVICE_TOKEN:SERVICE_SECRET,ANSTS_ADMISSION_SERVICE_TOKEN:"b".repeat(64),
+    ANSTS_BODY_AUTH_SECRET:SERVICE_SECRET,
+    ANSTS_TENANT_CONTROL_CELL:namespace(async()=>Response.json({reservation})),
+    ANSTS_CAPACITY_INVENTORY_CELL:namespace(async()=>Response.json({grant:live?{capacityReceipt,target:"body-1"}:null})),
+  });
+  const submit=(body:object)=>cell.fetch(new Request("https://scheduler.test/v1/scheduler/submit",{
+    method:"POST",headers:{authorization:"Gateway "+bodyServiceToken(SERVICE_SECRET,"gateway:control")},
+    body:JSON.stringify(body),
+  }));
+  const input={...task,capacity_reservation_id:reservation.id};
+  const constrained=await submit({...input,region_placement:{jurisdictions:["DE"]}});
+  assert.equal(constrained.status,409);
+  assert.deepEqual(await constrained.json(),{code:"REGION_PLACEMENT_NOT_ENABLED"});
+  assert.equal(cell.scheduler.allTasks.size,0);
+  assert.equal((await submit(input)).status,409);
+  assert.equal(cell.scheduler.allTasks.size,0);
+  live=true;
+  assert.ok((await submit(input)).ok);
+  const original=cell.scheduler.allTasks.get(task.task_id);
+  assert.equal(original?.capacity_target_node_id,"body-1");
+  assert.equal(original?.resource_profile.act_cpu_cores,1);
+  assert.equal(original?.resource_profile.act_memory_mb,512);
+  assert.ok((await submit(input)).ok);
+  assert.equal(cell.scheduler.allTasks.get(task.task_id),original);
+  assert.equal((await submit(task)).status,409);
+  const schedulerRequest=(path:string,body:object={})=>cell.fetch(new Request(
+    "https://scheduler.test/v1/scheduler/"+path,{method:"POST",body:JSON.stringify(body)},
+  ));
+  assert.ok((await schedulerRequest("register-node",{node_id:"body-2"})).ok);
+  assert.deepEqual((await (await schedulerRequest("schedule-tick")).json() as {placements:unknown[]}).placements,[]);
+  assert.ok((await schedulerRequest("register-node",{node_id:"body-1"})).ok);
+  assert.deepEqual((await (await schedulerRequest("schedule-tick")).json() as {placements:unknown[]}).placements,
+    [[task.task_id,"body-1",reservation.fencing]]);
+  assert.equal(cell.scheduler.nodes.get("body-1")?.free_memory_mb,65536-512);
+  const lease={
+    task_id:task.task_id,node_id:"body-1",tenant_id:task.tenant_id,attempt_id:reservation.attemptId,
+    input_digest:reservation.executionInputDigest,fencing_token:reservation.fencing,
+  };
+  live=false;
+  assert.equal((await schedulerRequest("lease-renew",{...lease,start_check:true})).status,409);
+  live=true;
+  assert.equal((await schedulerRequest("lease-renew",{...lease,attempt_id:"wrong",start_check:true})).status,409);
+  reservation.phase="CANCELLED";
+  const revoked=await schedulerRequest("lease-renew",{...lease,start_check:true});
+  assert.equal(revoked.status,409);
+  assert.deepEqual(await revoked.json(),{renewed:false,reason:"CAPACITY_START_UNAVAILABLE"});
+  reservation.phase="START_AUTHORIZED";
+  reservation.generation++;
+  assert.equal((await schedulerRequest("lease-renew",{...lease,start_check:true})).status,409);
+  reservation.generation--;
+  assert.equal((await schedulerRequest("lease-renew",{...lease,start_check:true})).status,200);
+  live=false;
+  assert.equal((await schedulerRequest("lease-renew",lease)).status,200);
+  assert.equal((await schedulerRequest("lease-renew",{...lease,start_check:true})).status,409);
+});
+
+
+
+

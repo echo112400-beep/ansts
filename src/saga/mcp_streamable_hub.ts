@@ -16,9 +16,9 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { FenceToken, TaskState } from "../models";
-import { StaleFenceError } from "../lease_coordinator";
-import { DurableWorkflowContext } from "../cloudflare/celld_ha_engine";
+import { FenceToken, TaskState } from "../models.js";
+import { StaleFenceError } from "../lease_coordinator.js";
+import { DurableWorkflowContext } from "../cloudflare/celld_ha_engine.js";
 
 export type McpNotificationMethod =
   | "notifications/resources/updated"
@@ -121,9 +121,7 @@ export class McpStreamableEventHub {
       (params.fence.epoch < prevFence.epoch ||
         (params.fence.epoch === prevFence.epoch && params.fence.turnSeq < prevFence.turnSeq))
     ) {
-      throw new StaleFenceError(
-        `409 StaleMcpNotificationFence: (${params.fence.epoch},${params.fence.turnSeq}) < (${prevFence.epoch},${prevFence.turnSeq})`,
-      );
+      throw new StaleFenceError(sub.taskId, params.fence, prevFence);
     }
     this.highestTaskFence.set(sub.taskId, params.fence);
 
@@ -148,14 +146,14 @@ export class McpStreamableEventHub {
     fs.writeFileSync(spoolFile, JSON.stringify(envelope), "utf8");
 
     let wokeHibernatedCell = false;
-    let newTaskState = params.currentTaskState ?? TaskState.RUNNING;
+    let newTaskState = params.currentTaskState ?? TaskState.RUNNING_THINK;
 
     if (params.workflowCtx) {
       params.workflowCtx.sendEvent(sub.workflowEventType, envelope.params);
-      if (params.currentTaskState === TaskState.HIBERNATED || params.workflowCtx.isolateHibernated) {
+      if (params.workflowCtx.isolateHibernated) {
         params.workflowCtx.isolateHibernated = false;
         wokeHibernatedCell = true;
-        newTaskState = TaskState.RUNNING;
+        newTaskState = TaskState.RUNNING_THINK;
       }
     }
 

@@ -142,7 +142,7 @@ export class S3SigV4Client {
       const resp = await fetch(`${this.endpoint}${canonicalPath}`, {
         method,
         headers,
-        body: method === "GET" || method === "HEAD" ? undefined : payload,
+        body: method === "GET" || method === "HEAD" || payload === undefined ? undefined : Uint8Array.from(payload),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       const body = method === "HEAD" ? null : await resp.text();

@@ -1,6 +1,6 @@
 # 后台能力建设方案
 
-状态：**M0 六项、MK-01 与 QF-03 已验收完成，剩余29项继续推进**。更新：2026-11-17。
+状态：**M0 六项、MK-01、QF-03 与 QF-04 已验收完成，剩余28项继续推进**。更新：2026-11-18。
 
 用户已确认：首期面向**内部成本分摊与容量分配**；多地域**先规划，地域和供应商待定**。目前已开始基础契约实现，目录控制面已部署到开发Fleet与双Gateway，配额策略管理已部署；QF-02租户侧持久预留及认证凭证已接入影子内部服务，支持原生alarm自动投递与暂停恢复，Host观察持久outbox、自动relay、已有预留自动绑定与agent观察已通过隔离真实验收并部署；MK-01物理容量目录及自动报告已部署并验证共同Host去重/重启恢复；执行配额/价格尚未启用。
 
@@ -16,6 +16,10 @@
 | [overview.html](overview.html) | 可浏览的方案总览；源稿为 overview.md |
 
 QF-03 已完成用量源、Fleet 自动投递、租户分页及告警，真实开发任务和重启恢复已验收；默认关闭，仅显式试验租户 shadow，不启用计费或硬配额。见 [用量服务验收](../validation/admin-platform/usage-service-acceptance.md)。
+
+QF-04 已验收：目录费率、显式激活、固定执行快照、自动账目、授权分页汇总、统一审计及单权威独立备份恢复已部署；历史未知价格继续 pending。准入自动成本预留和硬门禁继续由 QF-02/QF-08 推进，见 [收尾验收](../validation/admin-platform/rate-ledger-recovery-acceptance.md)。
+
+QF-05 已开始月结/晚到调整内核，尚未启用生产关账；本批发现的 provider 跨零点分段问题已修复并安全部署。见 [月结内核验收](../validation/admin-platform/period-settlement-foundation.md)。
 
 ## 范围与推进顺序
 

@@ -14,6 +14,16 @@ export interface SseEventEnvelope {
   data: Record<string, unknown>;
 }
 
+export interface SseEventFrame {
+  id: string;
+  event: string;
+  taskId: string;
+  clientId: string;
+  eventSeq: number;
+  timestampMs: number;
+  payload: string;
+}
+
 export class ClientStreamSubscription {
   public readonly subscriptionId: string;
   public readonly taskId: string;
@@ -55,11 +65,46 @@ export class SseEventStreamGateway {
   private readonly historyByTask: Map<string, SseEventEnvelope[]> = new Map();
   private readonly seenEventIdsByTask: Map<string, Set<string>> = new Map();
   private readonly maxHistoryPerTask: number;
+  private readonly clientCredits = new Map<string, number>();
+  private eventSeq = 0;
 
   constructor(maxHistoryPerTask = 100) {
     const rawMax = Number(maxHistoryPerTask);
     this.maxHistoryPerTask =
       Number.isFinite(rawMax) && rawMax > 0 ? Math.max(1, Math.floor(rawMax)) : 100;
+  }
+
+  public registerClient(clientId: string, credits = 100): void {
+    if (!Number.isSafeInteger(credits) || credits < 0) throw new RangeError("INVALID_STREAM_CREDITS");
+    if (!this.clientCredits.has(clientId) && this.clientCredits.size >= 10_000) throw new Error("STREAM_CLIENT_LIMIT");
+    this.clientCredits.set(clientId, credits);
+  }
+
+  public ackCredits(clientId: string, credits: number): number {
+    const balance = this.getRemainingCredits(clientId) + credits;
+    if (!Number.isSafeInteger(credits) || credits < 0) throw new RangeError("INVALID_STREAM_CREDITS");
+    this.registerClient(clientId, balance);
+    return balance;
+  }
+
+  public getRemainingCredits(clientId: string): number {
+    return this.clientCredits.get(clientId) ?? 0;
+  }
+
+  public publishEvent(clientId: string, event: string, taskId: string, payload: string, turnIndex?: number): SseEventFrame[] {
+    const credits = this.clientCredits.get(clientId);
+    if (credits === 0) return [];
+    const eventSeq = ++this.eventSeq;
+    const frame = { id: `${taskId}-${eventSeq}`, event, taskId, clientId, eventSeq, timestampMs: Date.now(), payload };
+    let data: Record<string, unknown> = { value: payload };
+    try {
+      const parsed: unknown = JSON.parse(payload);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) data = { ...parsed };
+      else data = { value: parsed };
+    } catch {}
+    this.publish({ id: frame.id, event, taskId, turnIndex: turnIndex ?? eventSeq, timestampMs: frame.timestampMs, data });
+    if (credits !== undefined) this.clientCredits.set(clientId, credits - 1);
+    return [frame];
   }
 
   public subscribe(taskId: string, subscriptionId: string, replayFromEventId?: string): ClientStreamSubscription {

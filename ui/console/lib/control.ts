@@ -1,3 +1,16 @@
+export interface CapacityResources {cpuMilliCores:number;memoryMiB:number;slots:number}
+export interface CapacityPoolSummary {
+  id:string;name:string;region:string;status:'ACTIVE'|'DISABLED';
+  capacity:CapacityResources;available:CapacityResources;retainedReserved:CapacityResources;borrowed:CapacityResources;guaranteedShare:CapacityResources|null;
+  hostCount:number;isolatedHostCount:number;activeGrants:number;complete:boolean;allocationEnabled?:boolean;
+}
+export interface CapacityRequestRow {
+  id:string;tenantId:string;resources:CapacityResources;enqueuedAt:number;
+  state:'QUEUED'|'CANCELLED'|'GRANTED'|'RELEASED';
+  grantExpiresAt?:number;
+  queueReason?:'POOL_DISABLED'|'ALLOCATION_PAUSED'|'NO_HEALTHY_HOST'|'HOST_RESOURCES_UNAVAILABLE'|'TENANT_QUOTA_EXCEEDED'|'TENANT_QUOTA_UNAVAILABLE'|'AWAITING_ALLOCATION';
+}
+export interface CapacityAllocationControl {version:number;enabled:boolean}
 /** Shared management transport. Mutations never retry automatically. */
 export interface DirectoryArchiveManifest {id:string;schemaVersion:1;sourceVersion:number;digest:string;actor:string;reason:string;requestId:string;createdAt:string;bytes:number;tenantAuditWatermark:number;costCenterAuditWatermark:number;receiptRetention:'ALL_RETAINED';safeReplayWatermark:null}
 export interface DirectoryArchive {manifest:DirectoryArchiveManifest;snapshot:Record<string,unknown>}
@@ -26,7 +39,7 @@ export interface DirectoryTenant {
   version: number;
   costCenterHistory?: {costCenter:string;version:number;timestamp:string|null}[];
 }
-export interface ManagementAudit {id:string;domain:"tenant"|"cost-center";targetId:string;actor:string;reason:string;requestId:string;timestamp:string;previousVersion:number;version:number;changes?:{field:string;before:string|null;after:string}[]}
+export interface ManagementAudit {id:string;domain:"tenant"|"cost-center"|"rate-card"|"rate-activation";targetId:string;actor:string;reason:string;requestId:string;timestamp:string;previousVersion:number;version:number;changes?:{field:string;before:string|null;after:string}[]}
 export interface CostCenter {operationId?:string;id:string;name:string;status:"ACTIVE"|"DISABLED";version:number}
 export type CostCenterEdit=Pick<TenantEdit,"name"|"status"|"expectedVersion"|"reason">;
 export interface ControlPage<T> {items:T[];version:number;nextCursor:string|null}
@@ -42,6 +55,9 @@ export interface TenantEdit {
   status:'ACTIVE'|'DISABLED';
   expectedVersion:number;
   reason:string;
+}
+function capacityPath(section:string,query:Record<string,string>) {
+  return '/v1/admin/capacity/'+section+'?'+new URLSearchParams(query);
 }
 export function controlClient(fetcher:typeof fetch=fetch) {
   async function request<T>(path:string,options:RequestInit={}):Promise<T> {
@@ -63,6 +79,33 @@ export function controlClient(fetcher:typeof fetch=fetch) {
     return body as T;
   }
   return {
+    capacityPools(tenantId:string,signal?:AbortSignal) {
+      return request<{pools:CapacityPoolSummary[];asOf:number}>(capacityPath('catalog',{tenantId}),{signal});
+    },
+    capacityRequests(poolId:string,tenantId:string,signal?:AbortSignal) {
+      return request<{requests:CapacityRequestRow[]}>(capacityPath('requests',{poolId,tenantId}),{signal});
+    },
+    submitCapacityRequest(poolId:string,tenantId:string,resources:CapacityResources,key:string) {
+      return request<CapacityRequestRow>(capacityPath('requests',{poolId,tenantId}),{
+        method:'POST',headers:{'content-type':'application/json','idempotency-key':key},
+        body:JSON.stringify({resources}),
+      });
+    },
+    cancelCapacityRequest(poolId:string,tenantId:string,id:string) {
+      return request<CapacityRequestRow>(capacityPath('requests',{poolId,tenantId,id}),{method:'DELETE'});
+    },
+    capacityAllocationControl(poolId:string,signal?:AbortSignal) {
+      return request<CapacityAllocationControl>(capacityPath('allocation-control',{poolId}),{signal});
+    },
+    setCapacityAllocationControl(poolId:string,expectedVersion:number,enabled:boolean) {
+      return request<CapacityAllocationControl>(capacityPath('allocation-control',{poolId}),{
+        method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({expectedVersion,enabled}),
+      });
+    },
+    reservationSummary(tenantId:string){
+      return request<{policyVersion:number;used:{slots:number;cpuMilliCores:number;memoryMiB:number}}>(
+        '/v1/admin/tenants/'+encodeURIComponent(tenantId)+'/reservation-summary');
+    },
     quota(id:string,options:{cursor?:string;limit?:number;signal?:AbortSignal}={}) {
       const query=new URLSearchParams();if(options.cursor)query.set('cursor',options.cursor);if(options.limit!==undefined)query.set('limit',String(options.limit));
       return request<TenantQuotaView>('/v1/admin/tenants/'+encodeURIComponent(id)+'/quota'+(query.size?'?'+query:''),{signal:options.signal});
@@ -80,9 +123,10 @@ export function controlClient(fetcher:typeof fetch=fetch) {
     operation(id:string,signal?:AbortSignal) {
       return request<ControlOperation>('/v1/admin/operations/'+encodeURIComponent(id),{signal});
     },
-    audit(options:{domain?:string;cursor?:string;limit?:number;signal?:AbortSignal}={}) {
+    audit(options:{domain?:string;tenantId?:string;cursor?:string;limit?:number;signal?:AbortSignal}={}) {
       const query=new URLSearchParams();
       if(options.domain)query.set('domain',options.domain);
+      if(options.tenantId)query.set('tenantId',options.tenantId);
       if(options.cursor)query.set('cursor',options.cursor);
       if(options.limit!==undefined)query.set('limit',String(options.limit));
       return request<ControlPage<ManagementAudit>>('/v1/admin/audit'+(query.size?'?'+query:''),{signal:options.signal});
@@ -117,3 +161,10 @@ export function controlClient(fetcher:typeof fetch=fetch) {
     }
   };
 }
+
+
+
+
+
+
+

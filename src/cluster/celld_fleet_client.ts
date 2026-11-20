@@ -430,7 +430,8 @@ export class CelldFleetClient {
       }
     }
     throw new CelldFleetUnavailableError(
-      `celld purge unreachable: ${lastError instanceof Error ? lastError.message : "no node answered"}`
+      "fleet",
+      `purge unreachable: ${lastError instanceof Error ? lastError.message : "no node answered"}`
     );
   }
 

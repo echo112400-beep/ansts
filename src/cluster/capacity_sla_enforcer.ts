@@ -3,6 +3,7 @@
  * with Finite Metric Validation, Zero-Division Immunity, SQLite Headroom State Persistence & Dynamic Threshold Adjustment.
  */
 import { SqlStorageLike } from "../cloudflare/env.js";
+import type { TurnWalEngine } from "../checkpoint/wal_engine.js";
 
 export interface CapacitySlaPolicy {
   maxP0QueueWaitP99Ms: number;
@@ -32,7 +33,208 @@ export interface SpotQuotaLease {
   walFrozenTurnIndex?: number;
 }
 
+export interface BrainIsolateSizingSnapshot {
+  isolateId: string;
+  heapUsedMb: number;
+  heapLimitMb: number;
+  activeCells: number;
+  lastRehydrateRtoMs: number;
+}
+
+export interface BodyHostSizingSnapshot {
+  hostId: string;
+  vcpuCount: number;
+  ramGb: number;
+  activeSandboxes: number;
+  maxSandboxesLimit: number;
+  lastCgroupBoostLatencyMs: number;
+  lastVsockFastpathLatencyMs: number;
+}
+
+export interface TunnelGatewaySizingSnapshot {
+  gatewayId: string;
+  activeReverseStreams: number;
+  maxStreamsLimit: number;
+  lastOneHopRelayLatencyMs: number;
+  lastFailoverLatencyMs: number;
+}
+
+export interface RustFsEc4ClusterStatus {
+  totalDrives: number;
+  dataBlocks: number;
+  parityBlocks: number;
+  healthyDrives: number;
+  failedDrives: number;
+  lastEtagCasLatencyMs: number;
+}
+
+export interface SizingAdmissionVerdict {
+  allowed: boolean;
+  gcTriggered: boolean;
+  circuitBreakerTripped: boolean;
+  slaViolations: string[];
+  estimatedCellRamMb: number;
+}
+
+function sizingMetricsValid(...values: number[]): boolean {
+  return values.every(value => Number.isFinite(value) && value >= 0);
+}
+
 export class CapacitySlaEnforcer {
+  public static readonly BRAIN_HEAP_LIMIT_MB = 128;
+  public static readonly BRAIN_GC_WATERMARK_RATIO = 0.75;
+  public static readonly BRAIN_SHED_WATERMARK_RATIO = 0.90;
+  public static readonly CELL_FOOTPRINT_MB = 0.47;
+  public static readonly BRAIN_RTO_SLA_MS = 3000;
+
+  public static readonly BODY_MAX_SANDBOXES_PER_HOST = 32;
+  public static readonly BODY_CGROUP_BOOST_SLA_MS = 1.5;
+  public static readonly BODY_VSOCK_FASTPATH_SLA_MS = 0.15;
+
+  public static readonly TUNNEL_MAX_STREAMS_PER_GW = 20000;
+  public static readonly TUNNEL_ONE_HOP_RELAY_SLA_MS = 0.95;
+  public static readonly TUNNEL_FAILOVER_SLA_MS = 15.0;
+
+  public static readonly RUSTFS_EC4_PARITY_BLOCKS = 4;
+  public static readonly RUSTFS_CAS_SLA_MS = 12.0;
+
+  public evaluateBrainIsolateAdmission(snapshot: BrainIsolateSizingSnapshot): SizingAdmissionVerdict {
+    const limitMb = snapshot.heapLimitMb === 0 ? CapacitySlaEnforcer.BRAIN_HEAP_LIMIT_MB : snapshot.heapLimitMb;
+    if (!Number.isFinite(limitMb) || limitMb <= 0 || !sizingMetricsValid(snapshot.activeCells, snapshot.heapUsedMb, snapshot.lastRehydrateRtoMs)) {
+      return { allowed: false, gcTriggered: false, circuitBreakerTripped: true, slaViolations: ["INVALID_BRAIN_SIZING_METRICS"], estimatedCellRamMb: 0 };
+    }
+    const estimatedCellRamMb = Number((snapshot.activeCells * CapacitySlaEnforcer.CELL_FOOTPRINT_MB).toFixed(2));
+    const effectiveHeapMb = Math.max(snapshot.heapUsedMb, estimatedCellRamMb);
+    const ratio = effectiveHeapMb / limitMb;
+
+    const gcTriggered = ratio >= CapacitySlaEnforcer.BRAIN_GC_WATERMARK_RATIO;
+    const circuitBreakerTripped = ratio >= CapacitySlaEnforcer.BRAIN_SHED_WATERMARK_RATIO;
+    const slaViolations: string[] = [];
+
+    if (snapshot.lastRehydrateRtoMs > CapacitySlaEnforcer.BRAIN_RTO_SLA_MS) {
+      slaViolations.push(
+        `Brain Rehydration RTO ${snapshot.lastRehydrateRtoMs}ms exceeds SLA (${CapacitySlaEnforcer.BRAIN_RTO_SLA_MS}ms)`,
+      );
+    }
+    if (circuitBreakerTripped) {
+      slaViolations.push(
+        `Brain Isolate ${snapshot.isolateId} heap ${effectiveHeapMb.toFixed(1)}MB/${limitMb}MB (${(ratio * 100).toFixed(1)}%) >= 90% shedding watermark`,
+      );
+    }
+
+    return {
+      allowed: !circuitBreakerTripped,
+      gcTriggered,
+      circuitBreakerTripped,
+      slaViolations,
+      estimatedCellRamMb,
+    };
+  }
+
+  public evaluateBodyHostAdmission(snapshot: BodyHostSizingSnapshot): {
+    allowed: boolean;
+    availableSlots: number;
+    slaViolations: string[];
+  } {
+    const maxLimit = snapshot.maxSandboxesLimit === 0 ? CapacitySlaEnforcer.BODY_MAX_SANDBOXES_PER_HOST : snapshot.maxSandboxesLimit;
+    if (!Number.isSafeInteger(maxLimit) || maxLimit < 1 || !Number.isSafeInteger(snapshot.activeSandboxes) || !sizingMetricsValid(snapshot.activeSandboxes, snapshot.lastCgroupBoostLatencyMs, snapshot.lastVsockFastpathLatencyMs)) {
+      return { allowed: false, availableSlots: 0, slaViolations: ["INVALID_BODY_SIZING_METRICS"] };
+    }
+    const availableSlots = Math.max(0, maxLimit - snapshot.activeSandboxes);
+    const slaViolations: string[] = [];
+
+    if (snapshot.activeSandboxes >= maxLimit) {
+      slaViolations.push(
+        `BodyHost ${snapshot.hostId} reached max sandbox capacity (${snapshot.activeSandboxes}/${maxLimit})`,
+      );
+    }
+    if (snapshot.lastCgroupBoostLatencyMs > CapacitySlaEnforcer.BODY_CGROUP_BOOST_SLA_MS) {
+      slaViolations.push(
+        `Cgroups v2 boost latency ${snapshot.lastCgroupBoostLatencyMs}ms exceeds ${CapacitySlaEnforcer.BODY_CGROUP_BOOST_SLA_MS}ms SLA`,
+      );
+    }
+    if (snapshot.lastVsockFastpathLatencyMs > CapacitySlaEnforcer.BODY_VSOCK_FASTPATH_SLA_MS) {
+      slaViolations.push(
+        `UDS/AF_VSOCK fastpath latency ${snapshot.lastVsockFastpathLatencyMs}ms exceeds ${CapacitySlaEnforcer.BODY_VSOCK_FASTPATH_SLA_MS}ms SLA`,
+      );
+    }
+
+    return {
+      allowed: snapshot.activeSandboxes < maxLimit,
+      availableSlots,
+      slaViolations,
+    };
+  }
+
+  public evaluateTunnelGatewayCapacity(snapshot: TunnelGatewaySizingSnapshot): {
+    allowed: boolean;
+    utilizationRatio: number;
+    slaViolations: string[];
+  } {
+    const maxStreams = snapshot.maxStreamsLimit === 0 ? CapacitySlaEnforcer.TUNNEL_MAX_STREAMS_PER_GW : snapshot.maxStreamsLimit;
+    if (!Number.isSafeInteger(maxStreams) || maxStreams < 1 || !Number.isSafeInteger(snapshot.activeReverseStreams) || !sizingMetricsValid(snapshot.activeReverseStreams, snapshot.lastOneHopRelayLatencyMs, snapshot.lastFailoverLatencyMs)) {
+      return { allowed: false, utilizationRatio: 1, slaViolations: ["INVALID_TUNNEL_SIZING_METRICS"] };
+    }
+    const utilizationRatio = snapshot.activeReverseStreams / maxStreams;
+    const slaViolations: string[] = [];
+
+    if (snapshot.activeReverseStreams >= maxStreams) {
+      slaViolations.push(
+        `TunnelGateway ${snapshot.gatewayId} stream cap reached (${snapshot.activeReverseStreams}/${maxStreams})`,
+      );
+    }
+    if (snapshot.lastOneHopRelayLatencyMs > CapacitySlaEnforcer.TUNNEL_ONE_HOP_RELAY_SLA_MS) {
+      slaViolations.push(
+        `1-Hop relay latency ${snapshot.lastOneHopRelayLatencyMs}ms exceeds ${CapacitySlaEnforcer.TUNNEL_ONE_HOP_RELAY_SLA_MS}ms SLA`,
+      );
+    }
+    if (snapshot.lastFailoverLatencyMs > CapacitySlaEnforcer.TUNNEL_FAILOVER_SLA_MS) {
+      slaViolations.push(
+        `Secondary tunnel failover ${snapshot.lastFailoverLatencyMs}ms exceeds ${CapacitySlaEnforcer.TUNNEL_FAILOVER_SLA_MS}ms SLA`,
+      );
+    }
+
+    return {
+      allowed: snapshot.activeReverseStreams < maxStreams,
+      utilizationRatio,
+      slaViolations,
+    };
+  }
+
+  public evaluateRustFsEc4Reliability(status: RustFsEc4ClusterStatus): {
+    rpoZeroGuaranteed: boolean;
+    quorumIntact: boolean;
+    remainingFaultToleranceDrives: number;
+    slaViolations: string[];
+  } {
+    const { totalDrives, dataBlocks, parityBlocks, healthyDrives, failedDrives } = status;
+    if (![totalDrives, dataBlocks, parityBlocks, healthyDrives, failedDrives].every(value => Number.isSafeInteger(value) && value >= 0) ||
+      dataBlocks === 0 || dataBlocks + parityBlocks !== totalDrives || healthyDrives + failedDrives !== totalDrives || !sizingMetricsValid(status.lastEtagCasLatencyMs)) {
+      return { rpoZeroGuaranteed: false, quorumIntact: false, remainingFaultToleranceDrives: 0, slaViolations: ["INVALID_RUSTFS_SIZING_METRICS"] };
+    }
+    const quorumIntact = healthyDrives >= dataBlocks;
+    const remainingFaultToleranceDrives = Math.max(0, status.parityBlocks - status.failedDrives);
+    const slaViolations: string[] = [];
+
+    if (!quorumIntact) {
+      slaViolations.push(
+        `RustFS EC:${status.parityBlocks} quorum lost: ${status.failedDrives} drives failed > ${status.parityBlocks} parity blocks`,
+      );
+    }
+    if (status.lastEtagCasLatencyMs > CapacitySlaEnforcer.RUSTFS_CAS_SLA_MS) {
+      slaViolations.push(
+        `RustFS ETag CAS latency ${status.lastEtagCasLatencyMs}ms exceeds ${CapacitySlaEnforcer.RUSTFS_CAS_SLA_MS}ms SLA`,
+      );
+    }
+
+    return {
+      rpoZeroGuaranteed: quorumIntact,
+      quorumIntact,
+      remainingFaultToleranceDrives,
+      slaViolations,
+    };
+  }
+
   private policy: CapacitySlaPolicy;
   private emergencyHeadroomActive = false;
   private readonly spotOffers: Map<string, SpotQuotaOffer> = new Map();
@@ -281,16 +483,7 @@ export class CapacitySlaEnforcer {
     lenderTenantId: string;
     urgentTaskId: string;
     requiredSlots: number;
-    walEngine?: {
-      appendTurnDelta: (args: {
-        taskId: string;
-        turnIndex: number;
-        fencingToken: number;
-        thoughtSummary: string;
-        toolName: string;
-        changedFiles: string[];
-      }) => { turnIndex: number };
-    };
+    walEngine?: Pick<TurnWalEngine, "appendTurnDelta">;
     scheduler?: {
       freezeAndRequeueSpotTask: (taskId: string, reason?: string) => boolean;
     };
@@ -317,9 +510,9 @@ export class CapacitySlaEnforcer {
           taskId: lease.taskId,
           turnIndex: 1,
           fencingToken: 1,
-          thoughtSummary: `Sub-second WAL checkpoint freeze before Spot quota recall by lender ${params.lenderTenantId}`,
-          toolName: "spot_wal_freeze",
           changedFiles: ["workspace/spot_checkpoint.json"],
+          sqliteWalPages: 0,
+          highestSubmittedFencingToken: 1,
         });
         lease.walFrozenTurnIndex = walEntry.turnIndex;
       } else {

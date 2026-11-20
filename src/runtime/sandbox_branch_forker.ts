@@ -2,6 +2,94 @@
  * @fileoverview M22 & M37 Copy-on-Write Sandbox Branch Forker for Parallel Speculative & Deterministic Execution.
  */
 import { LayerFsWorkspaceDriver } from "./layerfs_workspace_driver.js";
+import { randomUUID } from "node:crypto";
+
+interface SandboxCheckpoint {
+  checkpointId: string;
+  parentSandboxId: string;
+  commitId: string;
+  workspaceBranch: string;
+}
+
+export interface SandboxBranch {
+  branchId: string;
+  parentSandboxId: string;
+  checkpointId: string;
+  forkLatencyMs: number;
+  active: boolean;
+}
+
+export class SandboxBranchForker {
+  private readonly checkpoints = new Map<string, SandboxCheckpoint>();
+  private readonly branches = new Map<string, SandboxBranch & { modifiedFiles: Set<string> }>();
+
+  constructor(private readonly driver = new LayerFsWorkspaceDriver()) {}
+
+  public createCheckpoint(sandboxId: string, label: string, seedFiles: Record<string, string> = {}): SandboxCheckpoint {
+    if (!sandboxId.trim()) throw new Error("INVALID_SANDBOX_ID");
+    const checkpointId = `chk_${randomUUID()}`;
+    const workspaceBranch = `sandbox-${checkpointId}`;
+    let commitId = this.driver.forkBranch("main", workspaceBranch).headCommitId;
+    try {
+      for (const [filePath, newContent] of Object.entries(seedFiles)) {
+        commitId = this.driver.executeInProcessFileTool({
+          branchName: workspaceBranch, agentId: sandboxId, stepId: label, operation: "write", filePath, newContent,
+        }).commitId;
+      }
+    } catch (error) {
+      this.driver.deleteBranch(workspaceBranch);
+      throw error;
+    }
+    const checkpoint = { checkpointId, parentSandboxId: sandboxId, commitId, workspaceBranch };
+    this.checkpoints.set(checkpointId, checkpoint);
+    return { ...checkpoint };
+  }
+
+  public forkBranch(parentSandboxId: string, checkpointId: string): SandboxBranch {
+    const checkpoint = this.checkpoints.get(checkpointId);
+    if (!checkpoint || checkpoint.parentSandboxId !== parentSandboxId) throw new Error("SANDBOX_CHECKPOINT_NOT_FOUND");
+    const branchId = `brn_${randomUUID()}`;
+    const started = performance.now();
+    this.driver.forkBranch(checkpoint.commitId, branchId);
+    const branch = { branchId, parentSandboxId, checkpointId, forkLatencyMs: performance.now() - started, active: true };
+    this.branches.set(branchId, { ...branch, modifiedFiles: new Set() });
+    return branch;
+  }
+
+  public recordBranchFileMutation(branchId: string, filePath: string, newContent: string): string {
+    const branch = this.branches.get(branchId);
+    if (!branch?.active) throw new Error("SANDBOX_BRANCH_INACTIVE");
+    const result = this.driver.executeInProcessFileTool({
+      branchName: branchId, agentId: branch.parentSandboxId, stepId: "patch", operation: "write", filePath, newContent,
+    });
+    if (result.committedNewSnapshot) branch.modifiedFiles.add(filePath);
+    return result.commitId;
+  }
+
+  public writeFileInBranch(branchId: string, filePath: string, content: string): string {
+    return this.recordBranchFileMutation(branchId, filePath, content);
+  }
+
+  public mergeWinningBranchAndPruneSiblings(winningBranchId: string) {
+    const winner = this.branches.get(winningBranchId);
+    if (!winner?.active) throw new Error("SANDBOX_BRANCH_INACTIVE");
+    const { workspaceBranch } = this.checkpoints.get(winner.checkpointId)!;
+    this.driver.forkBranch(winner.branchId, workspaceBranch);
+    winner.active = false;
+    const prunedSiblingBranchIds: string[] = [];
+    for (const [branchId, branch] of this.branches) {
+      if (branchId !== winningBranchId && branch.checkpointId === winner.checkpointId && branch.active) {
+        this.destroyBranch(branchId);
+        prunedSiblingBranchIds.push(branchId);
+      }
+    }
+    return { success: true, mergedBranchName: workspaceBranch, mergedFilesCount: winner.modifiedFiles.size, prunedSiblingBranchIds };
+  }
+
+  public destroyBranch(branchId: string): void {
+    if (this.branches.delete(branchId)) this.driver.deleteBranch(branchId);
+  }
+}
 import { DeterministicExecutionEnvelope } from "./deterministic_envelope.js";
 
 export class CoWSandboxBranchForker {

@@ -14,6 +14,7 @@ import { DagEscrowCoordinator } from "../dag/escrow.js";
 import { FinOpsBudgetController } from "../finops/budget_controller.js";
 import { CognitiveRouter } from "../cognitive_router.js";
 import { McpDynamicToolRegistry } from "../saga/mcp_registry.js";
+import type { FaultTolerantObservabilityCoordinator } from "../telemetry/observability_recovery.js";
 
 export class UnifiedComponentPersistenceStore {
   private readonly sql: SqlStorageLike;
@@ -33,6 +34,7 @@ export class UnifiedComponentPersistenceStore {
       "CREATE TABLE IF NOT EXISTS persisted_approval_tickets (ticket_id TEXT PRIMARY KEY, payload_json TEXT)",
       "CREATE TABLE IF NOT EXISTS persisted_finops_ledgers (tenant_id TEXT PRIMARY KEY, payload_json TEXT)",
       "CREATE TABLE IF NOT EXISTS persisted_mcp_tools (tool_name TEXT PRIMARY KEY, payload_json TEXT)",
+      "CREATE TABLE IF NOT EXISTS persisted_observability (cell_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL)",
     ];
     for (const ddl of tables) {
       this.sql.exec(ddl);
@@ -183,10 +185,8 @@ export class UnifiedComponentPersistenceStore {
       }
       if (
         spec.state !== TaskState.COMPLETED &&
-        spec.state !== TaskState.SUCCEEDED &&
         spec.state !== TaskState.FAILED &&
-        spec.state !== TaskState.DEAD_LETTER &&
-        spec.state !== TaskState.CANCELLED
+        spec.state !== TaskState.DEAD_LETTER
       ) {
         targetScheduler.contentFingerprintIndex.set(spec.content_fingerprint, spec.task_id);
       }
@@ -201,6 +201,36 @@ export class UnifiedComponentPersistenceStore {
       restored += 1;
     }
     return restored;
+  }
+
+  public persistObservabilityState(coordinator: FaultTolerantObservabilityCoordinator, cellId: string): { spansSaved: number; cloudEventsSaved: number } {
+    const { spooledSpans, spooledCloudEvents, droppedSpansCount, droppedCloudEventsCount } = coordinator.spooler;
+    const payload = {
+      spooledSpans, spooledCloudEvents, droppedSpansCount, droppedCloudEventsCount,
+      activeTaskTraces: [...coordinator.tracePropagator.activeTaskTraceMap],
+    };
+    this.sql.exec("INSERT OR REPLACE INTO persisted_observability (cell_id, payload_json) VALUES (?, ?)", cellId, JSON.stringify(payload));
+    return { spansSaved: spooledSpans.length, cloudEventsSaved: spooledCloudEvents.length };
+  }
+
+  public rehydrateObservabilityState(coordinator: FaultTolerantObservabilityCoordinator, cellId: string): boolean {
+    const row = this.sql.exec<{ payload_json: string }>("SELECT payload_json FROM persisted_observability WHERE cell_id = ?", cellId).one();
+    if (!row) return false;
+    const { spooler, tracePropagator } = coordinator;
+    const payload = JSON.parse(row.payload_json) as {
+      spooledSpans: typeof spooler.spooledSpans;
+      spooledCloudEvents: typeof spooler.spooledCloudEvents;
+      droppedSpansCount: number;
+      droppedCloudEventsCount: number;
+      activeTaskTraces: Array<[string, { traceId: string; lastSpanId: string }]>;
+    };
+    spooler.spooledSpans = payload.spooledSpans.slice(-spooler.maxSpanSpoolCapacity);
+    spooler.spooledCloudEvents = payload.spooledCloudEvents.slice(-spooler.maxCloudEventSpoolCapacity);
+    spooler.droppedSpansCount = payload.droppedSpansCount + payload.spooledSpans.length - spooler.spooledSpans.length;
+    spooler.droppedCloudEventsCount = payload.droppedCloudEventsCount + payload.spooledCloudEvents.length - spooler.spooledCloudEvents.length;
+    tracePropagator.activeTaskTraceMap.clear();
+    for (const [taskId, context] of payload.activeTaskTraces) tracePropagator.activeTaskTraceMap.set(taskId, context);
+    return true;
   }
 
   /**

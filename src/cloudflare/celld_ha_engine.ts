@@ -89,6 +89,11 @@ export class DurableWorkflowContext {
   private readonly sql: SqlStorageLike;
   private readonly workflowId: string;
   private readonly inFlightSteps: Map<string, Promise<unknown>> = new Map();
+  private readonly pendingEvents = new Map<string, Array<Record<string, unknown>>>();
+  private readonly eventWaiters = new Map<string, Array<(event: Record<string, unknown>) => void>>();
+  private queuedEvents = 0;
+  private waitingConsumers = 0;
+  public isolateHibernated = false;
 
   constructor(sql: SqlStorageLike, workflowId: string) {
     this.sql = sql;
@@ -96,6 +101,39 @@ export class DurableWorkflowContext {
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS workflow_steps (step_key TEXT PRIMARY KEY, workflow_id TEXT, output_json TEXT, completed_at INTEGER)"
     );
+  }
+
+  public sendEvent(eventType: string, payload: Record<string, unknown>): void {
+    const waiters = this.eventWaiters.get(eventType);
+    const next = waiters?.shift();
+    if (next) {
+      if (!waiters?.length) this.eventWaiters.delete(eventType);
+      this.waitingConsumers--;
+      next(payload);
+      return;
+    }
+    if (this.queuedEvents >= 1024) throw new Error("WORKFLOW_EVENT_QUEUE_FULL");
+    const pending = this.pendingEvents.get(eventType) ?? [];
+    pending.push(payload);
+    this.pendingEvents.set(eventType, pending);
+    this.queuedEvents++;
+  }
+
+  public waitForEvent(eventType: string): Promise<Record<string, unknown>> {
+    const pending = this.pendingEvents.get(eventType);
+    const next = pending?.shift();
+    if (next) {
+      if (!pending?.length) this.pendingEvents.delete(eventType);
+      this.queuedEvents--;
+      return Promise.resolve(next);
+    }
+    if (this.waitingConsumers >= 1024) return Promise.reject(new Error("WORKFLOW_EVENT_WAIT_LIMIT"));
+    return new Promise((resolve) => {
+      const waiters = this.eventWaiters.get(eventType) ?? [];
+      waiters.push(resolve);
+      this.eventWaiters.set(eventType, waiters);
+      this.waitingConsumers++;
+    });
   }
 
   /**

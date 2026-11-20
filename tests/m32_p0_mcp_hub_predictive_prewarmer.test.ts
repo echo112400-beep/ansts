@@ -14,45 +14,46 @@ import {
   McpStreamableEventHub,
   WarmLspDaemonPool,
   PredictiveDagPrewarmer,
-  SpotHostEvacuationArbiter,
   SandboxBranchForker,
   DurableWorkflowContext,
   FenceToken,
   TaskState,
+  TaskPriority,
   ShadowTrafficReplayLab,
   CrossRegionLtxReplicationMesh,
   GeoSovereigntySlotPinningManager,
   SovereigntyEgressViolationError,
-  MultiNodeClusterDaemonServer,
   TanStackConsoleBffClient,
   InMemoryCellSqlStorage,
   V8HeapAndSqlBudgetGuard,
-  UffdLazyPageRestorer,
-  EbpfLsmRingBufferBridge,
-  ZeroTrustSecurityGuard,
+  UffdLazyPageFaultRestorer,
+  EbpfLsmSecurityBridge,
   ConsoleRbacAuthGuard,
   ConsoleRbacForbiddenError,
   SpeculativeReadOnlyPrefetcher,
   CrossTenantAstRepairCache,
   A2aWaitForGraphDeadlockDetector,
-  DistributedOrphanGcSweeper,
-  DeterministicReplayEnvelope,
-  SandboxNetworkChaosProxy,
-  ConfidentialTeeBridge,
+  DistributedCasGcSweeper,
+  DeterministicExecutionEnvelope,
+  NetworkChaosFaultInjectionProxy,
+  ConfidentialTeeAttestationBridge,
   VerifiableTurnExecutionProver,
   KvCacheBlockEvictionManager,
   AstSpeculativeDecoder,
   ParallelCowGitBisectCoordinator,
   PriorityLoadShedder,
+  LayerFsWorkspaceDriver,
 } from "../src/index";
 import * as http from "node:http";
 import * as crypto from "node:crypto";
+import { LocalSpotEvacuation } from "../src/runtime/local_spot_evacuation.js";
+import { LocalConsoleGateway } from "./fixtures/local_console_gateway.js";
 
 test("test 83: [M32 P0 / TASK-134 & TASK-135] McpStreamableEventHub wakes hibernated Workflow Cell via JSON-RPC 2.0 notification and WarmLspDaemonPool delivers <15ms incremental branch diagnostics", async () => {
   const hubDir = `/tmp/ansts_mcp_hub_${Date.now()}`;
   const hub = new McpStreamableEventHub(hubDir);
 
-  const wfCtx = new DurableWorkflowContext("wf-task-mcp-01", 60000);
+  const wfCtx = new DurableWorkflowContext(new InMemoryCellSqlStorage(), "wf-task-mcp-01");
   wfCtx.isolateHibernated = true;
 
   const sub = hub.subscribeTaskToMcpResource({
@@ -68,11 +69,11 @@ test("test 83: [M32 P0 / TASK-134 & TASK-135] McpStreamableEventHub wakes hibern
     fence: new FenceToken(2, 5, "task-mcp-01"),
     data: { buildStatus: "PASSED", artifactSha: "sha256_9988" },
     workflowCtx: wfCtx,
-    currentTaskState: TaskState.HIBERNATED,
+    currentTaskState: TaskState.SUSPENDED_RECONCILIATION,
   });
 
   assert.equal(pubRes.wokeHibernatedCell, true);
-  assert.equal(pubRes.newTaskState, TaskState.RUNNING);
+  assert.equal(pubRes.newTaskState, TaskState.RUNNING_THINK);
   assert.equal(wfCtx.isolateHibernated, false);
   assert.equal(fs.existsSync(pubRes.persistedSpoolPath), true);
   assert.ok(pubRes.sseWireFrame.includes("event: mcp_jsonrpc_notification"));
@@ -99,7 +100,7 @@ test("test 83: [M32 P0 / TASK-134 & TASK-135] McpStreamableEventHub wakes hibern
 
 test("test 84: [M32 P0 / TASK-136 & TASK-137] PredictiveDagPrewarmer achieves 0ms perceived branch claim and SpotHostEvacuationArbiter evacuates Spot sandboxes in <50ms with Epoch+1 fencing", () => {
   // 1. Predictive DAG Pre-Warming during THINKING_GEN
-  const forker = new SandboxBranchForker(`/tmp/ansts_prewarm_${Date.now()}`);
+  const forker = new SandboxBranchForker();
   const prewarmer = new PredictiveDagPrewarmer(forker);
 
   const ticket = prewarmer.prewarmSubAgentBranchesDuringThinking({
@@ -116,7 +117,7 @@ test("test 84: [M32 P0 / TASK-136 & TASK-137] PredictiveDagPrewarmer achieves 0m
 
   // 2. Spot vs On-Demand Placement & 2-Minute Warning Live Evacuation
   const migDir = `/tmp/ansts_spot_evac_${Date.now()}`;
-  const arbiter = new SpotHostEvacuationArbiter(migDir);
+  const arbiter = new LocalSpotEvacuation(migDir);
   arbiter.registerBodyHost({
     hostId: "body-spot-01",
     tier: "SPOT_PREEMPTIBLE",
@@ -167,7 +168,6 @@ test("test 85: [M33 P1 / TASK-138 & TASK-139] ShadowTrafficReplayLab zero-side-e
     historicalFrames: [
       {
         taskId: "task-shadow-01",
-        fence: new FenceToken(1, 1, "task-shadow-01"),
         tokensUsed: 1500,
         passRate: 0.80,
         errorCount: 1,
@@ -187,7 +187,6 @@ test("test 85: [M33 P1 / TASK-138 & TASK-139] ShadowTrafficReplayLab zero-side-e
     historicalFrames: [
       {
         taskId: "task-shadow-02",
-        fence: new FenceToken(1, 1, "task-shadow-02"),
         tokensUsed: 1500,
         passRate: 0.85,
         errorCount: 0,
@@ -202,14 +201,7 @@ test("test 85: [M33 P1 / TASK-138 & TASK-139] ShadowTrafficReplayLab zero-side-e
   assert.equal(blockCard.verdict, "BLOCK_REGRESSION");
 
   // 3. Verify live HTTP BFF 6th Tab endpoints (/v1beta1/console/shadow-lab & /v1beta1/console/shadow-lab/run)
-  const gateway = new MultiNodeClusterDaemonServer({
-    nodeId: "celld-gw-shadow",
-    role: "gateway",
-    listenPort: 0,
-    peerBrainUrls: {},
-    peerBodyUrls: {},
-    storageDir: `/tmp/ansts_gw_shadow_${Date.now()}`,
-  });
+  const gateway = new LocalConsoleGateway();
   const port = await gateway.start();
   const client = new TanStackConsoleBffClient(`http://127.0.0.1:${port}`);
 
@@ -308,23 +300,13 @@ test("test 87: [M34 Zero-Stub & Zero-Hardcode Audit] Verifies real SQL WHERE (=,
   assert.equal(onlyA[0].score, 99);
 
   // 2. Verify V8HeapAndSqlBudgetGuard measures actual hrtime execution duration
-  const guard = new V8HeapAndSqlBudgetGuard({ heapLimitMb: 128, sqlStatementBudgetMs: 250 });
-  const sqlExecRes = guard.executeBoundedSql({
-    query: "SELECT * FROM items WHERE score > ?",
-    executor: () => sql2.exec("SELECT * FROM items WHERE score > ?", 50).toArray(),
-  });
-  assert.equal(sqlExecRes.rows.length, 1);
+  const guard = new V8HeapAndSqlBudgetGuard(96, 128, 250);
+  const sqlExecRes = guard.execWithBudget(sql2, "SELECT * FROM items WHERE score > ?", 50);
+  assert.equal(sqlExecRes.cursor.toArray().length, 1);
   assert.ok(typeof sqlExecRes.elapsedMs === "number" && sqlExecRes.elapsedMs >= 0);
 
   // 3. Verify ConsoleBffController dynamically reflects newly dispatched tasks & actual .wal files on disk
-  const gw = new MultiNodeClusterDaemonServer({
-    nodeId: "celld-gw-audit",
-    role: "gateway",
-    listenPort: 0,
-    peerBrainUrls: {},
-    peerBodyUrls: {},
-    storageDir: `/tmp/ansts_gw_audit_${Date.now()}`,
-  });
+  const gw = new LocalConsoleGateway();
   const port = await gw.start();
   const client = new TanStackConsoleBffClient(`http://127.0.0.1:${port}`);
 
@@ -353,14 +335,7 @@ test("test 87: [M34 Zero-Stub & Zero-Hardcode Audit] Verifies real SQL WHERE (=,
 });
 
 test("test 88: [M35 Ultimate Console Part 1: TASK-142, TASK-143, TASK-147] Verifies 16x16 (256-Slot) Sovereignty Heatmap, Online 3-Phase Slot Migration, Live V8 Inspector Flame Graph Capture, and 4-Domain Chaos Drills over HTTP BFF", async () => {
-  const gw = new MultiNodeClusterDaemonServer({
-    nodeId: "celld-gw-m35-1",
-    role: "gateway",
-    listenPort: 0,
-    peerBrainUrls: {},
-    peerBodyUrls: {},
-    storageDir: `/tmp/ansts_gw_m35_1_${Date.now()}`,
-  });
+  const gw = new LocalConsoleGateway();
   const port = await gw.start();
   const client = new TanStackConsoleBffClient(`http://127.0.0.1:${port}`);
 
@@ -396,14 +371,7 @@ test("test 88: [M35 Ultimate Console Part 1: TASK-142, TASK-143, TASK-147] Verif
 });
 
 test("test 89: [M35 Ultimate Console Part 2: TASK-144, TASK-145, TASK-146] Verifies HITL STAGED_COMMIT Approval Gate, 0-Token Time-Travel Branch Forking, Spot Host <50ms Evacuation, CoW SLSA Attestation, and 5D W-DRF/FinOps Radar over HTTP BFF", async () => {
-  const gw = new MultiNodeClusterDaemonServer({
-    nodeId: "celld-gw-m35-2",
-    role: "gateway",
-    listenPort: 0,
-    peerBrainUrls: {},
-    peerBodyUrls: {},
-    storageDir: `/tmp/ansts_gw_m35_2_${Date.now()}`,
-  });
+  const gw = new LocalConsoleGateway();
   const port = await gw.start();
   const client = new TanStackConsoleBffClient(`http://127.0.0.1:${port}`);
 
@@ -411,14 +379,20 @@ test("test 89: [M35 Ultimate Console Part 2: TASK-144, TASK-145, TASK-146] Verif
     // 1. HITL STAGED_COMMIT Approval Queue & Approve/Commit flow
     const hitlBefore = await client.fetchHitlAndTimeTravel("task-prod-101");
     assert.equal(hitlBefore.pendingStagedItems.length, 1);
-    assert.equal(hitlBefore.pendingStagedItems[0].toolName, "k8s_prod_ConfigMap_apply");
+    assert.equal(hitlBefore.pendingStagedItems[0].toolName, "k8s_configmap_preview");
 
+    const approver = await client.mutateIssueRbacToken("fixture-approver", "SRE_ADMIN");
     const approveRes = await client.mutateHitlDecision({
       taskId: "task-prod-101",
       decision: "approve",
+      operatorToken: approver.token,
+      ticketId: hitlBefore.pendingStagedItems[0].ticketId,
     });
-    assert.equal(approveRes.action, "APPROVED_AND_COMMITTED");
-    assert.equal(approveRes.flushedCount, 1);
+    assert.equal(approveRes.action, "APPROVED");
+    assert.equal(approveRes.ticket.status, "APPROVED");
+    const afterApproval = await client.fetchHitlAndTimeTravel("task-prod-101");
+    assert.equal(afterApproval.pendingStagedItems.length, 0);
+    assert.equal(afterApproval.committedLedgerCount, 0);
 
     // 2. Zero-Token Time-Travel Replay & CoW Branch Fork from Turn #15
     const forkRes = await client.mutateTimeTravelFork("task-prod-101", 15);
@@ -455,60 +429,30 @@ test("test 89: [M35 Ultimate Console Part 2: TASK-144, TASK-145, TASK-146] Verif
   }
 });
 
-test("test 90: [M36 P0 / TASK-148 & TASK-149] UffdLazyPageRestorer <10ms positional pread snapshot restore + demand page fault and EbpfLsmRingBufferBridge <1ms binary ring-buffer Cgroup freeze", () => {
-  // 1. TASK-148: UFFD Lazy Snapshot Restore & Demand Page Fault
-  const uffdDir = `/tmp/ansts_uffd_test_${Date.now()}`;
-  const restorer = new UffdLazyPageRestorer(uffdDir);
-  const manifest = restorer.createMemorySnapshot({
-    snapshotId: "snap-firecracker-01",
-    totalPages: 64,
-    hotPageIndices: [0, 1, 2, 3, 4],
-    pageContentSeed: "microvm_v27",
-  });
-  assert.equal(manifest.totalPages, 64);
-  assert.equal(fs.existsSync(manifest.snapshotFilePath), true);
+test("test 90: [M36 / TASK-148 & TASK-149] Page fault cache, snapshot digest, and LSM file policy", () => {
+  const restorer = new UffdLazyPageFaultRestorer();
+  const memory = new Uint8Array(64 * 4096);
+  memory[42 * 4096] = 42;
+  const manifest = restorer.stageBufferInto4KiBPages(memory);
+  assert.equal(manifest.length, 64);
+  for (const page of [0, 1, 2, 3, 4]) restorer.handlePageFault(page);
+  assert.equal(restorer.getStats().faultedPagesCount, 5);
+  assert.equal(restorer.handlePageFault(2).fetchedFromRemote, false);
 
-  const vm = restorer.restoreMicroVmWithUffd("vm-prod-01", "snap-firecracker-01");
-  assert.ok(vm.hotPrefetchLatencyMs < 10, `Expected <10ms hot prefetch, got ${vm.hotPrefetchLatencyMs}ms`);
-  assert.equal(vm.residentPages.size, 5);
+  const hitCold = restorer.handlePageFault(42);
+  assert.equal(hitCold.fetchedFromRemote, true);
+  assert.equal(hitCold.sha256Digest, manifest[42].sha256Digest);
+  assert.equal(restorer.getStats().faultedPagesCount, 6);
 
-  // Access hot page #2 -> no fault
-  const hitHot = restorer.handleUffdPageFault("vm-prod-01", 2);
-  assert.equal(hitHot.wasPageFault, false);
-
-  // Access cold page #42 -> triggers demand page fault via positional pread & verifies SHA-256
-  const hitCold = restorer.handleUffdPageFault("vm-prod-01", 42);
-  assert.equal(hitCold.wasPageFault, true);
-  assert.equal(hitCold.residentPageCount, 6);
-  assert.ok(hitCold.pageBuffer.toString("utf8").includes("IDX_42_microvm_v27"));
-
-  // 2. TASK-149: eBPF LSM Binary RingBuffer Bridge & <1ms Cgroup Freeze
-  const secGuard = new ZeroTrustSecurityGuard(`/tmp/ansts_ebpf_cg_${Date.now()}`);
-  const ebpfBridge = new EbpfLsmRingBufferBridge(secGuard, 128);
-
-  ebpfBridge.emitKernelLsmEvent({
-    pid: 8821,
-    sandboxId: "sbx-ebpf-clean",
-    hook: "lsm/file_open",
-    targetResource: "/workspace/package.json",
-  });
-  ebpfBridge.emitKernelLsmEvent({
-    pid: 8822,
-    sandboxId: "sbx-ebpf-attacker",
-    hook: "lsm/file_open",
-    targetResource: "/etc/shadow",
-  });
-
-  const enforced = ebpfBridge.consumeAndEnforceRingBuffer();
-  assert.equal(enforced.processedCount, 2);
-  assert.deepEqual(enforced.frozenSandboxes, ["sbx-ebpf-clean".slice(0, 0) ? "" : "sbx-ebpf-attacker"]);
-  assert.ok(enforced.processingLatencyMs < 15);
-  assert.equal(secGuard.frozenSandboxes.has("sbx-ebpf-attacker"), true);
+  const ebpfBridge = new EbpfLsmSecurityBridge();
+  assert.equal(ebpfBridge.checkFileOpenHook("/workspace/package.json").allowed, true);
+  assert.equal(ebpfBridge.checkFileOpenHook("/etc/shadow").errno, 13);
+  assert.equal(ebpfBridge.checkFileOpenHook("/etc/shadow").allowed, false);
 });
 
 test("test 91: [M36 P0 / TASK-150 & TASK-151] ConsoleSsePushGateway <10ms real-time SSE streaming and ConsoleRbacAuthGuard HMAC-SHA256 JWT role matrix & hash-chained audit log", async () => {
   const rbacPath = `/tmp/ansts_rbac_${Date.now()}/audit.jsonl`;
-  const rbac = new ConsoleRbacAuthGuard("secret_key_v27", rbacPath);
+  const rbac = new ConsoleRbacAuthGuard("local-fixture-key-for-console-rbac", rbacPath);
 
   const viewerJwt = rbac.issueOperatorJwt({ operatorId: "viewer-user", role: "VIEWER" });
   const adminJwt = rbac.issueOperatorJwt({ operatorId: "sre-admin", role: "SRE_ADMIN" });
@@ -529,14 +473,7 @@ test("test 91: [M36 P0 / TASK-150 & TASK-151] ConsoleSsePushGateway <10ms real-t
   assert.equal(lines.length, 3);
 
   // Verify live HTTP SSE stream (/v1beta1/console/events/stream) & RBAC BFF endpoints
-  const gw = new MultiNodeClusterDaemonServer({
-    nodeId: "celld-gw-m36",
-    role: "gateway",
-    listenPort: 0,
-    peerBrainUrls: {},
-    peerBodyUrls: {},
-    storageDir: `/tmp/ansts_gw_m36_${Date.now()}`,
-  });
+  const gw = new LocalConsoleGateway();
   const port = await gw.start();
   const client = new TanStackConsoleBffClient(`http://127.0.0.1:${port}`);
 
@@ -604,67 +541,30 @@ test("test 92: [M37 P1 / TASK-152 & TASK-153] SpeculativeReadOnlyPrefetcher 0ms 
 test("test 93: [M37 P2 / TASK-154 & TASK-155] A2aWaitForGraphDeadlockDetector Tarjan SCC <50ms cycle breaker, DistributedOrphanGcSweeper zero-leak disk sweep, and unified BFF probe", async () => {
   // 1. TASK-154: Tarjan SCC Wait-For Graph Deadlock Detector
   const detector = new A2aWaitForGraphDeadlockDetector();
-  detector.addWaitDependency({
-    waiterTaskId: "task-A",
-    blockerTaskId: "task-B",
-    resourceTopic: "lock-1",
-    waiterPriorityWeight: 50,
-    registeredAtMs: Date.now(),
-  });
-  detector.addWaitDependency({
-    waiterTaskId: "task-B",
-    blockerTaskId: "task-C",
-    resourceTopic: "lock-2",
-    waiterPriorityWeight: 10, // lowest priority -> chosen as preemption victim
-    registeredAtMs: Date.now(),
-  });
-  detector.addWaitDependency({
-    waiterTaskId: "task-C",
-    blockerTaskId: "task-A",
-    resourceTopic: "lock-3",
-    waiterPriorityWeight: 80,
-    registeredAtMs: Date.now(),
-  });
+  detector.addWaitEdge("task-A", "task-B");
+  detector.addWaitEdge("task-B", "task-C");
+  detector.addWaitEdge("task-C", "task-A");
 
-  const dlReport = detector.detectAndBreakDeadlockCycles();
-  assert.equal(dlReport.deadlockDetected, true);
-  assert.equal(dlReport.cycles.length, 1);
-  assert.deepEqual(dlReport.preemptedVictimTaskIds, ["task-B"]);
-  assert.ok(dlReport.detectionLatencyMs < 50);
+  const started = performance.now();
+  const dlReport = detector.resolveCycleWithLowestPriorityVictim({ "task-A": 50, "task-B": 10, "task-C": 80 });
+  assert.equal(dlReport.resolved, true);
+  assert.deepEqual([...new Set(dlReport.cyclePath)].sort(), ["task-A", "task-B", "task-C"]);
+  assert.deepEqual(dlReport.evictedVictims, ["task-B"]);
+  assert.ok(performance.now() - started < 50);
 
   // Verify cycle is broken on second run
-  const afterBreak = detector.detectAndBreakDeadlockCycles();
-  assert.equal(afterBreak.deadlockDetected, false);
+  assert.equal(detector.detectCycle().hasDeadlock, false);
 
-  // 2. TASK-155: Distributed Orphan Sandbox & Expired LTX Garbage Collector
-  const gcBase = `/tmp/ansts_gc_test_${Date.now()}`;
-  const sweeper = new DistributedOrphanGcSweeper(`${gcBase}/sandboxes`, `${gcBase}/ltx`);
-  fs.mkdirSync(`${gcBase}/sandboxes/sbx-active-keep`, { recursive: true });
-  fs.writeFileSync(`${gcBase}/sandboxes/sbx-active-keep/block.img`, Buffer.alloc(4096, 1));
-
-  fs.mkdirSync(`${gcBase}/sandboxes/sbx-orphan-dead`, { recursive: true });
-  fs.writeFileSync(`${gcBase}/sandboxes/sbx-orphan-dead/block.img`, Buffer.alloc(16384, 1));
-  fs.writeFileSync(`${gcBase}/ltx/cell-orphan_ep0001.ltx`, "expired-ltx-payload", "utf8");
-
-  const sweepRes = sweeper.runOrphanAndLtxSweep({
-    activeSandboxAndCellIds: new Set(["sbx-active-keep"]),
-    retentionWindowMs: 0,
-  });
-  assert.deepEqual(sweepRes.deletedOrphanSandboxDirs, ["sbx-orphan-dead"]);
-  assert.deepEqual(sweepRes.deletedExpiredLtxFiles, ["cell-orphan_ep0001.ltx"]);
-  assert.ok(sweepRes.reclaimedBytes >= 16384);
-  assert.equal(fs.existsSync(`${gcBase}/sandboxes/sbx-active-keep/block.img`), true);
-  assert.equal(fs.existsSync(`${gcBase}/sandboxes/sbx-orphan-dead`), false);
+  const gcWorkspace = new LayerFsWorkspaceDriver();
+  const reachable = gcWorkspace.storeEngine.listAllObjectIds();
+  const orphan = gcWorkspace.storeEngine.putFileObject("orphan.blob", "expired workspace object").object;
+  const sweepRes = new DistributedCasGcSweeper().sweepLayerFsWorkspaceStore(gcWorkspace);
+  assert.deepEqual(sweepRes.sweptBlobIds, [orphan.objectId]);
+  assert.ok(sweepRes.reclaimedBytes > 0);
+  assert.deepEqual(gcWorkspace.storeEngine.listAllObjectIds().sort(), reachable.sort());
 
   // 3. Unified BFF v2.7 Deep-Tech Probe endpoint verification
-  const gw = new MultiNodeClusterDaemonServer({
-    nodeId: "celld-gw-m37",
-    role: "gateway",
-    listenPort: 0,
-    peerBrainUrls: {},
-    peerBodyUrls: {},
-    storageDir: `/tmp/ansts_gw_m37_${Date.now()}`,
-  });
+  const gw = new LocalConsoleGateway();
   const port = await gw.start();
   const client = new TanStackConsoleBffClient(`http://127.0.0.1:${port}`);
 
@@ -682,39 +582,34 @@ test("test 93: [M37 P2 / TASK-154 & TASK-155] A2aWaitForGraphDeadlockDetector Ta
 
 test("test 94: [M38 & M39 Ultimate Verification Suite: TASK-156 ~ TASK-163] Deterministic replay, network chaos proxy, TEE quote unsealing, ZK turn prover, KV block eviction, AST speculative decoder, CoW bisect, and priority load shedder", async () => {
   // 1. TASK-156: Deterministic Replay Envelope
-  const env = new DeterministicReplayEnvelope({
-    envelopeId: "env_01",
-    virtualBaseTimestampMs: 1700000000000,
-    virtualClockTickOffsetMs: 0,
-    randomSeedHex: "abcdef0123456789",
-    consumedRandomBytesCount: 0,
-  });
-  const t1 = env.getDeterministicNowMs();
-  const t2 = env.getDeterministicNowMs();
-  assert.equal(t2 - t1, 10);
-  const r1 = env.getDeterministicRandom();
-  assert.ok(r1 >= 0 && r1 < 1);
+  const envelope = new DeterministicExecutionEnvelope(42, 1_700_000_000_000);
+  const replay = new DeterministicExecutionEnvelope(42, 1_700_000_000_000);
+  const prefix = envelope.buildDeterministicShellExportPrefix(0);
+  assert.match(prefix, /ANSTS_VIRTUAL_CLOCK_MS=1700000000000\b/);
+  assert.equal(replay.buildDeterministicShellExportPrefix(0), prefix);
+  assert.match(envelope.buildDeterministicShellExportPrefix(10), /ANSTS_VIRTUAL_CLOCK_MS=1700000000010\b/);
+  assert.equal(envelope.nextDeterministicRandom() >= 0, true);
 
   // 2. TASK-157: Sandbox Network Chaos Proxy
-  const proxy = new SandboxNetworkChaosProxy({ dropPacketPct: 0, jitterMs: 5, rateLimitExceeded: false });
-  const netRes = await proxy.interceptOutboundFetch("https://registry.npmjs.org/ansts");
-  assert.equal(netRes.status, 200);
-  assert.equal(netRes.dropped, false);
+  const proxy = new NetworkChaosFaultInjectionProxy();
+  const registry = "registry.npmjs.org";
+  proxy.injectLatencyJitter(registry, 5);
+  proxy.injectPartition(registry, 10, 100);
+  assert.equal(proxy.inspectActiveFaults(100).jitterByHost[registry], 5);
+  assert.throws(() => proxy.assertReachable(registry, 100), /simulated network partition/);
+  assert.doesNotThrow(() => proxy.assertReachable(registry, 110));
 
   // 3. TASK-158: Confidential TEE Bridge
-  const tee = new ConfidentialTeeBridge("expected_rootfs_merkle_root_v27");
-  const hmacKey = Buffer.from("tee_secret_key", "utf8");
-  const quote = {
-    platform: "AWSNitroEnclave" as const,
-    pcr0CodeDigestSha256: tee.expectedPcr0,
-    pcr1ConfigDigestSha256: tee.expectedPcr1,
-    pcr2RootfsDigestSha256: tee.expectedPcr2,
-    quoteSignature: crypto.createHmac("sha256", hmacKey).update(`${tee.expectedPcr0}:${tee.expectedPcr1}:${tee.expectedPcr2}`, "utf8").digest("hex"),
-    timestampMs: Date.now(),
+  const tee = new ConfidentialTeeAttestationBridge();
+  const quoteInput = {
+    vmId: "vm-attestation-fixture",
+    measurementDigestHex: crypto.createHash("sha256").update("fixture rootfs").digest("hex"),
+    nonce: "attestation-fixture-nonce",
   };
-  const unseal = tee.verifyQuoteAndUnsealSecret(quote, Buffer.from("PROD_API_KEY_SECRET_99", "utf8").toString("base64"), hmacKey);
-  assert.equal(unseal.unsealed, true);
-  assert.equal(unseal.secretContent, "PROD_API_KEY_SECRET_99");
+  const quote = tee.generateAndVerifyAttestationQuote(quoteInput);
+  assert.equal(quote.verified, true);
+  assert.equal(tee.verifyExternalAttestationQuote({ ...quoteInput, ed25519SignatureHex: quote.ed25519SignatureHex }), true);
+  assert.equal(tee.verifyExternalAttestationQuote({ ...quoteInput, nonce: "different", ed25519SignatureHex: quote.ed25519SignatureHex }), false);
 
   // 4. TASK-159: Verifiable Turn Execution Prover
   const prover = new VerifiableTurnExecutionProver();
@@ -750,25 +645,18 @@ test("test 94: [M38 & M39 Ultimate Verification Suite: TASK-156 ~ TASK-163] Dete
   assert.ok(decRes.acceptanceRatePct > 0);
 
   // 7. TASK-162: Parallel CoW Git-Bisect Coordinator
-  const forker = new SandboxBranchForker(`/tmp/ansts_bisect_${Date.now()}`);
-  const bisectCoord = new ParallelCowGitBisectCoordinator(forker);
-  const bisectRep = bisectCoord.runParallelBisect({
-    sandboxId: "sbx-bisect-01",
-    commitRange: ["c1", "c2", "c3", "culprit_c4", "c5"],
-    culpritCommit: "culprit_c4",
-  });
-  assert.equal(bisectRep.resolvedInSingleRound, true);
-  assert.equal(bisectRep.culpritCommitHash, "culprit_c4");
+  const driver = new LayerFsWorkspaceDriver();
+  const commits = [0, 0, 1, 1].map((exitCode, index) => driver.executeInProcessFileTool({
+    branchName: "main", agentId: "bisect-fixture", stepId: `bisect-${index}`,
+    operation: "write", filePath: "check.sh", newContent: `# revision ${index}\nexit ${exitCode}\n`,
+  }).commitId);
+  const bisectCoord = new ParallelCowGitBisectCoordinator();
+  const bisectRep = bisectCoord.executeLiveLayerFsBisect({ driver, commits, testShellCommand: "sh check.sh" });
+  assert.equal(bisectRep.firstBadCommit, commits[2]);
+  assert.ok(bisectRep.probedCommits.every(probe => probe.cleanedUp));
 
   // 8. TASK-163: Priority-Based Load Shedder
-  const shedder = new PriorityLoadShedder(100);
-  const loadRep = shedder.evaluateAdmissionAndShed(
-    [
-      { taskId: "p3-1", priorityClass: "P3_BACKGROUND" },
-      { taskId: "p0-1", priorityClass: "P0_CRITICAL" },
-    ],
-    95, // 95% load ratio >= 90% threshold
-  );
-  assert.equal(loadRep.shedDetails.P3_BACKGROUND, 1);
-  assert.equal(loadRep.shedDetails.P0_CRITICAL, 0); // P0 critical survives 100%
+  const shedder = new PriorityLoadShedder();
+  assert.equal(shedder.shouldAdmitUnderLoad(TaskPriority.P3_BATCH, 0.95), false);
+  assert.equal(shedder.shouldAdmitUnderLoad(TaskPriority.P0_EMERGENCY, 1), true);
 });

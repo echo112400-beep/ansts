@@ -284,11 +284,7 @@ export class SagaToolGateway {
       );
     }
 
-    if (
-      compensateHandler ||
-      effectClass === ToolCallEffectClass.COMPENSATABLE ||
-      effectClass === ToolCallEffectClass.COMPENSATABLE_WRITE
-    ) {
+    if (compensateHandler || effectClass === ToolCallEffectClass.COMPENSATABLE) {
       this.compensator.recordForwardStep({
         stepId: idemKey.slice(0, 16),
         taskId,

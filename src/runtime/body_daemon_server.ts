@@ -265,9 +265,16 @@ export class BodyDaemonServer {
       const lease = { task_id: taskId, tenant_id: tenantId, attempt_id: attemptId, node_id: this.options.nodeId, fencing_token: fencingToken, input_digest: taskInputDigest(tenantId, taskId, body.promptText, execution) };
       const granted = await this.rpc(`/v1/body/verify-execution-token?taskId=${encodeURIComponent(String(taskId))}`, { ...lease, execution_token: body.executionToken }, controller.signal);
       if (!granted.ok) { this.json(response, granted.status, { error: "EXECUTION_GRANT_REJECTED" }); return; }
-      const leaseResponse = await this.rpc("/v1/scheduler/lease-renew", lease, controller.signal);
+      const leaseResponse = await this.rpc("/v1/scheduler/lease-renew", { ...lease, start_check: true }, controller.signal);
       if (!leaseResponse.ok) { this.json(response, 409, { error: "STALE_EXECUTION_LEASE" }); return; }
-      const leaseState = await leaseResponse.json() as { cancel_requested?: unknown; lease_expires_at?: number; resume_node_id?: string };
+      const leaseState = await leaseResponse.json() as {
+        cancel_requested?: unknown; lease_expires_at?: number; resume_node_id?: string;
+        capacity_observation_required?: boolean;
+      };
+      if (leaseState.capacity_observation_required && !observation) {
+        this.json(response, 409, { error: "EXECUTION_OBSERVATION_UNAVAILABLE" });
+        return;
+      }
       let leaseDeadline = (leaseState.lease_expires_at ?? Date.now() / 1000 + 12) * 1000;
       const journalKey = JSON.stringify([tenantId, taskId, attemptId]);
       const admission = this.journal.admit(journalKey);
@@ -360,3 +367,5 @@ export class BodyDaemonServer {
     }
   }
 }
+
+

@@ -64,3 +64,48 @@ export class PredictiveSandboxPrewarmer {
     return { predictedConcurrency, recommendedWarmPoolSize };
   }
 }
+import type { SandboxBranch, SandboxBranchForker } from "./sandbox_branch_forker.js";
+
+interface PrewarmedBranchTicket {
+  parentTaskId: string;
+  parentSandboxId: string;
+  checkpointId: string;
+  prewarmedBranches: SandboxBranch[];
+  prewarmWallTimeMs: number;
+}
+
+export class PredictiveDagPrewarmer {
+  private readonly tickets = new Map<string, PrewarmedBranchTicket>();
+
+  constructor(private readonly branchForker: SandboxBranchForker) {}
+
+  public prewarmSubAgentBranchesDuringThinking(params: {
+    parentTaskId: string;
+    parentSandboxId: string;
+    seedFiles: Record<string, string>;
+    fanOutCount: number;
+  }): PrewarmedBranchTicket {
+    if (!Number.isSafeInteger(params.fanOutCount) || params.fanOutCount < 1 || params.fanOutCount > 32) {
+      throw new RangeError("INVALID_PREWARM_FANOUT");
+    }
+    if (this.tickets.has(params.parentTaskId)) throw new Error("PREWARM_TICKET_ALREADY_ACTIVE");
+    const started = performance.now();
+    const checkpoint = this.branchForker.createCheckpoint(params.parentSandboxId, "prewarm", params.seedFiles);
+    const prewarmedBranches = Array.from({ length: params.fanOutCount }, () =>
+      this.branchForker.forkBranch(params.parentSandboxId, checkpoint.checkpointId));
+    const ticket = {
+      parentTaskId: params.parentTaskId, parentSandboxId: params.parentSandboxId,
+      checkpointId: checkpoint.checkpointId, prewarmedBranches, prewarmWallTimeMs: performance.now() - started,
+    };
+    this.tickets.set(params.parentTaskId, ticket);
+    return { ...ticket, prewarmedBranches: prewarmedBranches.map(branch => ({ ...branch })) };
+  }
+
+  public claimPrewarmedBranch(parentTaskId: string): { branch: SandboxBranch; perceivedAcquireLatencyMs: 0 } {
+    const ticket = this.tickets.get(parentTaskId);
+    const branch = ticket?.prewarmedBranches.shift();
+    if (!branch) throw new Error("NO_PREWARMED_BRANCH_AVAILABLE");
+    if (!ticket?.prewarmedBranches.length) this.tickets.delete(parentTaskId);
+    return { branch, perceivedAcquireLatencyMs: 0 };
+  }
+}

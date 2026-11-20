@@ -2,6 +2,10 @@
 import {useCallback,useEffect,useMemo,useRef,useState,type FormEvent} from 'react';
 import {controlClient,ControlApiError,type CostCenter,type ControlPage,type DirectoryTenant,type TenantEdit} from '../lib/control';
 import TenantQuota from "./tenant-quota";
+import FinopsSummary from "./finops-summary";
+import TenantCostExport from "./tenant-cost-export";
+import TenantCostDetails from "./tenant-cost-details";
+import TenantActivity from "./tenant-activity";
 import CostCenterDirectory from "./cost-center-directory";
 import type {User} from '../lib/console';
 export default function TenantDirectory({user,fetcher=fetch}:{user:User;fetcher?:typeof fetch}) {
@@ -85,5 +89,5 @@ export default function TenantDirectory({user,fetcher=fetch}:{user:User;fetcher?
       <p>目录元数据变更会记录审计。执行准入、资源配额和计费仍需各自模块接入。</p>
       <div className="directory-actions"><button type="submit" className="primary" disabled={saving}>{saving?'正在保存…':'确认保存'}</button><button type="button" className="secondary" disabled={saving} onClick={closeEditor}>取消编辑</button></div>
     </form>}
-  </section>{quotaTenant&&<TenantQuota key={quotaTenant.id} tenant={quotaTenant} user={user} client={client}/>}</>;
+  </section><FinopsSummary fetcher={fetcher}/>{quotaTenant&&<div key={quotaTenant.id}><TenantQuota tenant={quotaTenant} user={user} client={client}/><TenantActivity tenantId={quotaTenant.id} fetcher={fetcher}/><TenantCostDetails tenantId={quotaTenant.id} fetcher={fetcher}/>{user.role!=="VIEWER"&&user.canWrite&&<TenantCostExport tenantId={quotaTenant.id} fetcher={fetcher}/>}</div>}</>;
 }

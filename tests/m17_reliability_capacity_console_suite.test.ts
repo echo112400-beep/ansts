@@ -15,19 +15,19 @@ import {
   TurnWalEngine,
   FenceToken,
   TaskState,
-  TunnelGatewayCell,
-  EdgeTunnelHaDynamicRouter,
+  EdgeTunnelHaRouter,
+  EdgeTunnelRoutePlanner,
   MultiRegionGeoRouter,
-  ConsoleBffController,
   CloudEventsBus,
   OtelAndPrometheusExporter,
   FaultTolerantObservabilityCoordinator,
   UnifiedComponentPersistenceStore,
-  InMemorySqlStorage,
-  CanaryRolloutController,
-  ProductionChaosDrillRunner,
-  HaPartitionedSchedulerMeshCoordinator,
+  InMemoryCellSqlStorage,
 } from "../src/index";
+import { SlotCanaryRolloutPlanner } from "../src/cluster/slot_canary_rollout_planner.js";
+import { ConsoleBffController } from "../src/dashboard/console_bff_api.js";
+import { LocalSchedulerMesh } from "../src/cloudflare/local_scheduler_mesh.js";
+import { LocalReliabilityDrillRunner } from "../src/cluster/local_reliability_drills.js";
 
 test("test 61: [TASK-84] CapacitySlaEnforcer enforces Brain 128MB watermarks, Body 32-sandbox cap, Tunnel 20k stream cap, and RustFS EC:4 quorum", () => {
   const enforcer = new CapacitySlaEnforcer();
@@ -106,7 +106,7 @@ test("test 62: [TASK-85 & TASK-86] AgentStreamQueuePublisher persists TurnWAL fr
     clientId: "client-ui-01",
     taskId: "task-stream-202",
     eventType: "TASK_CLAIMED",
-    state: TaskState.THINKING_GEN,
+    state: TaskState.RUNNING_THINK,
     fence: new FenceToken(2, 1, "task-stream-202"),
     payload: { message: "Claimed by HarnessCell" },
   });
@@ -114,7 +114,7 @@ test("test 62: [TASK-85 & TASK-86] AgentStreamQueuePublisher persists TurnWAL fr
     clientId: "client-ui-01",
     taskId: "task-stream-202",
     eventType: "REASONING_CHUNK",
-    state: TaskState.THINKING_GEN,
+    state: TaskState.RUNNING_THINK,
     fence: new FenceToken(2, 2, "task-stream-202"),
     payload: { delta: "Analyzing sandbox cgroups..." },
   });
@@ -122,7 +122,7 @@ test("test 62: [TASK-85 & TASK-86] AgentStreamQueuePublisher persists TurnWAL fr
     clientId: "client-ui-01",
     taskId: "task-stream-202",
     eventType: "TOOL_EXEC_PULSE",
-    state: TaskState.TOOL_EXEC,
+    state: TaskState.RUNNING_ACT,
     fence: new FenceToken(2, 3, "task-stream-202"),
     payload: { tool: "bash", boost: "8.0C" },
   });
@@ -142,8 +142,8 @@ test("test 62: [TASK-85 & TASK-86] AgentStreamQueuePublisher persists TurnWAL fr
   assert.equal(catchup.liveStreamResumed, true);
 });
 
-test("test 63: [TASK-87 & TASK-88] TunnelGatewayCell heartbeat eviction, failover, and ConsoleBffController integration", () => {
-  const haRouter = new EdgeTunnelHaDynamicRouter("celld-gw-01");
+test("test 63: [TASK-87 & TASK-88] TunnelGatewayCell heartbeat eviction, failover, and ConsoleBffController integration", async () => {
+  const haRouter = new EdgeTunnelRoutePlanner("celld-gw-01");
   haRouter.registerTunnelGateway({
     gatewayId: "celld-gw-01",
     internalRelayUrl: "https://10.240.16.11:9444/relay",
@@ -159,8 +159,8 @@ test("test 63: [TASK-87 & TASK-88] TunnelGatewayCell heartbeat eviction, failove
     draining: false,
   });
 
-  const tunnelCell = new TunnelGatewayCell("celld-gw-01", haRouter);
-  tunnelCell.acceptDaemonTunnelStream({
+  const tunnelCell = haRouter.tunnelCell;
+  haRouter.registerInboundDaemonStream({
     hostId: "body-edge-09",
     gatewayId: "celld-gw-01",
     role: "PRIMARY",
@@ -168,7 +168,7 @@ test("test 63: [TASK-87 & TASK-88] TunnelGatewayCell heartbeat eviction, failove
     epoch: 1,
     nowMs: 1000,
   });
-  tunnelCell.acceptDaemonTunnelStream({
+  haRouter.registerInboundDaemonStream({
     hostId: "body-edge-09",
     gatewayId: "celld-gw-02",
     role: "SECONDARY",
@@ -178,22 +178,25 @@ test("test 63: [TASK-87 & TASK-88] TunnelGatewayCell heartbeat eviction, failove
   });
 
   // Simulate primary stream missing >3 heartbeats (nowMs = 20000 > 1000 + 15000) while secondary stays fresh
-  tunnelCell.recordDaemonHeartbeat("body-edge-09", "celld-gw-02", 19000);
-  const evicted = tunnelCell.evictTimedOutStreams(20000);
-  assert.deepEqual(evicted, ["celld-gw-01:body-edge-09"]);
+  tunnelCell.pollPendingCommands("body-edge-09", "celld-gw-02", 19000);
+  const evicted = tunnelCell.evictStaleTunnelsAndRequeueInFlight(20000, 15000);
+  assert.deepEqual(evicted.demotedGateways, [{ gatewayId: "celld-gw-01", hostId: "body-edge-09" }]);
 
   // Next command automatically fails over to celld-gw-02
-  const relayRes = tunnelCell.relayBrainCommand({
-    commandId: "cmd-ha-9",
+  const relay = new EdgeTunnelHaRouter(tunnelCell).dispatchOverReverseTunnel("body-edge-09", {
     taskId: "task-ha-9",
     sandboxId: "sbx-9",
-    targetBodyHostId: "body-edge-09",
     fence: { epoch: 1, turnSeq: 1 },
     action: "CGROUP_BOOST_8C",
     payload: {},
   });
+  const [command] = tunnelCell.pollPendingCommands("body-edge-09", "celld-gw-02", 20000);
+  assert.equal(command.gatewayId, "celld-gw-02");
+  assert.equal(tunnelCell.acknowledgeCommand(command.commandId, { executed: true }), true);
+  const relayRes = await relay;
   assert.equal(relayRes.routedViaGatewayId, "celld-gw-02");
-  assert.equal(relayRes.failoverTriggered, true);
+  assert.equal(relayRes.role, "SECONDARY");
+  assert.deepEqual(relayRes.executionResult, { executed: true });
 
   // Verify Console BFF Controller overview
   const geoRouter = new MultiRegionGeoRouter("us-west-2");
@@ -221,7 +224,7 @@ test("test 63: [TASK-87 & TASK-88] TunnelGatewayCell heartbeat eviction, failove
 });
 
 test("test 64: [TASK-90 & TASK-91] FaultTolerantObservabilityCoordinator bounded ring spooling during collector outage and SQLite RPO=0 crash rehydration", () => {
-  const sql = new InMemorySqlStorage();
+  const sql = new InMemoryCellSqlStorage();
   const stateStore = new UnifiedComponentPersistenceStore(sql);
 
   const otel = new OtelAndPrometheusExporter();
@@ -314,7 +317,7 @@ test("test 65: [TASK-92] W3cTraceContinuityPropagator preserves root traceId and
 });
 
 test("test 66: [TASK-93 & TASK-94] CanaryRolloutController session version pinning and 4-phase progressive virtual slot cutover", () => {
-  const rollout = new CanaryRolloutController("v2.3.0", "v2.3.1-canary");
+  const rollout = new SlotCanaryRolloutPlanner("v2.3.0", "v2.3.1-canary");
 
   // 1. Existing task `task-active-1` starts on Stable v2.3.0 in slot 250
   const initialRoute = rollout.resolveTaskVersionAndNode({
@@ -351,11 +354,11 @@ test("test 66: [TASK-93 & TASK-94] CanaryRolloutController session version pinni
 });
 
 test("test 67: [TASK-95 & TASK-96] CanaryRolloutController automated SLA breach rollback, Make-Before-Break gateway drain, and N-1 WAL schema compatibility", () => {
-  const rollout = new CanaryRolloutController("v2.3.0", "v2.3.1-canary");
+  const rollout = new SlotCanaryRolloutPlanner("v2.3.0", "v2.3.1-canary");
   rollout.advanceRolloutPhase("PHASE_3_PARTIAL_64_SLOTS");
   assert.equal(rollout.currentPhase, "PHASE_3_PARTIAL_64_SLOTS");
 
-  const haRouter = new EdgeTunnelHaDynamicRouter("celld-gw-stable-01");
+  const haRouter = new EdgeTunnelRoutePlanner("celld-gw-stable-01");
   haRouter.registerTunnelGateway({
     gatewayId: "celld-gw-stable-01",
     internalRelayUrl: "https://10.240.16.11:9444/relay",
@@ -433,21 +436,22 @@ test("test 67: [TASK-95 & TASK-96] CanaryRolloutController automated SLA breach 
   assert.deepEqual(compat.preservedUnknownFields, ["canaryExperimentalTraceTag"]);
 });
 
-test("test 68: [TASK-97 ~ TASK-100] ProductionChaosDrillRunner executes all 4 end-to-end fault injection drills with RPO=0 and trace continuity", () => {
-  const runner = new ProductionChaosDrillRunner();
-  const summary = runner.runAllProductionDrills();
+test("test 68: [TASK-97 ~ TASK-100] Local drills exercise partition recovery, parity policy, rollback, and trace rehydration", () => {
+  const runner = new LocalReliabilityDrillRunner();
+  const summary = runner.run();
 
+  assert.equal(summary.scope, "LOCAL_SIMULATION");
   assert.equal(summary.totalDrills, 4);
   assert.equal(summary.allPassed, true);
   for (const report of summary.reports) {
     assert.equal(report.passed, true, `Chaos drill ${report.drillId} failed`);
-    assert.equal(report.rpoZeroVerified, true);
-    assert.equal(report.traceContinuityVerified, true);
+    assert.ok(Object.keys(report.checks).length > 0);
+    assert.ok(Object.values(report.checks).every(Boolean));
   }
 });
 
 test("test 69: [TASK-101 & TASK-102] HaPartitionedSchedulerMeshCoordinator 0-Hop/1-Hop slot routing, DRAINING micro-buffer, and 3-phase online scale-out", () => {
-  const mesh = new HaPartitionedSchedulerMeshCoordinator([
+  const mesh = new LocalSchedulerMesh([
     { shardId: "scheduler-shard-00", hostBrainNodeId: "brain-node-01" },
     { shardId: "scheduler-shard-01", hostBrainNodeId: "brain-node-02" },
   ]);
@@ -497,7 +501,7 @@ test("test 69: [TASK-101 & TASK-102] HaPartitionedSchedulerMeshCoordinator 0-Hop
 });
 
 test("test 70: [TASK-103 & TASK-104] HaPartitionedSchedulerMeshCoordinator crash failover SQLite RPO=0 rehydration (<3s RTO) and Stale-Route 409 self-healing", () => {
-  const mesh = new HaPartitionedSchedulerMeshCoordinator([
+  const mesh = new LocalSchedulerMesh([
     { shardId: "scheduler-shard-00", hostBrainNodeId: "brain-node-01" },
     { shardId: "scheduler-shard-01", hostBrainNodeId: "brain-node-02" },
   ]);

@@ -28,6 +28,7 @@ export function bodySchedulerClient(env: BodyWorkerEnv): { fetch(request: Reques
 }
 export async function handleBodyRequest(request: Request, env: BodyWorkerEnv): Promise<Response> {
   const url = new URL(request.url);
+  if(url.pathname==='/v1/body/execution-inventory')return Response.json({code:'INTERNAL_ROUTE'},{status:403});
   if (env.ANSTS_BODY_NAMESPACE_PREFIX && env.ANSTS_BODY_CELL) {
     const namespace = env.ANSTS_BODY_CELL, prefix = env.ANSTS_BODY_NAMESPACE_PREFIX;
     env = { ...env, ANSTS_BODY_CELL: { idFromName: name => namespace.idFromName(prefix + name), get: id => namespace.get(id) } };

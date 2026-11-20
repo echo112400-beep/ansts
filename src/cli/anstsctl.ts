@@ -34,7 +34,12 @@ export class AnstsClusterRuntime {
   public epochCandidates: CellEpochGcCandidate[] = [];
 }
 
-export function runCli(argv: string[], runtime = new AnstsClusterRuntime()): { exitCode: number; stdout: string } {
+export interface CliCommandOutput {
+  exitCode: number;
+  stdout: string;
+}
+
+export function runCli(argv: string[], runtime = new AnstsClusterRuntime()): CliCommandOutput {
   const [cmd, ...rest] = argv;
   if (cmd === "submit") {
     const taskId = rest[0] ?? `task-${Date.now()}`;

@@ -143,9 +143,9 @@ describe("M72 Phase 2 Episodic Memory, Formal Guardrails & Shadow WAL Replay Sui
       taskId: "t-shadow-1",
       turnIndex: 1,
       fencingToken: 4,
-      thoughtSummary: "Analyze index",
-      toolName: "db_explain",
       changedFiles: ["sql/idx.sql"],
+      sqliteWalPages: 0,
+      highestSubmittedFencingToken: 4,
     });
 
     const replayer = new DeterministicTimeTravelReplayer();
@@ -183,7 +183,7 @@ describe("M72 Phase 2 Episodic Memory, Formal Guardrails & Shadow WAL Replay Sui
     const server = new AnstsLocalAndComposeServer({
       apiPort: 0,
       dashboardPort: 0,
-      dataDir: tmpDir,
+      storageDir: tmpDir,
     });
     const { apiPort } = await server.start();
     const baseUrl = `http://127.0.0.1:${apiPort}`;

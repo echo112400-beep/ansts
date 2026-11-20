@@ -11,7 +11,9 @@ export interface DirectoryApiEnv {
 export async function handleDirectoryApi(request: Request, env: DirectoryApiEnv, actor: ControlActor & {readOnly?:boolean}): Promise<Response> {
   const url=new URL(request.url);
   const quota=/^\/v1\/admin\/tenants\/[^/]+\/quota$/.test(url.pathname);
-  const usage=/^\/v1\/admin\/tenants\/[^/]+\/usage$/.test(url.pathname),usageRead=usage&&request.method==='GET',tenantControl=quota||usage;
+  const activationAudit=url.pathname==='/v1/admin/audit'&&url.searchParams.get('domain')==='rate-activation';
+  const reservation=/^\/v1\/admin\/tenants\/[^/]+\/reservation-summary$/.test(url.pathname);
+  const usage=/^\/v1\/admin\/tenants\/[^/]+\/usage$/.test(url.pathname),usageRead=usage&&request.method==='GET',tenantControl=quota||usage||reservation||activationAudit;
   const quotaRead=quota&&request.method==='GET',quotaWrite=quota&&request.method==='PUT';
   const archiveRead=request.method==='GET'&&/^\/v1\/admin\/archives\/[^/]+$/.test(url.pathname);
   const archiveCreate=request.method==='POST'&&url.pathname==='/v1/admin/archives';
@@ -24,8 +26,8 @@ export async function handleDirectoryApi(request: Request, env: DirectoryApiEnv,
   const creating=request.method==='POST' && (url.pathname==='/v1/admin/tenants'||url.pathname==='/v1/admin/cost-centers');
   const result=(code:string,status:number)=>Response.json({code},{status,headers:{'cache-control':'no-store'}});
   let quotaTenantId='';
-  if(tenantControl){try{quotaTenantId=decodeURIComponent(url.pathname.split('/')[4]);}catch{return result('INVALID_TENANT_ID',422);}if(quotaTenantId.length>128||!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(quotaTenantId))return result('INVALID_TENANT_ID',422);if(actor.scopeTenant!=='all'&&actor.scopeTenant!==quotaTenantId)return result('TENANT_NOT_FOUND',404);}
-  if (!usageRead && !quotaRead && !quotaWrite && !archives && !listing && !audit && !operation && !updating && !creating) return result('NOT_FOUND',404);
+  if(tenantControl){try{quotaTenantId=activationAudit?(url.searchParams.get('tenantId')??''):decodeURIComponent(url.pathname.split('/')[4]);}catch{return result('INVALID_TENANT_ID',422);}if(quotaTenantId.length>128||!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(quotaTenantId))return result('INVALID_TENANT_ID',422);if(actor.scopeTenant!=='all'&&actor.scopeTenant!==quotaTenantId)return result('TENANT_NOT_FOUND',404);}
+  if (!(reservation&&request.method==='GET') && !usageRead && !quotaRead && !quotaWrite && !archives && !listing && !audit && !operation && !updating && !creating) return result('NOT_FOUND',404);
   if ((quotaWrite || archives || audit || operation || updating || creating) && actor.role!=='SRE_ADMIN') return result('CONTROL_FORBIDDEN',403);
   if ((quotaWrite || archiveCreate || updating || creating) && actor.readOnly) return result('CONTROL_FORBIDDEN',403);
   if (((tenantControl?!env.ANSTS_TENANT_CONTROL_CELL:!env.ANSTS_TENANT_DIRECTORY_CELL) && !env.ANSTS_DIRECTORY_URL) || !env.ANSTS_DIRECTORY_SERVICE_TOKEN || env.ANSTS_DIRECTORY_SERVICE_TOKEN.length<32) return result('DIRECTORY_UNAVAILABLE',503);
@@ -44,7 +46,7 @@ export async function handleDirectoryApi(request: Request, env: DirectoryApiEnv,
     } catch {return result('INVALID_JSON',400);}
   }
   try {
-    const action=usage?'usage-read':quota?(quotaWrite?'policy-write':'policy-read'):archives?(archiveCreate?'archive-create':archiveRead?'archive-read':'archive-list'):operation?'operation':centers?(listing?'cost-centers':'cost-center-mutate'):listing?'list':audit?'audit':'mutate';
+    const action=activationAudit?'rate-activation-audit':reservation?'reservation-summary':usage?'usage-read':quota?(quotaWrite?'policy-write':'policy-read'):archives?(archiveCreate?'archive-create':archiveRead?'archive-read':'archive-list'):operation?'operation':centers?(listing?'cost-centers':'cost-center-mutate'):listing?'list':audit?'audit':'mutate';
     let destination='https://directory.internal/'+action;
     let dispatch:(request:Request)=>Promise<Response>;
     if(env.ANSTS_DIRECTORY_URL) {

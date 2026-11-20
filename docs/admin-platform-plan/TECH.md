@@ -227,3 +227,59 @@ Fleet Host 专用 binding/usage 入口从已认证 Host 和真实 Body RUNNING �
 生产 BodyAgent 独立循环自动投递，源端 60 秒 checkpoint 并按 UTC 日界拆分；无结构执行 CPU/内存为 null，只记录已知 slot。未知停止不假设释放，结构化分配仅在正向 Engine 清理后恢复关闭。接收端同事务保存事件、receivedAt、水位和稳定分页顺序；上下文固定租户版本/地域/成本中心，费率为空。授权查询采用 actor/scope/tenant 版本绑定的 HMAC 游标，冻结上界避免分页期间追加漂移。
 
 四条低基数 Prometheus 规则覆盖冲突、投递积压、provider 未知和资源缺失。原生生产脚本验收覆盖远端提交后丢回执、旧 Body 不可读、租户接收重建及实际 fork 旧执行；没有真实模型请求。验收证据见 ../validation/admin-platform/usage-service-acceptance.md。计量接收不代替 QF-02 执行授权，也未接入价格、账本或硬配额。
+
+## 2026-11-17 QF-04 费率与派生账目内核
+
+`RateCatalog` 是未来 TenantDirectoryCell 唯一写入适配器使用的内核，当前尚未连接服务路由。费率仅接受版本化 credit-subunit、整数分子/分母、FLOOR/CEIL/HALF_EVEN 和显式资源/模型字段；缺失费率是 null，零费率必须显式填写。全局管理员 CAS 创建版本，内容摘要、幂等回执和审计同事务写入，不允许覆盖旧版本。分子/分母最大 2^127−1，精确计算约分后最大 2^255−1，舍入 credit 及汇总最大 2^127−1；溢出拒绝，不截断。
+
+`TenantRateStore` 只接受可信目录适配器解析的费率，不得从浏览器直接接收快照。显式激活保存租户元数据版本、完整费率和原因；模板创建不会自动激活。执行前 pin 固定租户/地域/成本中心版本/池和激活版本，包括未激活的 null；已有用量绑定后禁止首次补 pin。租户元数据版本变化要求重新激活。已有流保持原快照，旧缺失价格不会因新模板或账目重建而自动补价。
+
+`UsageCostLedger` 仅从同权威已接收 UsageInbox 事件创建不可变派生记录，并核对执行时归属；记录原始事件、来源摘要、接收时间、精确数量/费率/分数与 pending 原因。资源分配按源 UTC 分段，provider 数量归属响应事件所在 UTC 日。舍入桶固定为 UTC 日、成本中心版本、费率版本/激活版本和维度；先累加精确分数再舍入，不逐事件累加舍入值。缓存分拆价格与全部输入价格互斥，不重复累计 input/cache token；模型须精确匹配 provider/requested/reported 三项。
+
+原始数量、费率、归属版本、池选择或 provider 响应缺失均保持 pending。派生汇总最多处理 10000 个事件和流，截断、未投影、open、隔离或缺响应均明确不完整；完整总额为 null，已知子总额单列。跨租户聚合缺少响应也不返回完整总额。`final=false` 固定，本内核不实施 QF-05 关账或晚到调整，不能作为已结算账单。
+
+本阶段没有实例化生产费率/账目服务、执行 pin 或自动投影，没有修改现有用量或启用硬配额。API、实际权威接线与部署仍属 QF-04 未完成项。证据见 ../validation/admin-platform/rate-ledger-foundation.md。
+
+## 2026-11-17 QF-04 服务与原生执行接线
+
+TenantDirectoryCell 已实例化 RateCatalog，负责唯一模板写入和独立事务审计；TenantControlCell 的激活适配器从目录私有 `rate-resolve` 读取真实模板，浏览器仅提供版本号。真实 Host ingress 根据首次 RUNNING 绑定给出私有 priceEligible，目录 `accounting-context` 提供固定归属与成本中心版本。存在旧预留或旧用量绑定、迟到/完成流均不能补价；未知池保留 null。准入自身的自动价格快照仍待后续接线。
+
+价格 pin、用量绑定，以及事件接收、账目投影分别同一原生同步事务；joinedTransactions 仅在同步调用栈合并嵌套内核事务，不跨 await。新事件自动投影，历史读时每批最多恢复100条未投影事件，原始无价格数据保持 pending。账目/费率/激活历史使用作用域 HMAC 游标和冻结水位。跨租户汇总仅查询授权目录，最多1000租户、并发4，时间预算用尽或响应不可达的租户显式列缺失，不形成完整总额。
+
+接口与验证详见 ../validation/admin-platform/rate-ledger-service-acceptance.md。统一审计合并、独立备份恢复、准入价格/可信成本上限及更多跨对象故障仍未验收，不提前标记QF-04完成。
+
+## 2026-11-17 QF-04 统一审计与独立恢复
+
+管理审计目录范围合入 rate-card；rate-activation 通过同一 API 的显式 tenantId 分派到租户权威，不复制成第二份可写审计。目录页 coverage 说明激活需选择租户，UI 按原 hrui 控件提供两个筛选，后续激活记录 before 值对应实际旧快照。
+
+新增 AuthorityArchiveStore，同一事务捕获固定 SQL 表/列清单的单权威快照，原始业务 JSON 字节不重写；源摘要 CAS、归档与幂等回执同时保存。目录含元数据/费率/审计/业务回执，租户含策略/预留/outbox/投递控制/用量/价格/账目；归档目录本身及外部 Host/Engine/mailbox/容量权威不包含。多个单权威备份不是全系统同时冻结。
+
+归档摘要/表计数及独立 HMAC 校验；还核对事件身份/连续序号/水位、价格绑定/历史激活/审计和账目重算。限100000行/32MiB，每权威100份，超限不截断。恢复仅支持专用 CLI 创建全新离线 SQLite 文件，拒绝已有目标，失败整体回滚；逐表摘要、既有账目重算一致后返回 operationalResume=DISABLED。不开放在线导入、不启动 alarm，不推断 UNCERTAIN 停止，也不释放预算或重发消息。
+
+当前准入 prepare 仍接收调用方 estimatedCreditUnits，rateSnapshot=null；缺少可信成本上限及真实容量授权。后续由 QF-02/QF-08 完成，不将运行时计量价格回填旧预留；不再把该跨任务门禁误写成 QF-04 自身费率内核未完成。成本汇总现在将任何未结预留列为不完整，防止空用量事件被当成完整零成本。
+
+接口、离线命令及独立原生/部署验收见 ../validation/admin-platform/rate-ledger-recovery-acceptance.md。
+
+## 2026-11-18 QF-05 月结与调整内核
+
+新增 PeriodSettlement，首期关账为UTC_MONTH（YYYY-MM），日分段和按日/归属/费率激活/维度的舍入桶不变。预览在同步原生事务内核对已接收事件序号/窗口、完整 provider 响应、固定价格、相关 attempt 覆盖与跨期未结预留，缺失不最终关账。关账固定水位、原账目摘要、覆盖声明、校验时的流状态和计价桶；basis摘要可重算。CAS、不可变关账单与幂等回执同事务，原数据和准入占用不改写。
+
+晚到源事件按接收ordinal与原闭账水位识别，追加关联原账单/事件/价格的确定性调整，落到不早于原周期下一月的当前开放周期。差额为 round(原精确量+已结晚到量+本期晚到量)-round(原精确量+已结晚到量)，不独立逐条舍入；更早调整期未结阻止依赖其基数的后续关闭。来源冲突形成独立attention，遗漏投递钩子也会被关账预览拒绝。单据和读取有行数/历史长度保护，超限不截断。
+
+SettlementCoverage 当前仅是未来可信适配器参数；生产清单认证/全量覆盖和历史未计量任务门禁尚未接入，不得直接将浏览器 complete=true 作为证据。内核尚未实例化到TenantControlCell，未开放在线关账 API；实际成本分摊/准入结算/人工调整及备份v2兼容需要后续接线。现有备份v1不覆盖period表，启用服务前必须补齐。
+
+另修复 BodyUsageJournal 月界顺序：provider回调落盘前先原子保存已经跨过的UTC日界资源片段，避免后来checkpoint追加更早时间戳。当天普通回调不额外切段，已关闭资源不因晚到响应重新分配；旧事件前缀不改写。此修复已实际安全部署，关账本身仍未启用。验证和边界见 ../validation/admin-platform/period-settlement-foundation.md。
+
+## 2026-11-18 period 备份 v2
+
+财务归档根据实际 period 数据选择 schemaVersion=2，补入关账身份、单据、幂等回执和调整四表；没有 period 数据时仍生成 v1。签名信封目的保持兼容，schemaVersion/版本化白名单受签名和内容校验约束。离线验证复核冻结 basis、关账摘要、回执引用和调整来源，恢复不触发结算。旧v1表清单与签名验证保留。
+
+原生SQLite的关账/调整恢复和三份既有实际v1文件兼容通过；新格式尚未部署，实际celld与生产关账适配器仍待验收。见 ../validation/admin-platform/period-backup-v2-acceptance.md。
+
+## 2026-11-18 QF-05 执行清单来源
+
+Scheduler 和 Body 新增原生事务执行历史：状态和精简观察记录同事务保存，任务清理不删清单；保留每租户连续序号、摘要链与来源水位。没有原生事务的旧模拟存储不提供可信清单。首次启用仅记录当前状态为 baseline，coverageSince 之前的周期不能证明完整；迁移导入提升覆盖起点。
+
+私有 execution-inventory 与 settlement-coverage 接口验证服务凭据和目录租户权限，固定 Scheduler 分片、Body 名称和代理来源。覆盖适配器核对身份、历史阶段、源水位及前后 Scheduler 版本；缺来源、截断或历史不足保持 complete=false。每来源最多10000条/8MiB，最多发现1000个Body，发现时间受限。`GET /v1/admin/tenants/:tenantId/settlements/:periodId/preview` 在租户权威内收集该覆盖并调用月结预览，响应不含执行流标识、事件摘要或冻结 basis；当前源码已接线，尚未运行时/部署验收。最终关账仍未接为在线 API，不释放预算。
+
+整表诊断与 Body 快照继续使用 10000 条/8 MiB 上限。月结覆盖通过私有 Scheduler 接口按序号分页：每页 512 条，最多 128 页。收集器校验每页的租户、序号、跨页摘要与固定水位，读完 Body 后复查 Scheduler 水位；读取中断时覆盖保持不完整。

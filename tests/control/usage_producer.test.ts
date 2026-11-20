@@ -154,3 +154,17 @@ test('unstructured legacy allocation records known slot time and preserves unkno
   assert.equal(segment.allocation!.cpuNanoCoreMilliseconds,null);assert.equal(segment.allocation!.memoryMiBMilliseconds,null);assert.equal(segment.allocation!.slotMilliseconds,'20');for(const e of events)s.sink.receive(e,identity);assert.equal(s.sink.inspect(identity)!.pending,true);
  }finally{s.db.close();j.close();}
 });
+test('provider callbacks flush crossed UTC boundaries atomically without reordering persisted signed events',()=>{
+ const j=journal(),s=inbox();try{
+  const midnight=Date.UTC(2026,10,18);j.source.begin(identity,resources,midnight-10);j.source.providerStarted(identity,1,{provider:'deepseek',model:'requested'},midnight+1);
+  const prefix=j.source.events(identity);assert.deepEqual(prefix.map(e=>e.kind),['RESOURCE_OPEN','RESOURCE_SEGMENT','PROVIDER_REQUEST']);assert.equal(prefix[1].at,midnight);
+  const source=new BodyUsageJournal(j.dir),temporary=join(j.dir,usageStreamId(identity)+'.json.tmp');mkdirSync(temporary);
+  assert.throws(()=>source.providerFinished(identity,1,providerResponse,midnight+2));assert.deepEqual(source.events(identity),prefix);rmSync(temporary,{recursive:true});
+  source.providerFinished(identity,1,providerResponse,midnight+2);source.finish(identity,midnight+10);const events=source.events(identity);assert.deepEqual(events.slice(0,prefix.length),prefix);for(const event of events)assert.equal(s.sink.receive(event,identity).outcome,'RECORDED');
+  assert.equal(s.sink.inspect(identity)!.pending,false);assert.equal(events.filter(e=>e.kind==='RESOURCE_SEGMENT').reduce((sum,e)=>sum+BigInt(e.allocation!.slotMilliseconds),0n),20n);
+ }finally{s.db.close();j.close();}
+});
+test('unknown provider response spanning midnight remains unknown while exact resource segments still close',()=>{
+ const j=journal(),s=inbox();try{const midnight=Date.UTC(2026,10,18);j.source.begin(identity,resources,midnight-10);j.source.providerStarted(identity,1,{provider:'deepseek',model:'requested'},midnight-5);j.source.providerUncertain(identity,1,midnight+5);new BodyUsageJournal(j.dir).finish(identity,midnight+10);const events=j.source.events(identity);for(const event of events)s.sink.receive(event,identity);assert.ok(s.sink.inspect(identity)!.closed);assert.ok(s.sink.inspect(identity)!.pending);assert.equal(events.find(e=>e.kind==='PROVIDER_USAGE')!.provider!.totalTokens,null);
+ }finally{s.db.close();j.close();}
+});

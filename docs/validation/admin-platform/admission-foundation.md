@@ -39,3 +39,27 @@ QF-01/QF-02仍为in_progress，整体任务没有标记完成。
 严格检查与65项测试通过。隔离三个真实celld进程验证影子并发不超发、幂等、凭证目标限制、服务身份分离、原生权威重启后状态与凭证一致，以及UNCERTAIN恢复和旧凭证拒绝。后续真实开发影子流程及重启恢复已通过，见 [服务验收](admission-service-acceptance.md)；真实执行链仍未接入。
 
 事务与游标使用约束对照了[Cloudflare SQLite存储文档](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)；当前实际后端是celld，兼容性证据来自上述原生进程测试，而不是假定两者运行时完全等价。
+
+QF-02 凭证持久化补证：控制面 SQLite 用例在 START_AUTHORIZED 后重开，验证原凭证在有效期内可读，到期边界拒绝凭证及 RUNNING 转移。凭从未启动的证据撤销后再次重开，验证代际提升、旧凭证与旧代际转移均被拒绝，重复撤销返回原结果。该凭证属于影子协议；此用例未验证 Body/Engine 的实际启动拒绝。
+
+QF-02 Host 独立恢复：在终止证据已提交但响应丢失时停止原 BodyDaemon，将其状态目录复制到独立临时目录，由另一 BodyDaemon 读取。恢复的签名终止证明与原始字节一致，待确认 outbox 在退避窗口结束后重新可见且仅含该证明。原目录上的后续重放仍返回同一租户预留结果。隔离原生演练退出 0；此证据只覆盖停机副本，不代表在线 Host 备份或 Body Cell 独立恢复已验收。
+
+QF-02 Body Cell 独立恢复：隔离 celld 通过现有迁移协议导出真实已完成执行的 Body 状态，导入未初始化的独立对象，重新导出与源完全一致（含执行及已消费令牌记录）；再次导入不会覆盖。组合复跑验证 Host 停机副本及原生 Body 到期拒绝，退出 0。未恢复在线路由或历史执行清单，本项仅覆盖 Body 状态行。
+
+QF-02 独立恢复复验：导入后的 Body Cell 在真实 celld 重启后重新导出，执行及已消费令牌状态仍与原档一致。独立恢复及到期启动模式退出 0。默认完整原生回归另在月结预览遇到额外 BODY_ATTEMPT_SEQUENCE_UNPROVEN；禁用独立对象导入后仍复现，不能归因于导入夹具，也未放宽断言。该差异待核实。
+
+完整原生回归复验：连续两次默认模式退出 0，均通过非空 Scheduler/Body 覆盖、预览授权与水位校验、真实 Agent 和账本恢复。保留原序列断言；新增仅在 BODY_ATTEMPT_SEQUENCE_UNPROVEN 出现时输出隔离任务的状态、版本、来源时间与 baseline 标记。此前额外诊断未再复现，根因仍未证实。
+
+QF-02 恢复对象在线读回：隔离 celld 重启后，经生产 /v1/body/result 处理器读取恢复对象，按原任务及租户返回与源对象一致的 COMPLETED 结果及 fencing；无认证返回 401，错误租户返回 404。目标对象由夹具映射，无共享环境路由变更，也不表示历史覆盖已恢复。组合原生演练退出 0。
+
+恢复结果路由补验：隔离演练改用生产 ANSTS_BODY_NAMESPACE_PREFIX 配置定向到独立恢复对象，无自定义对象 ID 重写。celld 重启后，恢复结果与源一致，无认证 401、错误租户 404 的断言保持通过，整轮退出 0。共享集群未切换路由。
+
+恢复覆盖边界补验：恢复结果经真实路由可读，重启后的恢复对象清单仍只有一条 COMPLETED 导入基线，其 coverageSince 晚于原始执行时间，不会冒充完整执行历史。隔离原生演练退出 0。
+
+QF-02 启动撤销门禁：Scheduler 的试点 start_check 现重新读取租户权威并核对 START_AUTHORIZED、代际、fencing、目标、执行摘要、容量回执及到期时间，再读取容量授权。租户已撤销或代际变化时，即使容量对象仍显示 grant，启动仍被拒绝。统一 Gateway 定向用例 5/5，默认 Body/celld 原生演练退出 0。尚未发布共享 Fleet。
+
+QF-02 撤销联跑：ANSTS_EVIDENCE_REVOKE_BEFORE_START=true 下，隔离夹具在 Body 权威签发执行令牌后，以夹具 Host 密钥向真实租户权威送入未启动证明。租户在原有效期内取消预留并提升代际；携带旧令牌的真实 BodyDaemon HTTP 启动请求返回 409 STALE_EXECUTION_LEASE，模型调用为零且执行证据查询 404。整轮退出 0，未发布共享 Fleet。
+
+QF-02 撤销门禁已发布到共享开发 Fleet，配置保持 observe。维护退出 0，121 条任务及执行规格保留、恢复原 Drain，双 Gateway 与三 Scheduler 均健康。双 Gateway 结算读回与既有 observe 基线逐字一致。撤销拒绝行为来自真实 Scheduler/BodyDaemon 隔离联跑，未在共享环境撤销用户任务。
+
+QF-02 运行中控制面恢复：启用 ANSTS_EVIDENCE_RESTART_WHILE_RUNNING=true，在真实 BodyAgent 等待首次模型响应且租户预留为 RUNNING 时硬停隔离 celld。固定夹具宿主端口后，原 Agent 保持控制地址不变；重启读回 RUNNING 预留与停机前逐字段相同，放行模型后继续原执行、投递终止证明并完成费用结算。完整原生复跑退出 0。此前一次重跑在到达硬停前遇到夹具会话 401，未复现，未修改鉴权。

@@ -47,15 +47,16 @@ describe("M64 End-to-End Implementation Consistency & Authentic Feature Wiring S
       CELLD_REGION: "us-west-2",
       ANSTS_SCHEDULER_CELL: {
         idFromName: (name: string) => ({ toString: () => name }),
-        get: () => ({ fetch: (req: Request) => schedCell.fetch(req) }),
+        get: (id) => ({ id, fetch: (input, init) => schedCell.fetch(input instanceof Request ? input : new Request(input, init)) }),
       },
       ANSTS_HARNESS_CELL: {
         idFromName: (name: string) => ({ toString: () => name }),
-        get: () => ({ fetch: (req: Request) => harnessCell.fetch(req) }),
+        get: (id) => ({ id, fetch: (input, init) => harnessCell.fetch(input instanceof Request ? input : new Request(input, init)) }),
       },
       ANSTS_CHECKPOINT_BUCKET: r2,
-      ANSTS_KV_CACHE: new InMemoryKvNamespace(),
-      ANSTS_TASK_QUEUE: new InMemoryQueueProducer(),
+      ANSTS_IDEMPOTENCY_KV: new InMemoryKvNamespace(),
+      ANSTS_TASK_DISPATCH_QUEUE: new InMemoryQueueProducer(),
+      ANSTS_WEBHOOK_OUTBOX_QUEUE: new InMemoryQueueProducer(),
     };
 
     // 1. Submit task via Worker `/v1/scheduler/submit`
@@ -86,6 +87,7 @@ describe("M64 End-to-End Implementation Consistency & Authentic Feature Wiring S
           {
             id: "msg-1",
             timestamp: new Date(),
+            attempts: 1,
             body: {
               task_id: "task-worker-queue-02",
               tenant_id: "Northstar",

@@ -44,6 +44,11 @@ const PURGEABLE_STATES = new Set<TaskState>([
   TaskState.DEAD_LETTER,
 ]);
 
+function reservedMemoryMb(task: TaskSpec): number {
+  const memory = task.resource_profile.act_memory_mb;
+  return task.capacity_target_node_id ? memory : Math.floor(memory * 0.25);
+}
+
 export class CoreScheduler5D {
   public readonly queueManager: HierarchicalQueueManager;
   public readonly leaseCoordinator: LeaseCoordinator;
@@ -353,9 +358,17 @@ export class CoreScheduler5D {
       const task = this.queueManager.popNext();
       if (!task) break;
 
+      if (task.capacity_target_node_id &&
+          (task.capacity_expires_at === undefined || nowSec*1000 >= task.capacity_expires_at ||
+           task.capacity_fencing !== this.leaseCoordinator.getHighestFencingToken(task.task_id)+1)) {
+        this.queueManager.completeTask(task);
+        deferredTasks.push(task);
+        continue;
+      }
+
       let bestNode = this.findBestNodeForTask(task, nowSec);
 
-      if (bestNode === null && task.priority <= TaskPriority.P1_HIGH) {
+      if (bestNode === null && !task.capacity_target_node_id && task.priority <= TaskPriority.P1_HIGH) {
         if (this.tryPreemptBatchTask(task, nowSec)) {
           bestNode = this.findBestNodeForTask(task, nowSec);
         }
@@ -368,7 +381,7 @@ export class CoreScheduler5D {
         task.lease_fencing_token = lease.fencing_token;
 
         bestNode.free_cpu_cores -= task.resource_profile.think_cpu_cores;
-        bestNode.free_memory_mb -= Math.floor(task.resource_profile.act_memory_mb * 0.25);
+        bestNode.free_memory_mb -= reservedMemoryMb(task);
         bestNode.running_tasks += 1;
         if (bestNode.warm_pool_ready > 0) {
           bestNode.warm_pool_ready -= 1;
@@ -391,6 +404,7 @@ export class CoreScheduler5D {
     let bestNode: NodeHeartbeat | null = null;
     let bestScore = -1.0;
     for (const node of this.nodes.values()) {
+      if (task.capacity_target_node_id && node.node_id !== task.capacity_target_node_id) continue;
       if (node.execution_slots !== undefined && [...this.allTasks.values()].filter(candidate => candidate.assigned_node_id === node.node_id && [TaskState.LEASED, TaskState.PREEMPTING, TaskState.RUNNING_THINK, TaskState.RUNNING_ACT].includes(candidate.state)).length >= node.execution_slots) continue;
       const s = CoreScheduler5D.scoreNodeForTask(task, node, nowSec, this.nodeHeartbeatTtlSeconds);
       if (s > bestScore) {
@@ -408,6 +422,7 @@ export class CoreScheduler5D {
   private tryPreemptBatchTask(urgentTask: TaskSpec, nowSec = Date.now() / 1000): boolean {
     const batchVictims = Array.from(this.allTasks.values()).filter(
       (t) =>
+        !t.capacity_target_node_id &&
         t.priority === TaskPriority.P3_BATCH &&
         (t.state === TaskState.LEASED ||
           t.state === TaskState.RUNNING_THINK ||
@@ -441,7 +456,7 @@ export class CoreScheduler5D {
         node.free_memory_mb +
           Math.max(
             urgentTask.resource_profile.act_memory_mb,
-            Math.floor(victim.resource_profile.act_memory_mb * 0.25)
+            reservedMemoryMb(victim)
           )
       );
       node.running_tasks = Math.max(0, node.running_tasks - 1);
@@ -488,7 +503,7 @@ export class CoreScheduler5D {
     const node = this.nodes.get(nodeId);
     if (node) {
       node.free_cpu_cores = Math.min(node.total_cpu_cores, node.free_cpu_cores + task.resource_profile.think_cpu_cores);
-      node.free_memory_mb = Math.min(node.total_memory_mb, node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25));
+      node.free_memory_mb = Math.min(node.total_memory_mb, node.free_memory_mb + reservedMemoryMb(task));
       node.running_tasks = Math.max(0, node.running_tasks - 1);
     }
     task.state = TaskState.SUSPENDED_RECONCILIATION;
@@ -543,7 +558,7 @@ export class CoreScheduler5D {
       );
       node.free_memory_mb = Math.min(
         node.total_memory_mb,
-        node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25)
+        node.free_memory_mb + reservedMemoryMb(task)
       );
       node.running_tasks = Math.max(0, node.running_tasks - 1);
     }
@@ -591,7 +606,7 @@ export class CoreScheduler5D {
                 );
                 node.free_memory_mb = Math.min(
                   node.total_memory_mb,
-                  node.free_memory_mb + Math.floor(candidate.resource_profile.act_memory_mb * 0.25)
+                  node.free_memory_mb + reservedMemoryMb(candidate)
                 );
                 node.running_tasks = Math.max(0, node.running_tasks - 1);
               }
@@ -635,7 +650,7 @@ export class CoreScheduler5D {
         );
         oldNode.free_memory_mb = Math.min(
           oldNode.total_memory_mb,
-          oldNode.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25)
+          oldNode.free_memory_mb + reservedMemoryMb(task)
         );
         oldNode.running_tasks = Math.max(0, oldNode.running_tasks - 1);
       }
@@ -729,7 +744,7 @@ export class CoreScheduler5D {
             );
             node.free_memory_mb = Math.min(
               node.total_memory_mb,
-              node.free_memory_mb + Math.floor(t.resource_profile.act_memory_mb * 0.25)
+              node.free_memory_mb + reservedMemoryMb(t)
             );
             node.running_tasks = Math.max(0, node.running_tasks - 1);
           }
@@ -857,7 +872,7 @@ export class CoreScheduler5D {
       );
       node.free_memory_mb = Math.min(
         node.total_memory_mb,
-        node.free_memory_mb + Math.floor(task.resource_profile.act_memory_mb * 0.25)
+        node.free_memory_mb + reservedMemoryMb(task)
       );
       node.running_tasks = Math.max(0, node.running_tasks - 1);
     }
@@ -877,3 +892,7 @@ export class CoreScheduler5D {
     return true;
   }
 }
+
+
+
+

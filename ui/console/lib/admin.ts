@@ -1,4 +1,5 @@
 export const ADMIN_MODULES = [
+  { id: "capacity", title: "容量分配", description: "容量池与租户申请", group: "运行管理" },
   {
     id: "overview",
     title: "平台总览",
@@ -73,3 +74,4 @@ export const ADMIN_MODULES = [
   },
 ];
 export const ADMIN_IDS = ADMIN_MODULES.map((m) => m.id);
+

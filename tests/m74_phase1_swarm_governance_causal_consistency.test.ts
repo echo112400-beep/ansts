@@ -287,7 +287,7 @@ describe("M74 Phase 1 Multi-Agent Swarm Governance & Causal Consistency Suite", 
     const server = new AnstsLocalAndComposeServer({
       apiPort: 0,
       dashboardPort: 0,
-      dataDir: tmpDir,
+      storageDir: tmpDir,
     });
     const { apiPort } = await server.start();
     const baseUrl = `http://127.0.0.1:${apiPort}`;

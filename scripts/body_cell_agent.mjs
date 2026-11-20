@@ -132,7 +132,7 @@ while (!stopping) {
       if (outbox.pending().some(delivery => delivery.lease.task_id === task.task_id && delivery.lease.tenant_id === task.tenant_id)) continue;
       try {
       if (!(await heartbeat(0)).healthy) break;
-      const lease = { task_id: task.task_id, tenant_id: task.tenant_id, attempt_id: `${task.task_id}:${task.lease_fencing_token}`, input_digest: taskInputDigest(task.tenant_id, task.task_id, task.prompt, task.execution), node_id: nodeId, fencing_token: task.lease_fencing_token };
+      const lease = { task_id: task.task_id, tenant_id: task.tenant_id, attempt_id: task.capacity_attempt_id ?? `${task.task_id}:${task.lease_fencing_token}`, input_digest: taskInputDigest(task.tenant_id, task.task_id, task.prompt, task.execution), node_id: nodeId, fencing_token: task.lease_fencing_token };
       await rpc('/v1/scheduler/lease-renew', lease);
       const controller = new AbortController();
       const executionPath = `/v1/body/acquire?taskId=${encodeURIComponent(task.task_id)}`;
@@ -196,3 +196,4 @@ while (!stopping) {
   } catch (error) { console.error(String(error)); }
   await new Promise(resolve => setTimeout(resolve, 2000));
 }
+

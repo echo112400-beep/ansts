@@ -220,6 +220,12 @@ export class StagingCommitAndApprovalGate {
     return [...(this.stagedByTask.get(taskId) ?? [])];
   }
 
+  public listApprovalTickets(taskId?: string): ApprovalTicket[] {
+    return Array.from(this.tickets.values())
+      .filter(ticket => taskId === undefined || ticket.taskId === taskId)
+      .map(ticket => ({ ...ticket, args: structuredClone(ticket.args) }));
+  }
+
   /**
    * [M61-2] Coalesces duplicate `PENDING` approval requests for the same `(task.task_id, toolName, canonicalArgs)`
    * so retried turns never spawn duplicate human approval tickets.

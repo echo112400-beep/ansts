@@ -7,6 +7,22 @@ export default function TenantQuota({tenant,user,client}:{tenant:DirectoryTenant
  const [pageSize,setPageSize]=useState(10);
  const [data,setData]=useState<TenantQuotaView|null>(null),[busy,setBusy]=useState(false),[saving,setSaving]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState('');
  const [draft,setDraft]=useState<{expectedVersion:number;values:Record<string,string>;period:'UTC_DAY'|'UTC_MONTH';credits:string;bps:string;reason:string}|null>(null);
+ const [impact,setImpact]=useState<{key:string;message:string}|null>(null);
+ const draftKey=JSON.stringify(draft);
+ async function previewImpact(){
+  if(!draft)return;
+  const key=draftKey;
+  setImpact(null);
+  try{
+   const snapshot=await client.reservationSummary(tenant.id);
+   if(snapshot.policyVersion!==draft.expectedVersion)throw new Error();
+   const constrained=[['concurrentAttempts','slots'],['cpuMilliCores','cpuMilliCores'],['memoryMiB','memoryMiB']] as const;
+   const below=constrained.filter(([field,usage])=>Number(draft.values[field])<snapshot.used[usage]);
+   if(alive.current)setImpact({key,message:below.length
+    ?'拟议额度低于部分当前占用。现有预留保留，新准入将按新策略判断。'
+    :'当前预留资源占用未超过拟议并发、CPU 和内存额度。'});
+  }catch{if(alive.current)setImpact({key,message:'无法核对当前占用或策略版本，请刷新后重试。'});}
+ }
  const alive=useRef(true),sequence=useRef(0),receipt=useRef<{payload:string;key:string}|null>(null),form=useRef<HTMLFormElement>(null);
  const load=useCallback(async(cursor?:string)=>{
   const serial=++sequence.current;setBusy(true);setError('');
@@ -15,7 +31,7 @@ export default function TenantQuota({tenant,user,client}:{tenant:DirectoryTenant
   finally{if(alive.current&&serial===sequence.current)setBusy(false);}
  },[client,tenant.id,tenant.version,pageSize]);
  useEffect(()=>{alive.current=true;setData(null);setDraft(null);setNotice('');void load();return()=>{alive.current=false;sequence.current++;};},[load]);
- function edit(){if(!data)return;const current=data.current;setDraft({expectedVersion:current?.version??0,values:Object.fromEntries(dimensions.map(([key])=>[key,current?String(current.resources[key]):''])),period:current?.budget.period??'UTC_DAY',credits:current?.budget.limitCreditUnits??'',bps:String(current?.budget.softThresholdBps??8000),reason:''});receipt.current=null;setNotice('');requestAnimationFrame(()=>form.current?.querySelector<HTMLInputElement>('input')?.focus());}
+ function edit(){if(!data)return;const current=data.current;setImpact(null);setDraft({expectedVersion:current?.version??0,values:Object.fromEntries(dimensions.map(([key])=>[key,current?String(current.resources[key]):''])),period:current?.budget.period??'UTC_DAY',credits:current?.budget.limitCreditUnits??'',bps:String(current?.budget.softThresholdBps??8000),reason:''});receipt.current=null;setNotice('');requestAnimationFrame(()=>form.current?.querySelector<HTMLInputElement>('input')?.focus());}
  async function save(event:FormEvent){
   event.preventDefault();if(!draft||saving)return;
   const resources=Object.fromEntries(dimensions.map(([key])=>[key,Number(draft.values[key])])) as TenantQuotaEdit['resources'];
@@ -41,6 +57,13 @@ export default function TenantQuota({tenant,user,client}:{tenant:DirectoryTenant
    <label>预算窗口<select disabled={saving} value={draft.period} onChange={e=>setDraft({...draft,period:e.target.value as 'UTC_DAY'|'UTC_MONTH'})}><option value="UTC_DAY">UTC日</option><option value="UTC_MONTH">UTC月</option></select></label>
    <label>软阈值（基点，8000 = 80%）<input type="number" min="0" max="10000" step="1" required disabled={saving} value={draft.bps} onChange={e=>setDraft({...draft,bps:e.target.value})}/></label>
    <label>配额变更原因<textarea required maxLength={1000} disabled={saving} value={draft.reason} onChange={e=>setDraft({...draft,reason:e.target.value})}/></label>
+   <details>
+    <summary>查看拟议变更</summary>
+    <ul>{dimensions.map(([key,label])=><li key={key}>{label}：{data?.current?.resources[key]??"未配置"} → {draft.values[key]||"未填写"}</li>)}</ul>
+    <p>预算：{data?.current?.budget.limitCreditUnits??"未配置"} → {draft.credits||"未填写"}；窗口：{data?.current?.budget.period??"未配置"} → {draft.period}；软阈值：{data?.current?.budget.softThresholdBps??"未配置"} → {draft.bps||"未填写"}</p>
+    <button type="button" disabled={saving||!data?.current} onClick={()=>void previewImpact()}>核对预留占用</button>
+    {impact?.key===draftKey&&<p role="status">{impact.message}</p>}
+   </details>
    <div className="directory-actions"><button type="submit" className="primary" disabled={saving}>确认保存策略</button><button type="button" className="secondary" disabled={saving} onClick={()=>setDraft(null)}>取消策略编辑</button></div>
   </form>}
  </section>;

@@ -5,8 +5,12 @@ import {ControlError,assertControlAccess,type ControlActor} from '../control/con
 import type {TenantRecord} from '../control/tenant_directory.js';
 import type {DirectoryStorage} from '../control/tenant_directory.js';
 export interface UsageContext {tenantVersion:number;region:string;costCenter:string;rateCardVersion:number|null;}
+export const MAX_USAGE_STREAM_EVENTS=5000;
 interface Stream {schemaVersion:1;context?:UsageContext|null;identity:UsageIdentity;resources:UsageEvent['resources'];sequence:number;cursor:number;lastAt:number;receivedAt:number;closed:boolean;quarantined:boolean;calls:Record<string,{request:ProviderUsage;response:ProviderUsage|null}>;}
 export interface UsageReceipt {eventId:string;digest:string;outcome:'RECORDED'|'CONFLICT'|'QUARANTINED';}
+export function usageConflictId(eventId:string,incomingDigest:string):string {
+ return createHash('sha256').update(eventId+':'+incomingDigest).digest('hex');
+}
 export class UsageInbox {
  constructor(private readonly storage:DirectoryStorage){
   if(typeof storage.transactionSync!=='function')throw new ControlError('DURABLE_TRANSACTION_REQUIRED',503);
@@ -29,7 +33,7 @@ export class UsageInbox {
   if(!old){const owners=this.storage.sql.exec<{tenant_id:string}>('SELECT DISTINCT tenant_id FROM tenant_usage_event_order LIMIT 2').toArray();if(owners.some(row=>row.tenant_id!==tenantId))throw new ControlError('USAGE_TENANT_IDENTITY_CONFLICT',503);if(create)this.storage.sql.exec('INSERT INTO tenant_usage_metadata (id, tenant_id) VALUES (?, ?)', 'tenant',tenantId);}
  }
  private stream(id:string):Stream|null {const row=this.storage.sql.exec<{payload_json:string}>('SELECT payload_json FROM tenant_usage_streams WHERE id = ?',id).toArray()[0];if(!row)return null;const s=JSON.parse(row.payload_json) as Stream;if(s.schemaVersion!==1||usageStreamId(s.identity)!==id)throw new ControlError('USAGE_INBOX_CORRUPT',503);return s;}
- private save(id:string,stream:Stream){const json=JSON.stringify(stream);if(Buffer.byteLength(json)>1024*1024||stream.sequence>5000)throw new ControlError('USAGE_INBOX_FULL',503);this.storage.sql.exec('INSERT OR REPLACE INTO tenant_usage_streams (id, payload_json) VALUES (?, ?)',id,json);}
+ private save(id:string,stream:Stream){const json=JSON.stringify(stream);if(Buffer.byteLength(json)>1024*1024||stream.sequence>MAX_USAGE_STREAM_EVENTS)throw new ControlError('USAGE_INBOX_FULL',503);this.storage.sql.exec('INSERT OR REPLACE INTO tenant_usage_streams (id, payload_json) VALUES (?, ?)',id,json);}
  bind(identity:UsageIdentity,resources:UsageEvent['resources'],context:UsageContext,now=Date.now()):void {
   identity=canonicalUsageIdentity(identity);resources=canonicalUsageResources(resources);const id=usageStreamId(identity);
   if(!Number.isSafeInteger(context.tenantVersion)||context.tenantVersion<1||!context.region||!context.costCenter||context.rateCardVersion!==null&&(!Number.isSafeInteger(context.rateCardVersion)||context.rateCardVersion<1))throw new ControlError('INVALID_USAGE_CONTEXT',422);
@@ -47,7 +51,7 @@ export class UsageInbox {
    if(previous){
     if(previous.digest===digest)return {eventId:event.eventId,digest,outcome:'RECORDED'};
     if(!stream)throw new ControlError('USAGE_INBOX_CORRUPT',503);stream.quarantined=true;this.save(streamId,stream);
-    const id=createHash('sha256').update(event.eventId+':'+digest).digest('hex');
+    const id=usageConflictId(event.eventId,digest);
     this.storage.sql.exec('INSERT OR REPLACE INTO tenant_usage_conflicts (id, payload_json) VALUES (?, ?)',id,JSON.stringify({streamId,eventId:event.eventId,originalDigest:previous.digest,incomingDigest:digest,code:'USAGE_EVENT_CONFLICT',requiresAttention:true,receivedAt:now}));
     return {eventId:event.eventId,digest,outcome:'CONFLICT'};
    }

@@ -107,3 +107,176 @@ test('native Daemon signs actual local resource snapshots and advances epoch acr
   await daemon.stop();daemon=new BodyDaemonServer(options);({port}=await daemon.start());const next=verifyCapacityReport((await (await capture()).json()).proof,key);assert.equal(next.epoch,report.epoch+1);assert.equal(next.sequence,1);
  }finally{await daemon.stop();rmSync(dir,{recursive:true,force:true});}
 });
+
+test('capacity request API enforces tenant, region and operator write scope', async () => {
+ const fixtureState = fixture();
+ try {
+  setup(fixtureState);
+  const token = 'capacity-service-token'.padEnd(32, '0');
+  const cell = new CapacityInventoryCell(
+   {storage:fixtureState.storage} as DurableObjectStateLike,
+   {ANSTS_DIRECTORY_SERVICE_TOKEN:token},
+  );
+  const env = {
+   ANSTS_DIRECTORY_SERVICE_TOKEN:token,
+   ANSTS_CAPACITY_INVENTORY_CELL:{idFromName:()=> 'inventory',get:()=>cell},
+  } as unknown as Parameters<typeof handleCapacityApi>[1];
+  const operator = {sub:'operator',role:'OPERATOR' as const,scopeTenant:'team',scopeRegion:'dev'};
+  const path = 'https://gateway.test/v1/admin/capacity/requests?poolId=pool&tenantId=';
+  const submit = (tenant: string, principal: Parameters<typeof handleCapacityApi>[2]) =>
+   handleCapacityApi(new Request(path+tenant,{
+    method:'POST',headers:{'idempotency-key':'once'},
+    body:JSON.stringify({resources:{...limit,slots:1},priority:999,tenantId:'other'}),
+   }),env,principal);
+
+  const control = (name:string, input?:object, principal:Parameters<typeof handleCapacityApi>[2]=admin) =>
+   handleCapacityApi(new Request('https://gateway.test/v1/admin/capacity/'+name+'?poolId=pool',
+    input?{method:'PUT',body:JSON.stringify(input)}:undefined),env,principal);
+  assert.equal((await control('allocation-control',undefined,operator)).status,403);
+  assert.deepEqual(await (await control('allocation-control')).json(),{version:0,enabled:true});
+  assert.deepEqual(await (await control('allocation-control',{expectedVersion:0,enabled:false})).json(),
+   {version:1,enabled:false});
+  assert.equal((await control('allocation-control',{expectedVersion:0,enabled:true})).status,409);
+  assert.deepEqual(await (await control('queue-policy',{expectedVersion:0,maxWaitMs:2000,weights:{team:3},priorities:{team:20}})).json(),
+   {version:1,maxWaitMs:2000,weights:{team:3},priorities:{team:20},guaranteedShares:{}});
+  assert.equal((await submit('other',operator)).status,403);
+  assert.equal((await submit('team',{...operator,scopeRegion:'elsewhere'})).status,403);
+  assert.equal((await submit('team',{...operator,role:'VIEWER'})).status,403);
+  assert.equal((await submit('team',{...operator,readOnly:true})).status,403);
+  const created = await submit('team',operator);
+  assert.equal(created.status,200);
+  const request = await created.json() as {id:string;tenantId:string;priority:number};
+  assert.equal(request.tenantId,'team');
+  assert.equal(request.priority,0);
+  assert.deepEqual(await (await submit('team',operator)).json(),request);
+  assert.equal((await handleCapacityApi(new Request(path+'team'),env,{...operator,scopeTenant:'other'})).status,403);
+  const viewer = {...operator,role:'VIEWER' as const};
+  assert.deepEqual(await (await handleCapacityApi(new Request(path+'team'),env,viewer)).json(),{requests:[{...request,queueReason:'ALLOCATION_PAUSED'}]});
+  const cancel = () => new Request(path+'team&id='+request.id,{method:'DELETE'});
+  assert.equal((await handleCapacityApi(cancel(),env,viewer)).status,403);
+  assert.equal((await handleCapacityApi(cancel(),env,operator)).status,200);
+  assert.equal((await (await submit('team',operator)).json() as {state:string}).state,'CANCELLED');
+ } finally {
+  fixtureState.db.close();
+ }
+});
+
+
+
+test('grant issuance reads tenant authority and reports held capacity to the queue',async()=>{
+ const s=fixture();
+ try{
+  setup(s);
+  const now=Date.now();
+  for(const daemon of ['d1','d2'])s.inventory.report(daemon,report(daemon,1,{
+   observedAt:now,reserved:{cpuMilliCores:0,memoryMiB:0,slots:0},
+  }),now);
+  const token='directory-token'.padEnd(36,'0'),admissionToken='admission-token'.padEnd(36,'0');
+  const queried:string[]=[];
+  let alarmAt:number|null=null;
+  const storage={...s.storage,getAlarm:async()=>alarmAt,setAlarm:async(at:number)=>{alarmAt=at;}};
+  const cell=new CapacityInventoryCell({storage} as DurableObjectStateLike,{
+   ANSTS_DIRECTORY_SERVICE_TOKEN:token,ANSTS_ADMISSION_SERVICE_TOKEN:admissionToken,
+   ANSTS_TENANT_CONTROL_CELL:{
+    idFromName:(id:string)=>id,
+    get:()=>({fetch:async(request:Request)=>{
+     assert.equal(request.headers.get('authorization'),'Bearer '+admissionToken);
+     const {tenantId}=await request.json() as {tenantId:string};
+     queried.push(tenantId);
+     return Response.json({used:{cpuMilliCores:0,memoryMiB:0,slots:0},
+      remaining:tenantId==='limited'?{...limit,slots:0}:limit});
+    }}),
+   } as unknown as DurableObjectNamespaceLike,
+  });
+  const post=(path:string,body:object)=>cell.fetch(new Request('https://capacity.internal/'+path,{
+   method:'POST',headers:{authorization:'Bearer '+token},body:JSON.stringify(body),
+  }));
+  const unsupported=await post('request-submit',{
+   actor:admin,requestInput:{poolId:'pool',tenantId:'eligible',key:'multi-slot',resources:limit},
+  });
+  assert.equal(unsupported.status,422);
+  const guarantee=await post('queue-policy-write',{actor:admin,input:{
+   id:'pool',expectedVersion:0,maxWaitMs:1000,weights:{},guaranteedShares:{eligible:{...limit,slots:1}},
+  }});
+  assert.equal(guarantee.status,200);
+  const borrower=await post('request-submit',{actor:admin,requestInput:{
+   poolId:'pool',tenantId:'borrower',key:'guarantee-check',resources:{...limit,slots:1},
+  }});
+  assert.equal(borrower.status,200);
+  const borrowerView=await post('pool-catalog',{actor:admin,requestInput:{tenantId:'borrower'}});
+  const borrowerPool=(await borrowerView.json() as {pools:{available:typeof limit;guaranteedShare:null}[]}).pools[0];
+  assert.deepEqual(borrowerPool.available,{cpuMilliCores:0,memoryMiB:0,slots:1});
+  assert.equal(borrowerPool.guaranteedShare,null);
+  assert.deepEqual(await (await post('grant-issue',{actor:admin,input:{id:'pool'}})).json(),{grant:null});
+  const {id:borrowerId}=await borrower.json() as {id:string};
+  assert.equal((await post('request-cancel',{actor:admin,requestInput:{poolId:'pool',tenantId:'borrower',id:borrowerId}})).status,200);
+  queried.length=0;
+  let eligibleId='';
+  for(const tenantId of ['limited','eligible']){
+   const result=await post('request-submit',{actor:admin,requestInput:{poolId:'pool',tenantId,key:'request',resources:{...limit,slots:1}}});
+   assert.equal(result.status,200);
+   const submitted=await result.json() as {id:string};
+   if(tenantId==='eligible')eligibleId=submitted.id;
+  }
+  assert.ok(alarmAt!==null);
+  alarmAt=null;
+  await cell.alarm();
+  assert.ok(alarmAt!==null);
+  const issued=await post('grant-read',{actor:admin,requestInput:{poolId:'pool',tenantId:'eligible',id:eligibleId}});
+  assert.equal(issued.status,200);
+  const {grant}=await issued.json() as {grant:{hostId:string;requestId:string;target:string;capacityReceipt:string}};
+  assert.equal(grant.hostId,'physical-1');
+  assert.equal(grant.target,'d1');
+  assert.equal(grant.capacityReceipt,'capacity-grant:'+grant.requestId);
+  const readGrant = (tenantId:string) => post('grant-read',{actor:admin,requestInput:{poolId:'pool',tenantId,id:grant.requestId}});
+  assert.deepEqual(await (await readGrant('eligible')).json(),{grant});
+  assert.deepEqual(await (await readGrant('limited')).json(),{grant:null});
+  const catalog=await post('pool-catalog',{actor:admin,requestInput:{tenantId:'limited'}});
+  const view=await catalog.json() as {pools:{available:typeof limit;activeGrants:number}[]};
+  assert.equal(view.pools[0].activeGrants,1);
+  assert.deepEqual(view.pools[0].available,{cpuMilliCores:0,memoryMiB:0,slots:1});
+  assert.deepEqual(queried.sort(),['eligible','limited']);
+  const listed=await post('request-list',{actor:admin,requestInput:{poolId:'pool',tenantId:'limited'}});
+  assert.equal((await listed.json() as {requests:{queueReason:string}[]}).requests[0].queueReason,'HOST_RESOURCES_UNAVAILABLE');
+  assert.deepEqual(await (await post('grant-issue',{actor:admin,input:{id:'pool'}})).json(),{grant:null});
+  const binding={reservationId:'reservation',attemptId:'attempt',generation:1,fencing:7};
+  const readBound=(candidate= binding)=>post('grant-read',{
+   actor:admin,requestInput:{poolId:'pool',tenantId:'eligible',id:grant.requestId,binding:candidate},
+  });
+  assert.deepEqual(await (await readBound()).json(),{grant:null});
+  const reservation={
+   id:binding.reservationId,attemptId:binding.attemptId,generation:binding.generation,fencing:binding.fencing,
+   tenantId:'eligible',policy:{region:'dev'},phase:'PREPARING',expiresAt:Date.now()+10_000,
+   resources:{cpuMilliCores:limit.cpuMilliCores,memoryMiB:limit.memoryMiB,concurrentAttempts:1,queuedTasks:0},
+  };
+  const wrongDaemon=await post('grant-bind',{requestId:grant.requestId,target:'d2',reservation});
+  assert.equal(wrongDaemon.status,409);
+  assert.deepEqual(await wrongDaemon.json(),{code:'CAPACITY_TARGET_UNAVAILABLE'});
+  const bind=await post('grant-bind',{requestId:grant.requestId,target:grant.target,reservation});
+  assert.deepEqual(await bind.json(),{capacityReceipt:grant.capacityReceipt});
+  assert.deepEqual(await (await readBound()).json(),{grant});
+  assert.deepEqual(await (await readBound({...binding,fencing:6})).json(),{grant:null});
+  const restartedAt=Date.now();
+  s.inventory.report('d1',report('d1',1,{
+   epoch:2,observedAt:restartedAt,reserved:{cpuMilliCores:0,memoryMiB:0,slots:0},
+  }),restartedAt);
+  assert.deepEqual(await (await readGrant('eligible')).json(),{grant:null});
+  assert.deepEqual(await (await readBound()).json(),{grant:null});
+  const staleBind=await post('grant-bind',{requestId:grant.requestId,target:grant.target,reservation:{
+   tenantId:'eligible',policy:{region:'dev'},
+  }});
+  assert.equal(staleBind.status,409);
+  assert.deepEqual(await staleBind.json(),{code:'CAPACITY_TARGET_UNAVAILABLE'});
+ }finally{s.db.close();}
+});
+
+
+
+
+
+
+
+
+
+
+

@@ -41,8 +41,16 @@
         "class_name": "AdmissionShadowMailboxCell"
       },
       {
+        "name": "ANSTS_REGION_CATALOG_CELL",
+        "class_name": "RegionCatalogCell"
+      },
+      {
         "name": "ANSTS_CAPACITY_INVENTORY_CELL",
         "class_name": "CapacityInventoryCell"
+      },
+      {
+        "name": "ANSTS_CONFIG_RELEASE_CELL",
+        "class_name": "ConfigReleaseCell"
       }
     ]
   },
@@ -90,6 +98,14 @@
       "new_sqlite_classes": [
         "CapacityInventoryCell"
       ]
+    },
+    {
+      "tag": "v8-config-release",
+      "new_sqlite_classes": ["ConfigReleaseCell"]
+    },
+    {
+      "tag": "region-catalog-v1",
+      "new_sqlite_classes": ["RegionCatalogCell"]
     }
   ],
   "kv_namespaces": [
@@ -137,6 +153,11 @@
     "ANSTS_BODY_NAMESPACE_PREFIX": "",
     "ANSTS_DIRECTORY_SERVICE_TOKEN": "",
     "ANSTS_ADMISSION_SERVICE_TOKEN": "",
+    "ANSTS_ADMISSION_MODE": "observe",
+    "ANSTS_ADMISSION_PILOT_TENANTS": "",
+    "ANSTS_ADMISSION_PILOT_POOL": "",
+    "ANSTS_ADMISSION_SCHEDULER_SHARDS": "",
+    "ANSTS_ADMISSION_ESTIMATED_CREDIT_UNITS": "",
     "ANSTS_ADMISSION_SIGNING_KEY": ""
   }
 }

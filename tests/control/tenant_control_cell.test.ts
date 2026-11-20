@@ -148,3 +148,85 @@ test('tenant evidence API verifies pinned host and input before changing executi
   const response=await s.call('admission-observe-execution',{reservationId:r.id,proof});assert.equal(response.status,200);const result=await response.json() as {sourceVerified:boolean;reservation:AdmissionReservation};assert.equal(result.sourceVerified,true);assert.equal(result.reservation.phase,'RUNNING');
  }finally{s.db.close();}
 });
+
+test('capacity reservation cannot authorize start after its grant becomes unavailable',async()=>{
+ const s=fixture();
+ try{
+  const capacityReceipt='capacity-grant:'+'a'.repeat(64);
+  let live=false;
+  s.env.ANSTS_CAPACITY_INVENTORY_CELL={
+   idFromName:name=>({toString:()=>name}),
+   get:()=>({id:{toString:()=>''},async fetch(request){
+    assert.ok(request instanceof Request);
+    assert.equal(request.headers.get('authorization'),'Bearer '+directoryToken);
+    if(new URL(request.url).pathname==='/grant-bind')return Response.json({capacityReceipt});
+    const {requestInput}=await request.json() as {requestInput:{binding:unknown}};
+    assert.deepEqual(requestInput.binding,{
+     reservationId:s.prepare.reservationId,attemptId:s.prepare.attemptId,generation:1,fencing:7,
+    });
+    return Response.json({grant:live?{capacityReceipt,target:'body-1'}:null});
+   }}),
+  };
+  const prepared=await s.call('admission-prepare',{idempotencyKey:'prepare',input:s.prepare});
+  assert.equal(prepared.status,200);
+  const {reservation}=await prepared.json() as {reservation:AdmissionReservation};
+  const reserved=await s.step(reservation,'RESERVED',{target:'body-1',capacityReceipt});
+  s.reopen();
+  const failed=await s.call('admission-transition',{idempotencyKey:'START_AUTHORIZED',input:{
+   reservationId:reserved.id,expectedVersion:reserved.version,generation:reserved.generation,
+   fencing:reserved.fencing,to:'START_AUTHORIZED',reason:'check grant before authorizing',
+  }});
+  assert.equal(failed.status,409);
+  assert.deepEqual(await failed.json(),{code:'CAPACITY_TARGET_UNAVAILABLE'});
+  const read=await s.call('admission-read',{reservationId:reserved.id});
+  assert.deepEqual((await read.json() as {reservation:AdmissionReservation}).reservation,reserved);
+  live=true;
+  assert.equal((await s.step(reserved,'START_AUTHORIZED')).phase,'START_AUTHORIZED');
+ }finally{s.db.close();}
+});
+
+test('cancel recovers a capacity binding whose acknowledgement was lost',async()=>{
+ const s=fixture();
+ try{
+  const capacityReceipt='capacity-grant:'+'b'.repeat(64);
+  let held=false,releaseAttempts=0;
+  s.env.ANSTS_CAPACITY_INVENTORY_CELL={
+   idFromName:name=>({toString:()=>name}),
+   get:()=>({id:{toString:()=>''},async fetch(request){
+    assert.ok(request instanceof Request);
+    assert.equal(request.headers.get('authorization'),'Bearer '+directoryToken);
+    const body=await request.json() as {reservation:AdmissionReservation};
+    if(new URL(request.url).pathname==='/grant-bind'){
+     held=true;
+     throw new Error('binding acknowledgement lost');
+    }
+    assert.equal(body.reservation.capacityReceipt,capacityReceipt);
+    assert.equal(body.reservation.phase,'CANCELLED');
+    assert.equal(body.reservation.generation,2);
+    assert.equal(body.reservation.startAuthorized,false);
+    if(++releaseAttempts===1)return Response.json({code:'OFFLINE'},{status:503});
+    held=false;
+    return Response.json({released:true});
+   }}),
+  };
+  const prepared=await s.call('admission-prepare',{idempotencyKey:'prepare',input:s.prepare});
+  assert.equal(prepared.status,200);
+  const {reservation}=await prepared.json() as {reservation:AdmissionReservation};
+  const failed=await s.call('admission-transition',{idempotencyKey:'reserve',input:{
+   reservationId:reservation.id,expectedVersion:reservation.version,generation:reservation.generation,
+   fencing:reservation.fencing,to:'RESERVED',reason:'bind capacity',target:'body-1',capacityReceipt,
+  }});
+  assert.equal(failed.status,503);
+  assert.equal(held,true);
+  s.reopen();
+  const cancelled=await s.step(reservation,'CANCELLED');
+  assert.equal(cancelled.capacityReceipt,null);
+  await s.fireAlarm();
+  assert.equal(held,true);
+  s.reopen();
+  await s.fireAlarm();
+  assert.equal(held,false);
+  await s.fireAlarm();
+  assert.equal(releaseAttempts,2);
+ }finally{s.db.close();}
+});

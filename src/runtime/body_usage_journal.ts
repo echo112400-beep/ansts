@@ -35,17 +35,23 @@ export class BodyUsageJournal {
  /** Only after native startup positively confirms all previous local executions have stopped. */
  recoverReleased(now=Date.now()):void {for(const state of this.states())if(state.active&&state.resources.cpuNanoCores!==null)this.finish(state.identity,now);}
  checkpointActive(now=Date.now()):void {for(const state of this.states())if(state.active)this.checkpoint(state.identity,now);}
+ /** Flush only crossed UTC boundaries before a later provider timestamp becomes immutable.
+  * Otherwise the next resource checkpoint would append an older midnight after this response. */
+ private beforeProvider(state:State,now:number){
+  if(!Number.isSafeInteger(now)||now<0)throw new Error('USAGE_CLOCK_REGRESSION');
+  const boundary=Math.floor(now/86400000)*86400000;if(state.active&&boundary>state.cursor)this.segments(state,boundary);
+ }
  providerStarted(identity:UsageIdentity,call:number,source:{provider:string;model:string}|undefined,now=Date.now()):void {
   const state=this.load(identity);if(!state.active)throw new Error('USAGE_STREAM_CLOSED');
   const request=canonicalProviderUsage({call,provider:source?.provider??null,requestedModel:source?.model??null,reportedModel:null,responseId:null,inputTokens:null,outputTokens:null,totalTokens:null,cacheHitTokens:null,cacheMissTokens:null,evidenceDigest:null,source:'NO_RESPONSE',completeness:'UNKNOWN'}),key=String(call),old=state.calls[key];
   if(old){if(JSON.stringify(old.request)!==JSON.stringify(request))throw new Error('USAGE_CALL_CONFLICT');throw new Error('USAGE_CALL_ALREADY_STARTED');}
-  state.calls[key]={request,response:null};this.append(state,'PROVIDER_REQUEST',now,null,request);this.save(state);
+  this.beforeProvider(state,now);state.calls[key]={request,response:null};this.append(state,'PROVIDER_REQUEST',now,null,request);this.save(state);
  }
  providerFinished(identity:UsageIdentity,call:number,response:Omit<ProviderUsage,'call'|'provider'|'requestedModel'>|null,now=Date.now()):void {
   const state=this.load(identity),entry=state.calls[String(call)];if(!entry)throw new Error('USAGE_CALL_NOT_FOUND');
   const usage=canonicalProviderUsage({...entry.request,...(response??{}),call});
   if(entry.response){if(JSON.stringify(entry.response)!==JSON.stringify(usage))throw new Error('USAGE_CALL_CONFLICT');return;}
-  entry.response=usage;this.append(state,'PROVIDER_USAGE',now,null,usage);this.save(state);
+  this.beforeProvider(state,now);entry.response=usage;this.append(state,'PROVIDER_USAGE',now,null,usage);this.save(state);
  }
  providerUncertain(identity:UsageIdentity,call:number,now=Date.now()):void {const state=this.load(identity);if(state.calls[String(call)]?.response)return;this.providerFinished(identity,call,null,now);}
  private states():State[]{return readdirSync(this.directory).filter(name=>/^[a-f0-9]{64}\.json$/.test(name)).sort().map(name=>{const value=JSON.parse(readFileSync(join(this.directory,name),'utf8')) as State;if(this.path(value.identity)!==join(this.directory,name))throw new Error('USAGE_STREAM_CORRUPT');return this.load(value.identity);});}

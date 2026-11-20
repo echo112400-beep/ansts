@@ -2,6 +2,7 @@
 import { authenticateBody } from "./body_auth.js";
 import { BodyWorkerEnv, bodySchedulerClient, handleBodyRequest } from "./body_worker_routes.js";
 import { controlPlaneFetch } from "./control_plane_fetch.js";
+import {bodyInventoryIngress} from '../control/execution_inventory_ingress.js';
 export { AnstsBodyCell } from "./body_cell.js";
 
 const SCHEDULER_ROUTES = new Set(["/v1/scheduler/register-node", "/v1/scheduler/schedule-tick", "/v1/scheduler/tasks", "/v1/scheduler/lease-renew", "/v1/scheduler/complete", "/v1/scheduler/suspend-uncertain"]);
@@ -9,6 +10,7 @@ export default {
   async fetch(request: Request, env: BodyWorkerEnv): Promise<Response> {
     const url = new URL(request.url);
     try {
+      if(url.pathname==='/internal/v1/execution-inventory/body')return await bodyInventoryIngress(request,env);
       if (request.method === "GET" && ["/health", "/healthz", "/readyz"].includes(url.pathname)) {
         let ready = true;
         if (url.pathname === "/readyz") {

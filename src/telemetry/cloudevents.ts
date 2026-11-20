@@ -12,6 +12,7 @@ export interface CloudEventV1 {
   subject: string;
   time: string;
   datacontenttype: "application/json";
+  traceparent?: string;
   data: Record<string, unknown>;
 }
 
@@ -92,6 +93,7 @@ export class CloudEventsBus {
     eventId?: string;
     llmCostUsd?: number;
     sandboxCpuCoreSeconds?: number;
+    traceparent?: string;
     data?: Record<string, unknown>;
   }): CloudEventV1 {
     const dedupToken = params.idempotencyKey ?? params.eventId;
@@ -112,6 +114,7 @@ export class CloudEventsBus {
       subject: params.subject,
       time: new Date().toISOString(),
       datacontenttype: "application/json",
+      ...(params.traceparent !== undefined ? { traceparent: params.traceparent } : {}),
       data: { tenantId: params.tenantId, ...(params.data ?? {}) },
     };
     if (dedupToken) {

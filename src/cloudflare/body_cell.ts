@@ -1,15 +1,25 @@
 /** @fileoverview Durable Body registration, heartbeat and fenced execution receipts. */
 import { DurableObjectStateLike } from "./env.js";
 import { ExecutionAttempt, executionDigest, migrateAttempt, newAttempt, sameExecution, sameOwner } from "./execution_attempt.js";
+import {ExecutionInventory,type InventoryObservation} from '../control/execution_inventory.js';
+import type {DirectoryStorage} from '../control/tenant_directory.js';
 
 export class AnstsBodyCell {
+  private readonly inventory:ExecutionInventory|null;
   constructor(private readonly ctx: DurableObjectStateLike) {
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS body_state (id TEXT PRIMARY KEY, payload TEXT)");
+    const storage=ctx.storage as typeof ctx.storage & Partial<DirectoryStorage>;
+    this.inventory=typeof storage.transactionSync==='function'?new ExecutionInventory(storage as DirectoryStorage,'BODY',ctx.id.toString(),()=>this.inventoryBaseline()):null;
     this.finishMigration();
   }
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
     const route = path.slice("/v1/body/".length);
+    if(route==='execution-inventory') {
+      if(request.method!=='GET'||request.headers.get('x-ansts-verified-inventory')!=='true')return Response.json({code:'INTERNAL_ROUTE'},{status:403});
+      if(!this.inventory)return Response.json({code:'EXECUTION_INVENTORY_UNAVAILABLE'},{status:503});
+      try{return Response.json(this.inventory.snapshot(new URL(request.url).searchParams.get('tenantId')??''),{headers:{'cache-control':'no-store'}});}catch(error){return Response.json({code:(error as {code?:string}).code??'EXECUTION_INVENTORY_UNAVAILABLE'},{status:503});}
+    }
     const allowed = ["acquire", "start", "finish", "acknowledge", "uncertain", "reconcile", "heartbeat", "receipt", "state", "consume-grant", "export", "import", "logs"];
     if (!path.startsWith("/v1/body/") || !allowed.includes(route)) return Response.json({ error: "NOT_FOUND" }, { status: 404 });
     if ((["state", "export"].includes(route) && request.method !== "GET") || (!["state", "export"].includes(route) && request.method !== "POST")) {
@@ -76,11 +86,22 @@ export class AnstsBodyCell {
   private finishMigration(): void {
     const pending = this.ctx.storage.sql.exec<{ payload: string }>("SELECT * FROM body_state WHERE id = ?", "__migration_pending").toArray()[0];
     if (!pending) return;
-    for (const row of JSON.parse(pending.payload) as Array<{ id: string; payload: string }>) this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", row.id, row.payload);
-    this.ctx.storage.sql.exec("DELETE FROM body_state WHERE id = ?", "__migration_pending");
+    const write=()=>{
+      for (const row of JSON.parse(pending.payload) as Array<{ id: string; payload: string }>) this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", row.id, row.payload);
+      this.ctx.storage.sql.exec("DELETE FROM body_state WHERE id = ?", "__migration_pending");
+    };
+    if(this.inventory)this.inventory.importBaseline(write,()=>this.inventoryBaseline());else write();
   }
   private saveAttempt(attempt: ExecutionAttempt): void {
-    this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", "execution", JSON.stringify(attempt));
+    const write=()=>this.ctx.storage.sql.exec("INSERT OR REPLACE INTO body_state (id, payload) VALUES (?, ?)", "execution", JSON.stringify(attempt));
+    if(this.inventory)this.inventory.record(this.attemptObservation(attempt),write);else write();
+  }
+  private attemptObservation(attempt:ExecutionAttempt):InventoryObservation {
+    return {tenantId:attempt.tenant_id||'__legacy_unknown__',taskId:attempt.task_id||'__legacy_unknown__',inputDigest:attempt.input_digest,state:attempt.phase,fencing:attempt.fencing_token,nodeId:attempt.node_id||null,attemptId:attempt.attempt_id,version:attempt.version,sourceAt:attempt.updated_at};
+  }
+  private inventoryBaseline():InventoryObservation[] {
+    const row=this.ctx.storage.sql.exec<{payload:string}>('SELECT * FROM body_state WHERE id = ?', 'execution').toArray()[0];
+    return row?[this.attemptObservation(migrateAttempt(JSON.parse(row.payload)))]:[];
   }
   private reconcile(body: Record<string, unknown>, actor: string | null): Response {
     if (!actor) return Response.json({ error: "OPERATOR_AUTH_REQUIRED" }, { status: 401 });

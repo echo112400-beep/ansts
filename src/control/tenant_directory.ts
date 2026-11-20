@@ -29,7 +29,7 @@ interface AuditRecord {
   previousVersion: number;
   version: number;
 }
-export interface UnifiedAuditRecord {id:string;domain:"tenant"|"cost-center";targetId:string;actor:string;reason:string;requestId:string;timestamp:string;previousVersion:number;version:number;changes:{field:string;before:string|null;after:string}[]}
+export interface UnifiedAuditRecord {id:string;domain:"tenant"|"cost-center"|"rate-card"|"rate-activation";targetId:string;actor:string;reason:string;requestId:string;timestamp:string;previousVersion:number;version:number;changes:{field:string;before:string|null;after:string}[]}
 export interface CostCenterRecord { id:string; name:string; status:"ACTIVE"|"DISABLED"; version:number; }
 export interface CostCenterMutation extends Omit<CostCenterRecord,"version"> { expectedVersion:number; reason:string; requestId:string; idempotencyKey:string; }
 interface Snapshot {
@@ -187,12 +187,18 @@ export class TenantDirectory {
   }
   unifiedAuditPage(actor:ControlActor,options:{limit?:number;cursor?:string;domain?:string}={}) {
     const domain=options.domain??'all';
-    if(!['all','tenant','cost-center'].includes(domain))throw new ControlError('INVALID_AUDIT_DOMAIN',422);
+    if(!['all','tenant','cost-center','rate-card'].includes(domain))throw new ControlError('INVALID_AUDIT_DOMAIN',422);
     const state=this.load();
     const records:UnifiedAuditRecord[]=this.audit(actor).map(entry=>({...entry,id:'tenant:'+entry.tenantId+':'+entry.sequence,domain:'tenant',targetId:entry.tenantId}));
     if(actor.scopeTenant==='all'&&actor.scopeRegion==='all') for(const [index,entry] of (state.costCenterAudit??[]).entries()) records.push({...entry,id:'cost-center:'+entry.id+':'+index,domain:'cost-center',targetId:entry.id});
+    let rateCount=0;
+    const rateTable=this.storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'directory_rate_audit'").toArray()[0];
+    if(rateTable&&actor.scopeTenant==='all'&&actor.scopeRegion==='all')for(const row of this.storage.sql.exec<{version:number;payload_json:string}>('SELECT version, payload_json FROM directory_rate_audit ORDER BY version').toArray()){
+      const entry=JSON.parse(row.payload_json);rateCount++;
+      records.push({id:'rate-card:'+row.version,domain:'rate-card',targetId:'rate-card:'+row.version,actor:entry.actor,reason:entry.reason,requestId:entry.requestId,timestamp:new Date(entry.at).toISOString(),previousVersion:row.version-1,version:row.version,changes:[{field:'digest',before:null,after:entry.digest}]});
+    }
     const visible=records.filter(entry=>domain==='all'||entry.domain===domain).sort((a,b)=>a.timestamp<b.timestamp?-1:a.timestamp>b.timestamp?1:a.id<b.id?-1:a.id>b.id?1:0);
-    return this.page(actor,visible,state.audit.length+(state.costCenterAudit?.length??0),options,'unified-audit:'+domain);
+    return {...this.page(actor,visible,state.audit.length+(state.costCenterAudit?.length??0)+rateCount,options,'unified-audit:'+domain),coverage:{includedDomains:['tenant','cost-center','rate-card'],tenantSelectionRequired:['rate-activation']}};
   }
   costCenters(actor:ControlActor) {
     const state=this.load();

@@ -37,6 +37,8 @@ export enum ToolCallEffectClass {
 }
 
 export type PreemptionPolicy = "PreemptToHibernate" | "Never" | "YieldOnPressure";
+export type ReasoningEffort = "low" | "medium" | "high";
+export const EFFORT_MULTIPLIERS: Readonly<Record<ReasoningEffort, number>> = { low: 0.6, medium: 1.0, high: 1.6 };
 
 /**
  * Dual-Tuple Monotonic Fencing Token `(epoch, turnSeq, taskId)` aligned with `FenceTokenProto` in `proto/ansts_rpc.proto`.
@@ -220,6 +222,14 @@ export interface TaskSpecInit {
 }
 
 export class TaskSpec {
+  capacity_target_node_id?: string;
+  capacity_fencing?: number;
+  capacity_expires_at?: number;
+  capacity_attempt_id?: string;
+  capacity_reservation_id?: string;
+  capacity_receipt?: string;
+  capacity_generation?: number;
+  capacity_start_checked?: boolean;
   public task_id: string;
   public tenant_id: string;
   public priority: TaskPriority;
@@ -403,3 +413,10 @@ export interface ToolExecutionLog {
   compensation_tool?: string;
   executed_at: number;
 }
+
+export { TaskSpec as AgentTask, ToolCallEffectClass as ToolEffectClass };
+export type AgentTaskInit = TaskSpecInit;
+
+
+
+

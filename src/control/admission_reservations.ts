@@ -4,19 +4,23 @@ import {bodyEvidenceDigest,canonicalBodyEvidence,canonicalBodyObservationLookup,
 import {AdmissionOutbox,type AdmissionMessageReceipt,type AdmissionDelivery} from './admission_messages.js';
 import {assertControlAccess,assertExpectedVersion,ControlError,parseCreditUnits,validateQuota,type ControlActor,type ResourceQuota} from './contracts.js';
 import type {DirectoryStorage,TenantRecord} from './tenant_directory.js';
+import type {UsageIdentity,UsageResources} from './usage_event.js';
 import {internalBudgetPeriod} from '../finops/tenant_policy.js';
 import {TenantPolicyStore,type QuotaPolicyVersion} from '../finops/tenant_policy_store.js';
+import {exactAdd,roundCredit,type ExactAmount} from '../finops/rate_cards.js';
+import type {ReservationCostPreview} from '../finops/period_settlement.js';
 export type ReservationPhase='PREPARING'|'RESERVED'|'START_AUTHORIZED'|'RUNNING'|'UNCERTAIN'|'SETTLING'|'SETTLED'|'CANCELLED';
 export interface AdmissionReservation {
- id:string;tenantId:string;taskId:string;attemptId:string;requestDigest:string;executionInputDigest?:string;evidenceSequence?:number;fencing:number;generation:number;version:number;
+ id:string;tenantId:string;taskId:string;attemptId:string;requestDigest:string;executionInputDigest?:string;schedulerObjectId?:string;evidenceSequence?:number;fencing:number;generation:number;version:number;
  phase:ReservationPhase;policy:QuotaPolicyVersion;resources:ResourceQuota;estimatedCreditUnits:string;
  period:string;expiresAt:number;createdAt:number;updatedAt:number;startAuthorized:boolean;executionObserved:boolean;
  target:string|null;capacityReceipt:string|null;terminalEvidence:string|null;
- actualCreditUnits:string|null;rateSnapshot:null;
+ actualCreditUnits:string|null;rateSnapshot:null;priceAtUsageBinding?:true;
+ budgetSettlement?:{revision:string;chargesByDay:{day:string;creditUnits:string}[]};
 }
 export interface PrepareAdmission {
  reservationId:string;taskId:string;attemptId:string;fencing:number;expectedPolicyVersion:number;
- resources:ResourceQuota;estimatedCreditUnits:string;expiresAt:number;executionInputDigest?:string;
+ resources:ResourceQuota;estimatedCreditUnits:string;expiresAt:number;executionInputDigest?:string;schedulerObjectId?:string;
 }
 export interface AdmissionTransition {
  reservationId:string;expectedVersion:number;generation:number;fencing:number;
@@ -26,9 +30,11 @@ export interface AdmissionTransition {
  evidence?:{kind:'NOT_STARTED'|'TERMINATED';id:string;target:string;attemptId:string;fencing:number;generation:number};
  actualCreditUnits?:string;
 }
+export interface SettleAdmissionCost {reservationId:string;expectedVersion:number;expectedRevision:string}
 interface State {
  schemaVersion:1;tenantId:string;reservations:AdmissionReservation[];evidenceReceipts?:Record<string,{digest:string;evidence:BodyExecutionEvidence;result:AdmissionReservation}>;
  receipts:Record<string,{digest:string;result:AdmissionReservation}>;
+ settledCostBuckets?:Record<string,ExactAmount>;
  audit:{reservationId:string;actor:string;reason:string;version:number;phase:ReservationPhase;at:number}[];
 }
 function required(value:unknown,maxLength=128):asserts value is string {
@@ -37,6 +43,17 @@ function required(value:unknown,maxLength=128):asserts value is string {
 function integer(value:number){if(!Number.isSafeInteger(value)||value<1)throw new ControlError('INVALID_ADMISSION_GENERATION',422);}
 function hash(value:unknown){return createHash('sha256').update(JSON.stringify(value)).digest('hex');}
 const held=(r:AdmissionReservation)=>!['CANCELLED','SETTLED'].includes(r.phase);
+function occupiedBudget(reservation:AdmissionReservation,periodType:'UTC_DAY'|'UTC_MONTH',period:string):bigint {
+ if(held(reservation))return parseCreditUnits(reservation.estimatedCreditUnits);
+ if(reservation.phase!=='SETTLED')return 0n;
+ if(!reservation.budgetSettlement){
+  return internalBudgetPeriod(reservation.createdAt,periodType)===period?parseCreditUnits(reservation.actualCreditUnits!):0n;
+ }
+ return reservation.budgetSettlement.chargesByDay.reduce((sum,{day,creditUnits})=>{
+  const usagePeriod=periodType+':'+day.slice(0,periodType==='UTC_DAY'?10:7);
+  return usagePeriod===period?sum+parseCreditUnits(creditUnits):sum;
+ },0n);
+}
 /** All policy reads, quota checks, receipts and reservation changes share one native transaction. */
 export class AdmissionReservationStore {
  private readonly policies:TenantPolicyStore;
@@ -68,12 +85,59 @@ export class AdmissionReservationStore {
    const result=change(state);state.receipts[receiptKey]={digest,result:structuredClone(result)};this.commit(state);this.messages.enqueueWithinTransaction(result);return structuredClone(result);
   });
  }
+ /** Current resource headroom for capacity queue ranking. prepare remains the quota authority. */
+ capacityHeadroom(actor:ControlActor,tenant:TenantRecord){
+  this.access(actor,tenant);
+  const policy=this.policies.read(actor,tenant).current;
+  if(tenant.status!=='ACTIVE'||!policy||policy.tenantVersion!==tenant.version||
+     policy.region!==tenant.region||policy.costCenter!==tenant.costCenter){
+   throw new ControlError('CAPACITY_QUOTA_UNAVAILABLE',409);
+  }
+  const used={cpuMilliCores:0,memoryMiB:0,slots:0};
+  const activeReservationIds:string[]=[];
+  for(const reservation of this.load(tenant.id).reservations){
+   if(!held(reservation)||reservation.phase==='SETTLING')continue;
+   activeReservationIds.push(reservation.id);
+   used.cpuMilliCores+=reservation.resources.cpuMilliCores;
+   used.memoryMiB+=reservation.resources.memoryMiB;
+   used.slots+=reservation.resources.concurrentAttempts;
+  }
+  return {policyVersion:policy.version,queueLimit:policy.resources.queuedTasks,activeReservationIds,used,remaining:{
+   cpuMilliCores:Math.max(0,policy.resources.cpuMilliCores-used.cpuMilliCores),
+   memoryMiB:Math.max(0,policy.resources.memoryMiB-used.memoryMiB),
+   slots:Math.max(0,policy.resources.concurrentAttempts-used.slots),
+  }};
+ }
+
+ previewEstimatedAdmission(actor:ControlActor,tenant:TenantRecord,resources:ResourceQuota,estimate:string,now:number):void {
+  this.access(actor,tenant);this.clock(now);validateQuota(resources);
+  if(resources.concurrentAttempts!==1||resources.queuedTasks!==0)throw new ControlError('INVALID_ADMISSION_PREPARATION',422);
+  if(tenant.status!=='ACTIVE')throw new ControlError('TENANT_DISABLED',422);
+  const policy=this.policies.read(actor,tenant).current;
+  if(!policy)throw new ControlError('QUOTA_POLICY_REQUIRED',409);
+  if(policy.tenantVersion!==tenant.version||policy.region!==tenant.region||policy.costCenter!==tenant.costCenter)
+   throw new ControlError('POLICY_METADATA_NOT_ACTIVATED',409);
+  this.checkLimits(this.load(tenant.id),policy,resources,estimate,now);
+ }
+ private checkLimits(state:State,policy:AdmissionReservation['policy'],resources:ResourceQuota,estimate:string,now:number){
+   const active=state.reservations.filter(r=>held(r)&&r.phase!=='SETTLING');
+   for(const dimension of ['concurrentAttempts','cpuMilliCores','memoryMiB'] as const){
+    const total=active.reduce((sum,r)=>sum+BigInt(r.resources[dimension]),BigInt(resources[dimension]));
+    if(total>BigInt(policy.resources[dimension]))throw new ControlError('RESOURCE_QUOTA_EXCEEDED',409);
+   }
+   const period=internalBudgetPeriod(now,policy.budget.period);
+   // Pending reservations from every period remain occupied after UTC boundaries.
+   const occupied=state.reservations.reduce((sum,r)=>sum+occupiedBudget(r,policy.budget.period,period),0n);
+   if(occupied+parseCreditUnits(estimate)>parseCreditUnits(policy.budget.limitCreditUnits))throw new ControlError('BUDGET_QUOTA_EXCEEDED',409);
+   return period;
+ }
  prepare(actor:ControlActor,tenant:TenantRecord,input:PrepareAdmission,key:string,now:number):AdmissionReservation {
   this.clock(now);required(input.reservationId);required(input.taskId,512);required(input.attemptId,512);integer(input.fencing);
   validateQuota(input.resources);parseCreditUnits(input.estimatedCreditUnits);if(input.executionInputDigest!==undefined&&(typeof input.executionInputDigest!=='string'||!/^[a-f0-9]{64}$/.test(input.executionInputDigest)))throw new ControlError('INVALID_EXECUTION_INPUT_DIGEST',422);
   if(input.resources.concurrentAttempts!==1||input.resources.queuedTasks!==0||!Number.isSafeInteger(input.expiresAt))throw new ControlError('INVALID_ADMISSION_PREPARATION',422);
+  if(input.schedulerObjectId!==undefined)required(input.schedulerObjectId);
   // Canonical allowlist: unrecognized request fields never enter durable state or receipts.
-  const command:PrepareAdmission={reservationId:input.reservationId,taskId:input.taskId,attemptId:input.attemptId,fencing:input.fencing,expectedPolicyVersion:input.expectedPolicyVersion,resources:{concurrentAttempts:1,cpuMilliCores:input.resources.cpuMilliCores,memoryMiB:input.resources.memoryMiB,queuedTasks:0},estimatedCreditUnits:input.estimatedCreditUnits,expiresAt:input.expiresAt,...(input.executionInputDigest?{executionInputDigest:input.executionInputDigest}:{})};
+  const command:PrepareAdmission={...(input.schedulerObjectId?{schedulerObjectId:input.schedulerObjectId}:{}),reservationId:input.reservationId,taskId:input.taskId,attemptId:input.attemptId,fencing:input.fencing,expectedPolicyVersion:input.expectedPolicyVersion,resources:{concurrentAttempts:1,cpuMilliCores:input.resources.cpuMilliCores,memoryMiB:input.resources.memoryMiB,queuedTasks:0},estimatedCreditUnits:input.estimatedCreditUnits,expiresAt:input.expiresAt,...(input.executionInputDigest?{executionInputDigest:input.executionInputDigest}:{})};
   return this.mutate(actor,tenant,key,{prepare:command},state=>{
    if(tenant.status!=='ACTIVE')throw new ControlError('TENANT_DISABLED',422);
    if(command.expiresAt<=now||command.expiresAt-now>300000)throw new ControlError('INVALID_ADMISSION_PREPARATION',422);
@@ -81,17 +145,73 @@ export class AdmissionReservationStore {
    assertExpectedVersion(input.expectedPolicyVersion,policy.version);
    if(policy.tenantVersion!==tenant.version||policy.region!==tenant.region||policy.costCenter!==tenant.costCenter)throw new ControlError('POLICY_METADATA_NOT_ACTIVATED',409);
    if(state.reservations.some(r=>r.id===input.reservationId||r.attemptId===input.attemptId))throw new ControlError('ATTEMPT_ALREADY_RESERVED',409);
-   const active=state.reservations.filter(r=>held(r)&&r.phase!=='SETTLING');
-   for(const dimension of ['concurrentAttempts','cpuMilliCores','memoryMiB'] as const){
-    const total=active.reduce((sum,r)=>sum+BigInt(r.resources[dimension]),BigInt(command.resources[dimension]));
-    if(total>BigInt(policy.resources[dimension]))throw new ControlError('RESOURCE_QUOTA_EXCEEDED',409);
-   }
-   const period=internalBudgetPeriod(now,policy.budget.period);
-   // Pending reservations from every period remain occupied after UTC boundaries.
-   const occupied=state.reservations.reduce((sum,r)=>sum+(held(r)?parseCreditUnits(r.estimatedCreditUnits):r.phase==='SETTLED'&&internalBudgetPeriod(r.createdAt,policy.budget.period)===period?parseCreditUnits(r.actualCreditUnits!):0n),0n);
-   if(occupied+parseCreditUnits(command.estimatedCreditUnits)>parseCreditUnits(policy.budget.limitCreditUnits))throw new ControlError('BUDGET_QUOTA_EXCEEDED',409);
-   const result:AdmissionReservation={id:command.reservationId,tenantId:tenant.id,taskId:command.taskId,attemptId:command.attemptId,requestDigest:hash({tenantId:tenant.id,prepare:command,...(command.executionInputDigest?{nonce:randomUUID()}: {})}),...(command.executionInputDigest?{executionInputDigest:command.executionInputDigest}:{}),fencing:command.fencing,generation:1,version:1,phase:'PREPARING',policy:structuredClone(policy),resources:command.resources,estimatedCreditUnits:command.estimatedCreditUnits,period,expiresAt:command.expiresAt,createdAt:now,updatedAt:now,startAuthorized:false,executionObserved:false,target:null,capacityReceipt:null,terminalEvidence:null,actualCreditUnits:null,rateSnapshot:null};
+   const period=this.checkLimits(state,policy,command.resources,command.estimatedCreditUnits,now);
+   const result:AdmissionReservation={...(command.schedulerObjectId?{schedulerObjectId:command.schedulerObjectId}:{}),id:command.reservationId,tenantId:tenant.id,taskId:command.taskId,attemptId:command.attemptId,requestDigest:hash({tenantId:tenant.id,prepare:command,...(command.executionInputDigest?{nonce:randomUUID()}: {})}),...(command.executionInputDigest?{executionInputDigest:command.executionInputDigest}:{}),fencing:command.fencing,generation:1,version:1,phase:'PREPARING',policy:structuredClone(policy),resources:command.resources,estimatedCreditUnits:command.estimatedCreditUnits,period,expiresAt:command.expiresAt,createdAt:now,updatedAt:now,startAuthorized:false,executionObserved:false,target:null,capacityReceipt:null,terminalEvidence:null,actualCreditUnits:null,rateSnapshot:null};
+   if(command.executionInputDigest)result.priceAtUsageBinding=true;
    state.reservations.push(result);state.audit.push({reservationId:result.id,actor:actor.sub,reason:'prepare',version:1,phase:result.phase,at:now});return result;
+  });
+ }
+ /** Replace a held estimate with verified charges and record the idempotent transition. */
+ settleUsageCost(actor:ControlActor,tenant:TenantRecord,input:SettleAdmissionCost,key:string,now:number,readCost:()=>ReservationCostPreview):AdmissionReservation {
+  assertControlAccess(actor,'administer',tenant.id,tenant.region);
+  if(actor.scopeRegion!=='all')throw new ControlError('COMPLETE_TENANT_SCOPE_REQUIRED',403);
+  this.clock(now);
+  if(!input||Object.keys(input).some(field=>!['reservationId','expectedVersion','expectedRevision'].includes(field))||
+     typeof input.expectedRevision!=='string'||!/^[a-f0-9]{64}$/.test(input.expectedRevision))throw new ControlError('INVALID_COST_SETTLEMENT',422);
+  required(input.reservationId);
+  const command={reservationId:input.reservationId,expectedVersion:input.expectedVersion,expectedRevision:input.expectedRevision};
+  return this.mutate(actor,tenant,key,{settleCost:command},state=>{
+   const r=state.reservations.find(reservation=>reservation.id===command.reservationId);
+   if(!r)throw new ControlError('RESERVATION_NOT_FOUND',404);
+   assertExpectedVersion(command.expectedVersion,r.version);
+   if(now<r.updatedAt)throw new ControlError('ADMISSION_CLOCK_REGRESSION',409);
+   if(r.phase!=='SETTLING')throw new ControlError('INVALID_ADMISSION_TRANSITION',409);
+   const preview=readCost();
+   if(!preview.complete||!preview.terminalDigest)throw new ControlError('RESERVATION_COST_INCOMPLETE',409);
+   if(preview.reservationId!==r.id||preview.version!==r.version||preview.revision!==command.expectedRevision){
+    throw new ControlError('RESERVATION_COST_REVISION_CONFLICT',409);
+   }
+   const cumulative=state.settledCostBuckets??={};
+   const daily=new Map<string,bigint>();
+   for(const {key:bucketKey,descriptor,exactCredit} of preview.buckets){
+    const previous=cumulative[bucketKey]??{numerator:'0',denominator:'1'};
+    const next=exactAdd(previous,exactCredit);
+    const delta=BigInt(roundCredit(next,descriptor.rounding))-BigInt(roundCredit(previous,descriptor.rounding));
+    cumulative[bucketKey]=next;
+    daily.set(descriptor.periodId,(daily.get(descriptor.periodId)??0n)+delta);
+   }
+   const chargesByDay=[...daily].sort(([a],[b])=>a.localeCompare(b))
+    .map(([day,credits])=>({day,creditUnits:credits.toString()}));
+   const actual=[...daily.values()].reduce((sum,charge)=>sum+charge,0n).toString();
+   parseCreditUnits(actual);
+   r.budgetSettlement={revision:command.expectedRevision,chargesByDay};r.actualCreditUnits=actual;
+   r.phase='SETTLED';r.version++;r.updatedAt=now;
+   state.audit.push({reservationId:r.id,actor:actor.sub,reason:'Settled verified Body usage',version:r.version,phase:r.phase,at:now});
+   return r;
+  });
+ }
+ /** Internal only: the tenant authority must obtain this confirmation from the pinned Scheduler. */
+ expireUnacceptedPilot(actor:ControlActor,tenant:TenantRecord,expected:AdmissionReservation,now:number):AdmissionReservation {
+  this.clock(now);
+  const subject={reservationId:expected.id,taskId:expected.taskId,schedulerObjectId:expected.schedulerObjectId,
+   executionInputDigest:expected.executionInputDigest,version:expected.version,generation:expected.generation,
+   fencing:expected.fencing,expiresAt:expected.expiresAt};
+  return this.mutate(actor,tenant,'scheduler-expiry-'+hash(subject),{schedulerExpiry:subject},state=>{
+   const r=state.reservations.find(candidate=>candidate.id===subject.reservationId);
+   if(!r)throw new ControlError('RESERVATION_NOT_FOUND',404);
+   assertControlAccess(actor,'request_capacity',tenant.id,r.policy.region);
+   if(!r.schedulerObjectId||!r.executionInputDigest||r.schedulerObjectId!==subject.schedulerObjectId||
+    r.executionInputDigest!==subject.executionInputDigest||r.taskId!==subject.taskId||r.version!==subject.version||
+    r.generation!==subject.generation||r.fencing!==subject.fencing||r.expiresAt!==subject.expiresAt||
+    r.phase!=='START_AUTHORIZED'||!r.startAuthorized||r.executionObserved||now<r.expiresAt||now<r.updatedAt||
+    !r.target||!r.capacityReceipt?.startsWith('capacity-grant:')){
+    throw new ControlError('SCHEDULER_EXPIRY_UNCONFIRMED',409);
+   }
+   r.phase='CANCELLED';r.generation++;r.version++;r.updatedAt=now;
+   r.terminalEvidence='scheduler-expiry:'+hash(subject);
+   state.audit.push({reservationId:r.id,actor:actor.sub,reason:'Pinned Scheduler confirmed expiry before acceptance',
+    version:r.version,phase:r.phase,at:now});
+   return r;
   });
  }
  /** Internal coordinator primitive: execution evidence must already be authenticated by its adapter. */
@@ -141,9 +261,19 @@ export class AdmissionReservationStore {
   if((['concurrentAttempts','cpuMilliCores','memoryMiB','queuedTasks'] as const).some(key=>r.resources[key]!==input.resources[key]))return null;
   return {reservationId:r.id,generation:r.generation,policyVersion:r.policy.version,tenantVersion:r.policy.tenantVersion,requestDigest:r.requestDigest,executionInputDigest:r.executionInputDigest!};
  }
- usageContext(actor:ControlActor,tenant:TenantRecord,identity:import('./usage_event.js').UsageIdentity){
-  this.access(actor,tenant);const r=this.load(tenant.id).reservations.find(r=>r.taskId===identity.taskId&&r.attemptId===identity.attemptId&&r.fencing===identity.fencing&&r.target===identity.producerId&&r.executionInputDigest===identity.executionInputDigest);
-  return {tenantVersion:r?.policy.tenantVersion??tenant.version,region:r?.policy.region??tenant.region,costCenter:r?.policy.costCenter??tenant.costCenter,rateCardVersion:null};
+ usageContext(actor:ControlActor,tenant:TenantRecord,identity:UsageIdentity,resources:UsageResources,now=Date.now()){
+  this.access(actor,tenant);
+  const reserved=this.load(tenant.id).reservations.find(r=>r.attemptId===identity.attemptId);
+  const r=reserved&&reserved.taskId===identity.taskId&&reserved.fencing===identity.fencing&&
+   reserved.target===identity.producerId&&reserved.executionInputDigest===identity.executionInputDigest?reserved:undefined;
+  // Older reservations and attempts already observed by Body must never acquire a price retroactively.
+  const priceEligible=!reserved||!!r&&r.priceAtUsageBinding===true&&r.phase==='START_AUTHORIZED'&&
+   r.startAuthorized&&!r.executionObserved&&now<r.expiresAt&&tenant.status==='ACTIVE'&&
+   r.policy.tenantVersion===tenant.version&&r.policy.region===tenant.region&&r.policy.costCenter===tenant.costCenter&&
+   r.resources.cpuMilliCores===resources.cpuMilliCores&&r.resources.memoryMiB===resources.memoryMiB&&
+   r.resources.concurrentAttempts===resources.slots;
+  return {tenantVersion:r?.policy.tenantVersion??tenant.version,region:r?.policy.region??tenant.region,
+   costCenter:r?.policy.costCenter??tenant.costCenter,priceEligible};
  }
  /** Evidence must first be authenticated against this reservation's pinned Body host. */
  applyBodyEvidence(actor:ControlActor,tenant:TenantRecord,evidence:BodyExecutionEvidence):AdmissionReservation {
@@ -194,4 +324,19 @@ export class AdmissionReservationStore {
   const result=this.load(tenant.id).reservations.find(r=>r.id===reservationId);if(!result)throw new ControlError('RESERVATION_NOT_FOUND',404);
   assertControlAccess(actor,'read',tenant.id,result.policy.region);return structuredClone(result);
  }
+ /** Only a receipt from the authenticated Body adapter can supply terminal cost evidence. */
+ readSettlementEvidence(actor:ControlActor,tenant:TenantRecord,reservationId:string){
+  this.access(actor,tenant);required(reservationId);
+  const state=this.load(tenant.id),reservation=state.reservations.find(r=>r.id===reservationId);
+  if(!reservation)throw new ControlError('RESERVATION_NOT_FOUND',404);
+  assertControlAccess(actor,'request_capacity',tenant.id,reservation.policy.region);
+  const receipt=reservation.terminalEvidence?state.evidenceReceipts?.[reservation.terminalEvidence]:undefined;
+  if(reservation.phase!=='SETTLING'||!reservation.startAuthorized||!reservation.executionObserved||!receipt||receipt.evidence.phase!=='TERMINATED')return {reservation,terminalDigest:null};
+  if(receipt.evidence.reservationId!==reservation.id||receipt.evidence.generation!==reservation.generation||
+     receipt.evidence.requestDigest!==reservation.requestDigest||receipt.result.terminalEvidence!==reservation.terminalEvidence||
+     bodyEvidenceDigest(receipt.evidence)!==receipt.digest)throw new ControlError('EXECUTION_EVIDENCE_CONFLICT',503);
+  return {reservation,terminalDigest:receipt.digest};
+ }
 }
+
+

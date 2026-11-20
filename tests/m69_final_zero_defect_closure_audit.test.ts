@@ -13,7 +13,7 @@ import { describe, it } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { InMemoryCellSqlStorage, InMemoryR2Bucket } from "../src/cloudflare/env.js";
+import { InMemoryCellSqlStorage, InMemoryR2Bucket, MockDurableObjectState } from "../src/cloudflare/env.js";
 import { CognitiveRouter } from "../src/cognitive_router.js";
 import { AnstsSchedulerCell } from "../src/cloudflare/scheduler_cell.js";
 import { UnifiedComponentPersistenceStore } from "../src/checkpoint/unified_state_store.js";
@@ -86,6 +86,7 @@ describe("M69 Final Deep Edge-Case Sweep & Zero-Residual-Defect Closure Suite", 
     const makeCellState = () => ({
       id: { toString: () => "cell-m69-01" },
       storage: {
+        ...new MockDurableObjectState().storage,
         sql,
         transactionSync: <T>(fn: () => T) => fn(),
         getAlarm: async () => null,
@@ -235,6 +236,7 @@ describe("M69 Final Deep Edge-Case Sweep & Zero-Residual-Defect Closure Suite", 
     const hState = {
       id: { toString: () => "hcell-m69" },
       storage: {
+        ...new MockDurableObjectState().storage,
         sql: hSql,
         transactionSync: <T>(fn: () => T) => fn(),
         getAlarm: async () => null,

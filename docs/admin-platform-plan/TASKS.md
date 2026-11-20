@@ -1,6 +1,6 @@
 # 实现任务清单
 
-状态：实施中；M0 的 CP-01～CP-06、MK-01 与 QF-03 已 `completed`，QF-01、QF-02 为 `in_progress`，其余27项为 `not_started`。验收对照见 [M0 验收](../validation/admin-platform/m0-acceptance.md)，详细过程见 [PROGRESS.md](PROGRESS.md)。
+状态：实施中；M0 的 CP-01～CP-06、MK-01、QF-03、QF-04 与 CF-01、CF-02、CF-03、CF-04、CF-05、CF-06、CF-07 已 `completed`，QF-01、QF-02、QF-05 为 `in_progress`，其余18项为 `not_started`。验收对照见 [M0 验收](../validation/admin-platform/m0-acceptance.md)，详细过程见 [PROGRESS.md](PROGRESS.md)。
 
 S/M/L 为相对复杂度：S 局部变更，M 单模块或常规跨层，L 跨权威状态/执行链/故障恢复。不能直接相加推算工期；先完成 M0 技术验证，再依据团队投入排期。负责项表示建议职能和代码责任范围，实际负责人待分配。目录为拟议接入目标，不保证已存在。
 

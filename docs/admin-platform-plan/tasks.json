@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "status": "implementing",
-  "updatedAt": "2026-11-17",
+  "updatedAt": "2026-11-18",
   "scope": "internal_showback_and_capacity_allocation",
   "regionMode": "provider_neutral_plan_only",
   "tasks": [
@@ -184,7 +184,7 @@
       "title": "租户额度与预算策略版本",
       "owner": "后端",
       "size": "M",
-      "status": "in_progress",
+      "status": "completed",
       "dependsOn": [
         "CP-03",
         "CP-04"
@@ -207,7 +207,7 @@
           "docs/validation/admin-platform/quota-acceptance.md"
         ],
         "verification": "严格检查47项、三进程原生权限/CAS/分页/重启、mock浏览器和UI生产构建通过；真实双Gateway CRUD/重放/CAS/分页及浏览器编辑通过；安全重启保留118条任务，4/4监控目标在线",
-        "remaining": "执行准入快照、费率快照与元数据激活接入仍待QF-02/QF-08；策略独立备份恢复尚待扩展；尚未启用执行配额"
+        "boundary": "原验收已通过：真实 Docker 执行跨策略降额和费率切换保持原快照，新增被拒；真实重启、单权威离线恢复通过。试点部署和启动恢复分别由 QF-08、QF-02 跟踪。"
       }
     },
     {
@@ -216,7 +216,7 @@
       "title": "统一准入预留与补偿协议",
       "owner": "调度/后端",
       "size": "L",
-      "status": "in_progress",
+      "status": "completed",
       "dependsOn": [
         "QF-01"
       ],
@@ -261,8 +261,8 @@
           "src/runtime/body_observation_binding.ts",
           "docs/validation/admin-platform/body-agent-binding-acceptance.md"
         ],
-        "verification": "严格检查91项、4项旧执行回归通过；隔离真实celld Scheduler/Body+Daemon+Docker Engine事实验签推进RUNNING/SETTLING、资源释放/预算保留及双端恢复通过；真实镜像部署与双Body鉴权/UNKNOWN、浏览器、118条任务规格和4/4监控通过；2026-11-17严格97项、300模块构建及隔离真实celld/Daemon/Engine观察relay、丢回执和重启重放通过；本批未重新部署开发集群，旧扩展名导入阻塞全仓库lint；同日下一批严格102项、301模块构建、实际生产BodyAgent长ID自动绑定/agent工具执行/事实自动投递确认通过；两批代码开发部署完成，118条原任务规格保留，3入口历史恢复、浏览器和4/4监控通过",
-        "remaining": "有可信成本上限的自动预留创建、真实容量授权/执行前租户硬门禁、队列额度、费率/用量producer/账本与结算、独立归档及全过程执行故障验收；已有预留自动绑定、agent观察和Host自动证据投递已部署，仍为SHADOW/NOT_CONNECTED"
+        "verification": "SQLite 各阶段重开；隔离原生授权应答丢失、RUNNING 硬停恢复、真实 Body 过期和撤销拒绝、UNCERTAIN 保留、费用结算重放及 Host/Body Cell 独立恢复均已验收。启动门禁已发布至共享开发 Fleet observe。",
+        "remaining": []
       }
     },
     {
@@ -315,7 +315,7 @@
       "title": "不可变账本与版本费率",
       "owner": "后端/FinOps",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "QF-03",
         "CP-04"
@@ -327,7 +327,29 @@
         "整数 credit 与费率有显式舍入；原始事件可重算，溢出受到拒绝。",
         "价格未知与用量缺失保持 pending；模型示例值及历史缺失不能自动补账。",
         "费率模板由目录唯一写入，租户快照显式激活；汇总部分不可达必须标注不完整。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "src/finops/rate_cards.ts",
+          "src/finops/tenant_rate_store.ts",
+          "src/finops/usage_cost_ledger.ts",
+          "tests/control/usage_cost_ledger.test.ts",
+          "docs/validation/admin-platform/rate-ledger-foundation.md",
+          "src/control/admin_finops_api.ts",
+          "src/finops/finops_page.ts",
+          "tests/control/finops_service.test.ts",
+          "scripts/verify_finops_deployment.mjs",
+          "docs/validation/admin-platform/rate-ledger-service-acceptance.md",
+          "src/finops/authority_archive.ts",
+          "scripts/restore_finops_archive.mjs",
+          "scripts/verify_finops_backup_deployment.mjs",
+          "ui/console/components/management-audit.tsx",
+          "docs/validation/admin-platform/rate-ledger-recovery-acceptance.md"
+        ],
+        "verification": "严格159项、323模块构建、Console类型检查通过。统一模板/租户激活审计、备份CAS/幂等/事务回滚、HMAC篡改/错误scope/非空目标/SQL白名单/数据一致性验证通过；原生celld/Daemon/Engine定价容器及目录/租户宿主机独立CLI恢复、真实Fleet重启通过。开发已部署并两次安全重启保留119条任务规格，三份实际快照下载并恢复到新离线SQLite，原用量/空价格/账目/UNCERTAIN/outbox精确保持，双Gateway/浏览器/4目标监控及原链回归通过。未创建开发费率或新任务，未调用付费模型",
+        "boundaries": "原条款验收完成。QF-02/QF-08继续承担可信成本上限、准入自动预留及容量/硬额度门禁；旧无价格预留保持pending。QF-05承担关账与晚到调整，QF-06/07承担导出与费用界面。备份是单权威离线恢复，不是全系统同时快照或在线恢复，operationalResume=DISABLED。"
+      },
+      "completedAt": "2026-11-18"
     },
     {
       "id": "QF-05",
@@ -335,7 +357,7 @@
       "title": "结算、跨期、关账与调整",
       "owner": "后端/FinOps",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "QF-04"
       ],
@@ -346,7 +368,37 @@
       "acceptance": [
         "跨零点预留保留、事件按 UTC 分段、取消和失败用量不丢。",
         "缺事件不能最终关账；重复关闭幂等，晚到事件以关联调整记录处理。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "src/finops/period_settlement.ts",
+          "tests/control/period_settlement.test.ts",
+          "src/runtime/body_usage_journal.ts",
+          "tests/control/usage_producer.test.ts",
+          "docs/validation/admin-platform/period-settlement-foundation.md",
+          "src/finops/authority_archive.ts",
+          "tests/control/finops_service.test.ts",
+          "docs/validation/admin-platform/period-backup-v2-acceptance.md",
+          "scripts/period_native_fixture.ts",
+          "scripts/verify_body_evidence_native.py",
+          "scripts/body_evidence_native_probe.ts",
+          "docs/validation/admin-platform/period-backup-v2-deployment.md",
+          "src/control/execution_inventory.ts",
+          "src/control/execution_inventory_ingress.ts",
+          "src/finops/execution_coverage.ts",
+          "tests/control/execution_inventory.test.ts",
+          "scripts/verify_execution_inventory_deployment.mjs",
+          "src/control/admin_finops_api.ts",
+          "src/cloudflare/tenant_control_cell.ts",
+          "docs/validation/admin-platform/period-preview-native-acceptance.md",
+          "docs/validation/admin-platform/reservation-cost-preview-acceptance.md",
+          "docs/validation/admin-platform/period-close-native-acceptance.md",
+          "docs/admin-platform-plan/REMAINING.md"
+        ],
+        "verification": "严格186项、325模块构建通过。原生SQLite隔离月结/冻结校验输入/CAS/幂等/缺失拒绝/晚到舍入差额/冲突attention/关闭重开一致，真实准入跨UTC预留占用仍保留。复现并修复provider跨UTC日界后的USAGE_CLOCK_REGRESSION；实际celld/Daemon/Engine/本地HTTP与独立恢复回归通过。源端修复已安全部署保留119条任务规格，原用量/空价格/账目/备份/UNCERTAIN/outbox/容量/4目标监控通过。关账内核尚未连接生产服务；没有创建线上关账单或付费模型调用；后续备份v2隔离恢复关账单/幂等回执/晚到调整通过，严格187项及325模块构建通过，升级CLI成功恢复三份实际历史v1文件；新格式未部署；v2真实celld隔离关账/调整归档、v1旧文件恢复及Fleet重启通过；兼容升级已部署并两次安全重启保留119条规格，三份新实际v1快照独立恢复/双Gateway保持一致，原链与4/4监控通过。生产无period数据，模拟覆盖仅测试入口；可信Scheduler/Body事务执行历史和私有覆盖诊断已实现，195项严格测试及329模块构建通过，真实celld重启和开发三入口/Body代理一致；旧历史不足保持不完整。只读预览通过隔离 celld 验收，覆盖 Gateway 授权、可信多页 Scheduler/Body、水位变化、稳定版本、扫描上限与关账/预留/预算只读核对。 用户指示按2026-10月基线增加10%完成规划估算：m3-pilot月度额度估算341 credit-subunit。此估算用于规划，不构成10月实际费用或历史月结凭证。",
+        "remaining": "历史月份连续权威执行清单及执行时签名用量、费率仍待核验，作为历史账务后续核算事项保留；不改变用户要求的QF-05规划结项。"
+      },
+      "completedAt": "2026-11-20"
     },
     {
       "id": "QF-06",
@@ -354,7 +406,7 @@
       "title": "成本中心汇总与安全导出",
       "owner": "后端",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "QF-05",
         "CP-03"
@@ -366,7 +418,12 @@
       "acceptance": [
         "汇总包含价格/归属版本、单位、水位和待核算标记。",
         "游标读取完整授权数据，异步导出再验权，CSV 公式注入防护通过。"
-      ]
+      ],
+      "evidence": {
+        "verification": "控制面 234/234；跨页水位、CSV 防护、隔离 celld 自动生成和重启后授权下载已验证。 QF-05 已按用户确定的 10 月基线加 10% 规划估算结项；历史实际账务持续标记待核算。",
+        "remaining": []
+      },
+      "completedAt": "2026-11-20"
     },
     {
       "id": "QF-07",
@@ -374,7 +431,7 @@
       "title": "租户额度与成本分摊界面",
       "owner": "前端",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CP-05",
         "QF-01",
@@ -387,7 +444,12 @@
       "acceptance": [
         "实现租户详情与 finops 汇总，额度/预留/用量/成本分别展示。",
         "编辑影响预览、CAS 冲突、pending、费用钻取与导出全流程可用。"
-      ]
+      ],
+      "evidence": {
+        "verification": "额度、占用、用量、待核算费用、汇总分组以及 CSV 已接线；三角色 Chromium 与类型检查通过。 浏览器空费用与用量服务 503 的独立状态显示复验通过。",
+        "remaining": []
+      },
+      "completedAt": "2026-11-20"
     },
     {
       "id": "QF-08",
@@ -395,7 +457,7 @@
       "title": "影子计量与试点强制配额",
       "owner": "调度/运维",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "QF-02",
         "QF-05",
@@ -408,7 +470,13 @@
       "acceptance": [
         "observe/shadow/enforce 有明确开关及试点租户；旧占用导入或隔离有证据。",
         "双网关争抢、一槽竞争、控制面断联均不绕过硬额度；停止试点不清账。"
-      ]
+      ],
+      "evidence": {
+        "validation": "../validation/admin-platform/m3-capacity-allocation-acceptance.md",
+        "verification": "共享 Fleet 已验证 enforce 单槽争抢和回切 observe 保账；隔离独立 Gateway 已验证旧占用及控制面断联拒绝准入，并通过新增队列单名额并发验证。",
+        "remaining": [],
+        "scopeNote": "按用户决定，M3 验收暂视 QF-05 历史关账前置已满足；QF-05 仍保持进行中。真实断联拒绝证据来自隔离环境。"
+      }
     },
     {
       "id": "CF-01",
@@ -416,7 +484,7 @@
       "title": "配置 schema 与不可变版本",
       "owner": "后端",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CP-04"
       ],
@@ -427,7 +495,17 @@
       "acceptance": [
         "白名单字段校验，secretRef 不返回密钥；禁止任意 JSON 修改身份和基础设施。",
         "每 scope 内容摘要、baseRevision、schemaVersion 和 CAS 可恢复。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "src/config_release/config_versions.ts",
+          "tests/control/config_versions.test.ts",
+          "src/cloudflare/config_release_cell.ts",
+          "deploy/celld/wrangler.celld.json",
+          "scripts/verify_directory_gateways.py"
+        ],
+        "verification": "控制面 204 项、类型检查、lint 和 337 模块构建通过。隔离原生 celld 验证服务身份、角色、字段和密钥引用白名单、分作用域摘要、并发 CAS 与重启恢复。"
+      }
     },
     {
       "id": "CF-02",
@@ -435,7 +513,7 @@
       "title": "差异与影响范围预检",
       "owner": "后端",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CF-01",
         "CP-06"
@@ -446,7 +524,16 @@
       "acceptance": [
         "结构化差异列出影响目标、新任务/热更新生效范围及风险。",
         "缺少真实观测、未知字段和不支持的重启动作明确阻止发布。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "src/config_release/config_preflight.ts",
+          "tests/control/config_preflight.test.ts",
+          "src/cloudflare/config_preflight_api.ts",
+          "scripts/verify_directory_gateways.py"
+        ],
+        "verification": "控制面 206 项、类型检查、lint、340 模块构建通过。双 Gateway 隔离 celld 验证读取不可变版本、探测真实 Fleet、目标与影响分类、拒绝伪造观测及阻断缺失观测与重启。"
+      }
     },
     {
       "id": "CF-03",
@@ -454,7 +541,7 @@
       "title": "配置专用双人审批",
       "owner": "后端",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CF-02",
         "CP-03"
@@ -466,7 +553,17 @@
       "acceptance": [
         "验证不同数字身份；自己审批、伪造 approvedBy 均失败。",
         "内容或目标变化重新审批；仅一名管理员时明确阻塞。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "src/config_release/config_approvals.ts",
+          "tests/control/config_approvals.test.ts",
+          "src/cloudflare/config_release_cell.ts",
+          "src/cloudflare/config_preflight_api.ts",
+          "scripts/verify_directory_gateways.py"
+        ],
+        "verification": "控制面 207 项、类型检查、lint、构建通过。隔离双 Gateway 与原生 Fleet 验证两位 GitHub 数字身份、自审与伪造字段拒绝、目标与版本变化重新审批、重启重放。SQLite 测试验证仅有一位管理员时明确阻断。"
+      }
     },
     {
       "id": "CF-04",
@@ -474,7 +571,7 @@
       "title": "目标应用适配器与实际 ACK",
       "owner": "运行时/后端",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CF-01",
         "CP-02"
@@ -487,7 +584,16 @@
       "acceptance": [
         "目标执行 dry-run/apply/readback，返回实际摘要与代际，拒绝过期发布。",
         "目标重启与重复命令幂等；200 或 desiredVersion 不能冒充生效。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "src/config_release/config_target_application.ts",
+          "tests/control/config_target_application.test.ts",
+          "src/cloudflare/scheduler_config_target.ts",
+          "scripts/verify_directory_gateways.py"
+        ],
+        "verification": "控制面 208 项、类型检查、lint 和构建通过。隔离原生 Scheduler 通过 dry-run、默认任务超时、阈值热更新、实际读回、代际隔离及重启重放验收。全量失败清单与 P0 一致。"
+      }
     },
     {
       "id": "CF-05",
@@ -495,7 +601,7 @@
       "title": "灰度协调器、暂停及恢复",
       "owner": "后端",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CF-03",
         "CF-04",
@@ -508,7 +614,18 @@
       "acceptance": [
         "冻结目标与健康窗口，单 scope 单活动发布，逐批取得 ACK 后验证。",
         "部分失败/缺指标进入暂停；协调器重启继续既有操作，旧 ACK 不覆盖新版本。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "src/config_release/config_rollout.ts",
+          "tests/control/config_rollout.test.ts",
+          "src/cloudflare/config_release_cell.ts",
+          "src/cloudflare/config_rollout_targets.ts",
+          "src/cloudflare/config_preflight_api.ts",
+          "scripts/verify_directory_gateways.py"
+        ],
+        "verification": "控制面 209 项、类型检查、lint 和构建通过。SQLite 验证单活动发布和旧代际拒绝；原生双目标 Gateway 发布验证自动推进、重启恢复、健康失败暂停和恢复后完成。"
+      }
     },
     {
       "id": "CF-06",
@@ -516,7 +633,7 @@
       "title": "前进版本回退与审计证据",
       "owner": "后端",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CF-05"
       ],
@@ -526,7 +643,17 @@
       "acceptance": [
         "回退创建新版本和审批，不修改旧发布证据或回滚数据库。",
         "目标失联时显示未恢复项，不能将部分回退标成全部成功。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "src/config_release/config_rollout.ts",
+          "src/cloudflare/config_release_cell.ts",
+          "src/cloudflare/config_preflight_api.ts",
+          "scripts/verify_directory_gateways.py",
+          "tests/control/config_target_application.test.ts"
+        ],
+        "verification": "原生双目标验证前进版本、重新审批、失联目标待恢复、恢复后读回和旧证据保持；控制面 209 项、类型检查、lint、构建通过。"
+      }
     },
     {
       "id": "CF-07",
@@ -534,7 +661,7 @@
       "title": "配置发布与审批界面",
       "owner": "前端",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CP-05",
         "CF-06"
@@ -546,7 +673,16 @@
       "acceptance": [
         "差异、预检、独立审批、每目标进度、暂停与回退流程闭环。",
         "覆盖同人拒绝、409 输入保留、离线目标和部分成功；保持 hrui 样式。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "ui/console/components/config-releases.tsx",
+          "ui/console/components/admin-workspace.tsx",
+          "src/cloudflare/config_preflight_api.ts",
+          "scripts/verify_directory_gateways.py"
+        ],
+        "verification": "Playwright 验证预检差异、409 保留、两位管理员、部分恢复状态、暂停恢复和回退草稿；原生 Gateway/Fleet 接口、控制面 209 项、类型检查、lint 与 Console 构建通过。"
+      }
     },
     {
       "id": "MK-01",
@@ -592,7 +728,7 @@
       "title": "容量申请与公平队列",
       "owner": "调度",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "MK-01",
         "QF-01"
@@ -603,7 +739,16 @@
       "acceptance": [
         "即时借用受租户额度、池容量和优先级策略约束；未支持未来预订。",
         "固定多资源负载验证权重与防饥饿轨迹；租户看不到他人任务内容。"
-      ]
+      ],
+      "evidence": {
+        "files": [
+          "tests/control/capacity_queue.test.ts",
+          "scripts/verify_capacity_inventory_native.py",
+          "docs/validation/admin-platform/m3-capacity-allocation-acceptance.md"
+        ],
+        "verification": "225 项控制面检查通过；原生 celld 验证租户额度、版本化优先级、多宿主机资源错配、双 Gateway 幂等及租户隔离。",
+        "boundary": "原验收和直接依赖已通过。容量绑定与到期回收由 MK-03/MK-04 跟踪。"
+      }
     },
     {
       "id": "MK-03",
@@ -611,7 +756,7 @@
       "title": "容量授权与准入绑定",
       "owner": "调度/后端",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "MK-02",
         "QF-02",
@@ -624,7 +769,12 @@
       "acceptance": [
         "grant 与 reservation/attempt 单一绑定，跨对象失败可恢复且无重复扣减。",
         "借用不能提高硬配额，授权不生成第二份费用，旧 epoch 不能重复消费。"
-      ]
+      ],
+      "evidence": {
+        "validation": "../validation/admin-platform/m3-capacity-allocation-acceptance.md",
+        "verification": "双 Gateway 单槽竞争、硬停后授权重放及共享试点按可信用量结算（预估 5，实际 3）已有证据。",
+        "remaining": []
+      }
     },
     {
       "id": "MK-04",
@@ -632,7 +782,7 @@
       "title": "到期、取消与不确定占用回收",
       "owner": "运行时/调度",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "MK-03",
         "QF-03"
@@ -644,7 +794,12 @@
       "acceptance": [
         "仅未消费授权可到期回收；RUNNING/UNCERTAIN 必须有退出证据。",
         "取消请求、主机断联和 outbox 重放不造成超卖或丢失占用。"
-      ]
+      ],
+      "evidence": {
+        "validation": "../validation/admin-platform/m3-capacity-allocation-acceptance.md",
+        "verification": "无人重试时，Scheduler 503 保留授权；恢复后凭未接收证明自动取消并释放。已接收标记经清理及重启保留。",
+        "remaining": []
+      }
     },
     {
       "id": "MK-05",
@@ -652,7 +807,7 @@
       "title": "内部算力分配界面",
       "owner": "前端",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CP-05",
         "MK-04"
@@ -664,7 +819,12 @@
       "acceptance": [
         "展示真实池容量、保障/借用、需求排队原因、到期与隔离。",
         "OPERATOR 申请/取消及 SRE 管池权限正确，无支付或外部交易 UI。"
-      ]
+      ],
+      "evidence": {
+        "validation": "../validation/admin-platform/m3-capacity-allocation-acceptance.md",
+        "verification": "隔离真实 Gateway 和 Chromium 验证三角色；OPERATOR 申请和取消，SRE 暂停和恢复，非管理员写池和暂停返回 403。",
+        "remaining": []
+      }
     },
     {
       "id": "MK-06",
@@ -672,7 +832,7 @@
       "title": "容量池负载与恢复演练",
       "owner": "测试/运维",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "MK-04",
         "MK-05",
@@ -685,7 +845,12 @@
       "acceptance": [
         "多租户 CPU/内存错配、单机多 Daemon、重复授权与断联轨迹通过。",
         "市场暂停后在途执行与成本结算继续，恢复不重发已消费授权。"
-      ]
+      ],
+      "evidence": {
+        "validation": "../validation/admin-platform/m3-capacity-allocation-acceptance.md",
+        "verification": "原生演练验证跨租户 CPU/内存错配、宿主机去重、失联保留占用；独立原生演练验证暂停期间已授权任务继续结算，恢复后已释放授权保持终态。",
+        "remaining": []
+      }
     },
     {
       "id": "RG-01",
@@ -693,7 +858,7 @@
       "title": "地域、故障域与可信目录",
       "owner": "后端",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CP-02",
         "CP-04"
@@ -705,7 +870,11 @@
       "acceptance": [
         "持久目录包含司法辖区、能力、身份引用和证据有效期。",
         "未知/未配置状态真实，单开发机多 Cell 不标记成多地域。"
-      ]
+      ],
+      "evidence": {
+        "verification": "Gateway 会话鉴权、SQLite 重开和版本冲突已验证；开发与证据过期状态分开。",
+        "remaining": []
+      }
     },
     {
       "id": "RG-02",
@@ -713,7 +882,7 @@
       "title": "驻留策略与放置模拟",
       "owner": "后端/调度",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "RG-01",
         "QF-01"
@@ -725,7 +894,11 @@
       "acceptance": [
         "驻留/模型/数据类型先过滤，健康与 RTT 后排序，输出逐项排除原因。",
         "模拟不调用 Engine、不扣额度；未知/过期驻留信息拒绝受约束任务。"
-      ]
+      ],
+      "evidence": {
+        "verification": "Gateway 到 SQLite 验证先筛驻留及证据、后按 RTT 排序；模拟前后目录一致，路径不调用 Engine 或额度。",
+        "remaining": []
+      }
     },
     {
       "id": "RG-03",
@@ -733,7 +906,7 @@
       "title": "适配器契约与安全探测",
       "owner": "后端/安全",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "RG-01",
         "CP-06"
@@ -745,7 +918,11 @@
       "acceptance": [
         "模拟适配器覆盖能力/身份/探测/提交/排空契约，任意 URL 与 SSRF 被阻止。",
         "服务身份可轮换；开发 loopback 例外不会进入生产配置。"
-      ]
+      ],
+      "evidence": {
+        "verification": "模拟契约、身份轮换、固定探测地址和生产拒绝 loopback 已验证；Gateway 与 SQLite 目录联跑覆盖管理员权限、未配置适配器及登记绑定的成功和失败。230 项控制面检查通过。",
+        "remaining": []
+      }
     },
     {
       "id": "RG-04",
@@ -753,7 +930,7 @@
       "title": "新任务放置与排空接入开关",
       "owner": "调度",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "RG-02",
         "RG-03",
@@ -766,7 +943,11 @@
       "acceptance": [
         "先通过模拟端到端与 feature gate；真实适配器未验收时不能启用。",
         "排空仅停止新放置，不迁移或重跑 RUNNING/UNCERTAIN 任务。"
-      ]
+      ],
+      "evidence": {
+        "verification": "Gateway 与 Scheduler 均拒绝真实地域放置。管理员模拟入口默认拒绝，生产无法开启；开发显式启用后，排空只影响新放置，旧绑定可重放，两地排空后无新放置。230 项控制面检查通过。",
+        "remaining": []
+      }
     },
     {
       "id": "RG-05",
@@ -774,7 +955,7 @@
       "title": "地域治理与证据页面",
       "owner": "前端",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "CP-05",
         "RG-02",
@@ -787,7 +968,11 @@
       "acceptance": [
         "目录空态、策略差异、放置原因和证据时效可读。",
         "RPO/RTO 目标与实测分开，未知供应商/灾备状态不显示为就绪。"
-      ]
+      ],
+      "evidence": {
+        "verification": "控制台类型检查通过；Chromium 390px 夹具验证空态、策略对比、证据时效、RPO/RTO 目标与实测、未验收状态及无横向溢出。Gateway 功能由控制面集成用例覆盖。",
+        "remaining": []
+      }
     },
     {
       "id": "RG-06",
@@ -795,7 +980,7 @@
       "title": "真实地域接入与灾备演练门禁",
       "owner": "架构/运维",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "RG-04",
         "RG-05"
@@ -808,7 +993,11 @@
         "交付供应商参数清单、身份/存储/复制/网络核验步骤和恢复演练模板。",
         "真实接入另建部署任务：设施与 RPO/RTO 目标未确定时保持未验收，不宣称跨域容灾。"
       ],
-      "externalGate": "具体供应商、地域、远端凭证、复制设施与业务恢复目标待用户确定；仅阻塞真实环境接入。"
+      "externalGate": "具体供应商、地域、远端凭证、复制设施与业务恢复目标待用户确定；仅阻塞真实环境接入。",
+      "evidence": {
+        "verification": "REGION-DEPLOYMENT-GATE.md 交付参数、核验步骤与演练模板；真实部署另立 REGION-LIVE-DEPLOYMENT.md，保持待配置、未验收。",
+        "remaining": []
+      }
     },
     {
       "id": "VA-01",
@@ -816,7 +1005,7 @@
       "title": "跨模块契约与故障注入回归",
       "owner": "测试/后端",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "QF-08",
         "CF-06",
@@ -829,7 +1018,12 @@
       "acceptance": [
         "覆盖双 Gateway、跨对象每阶段崩溃、零点、晚到事件、旧 ACK 和重复 outbox。",
         "所有负例对照 PRODUCT/TECH，保存账本重算与无超发证据。"
-      ]
+      ],
+      "evidence": {
+        "validation": "../validation/admin-platform/va01-cross-module.md",
+        "verification": "双 Gateway 单槽竞争、预留/绑定/启动授权/Scheduler 接收阶段丢应答、在途硬停恢复、UTC 零点、晚到事件、旧 ACK、重复 outbox、独立账本重算及额度边界均有隔离回归证据。最近控制面 233/233，统一 Gateway 5/5。",
+        "remaining": []
+      }
     },
     {
       "id": "VA-02",
@@ -837,7 +1031,7 @@
       "title": "后台浏览器与可访问性验收",
       "owner": "前端/测试",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "QF-07",
         "CF-07",
@@ -851,7 +1045,12 @@
       "acceptance": [
         "三角色、跨租户、冲突保留、审批分离、空态与部分失败回归。",
         "桌面/窄屏截图和键盘流程通过，旧登录/Profile/任务/拓扑回归通过。"
-      ]
+      ],
+      "evidence": {
+        "verification": "三角色、桌面与窄屏、键盘、配额冲突保留、审批分离和旧控制台路径已有浏览器证据。空费用和用量 503 同屏时仍可读预留；API 租户边界另有集成证据。",
+        "remaining": []
+      },
+      "completedAt": "2026-11-20"
     },
     {
       "id": "VA-03",
@@ -859,7 +1058,7 @@
       "title": "隔离 Compose 部署与恢复演练",
       "owner": "运维",
       "size": "L",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "VA-01",
         "VA-02"
@@ -871,7 +1070,12 @@
       "acceptance": [
         "独立项目、端口、卷与测试租户；新 control cell 绑定、迁移、健康检查完整。",
         "重启/升级/恢复验证账本、预留、授权与审计；现有开发任务和数据不被重置。"
-      ]
+      ],
+      "evidence": {
+        "verification": "隔离 Compose 健康检查、新控制对象绑定升级与恢复通过。三节点 Fleet 逐节点停机及租户对象所有者 SIGKILL 后，已计价账本、预留、授权、审计与归档读回一致。 三节点真实容器已计价账本、逐节点停机恢复、控制对象所有者 SIGKILL 后更高 epoch 恢复均通过；详见 va01-cross-module.md。",
+        "remaining": []
+      },
+      "completedAt": "2026-11-20"
     },
     {
       "id": "VA-04",
@@ -879,7 +1083,7 @@
       "title": "试点、交付证据与能力解锁",
       "owner": "产品/运维",
       "size": "M",
-      "status": "not_started",
+      "status": "completed",
       "dependsOn": [
         "VA-03",
         "QF-06",
@@ -892,7 +1096,12 @@
       "acceptance": [
         "按模块记录 API/持久化/执行链/浏览器四层证据，未过项继续标未接入。",
         "确认成本中心/费率维护人、试点额度、审批备份人、留存策略；真实地域验收单独保持待配置。"
-      ]
+      ],
+      "evidence": {
+        "verification": "va04-delivery.md 按模块记录 API、持久化、执行链及浏览器证据，并纳入三节点异常退出恢复。RG-06 门禁交付已完成，独立真实地域接入继续待配置。 维护/费率职责及备用审批职责确认为项目方本人账号；额度按用户授权估算，留存期一个月已确认。估算与正式部署输入见 va04-delivery.md。",
+        "remaining": []
+      },
+      "completedAt": "2026-11-20"
     }
   ]
 }

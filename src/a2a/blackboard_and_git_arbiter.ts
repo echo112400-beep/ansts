@@ -1,4 +1,124 @@
 import * as crypto from "node:crypto";
+import { FenceToken } from "../models.js";
+import { StaleFenceError } from "../lease_coordinator.js";
+
+export interface A2aBlackboardArtifact {
+  artifactId: string;
+  dagId: string;
+  producerTaskId: string;
+  topic: string;
+  fence: FenceToken;
+  schemaType: "CODE_PATCH" | "TEST_REPORT" | "AST_INTERFACE_CONTRACT" | "CONFLICT_RESOLUTION";
+  payload: Record<string, unknown>;
+  publishedAtMs: number;
+}
+
+export class A2aBlackboardBus {
+  private readonly artifactsByDag = new Map<string, A2aBlackboardArtifact[]>();
+  private readonly latestFencesByDag = new Map<string, Map<string, FenceToken>>();
+
+  private copy(artifact: A2aBlackboardArtifact): A2aBlackboardArtifact {
+    return { ...artifact, fence: new FenceToken(artifact.fence.epoch, artifact.fence.turnSeq, artifact.fence.taskId), payload: structuredClone(artifact.payload) };
+  }
+
+  public publishArtifact(artifact: A2aBlackboardArtifact): A2aBlackboardArtifact {
+    if (artifact.fence.taskId !== artifact.producerTaskId) throw new Error("A2A_ARTIFACT_IDENTITY_MISMATCH");
+    const producers = this.latestFencesByDag.get(artifact.dagId) ?? new Map<string, FenceToken>();
+    const last = producers.get(artifact.producerTaskId);
+    if (last && (artifact.fence.epoch < last.epoch || (artifact.fence.epoch === last.epoch && artifact.fence.turnSeq <= last.turnSeq))) {
+      throw new StaleFenceError(artifact.producerTaskId, artifact.fence, last);
+    }
+    const artifacts = this.artifactsByDag.get(artifact.dagId) ?? [];
+    if (artifacts.length >= 10_000 || (!this.artifactsByDag.has(artifact.dagId) && this.artifactsByDag.size >= 1_000)) {
+      throw new Error("A2A_ARTIFACT_CAPACITY");
+    }
+    const entry = this.copy(artifact);
+    artifacts.push(entry);
+    producers.set(entry.producerTaskId, entry.fence);
+    this.artifactsByDag.set(entry.dagId, artifacts);
+    this.latestFencesByDag.set(entry.dagId, producers);
+    return this.copy(entry);
+  }
+
+  public queryArtifacts(dagId: string, topic?: string): A2aBlackboardArtifact[] {
+    return (this.artifactsByDag.get(dagId) ?? []).filter(entry => topic === undefined || entry.topic === topic).map(entry => this.copy(entry));
+  }
+}
+
+export interface GitBranchPatchSubmission {
+  branchId: string;
+  agentTaskId: string;
+  baseCheckpointId: string;
+  modifiedFiles: Record<string, { touchedSymbols: string[]; diffPatch: string }>;
+}
+
+export class GitConflictArbiterCell {
+  public arbitrateParallelBranchPatches(submissions: GitBranchPatchSubmission[]) {
+    if (new Set(submissions.map(patch => patch.baseCheckpointId)).size > 1) throw new Error("GIT_PATCH_BASE_MISMATCH");
+    const patches = new Map<string, { symbols: Set<string>; text: string }>();
+    const autoResolved = new Set<string>();
+    const conflicts = new Set<string>();
+    for (const patch of submissions) {
+      for (const [filePath, change] of Object.entries(patch.modifiedFiles)) {
+        const seen = patches.get(filePath);
+        if (!seen) {
+          patches.set(filePath, { symbols: new Set(change.touchedSymbols), text: change.diffPatch });
+          continue;
+        }
+        const overlap = change.touchedSymbols.filter(symbol => seen.symbols.has(symbol));
+        for (const symbol of overlap) conflicts.add(`${filePath}::${symbol}`);
+        if (!overlap.length) {
+          seen.text += "\n" + change.diffPatch;
+          autoResolved.add(filePath);
+        }
+        for (const symbol of change.touchedSymbols) seen.symbols.add(symbol);
+      }
+    }
+    return {
+      mergedCleanly: conflicts.size === 0,
+      autoResolvedSymbolConflicts: [...autoResolved],
+      unresolvedFileConflicts: [...conflicts],
+      mergedFileMap: Object.fromEntries([...patches].map(([path, patch]) => [path, patch.text])),
+    };
+  }
+}
+
+export class WorkStealingQuotaBroker {
+  private revision = 1;
+
+  public rebalanceTenantQuotaAcrossShards(params: {
+    tenantId: string;
+    globalMaxSlots: number;
+    shardAllocations: Record<string, number>;
+    shardActiveUsage: Record<string, number>;
+    requestingHotShardId: string;
+    requestedExtraSlots: number;
+  }) {
+    const allocations = new Map(Object.entries(params.shardAllocations));
+    const valid = (value: number) => Number.isSafeInteger(value) && value >= 0;
+    if (!params.tenantId || !allocations.has(params.requestingHotShardId) ||
+      !valid(params.globalMaxSlots) || !valid(params.requestedExtraSlots)) throw new Error("INVALID_QUOTA_REBALANCE");
+    let total = 0;
+    for (const [shardId, allocation] of allocations) {
+      const used = params.shardActiveUsage[shardId];
+      if (!valid(allocation) || !Object.hasOwn(params.shardActiveUsage, shardId) || !valid(used) || used > allocation) {
+        throw new Error("INVALID_SHARD_QUOTA_SNAPSHOT");
+      }
+      total += allocation;
+    }
+    if (!valid(total) || total > params.globalMaxSlots) throw new Error("GLOBAL_QUOTA_EXCEEDED");
+    let grantedSlots = 0;
+    for (const [shardId, allocation] of allocations) {
+      if (shardId === params.requestingHotShardId) continue;
+      const transfer = Math.min(allocation - params.shardActiveUsage[shardId], params.requestedExtraSlots - grantedSlots);
+      allocations.set(shardId, allocation - transfer);
+      grantedSlots += transfer;
+      if (grantedSlots === params.requestedExtraSlots) break;
+    }
+    allocations.set(params.requestingHotShardId, allocations.get(params.requestingHotShardId)! + grantedSlots);
+    return { grantedSlots, updatedAllocations: Object.fromEntries(allocations), reconciliationVersion: ++this.revision };
+  }
+}
 /**
  * @fileoverview M23, M54-4 & M61-1: A2A Shared Blackboard CRDT/CAS Store & Multi-Agent Git Merge Arbiter
  * with Conflict-Aging Priority Boost, Idempotent CAS Retry, Duplicate Agent Patch Coalescing & SQLite Persistence.

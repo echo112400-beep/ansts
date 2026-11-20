@@ -16,6 +16,7 @@ export interface DurableObjectStubLike {
 
 export interface DurableObjectNamespaceLike {
   idFromName(name: string): DurableObjectIdLike;
+  idFromString?(id: string): DurableObjectIdLike;
   get(id: DurableObjectIdLike): DurableObjectStubLike;
 }
 
@@ -30,6 +31,7 @@ export interface SqlStorageLike {
 
 export interface DurableObjectStorageLike {
   sql: SqlStorageLike;
+  transactionSync?<T>(callback: () => T): T;
   get<T = unknown>(key: string): Promise<T | undefined>;
   put<T = unknown>(key: string, value: T): Promise<void>;
   delete(key: string): Promise<boolean>;
@@ -121,12 +123,24 @@ export interface DynamicWorkerLoaderBindingLike {
 }
 
 export interface CloudflareCelldEnv {
+  ANSTS_CONFIG_RELEASE_CELL?: DurableObjectNamespaceLike;
+  ANSTS_CONFIG_SERVICE_TOKEN?: string;
+  ANSTS_CONFIG_TARGET_TOKEN?: string;
+  ANSTS_CONFIG_TARGET_ORIGINS_JSON?: string;
+  ANSTS_CONFIG_SECRET_REFS?: string;
+  ANSTS_CONFIG_SCOPE_TARGETS_JSON?: string;
+  ANSTS_GITHUB_IDENTITIES_JSON?: string;
+  ANSTS_REGION_CATALOG_CELL?: DurableObjectNamespaceLike;
   ANSTS_CAPACITY_INVENTORY_CELL?: DurableObjectNamespaceLike;
   ANSTS_ADMISSION_MAILBOX?: DurableObjectNamespaceLike;
   ANSTS_TENANT_CONTROL_CELL?: DurableObjectNamespaceLike;
   ANSTS_TENANT_DIRECTORY_CELL?: DurableObjectNamespaceLike;
   ANSTS_DIRECTORY_SERVICE_TOKEN?: string;
   ANSTS_ADMISSION_SERVICE_TOKEN?: string;
+  ANSTS_ADMISSION_MODE?: string;
+  ANSTS_ADMISSION_PILOT_POOL?: string;
+  ANSTS_ADMISSION_SCHEDULER_SHARDS?: string;
+  ANSTS_ADMISSION_PILOT_TENANTS?: string;
   ANSTS_ADMISSION_SIGNING_KEY?: string;
   ANSTS_BODY_WORKER_URL?: string;
   ANSTS_BODY_NAMESPACE_PREFIX?: string;
@@ -348,11 +362,24 @@ export class InMemoryCellSqlStorage implements SqlStorageLike {
         const mWhere = q.match(/WHERE\s+(.+?)(?:\s+ORDER BY|\s+LIMIT|$)/i);
         let whereBindingsConsumed = 0;
         if (mWhere && bindings.length > 0) {
-          const condCols = mWhere[1].split(/\s+AND\s+/i).map((c) => c.split("=")[0].trim());
-          whereBindingsConsumed = condCols.length;
-          rows = rows.filter((r) =>
-            condCols.every((col, idx) => String(r[col]) === String(bindings[idx]))
-          );
+          const conditions = mWhere[1].split(/\s+AND\s+/i).map(clause =>
+            /^([a-zA-Z0-9_]+)\s*(<=|>=|<>|!=|=|<|>)\s*\?$/.exec(clause.trim()));
+          whereBindingsConsumed = conditions.length;
+          rows = rows.filter(row => conditions.every((condition, index) => {
+            if (!condition) return false;
+            const [, column, operator] = condition;
+            const actual = row[column], expected = bindings[index];
+            if (operator === "=") return String(actual) === String(expected);
+            if (actual == null || expected == null) return false;
+            if (operator === "<>" || operator === "!=") return String(actual) !== String(expected);
+            const compare = (typeof actual === "number" && typeof expected === "number")
+              ? actual - expected
+              : String(actual).localeCompare(String(expected));
+            if (operator === "<") return compare < 0;
+            if (operator === "<=") return compare <= 0;
+            if (operator === ">") return compare > 0;
+            return compare >= 0;
+          }));
         }
 
         const mOrder = q.match(/ORDER BY\s+([a-zA-Z0-9_]+)(?:\s+(ASC|DESC))?/i);

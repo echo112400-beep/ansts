@@ -22,7 +22,6 @@ import { SagaToolGateway } from "../src/saga_gateway.js";
 import { SagaCompensatorEngine } from "../src/saga/compensator.js";
 import { CapacitySlaEnforcer } from "../src/cluster/capacity_sla_enforcer.js";
 import { CoreScheduler5D } from "../src/scheduler.js";
-import { LeaseCoordinator } from "../src/lease_coordinator.js";
 import { TurnWalEngine } from "../src/checkpoint/wal_engine.js";
 import { InMemoryCellSqlStorage } from "../src/cloudflare/env.js";
 import { LlmEndpointMetrics, NodeHeartbeat, TaskPriority, TaskSpec, TaskState, ToolCallEffectClass } from "../src/models.js";
@@ -109,7 +108,7 @@ describe("M73 Phase 3 Hierarchical Working-Memory Compactor & Spot Quota Lending
   it("[M73-2 / F8] CapacitySlaEnforcer & CoreScheduler5D clear inter-tenant Spot quota bids and execute sub-second WAL freeze & recall on urgent arrival", () => {
     const sql = new InMemoryCellSqlStorage();
     const sla = new CapacitySlaEnforcer(undefined, sql);
-    const sched = new CoreScheduler5D(new LeaseCoordinator(15));
+    const sched = new CoreScheduler5D(15);
     const wal = new TurnWalEngine();
     const nowSec = Date.now() / 1000;
 
@@ -174,7 +173,7 @@ describe("M73 Phase 3 Hierarchical Working-Memory Compactor & Spot Quota Lending
     const server = new AnstsLocalAndComposeServer({
       apiPort: 0,
       dashboardPort: 0,
-      dataDir: tmpDir,
+      storageDir: tmpDir,
     });
     const { apiPort } = await server.start();
     const baseUrl = `http://127.0.0.1:${apiPort}`;

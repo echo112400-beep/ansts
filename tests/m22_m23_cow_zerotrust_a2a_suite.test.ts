@@ -9,7 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   SandboxBranchForker,
-  ZeroTrustSecurityGuard,
+  ZeroTrustSandboxSecurityGuard,
   A2aBlackboardBus,
   GitConflictArbiterCell,
   WorkStealingQuotaBroker,
@@ -17,7 +17,7 @@ import {
 } from "../src/index";
 
 test("test 71: [TASK-105 & TASK-106] SandboxBranchForker forks parallel CoW sub-agent branches in <80ms, merges winner, and prunes siblings", () => {
-  const forker = new SandboxBranchForker("/tmp/ansts_m22_cow_test");
+  const forker = new SandboxBranchForker();
   const chk = forker.createCheckpoint("sbx-parent-main", "/var/lib/ansts/lower", {
     "src/app.ts": "sha256_init",
   });
@@ -38,24 +38,15 @@ test("test 71: [TASK-105 & TASK-106] SandboxBranchForker forks parallel CoW sub-
   assert.deepEqual(mergeRes.prunedSiblingBranchIds.sort(), [b1.branchId, b3.branchId].sort());
 });
 
-test("test 72: [TASK-107 & TASK-108] ZeroTrustSecurityGuard secretless AF_VSOCK proxy, egress domain micro-segmentation, and cgroup.freeze=1 containment", () => {
-  const guard = new ZeroTrustSecurityGuard();
-  const tok = guard.issueShortLivedToken("tenant-sec", "github-git-https", 60000, 1000);
-
-  // 1. Valid VSOCK credential injection
-  const okProxy = guard.handleVsockCredentialProxyRequest("sbx-sec-01", tok.tokenId, 2000);
-  assert.equal(okProxy.authorized, true);
-  assert.equal(okProxy.secret, tok.shortLivedSecret);
-
-  // 2. Egress allowlist allows registry.npmjs.org but blocks unknown exfiltration domain
-  assert.equal(guard.validateEgressDomain("sbx-sec-01", "registry.npmjs.org").allowed, true);
-  assert.equal(guard.validateEgressDomain("sbx-sec-01", "evil-c2.example.com").allowed, false);
-
-  // 3. eBPF high-risk syscall triggers cgroup.freeze = 1 and blocks all subsequent VSOCK & egress requests
-  const freeze = guard.triggerHighRiskContainment("sbx-sec-01", "sys_ptrace escape attempt");
-  assert.equal(freeze.frozen, true);
-  assert.equal(freeze.cgroupFreezeValue, "1");
-  assert.equal(guard.handleVsockCredentialProxyRequest("sbx-sec-01", tok.tokenId, 3000).authorized, false);
+test("test 72: [TASK-107 & TASK-108] Sandbox guard evaluates AF_VSOCK egress and LSM file policy", () => {
+  const guard = new ZeroTrustSandboxSecurityGuard();
+  assert.equal(guard.evaluateAction({ egressUrl: "https://registry.npmjs.org/" }).allowed, true);
+  assert.deepEqual(guard.evaluateAction({ egressUrl: "https://unlisted.example.test/" }), {
+    allowed: false, reason: "VSOCK_EGRESS_ALLOWLIST_DENIED",
+  });
+  assert.equal(guard.evaluateAction({ filePath: "/workspace/package.json" }).allowed, true);
+  assert.equal(guard.evaluateAction({ filePath: "/etc/shadow" }).allowed, false);
+  assert.equal(guard.evaluateAction({ shellCommand: "cat /etc/shadow" }).allowed, false);
 });
 
 test("test 73: [TASK-109 ~ TASK-112] A2aBlackboardBus, GitConflictArbiterCell AST symbol merge, and WorkStealingQuotaBroker", () => {

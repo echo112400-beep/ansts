@@ -35,9 +35,16 @@ test('LayerFS remote sync honors daemon cancellation for push and pull',async()=
  } finally {globalThis.fetch=original;}
 });
 test('daemon admission metrics count durable admission, replay and grant rejection exactly once',async()=>{
- const http=await import('node:http');let rejectGrant=false;
+ const http=await import('node:http');let rejectGrant=false,rejectStart=true;
  const upstream=http.createServer(async(req,res)=>{
-  for await(const _chunk of req){}
+  let raw='';
+  for await(const chunk of req)raw+=String(chunk);
+  if(req.url==='/v1/scheduler/lease-renew'&&rejectStart){
+   assert.equal(JSON.parse(raw).start_check,true);
+   res.writeHead(409,{'content-type':'application/json'});
+   res.end(JSON.stringify({renewed:false,reason:'CAPACITY_START_UNAVAILABLE'}));
+   return;
+  }
   res.writeHead(rejectGrant&&req.url?.startsWith('/v1/body/verify-execution-token')?409:200,{'content-type':'application/json'});
   res.end(JSON.stringify({cancel_requested:true,lease_expires_at:Date.now()/1000+30}));
  });
@@ -47,6 +54,11 @@ test('daemon admission metrics count durable admission, replay and grant rejecti
  const {port}=await server.start();const base='http://127.0.0.1:'+port;
  const execute=()=>fetch(base+'/v1/sandboxes/execute',{method:'POST',headers:{authorization:'Body '+token,'x-ansts-body-id':'admission-test','content-type':'application/json'},body:JSON.stringify({taskId:'task',tenantId:'tenant',attemptId:'attempt',fencingToken:1})});
  try {
+  const expired=await execute();
+  assert.equal(expired.status,409);
+  assert.deepEqual(await expired.json(),{error:'STALE_EXECUTION_LEASE'});
+  assert.equal((await(await fetch(base+'/health')).json()).activeSandboxes,0);
+  rejectStart=false;
   assert.equal((await execute()).status,200);assert.equal((await execute()).status,200);
   rejectGrant=true;assert.equal((await execute()).status,409);
   const text=await(await fetch(base+'/metrics',{headers:{authorization:'Bearer '+monitor}})).text();

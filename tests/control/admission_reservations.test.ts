@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {Worker} from 'node:worker_threads';
 import {AdmissionReservationStore,type PrepareAdmission,type AdmissionTransition,type AdmissionReservation} from '../../src/control/admission_reservations.js';
+import {issueAdmissionCredential,verifyAdmissionCredential} from '../../src/control/admission_credentials.js';
 import {TenantPolicyStore,type QuotaPolicyWrite} from '../../src/finops/tenant_policy_store.js';
 import type {DirectoryStorage,DirectorySql,TenantRecord} from '../../src/control/tenant_directory.js';
 const load=createRequire(join(process.cwd(),'package.json'));
@@ -42,12 +43,18 @@ test('admission holds and immutable policy snapshots survive each phase restart 
 });
 test('quota and budget are atomic, pending budget crosses UTC boundaries, lower policy retains old occupancy',()=>{
  const s=open();try{
-  s.policies.write(actor,tenant,policy);const r=s.store.prepare(actor,tenant,prepare(),'one',now);
+  s.policies.write(actor,tenant,policy);const started=authorized(s);
+  const r=s.store.transition(actor,tenant,command(started,'RUNNING'),'running-lower-policy',now);
   assert.throws(()=>s.store.prepare(actor,tenant,prepare('r2'),'two',now+2000),{code:'BUDGET_QUOTA_EXCEEDED'});
   assert.throws(()=>s.store.prepare(actor,tenant,prepare('r2',{estimatedCreditUnits:'1',resources:{...prepare().resources,cpuMilliCores:501}}),'cpu',now),{code:'RESOURCE_QUOTA_EXCEEDED'});
   s.policies.write(actor,tenant,{...policy,expectedVersion:1,resources:{...policy.resources,concurrentAttempts:0},idempotencyKey:'lower'});
   assert.equal(s.store.read(actor,tenant,r.id).policy.version,1);
   assert.equal(s.store.read(actor,tenant,r.id).policy.resources.concurrentAttempts,2);
+  const headroom=s.store.capacityHeadroom(actor,tenant);
+  assert.equal(headroom.policyVersion,2);
+  assert.deepEqual(headroom.activeReservationIds,[r.id]);
+  assert.deepEqual(headroom.used,{slots:1,cpuMilliCores:500,memoryMiB:256});
+  assert.equal(s.store.read(actor,tenant,r.id).phase,'RUNNING');
   assert.throws(()=>s.store.prepare(actor,tenant,prepare('r2',{expectedPolicyVersion:2,estimatedCreditUnits:'1'}),'lowered',now),{code:'RESOURCE_QUOTA_EXCEEDED'});
  }finally{s.db.close();}
 });
@@ -75,6 +82,29 @@ test('pre-start revocation is persistent, stale or expired start rejected, attem
   assert.throws(()=>s.store.prepare(actor,tenant,prepare('different',{attemptId:r.attemptId}),'rebind',now),{code:'ATTEMPT_ALREADY_RESERVED'});
   assert.equal(s.store.prepare(actor,tenant,prepare('r2'),'fresh',now).phase,'PREPARING');
  }finally{s.db.close();}
+});
+test('authorization expiry and revocation survive reopening the authoritative store',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'ansts-admission-credential-')),path=join(dir,'state.sqlite');let s=open(path);
+ const restart=()=>{s.db.close();s=open(path);};
+ try{
+  s.policies.write(actor,tenant,policy);
+  const granted=authorized(s),key='a'.repeat(64);
+  const token=issueAdmissionCredential(granted,key,now);
+  restart();
+  const current=s.store.read(actor,tenant,granted.id);
+  assert.equal(verifyAdmissionCredential(token,key,current,now,'body-1').generation,granted.generation);
+  assert.throws(()=>verifyAdmissionCredential(token,key,current,current.expiresAt,'body-1'),{code:'ADMISSION_EXPIRED'});
+  assert.throws(()=>s.store.transition(actor,tenant,command(current,'RUNNING'),'expired-run',current.expiresAt),{code:'ADMISSION_EXPIRED'});
+  const revoke=command(current,'CANCELLED',{evidence:evidence(current,'NOT_STARTED')});
+  const revoked=s.store.transition(actor,tenant,revoke,'revoke-authorized',now+1);
+  restart();
+  const recovered=s.store.read(actor,tenant,granted.id);
+  assert.deepEqual(recovered,revoked);
+  assert.equal(recovered.generation,granted.generation+1);
+  assert.throws(()=>verifyAdmissionCredential(token,key,recovered,now+2,'body-1'),{code:'STALE_ADMISSION_CREDENTIAL'});
+  assert.throws(()=>s.store.transition(actor,tenant,command(recovered,'RUNNING',{generation:granted.generation}),'stale-run',now+2),{code:'STALE_ADMISSION_GENERATION'});
+  assert.deepEqual(s.store.transition(actor,tenant,revoke,'revoke-authorized',now+2),revoked);
+ }finally{s.db.close();rmSync(dir,{recursive:true,force:true});}
 });
 test('tenant role, metadata activation and idempotency are enforced without storing extraneous input',()=>{
  const s=open();try{

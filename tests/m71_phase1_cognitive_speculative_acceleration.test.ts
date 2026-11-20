@@ -20,7 +20,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DagEscrowCoordinator } from "../src/dag/escrow.js";
 import { CoreScheduler5D } from "../src/scheduler.js";
-import { LeaseCoordinator } from "../src/lease_coordinator.js";
 import { LlmEndpointMetrics, TaskPriority, TaskSpec, TaskState } from "../src/models.js";
 import { InMemoryCellSqlStorage } from "../src/cloudflare/env.js";
 import { CoWSandboxBranchForker } from "../src/runtime/sandbox_branch_forker.js";
@@ -33,7 +32,7 @@ describe("M71 Phase 1 Cognitive & Speculative Execution Acceleration Suite", () 
   it("[M71-1 / F1] DagEscrowCoordinator & CoreScheduler5D execute adaptive DAG subgraph replanning, dependency rewiring, and dead-letter revival", () => {
     const sql = new InMemoryCellSqlStorage();
     const escrow = new DagEscrowCoordinator(sql);
-    const sched = new CoreScheduler5D(new LeaseCoordinator(15));
+    const sched = new CoreScheduler5D(15);
 
     const parent = new TaskSpec({
       task_id: "p-m71-1",
@@ -221,7 +220,7 @@ describe("M71 Phase 1 Cognitive & Speculative Execution Acceleration Suite", () 
     const server = new AnstsLocalAndComposeServer({
       apiPort: 0,
       dashboardPort: 0,
-      dataDir: tmpDir,
+      storageDir: tmpDir,
     });
     const { apiPort } = await server.start();
     const baseUrl = `http://127.0.0.1:${apiPort}`;

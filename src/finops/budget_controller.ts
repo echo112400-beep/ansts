@@ -158,6 +158,14 @@ export class FinOpsBudgetController {
     return this.policies.get(tenantId);
   }
 
+  public listBudgetUsage(nowMs = Date.now()): Array<TenantBudgetPolicy & { spentUsd: number }> {
+    const day = FinOpsBudgetController.resolveUtcDayKey(nowMs);
+    return [...this.policies.values()].map(policy => ({
+      ...policy,
+      spentUsd: this.activeUtcDayByTenant.get(policy.tenantId) === day ? this.spendByTenantUsd.get(policy.tenantId) ?? 0 : 0,
+    }));
+  }
+
   public getSeenIdempotencyKeyCount(tenantId?: string): number {
     if (!tenantId) return this.seenLedgerIdempotencyKeys.size;
     const prefix = `${tenantId}::`;

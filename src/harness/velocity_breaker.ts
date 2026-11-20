@@ -85,6 +85,12 @@ export class SyntacticAndVelocityBreaker {
     }
   }
 
+  public computeProgressVelocity(passRate: number, errorReductionRatio: number, diffEntropy: number): number {
+    const clamp = (value: number) => Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+    const velocity = clamp(passRate) * 0.5 + clamp(errorReductionRatio) * 0.3 + (1 - clamp(diffEntropy)) * 0.2;
+    return Number(velocity.toFixed(4));
+  }
+
   /**
    * [M61-3 & M69-4] Coalesces retries at the exact same `turnIndex` (when `!d.streakCleared`) in-place
    * and sanitizes `tokensConsumed` + `timestampMs` against `NaN`/negative values so malformed telemetry

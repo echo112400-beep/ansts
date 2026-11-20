@@ -234,7 +234,7 @@ describe("M75 Phase 2 eBPF Network Tracing, Byzantine Slashing & Erasure Coding 
     const server = new AnstsLocalAndComposeServer({
       apiPort: 0,
       dashboardPort: 0,
-      dataDir: tmpDir,
+      storageDir: tmpDir,
     });
     const { apiPort } = await server.start();
     const baseUrl = `http://127.0.0.1:${apiPort}`;

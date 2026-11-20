@@ -1,0 +1,23 @@
+services:
+  control:
+    image: ghcr.io/denoland/celld:0.6.3
+    user: "${ANSTS_ACCEPTANCE_UID:?}:${ANSTS_ACCEPTANCE_GID:?}"
+    command: ["dev", "/probe", "--host", "0.0.0.0", "--port", "8080", "--no-watch"]
+    environment:
+      CELLD_ESBUILD: /tools/esbuild
+    ports:
+      - "${ANSTS_ACCEPTANCE_PORT_MAPPING:?}"
+    volumes:
+      - "${ANSTS_ACCEPTANCE_APP:?}:/probe"
+      - "${ANSTS_ACCEPTANCE_ESBUILD:?}:/tools/esbuild:ro"
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/bash
+        - "-c"
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.0\r\n\r\n' >&3 &&
+          head -n 1 <&3 | grep -q ' 200 '
+      interval: 2s
+      timeout: 2s
+      retries: 15

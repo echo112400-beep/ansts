@@ -10,11 +10,69 @@
 set -euo pipefail
 umask 077
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG="${CELLD_CONFIG:-$ROOT/deploy/celld/wrangler.celld.json}"
 BUCKET="${CELLD_BUCKET:-s3://ansts-fleet}"
 S3_ENDPOINT="${CELLD_S3_ENDPOINT:-${S3_ENDPOINT:-http://rustfs:9000}}"
 REGION="${AWS_REGION:-us-east-1}"
+
+resolve_pilot_roster() {
+  PILOT_SHARDS="${ANSTS_ADMISSION_SCHEDULER_SHARDS:-}"
+  if [[ -n "$PILOT_SHARDS" && ! "$PILOT_SHARDS" =~ ^([a-zA-Z0-9_-]+|id:[a-f0-9]{64})(,([a-zA-Z0-9_-]+|id:[a-f0-9]{64}))*$ ]]; then
+    echo "Invalid admission scheduler shard roster" >&2
+    exit 1
+  fi
+  if [[ ",$PILOT_SHARDS," != *,global-shard-0,* ]]; then
+    echo "Admission enforce mode requires a scheduler shard roster including global-shard-0" >&2
+    exit 1
+  fi
+  if ! scheduler_inventory="$(celld cell list AnstsSchedulerCell --bucket "$BUCKET" --endpoint "$S3_ENDPOINT" --region "$REGION" --all --json)"; then
+    echo "Cannot enumerate persisted Scheduler objects before enabling admission" >&2
+    exit 1
+  fi
+  retired="${ANSTS_DEV_VERIFIED_RETIRED_SCHEDULER:-}"
+  if [[ -n "$retired" ]]; then
+    if [[ "${ANSTS_RUNTIME_PROFILE:-}" != development || "$BUCKET" != s3://ansts-fleet ||
+          "$S3_ENDPOINT" != http://rustfs:9000 ||
+          "$retired" != 145c35efce31ecfb1342d557a646f9e16e1b1aa02568718c5fae717a723ab2d9 ||
+          ",$PILOT_SHARDS," == *",id:$retired,"* ]]; then
+      echo "Invalid retired Scheduler evidence for this deployment" >&2
+      exit 1
+    fi
+  fi
+  retired_seen=false
+  scheduler_id_pattern='"id"[[:space:]]*:[[:space:]]*"([a-f0-9]{64})"'
+  while IFS= read -r scheduler_row; do
+    [[ -n "$scheduler_row" ]] || continue
+    if [[ ! "$scheduler_row" =~ $scheduler_id_pattern ]]; then
+      echo "Invalid Scheduler object inventory response" >&2
+      exit 1
+    fi
+    scheduler_object="id:${BASH_REMATCH[1]}"
+    if [[ "$scheduler_object" == "id:$retired" ]]; then
+      retired_seen=true
+      continue
+    fi
+    if [[ ",$PILOT_SHARDS," != *",$scheduler_object,"* ]]; then
+      PILOT_SHARDS="$PILOT_SHARDS,$scheduler_object"
+    fi
+  done <<< "$scheduler_inventory"
+  if [[ -n "$retired" && "$retired_seen" != true ]]; then
+    echo "Verified historical Scheduler missing from shared inventory" >&2
+    exit 1
+  fi
+  IFS=, read -r -a scheduler_roster <<< "$PILOT_SHARDS"
+  if (( ${#scheduler_roster[@]} > 32 )); then
+    echo "Scheduler roster exceeds the enforce limit of 32 entries" >&2
+    exit 1
+  fi
+}
+if [[ "${1:-}" == --check-admission-roster ]]; then
+  resolve_pilot_roster
+  printf '%s\n' "$PILOT_SHARDS"
+  exit 0
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG="${CELLD_CONFIG:-$ROOT/deploy/celld/wrangler.celld.json}"
 
 # celld bundles with esbuild; prefer the platform binary shipped in node_modules so nothing is downloaded.
 if [[ -z "${CELLD_ESBUILD:-}" ]]; then
@@ -74,6 +132,39 @@ if [[ -n "${ANSTS_BODY_AUTH_SECRET_FILE:-}" ]]; then
     unset PREVIOUS_KEY PREVIOUS_UNTIL
   fi
 fi
+PILOT_MODE="${ANSTS_ADMISSION_MODE:-observe}"
+PILOT_TENANTS="${ANSTS_ADMISSION_PILOT_TENANTS:-}"
+case "$PILOT_MODE" in observe|shadow|enforce) ;; *) echo "Invalid admission mode" >&2; exit 1 ;; esac
+if [[ -n "$PILOT_TENANTS" && ! "$PILOT_TENANTS" =~ ^[a-zA-Z0-9_-]+(,[a-zA-Z0-9_-]+)*$ ]]; then
+  echo "Invalid admission pilot tenant list" >&2
+  exit 1
+fi
+if [[ "$PILOT_MODE" == enforce && -z "$PILOT_TENANTS" ]]; then
+  echo "Admission enforce mode requires pilot tenants" >&2
+  exit 1
+fi
+sed -i "s/\"ANSTS_ADMISSION_MODE\": \"observe\"/\"ANSTS_ADMISSION_MODE\": \"$PILOT_MODE\"/; s/\"ANSTS_ADMISSION_PILOT_TENANTS\": \"\"/\"ANSTS_ADMISSION_PILOT_TENANTS\": \"$PILOT_TENANTS\"/" "$PROJECT/wrangler.json"
+PILOT_SHARDS=""
+if [[ "$PILOT_MODE" == enforce || -n "${ANSTS_ADMISSION_SCHEDULER_SHARDS:-}" ]]; then
+  resolve_pilot_roster
+fi
+sed -i "s/\"ANSTS_ADMISSION_SCHEDULER_SHARDS\": \"\"/\"ANSTS_ADMISSION_SCHEDULER_SHARDS\": \"$PILOT_SHARDS\"/" "$PROJECT/wrangler.json"
+PILOT_POOL="${ANSTS_ADMISSION_PILOT_POOL:-}"
+if [[ -n "$PILOT_POOL" && ! "$PILOT_POOL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo "Invalid admission pilot pool" >&2
+  exit 1
+fi
+sed -i "s/\"ANSTS_ADMISSION_PILOT_POOL\": \"\"/\"ANSTS_ADMISSION_PILOT_POOL\": \"$PILOT_POOL\"/" "$PROJECT/wrangler.json"
+PILOT_ESTIMATE="${ANSTS_ADMISSION_ESTIMATED_CREDIT_UNITS:-}"
+if [[ -n "$PILOT_ESTIMATE" && ! "$PILOT_ESTIMATE" =~ ^[1-9][0-9]{0,77}$ ]]; then
+  echo "Invalid admission credit estimate" >&2
+  exit 1
+fi
+sed -i "s/\"ANSTS_ADMISSION_ESTIMATED_CREDIT_UNITS\": \"\"/\"ANSTS_ADMISSION_ESTIMATED_CREDIT_UNITS\": \"$PILOT_ESTIMATE\"/" "$PROJECT/wrangler.json"
+if [[ "$PILOT_MODE" == enforce && ( -z "$PILOT_POOL" || -z "$PILOT_ESTIMATE" ) ]]; then
+  echo "Admission enforce mode requires a capacity pool and a positive credit estimate" >&2
+  exit 1
+fi
 if [[ -n "${ANSTS_DIRECTORY_SERVICE_TOKEN_FILE:-}" ]]; then
   DIRECTORY_KEY="$(cat "$ANSTS_DIRECTORY_SERVICE_TOKEN_FILE")"
   [[ "$DIRECTORY_KEY" =~ ^[a-f0-9]{64}$ ]] || exit 1
@@ -96,6 +187,20 @@ fi
 cp -R "$ROOT/src" "$PROJECT/src"
 if [[ -d "$ROOT/migrations" ]]; then
   cp -R "$ROOT/migrations" "$PROJECT/migrations"
+fi
+
+if [[ "$PILOT_MODE" == enforce ]]; then
+  for pair in "MODE=$PILOT_MODE" "PILOT_TENANTS=$PILOT_TENANTS" "PILOT_POOL=$PILOT_POOL" \
+    "SCHEDULER_SHARDS=$PILOT_SHARDS" "ESTIMATED_CREDIT_UNITS=$PILOT_ESTIMATE"; do
+    if ! grep -Fq "\"ANSTS_ADMISSION_${pair%%=*}\": \"${pair#*=}\"" "$PROJECT/wrangler.json"; then
+      echo "Missing rendered admission configuration: ${pair%%=*}" >&2
+      exit 1
+    fi
+  done
+fi
+if [[ "${1:-}" == --check-release-inputs ]]; then
+  echo "Worker release inputs prepared; no deployment performed."
+  exit 0
 fi
 
 echo "[celld-deploy] config=$CONFIG project=$PROJECT bucket=$BUCKET s3=$S3_ENDPOINT region=$REGION esbuild=$CELLD_ESBUILD"

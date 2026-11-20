@@ -207,13 +207,15 @@ export class TanStackConsoleBffClient {
   public async mutateHitlDecision(params: {
     taskId: string;
     decision: "approve" | "reject" | "stage_new";
+    operatorToken: string;
+    ticketId?: string;
     toolName?: string;
     payload?: string;
   }): Promise<Record<string, any>> {
     const res = await fetch(`${this.baseUrl}/v1beta1/console/hitl/decide`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(params),
+      headers: { "content-type": "application/json", authorization: `Bearer ${params.operatorToken}` },
+      body: JSON.stringify({ taskId: params.taskId, decision: params.decision, ticketId: params.ticketId, toolName: params.toolName, payload: params.payload }),
     });
     if (!res.ok) throw new Error(`BFF mutateHitlDecision failed: ${res.status}`);
     return (await res.json()) as Record<string, any>;

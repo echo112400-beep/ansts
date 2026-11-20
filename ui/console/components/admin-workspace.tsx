@@ -20,6 +20,9 @@ import { ADMIN_MODULES } from "../lib/admin";
 import { labels, date, type Task, type User } from "../lib/console";
 import ManagementAuditPanel from "./management-audit";
 import TenantDirectory from "./tenant-directory";
+import CapacityAllocation from "./capacity-allocation";
+import ConfigReleases from "./config-releases";
+import RegionGovernance from "./region-governance";
 import SystemStatus from "./system-status";
 import { roleName } from "./profile";
 type Api = (path: string, body?: unknown) => Promise<any>;
@@ -31,6 +34,9 @@ export default function AdminWorkspace(props: {
   select: (task: Task) => void;
   navigate: (view: string) => void;
 }) {
+  if (props.module === "capacity") return <CapacityAllocation user={props.user} fetcher={props.controlFetch} />;
+  if (props.module === "federation") return <RegionGovernance fetcher={props.controlFetch} />;
+  if (props.module === "configs") return <ConfigReleases user={props.user} fetcher={props.controlFetch} />;
   return props.module === "nodes" ? (
     <SystemStatus api={props.api} user={props.user} />
   ) : (
@@ -112,7 +118,7 @@ function Workspace({
   );
   const isTasks = ["queues", "approvals", "runtime", "swarm"].includes(module);
   const unsupported: Record<string, string[]> = {
-    tenants: ["配额执行准入与用量计费", "费用与账单导出"],
+    tenants: ["普通租户强制准入", "历史月份关账"],
     configs: ["配置发布与版本回滚", "配置 Dry Run"],
     runtime: ["LayerFS 分支写入/合并", "在线调试注入"],
     observability: ["SLO 历史评估", "自动自愈与故障注入"],
@@ -834,3 +840,4 @@ function Reconcile({
     </div>
   );
 }
+

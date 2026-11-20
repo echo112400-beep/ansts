@@ -33,6 +33,7 @@ export interface RecoveredWalBreakpoint {
 
 export class TurnWalEngine {
   private readonly logsByTask: Map<string, WalDeltaEntry[]> = new Map();
+  private readonly streamFramesByTask = new Map<string, TurnWalFrame[]>();
   private globalSeq = 0;
   private sql?: SqlStorageLike;
 
@@ -50,6 +51,20 @@ export class TurnWalEngine {
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS turn_wal_entries (task_id TEXT, wal_seq INTEGER, turn_index INTEGER, fencing_token INTEGER, changed_files_json TEXT, sqlite_wal_pages INTEGER, checksum_sha256 TEXT, frame_crc32 TEXT, created_at REAL, PRIMARY KEY (task_id, wal_seq))"
     );
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS turn_stream_wal_frames (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, payload_json TEXT NOT NULL)"
+    );
+    this.streamFramesByTask.clear();
+    for (const row of this.sql.exec<{ payload_json: string }>("SELECT payload_json FROM turn_stream_wal_frames").toArray()) {
+      const payload: ConstructorParameters<typeof TurnWalFrame>[0] = JSON.parse(row.payload_json);
+      const frame = new TurnWalFrame({ ...payload, fence: new FenceToken(payload.fence.epoch, payload.fence.turnSeq, payload.taskId) });
+      const stream = this.streamFramesByTask.get(frame.taskId) ?? [];
+      stream.push(frame);
+      this.streamFramesByTask.set(frame.taskId, stream);
+    }
+    for (const stream of this.streamFramesByTask.values()) {
+      stream.sort((left, right) => left.fence.epoch - right.fence.epoch || left.fence.turnSeq - right.fence.turnSeq);
+    }
     const rows = this.sql
       .exec<Record<string, unknown>>("SELECT * FROM turn_wal_entries")
       .toArray()
@@ -216,15 +231,46 @@ export class TurnWalEngine {
     return (this.logsByTask.get(taskId) ?? []).map((e) => e.frame);
   }
 
+  public writeWalFrameIfNoneMatch(frame: TurnWalFrame): string {
+    if (frame.taskId !== frame.fence.taskId) throw new Error("WAL_TASK_IDENTITY_MISMATCH");
+    const stream = this.streamFramesByTask.get(frame.taskId) ?? [];
+    const last = stream.at(-1);
+    if (last && (last.fence.epoch > frame.fence.epoch ||
+      (last.fence.epoch === frame.fence.epoch && last.fence.turnSeq >= frame.fence.turnSeq))) {
+      if (last.fence.epoch === frame.fence.epoch && last.fence.turnSeq === frame.fence.turnSeq &&
+        last.state === frame.state && last.diffSnapshot === frame.diffSnapshot && last.crc32Hex === frame.crc32Hex) {
+        return last.frameId;
+      }
+      throw new StaleFenceError(frame.taskId, frame.fence, last.fence);
+    }
+    this.sql?.exec(
+      "INSERT INTO turn_stream_wal_frames (id, task_id, payload_json) VALUES (?, ?, ?)",
+      JSON.stringify([frame.taskId, frame.fence.epoch, frame.fence.turnSeq]), frame.taskId, JSON.stringify(frame)
+    );
+    stream.push(frame);
+    this.streamFramesByTask.set(frame.taskId, stream);
+    return frame.frameId;
+  }
+
+  public listTaskFrames(taskId: string): TurnWalFrame[] {
+    return [...(this.streamFramesByTask.get(taskId) ?? [])];
+  }
+
+  public countPersistedStreamFrames(): number {
+    return this.sql?.exec<{ count: number }>("SELECT COUNT(*) AS count FROM turn_stream_wal_frames").one()?.count ?? 0;
+  }
+
   /**
    * [M67-5] Purges WAL frames for a terminated/archived task from both memory and SQLite.
    */
   public purgeTaskWal(taskId: string): number {
     const existing = this.logsByTask.get(taskId);
-    const removedCount = existing ? existing.length : 0;
+    const removedCount = (existing?.length ?? 0) + (this.streamFramesByTask.get(taskId)?.length ?? 0);
     this.logsByTask.delete(taskId);
+    this.streamFramesByTask.delete(taskId);
     if (this.sql) {
       this.sql.exec("DELETE FROM turn_wal_entries WHERE task_id = ?", taskId);
+      this.sql.exec("DELETE FROM turn_stream_wal_frames WHERE task_id = ?", taskId);
     }
     return removedCount;
   }
@@ -235,7 +281,7 @@ export class TurnWalEngine {
   public gcCompletedTaskWals(activeTaskIds: Set<string>): { purgedTasks: number; purgedFrames: number } {
     let purgedTasks = 0;
     let purgedFrames = 0;
-    for (const taskId of Array.from(this.logsByTask.keys())) {
+    for (const taskId of new Set([...this.logsByTask.keys(), ...this.streamFramesByTask.keys()])) {
       if (!activeTaskIds.has(taskId)) {
         purgedFrames += this.purgeTaskWal(taskId);
         purgedTasks += 1;
