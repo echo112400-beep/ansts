@@ -1,4 +1,7 @@
 import {test} from 'node:test';
+import {signControlCheckpoint,restoreControlCheckpoint} from '../../src/control/control_checkpoint.js';
+import {CapacityInventory} from '../../src/cluster/capacity_inventory.js';
+import {CapacityRequestStore} from '../../src/cluster/capacity_request_store.js';
 import assert from 'node:assert/strict';
 import {createRequire} from 'node:module';
 import {join} from 'node:path';
@@ -13,10 +16,10 @@ import type {DirectoryStorage} from '../../src/control/tenant_directory.js';
 import type {CloudflareCelldEnv,DurableObjectStateLike} from '../../src/cloudflare/env.js';
 const {DatabaseSync}=createRequire(join(process.cwd(),'package.json'))('node:sqlite');
 const start=Date.UTC(2026,4,1),end=Date.UTC(2026,5,1),now=end+100;
-function database(){
+function database(id="source-cell"){
  const db=new DatabaseSync(':memory:');
  const storage:DirectoryStorage={sql:{exec<T>(query:string,...args:unknown[]){const rows=db.prepare(query).all(...args) as T[];return {toArray:()=>rows};}},transactionSync<T>(fn:()=>T){db.exec('BEGIN IMMEDIATE');try{const value=fn();db.exec('COMMIT');return value;}catch(error){db.exec('ROLLBACK');throw error;}}};
- const ctx={id:{toString:()=> 'source-cell'},storage:{...storage,sql:{exec<T>(query:string,...args:unknown[]){const rows=storage.sql.exec<T>(query,...args).toArray();return {toArray:()=>rows,one:()=>rows[0]??null};}},get:async()=>undefined,put:async()=>{},delete:async()=>true,setAlarm:async()=>{},getAlarm:async()=>null},blockConcurrencyWhile:async<T>(f:()=>Promise<T>)=>f()} satisfies DurableObjectStateLike;
+ const ctx={id:{toString:()=>id},storage:{...storage,sql:{exec<T>(query:string,...args:unknown[]){const rows=storage.sql.exec<T>(query,...args).toArray();return {toArray:()=>rows,one:()=>rows[0]??null};}},get:async()=>undefined,put:async()=>{},delete:async()=>true,setAlarm:async()=>{},getAlarm:async()=>null},blockConcurrencyWhile:async<T>(f:()=>Promise<T>)=>f()} satisfies DurableObjectStateLike;
  return {db,storage,ctx};
 }
 function observation(extra:Partial<InventoryObservation>={}):InventoryObservation{return {tenantId:'tenant',taskId:'task',inputDigest:'a'.repeat(64),state:'QUEUED',fencing:0,nodeId:null,attemptId:null,version:null,sourceAt:start+1,...extra};}
@@ -102,4 +105,46 @@ test('private ingress rejects browser, Host, arbitrary source fields and caller 
  assert.equal((await executionInventoryIngress(post({tenantId:'tenant',source:'SCHEDULER',shard:'injected'}),env)).status,422);
  assert.equal((await settlementCoverageIngress(post({tenantId:'tenant',periodId:'2026-05',complete:true}),env)).status,422);
  assert.equal((await bodyInventoryIngress(new Request('https://body/internal/v1/execution-inventory/body?tenantId=tenant&taskId=task',{headers:{authorization:'Body '+bodyServiceToken(secret,'body-1'),'x-ansts-verified-inventory':'true'}}),env)).status,401);
+});
+
+
+test('signed Scheduler checkpoint carries history and rolls back if the target is initialized', async () => {
+ const source=database(),target=database('target-cell');
+ const key='a'.repeat(64), expected={plane:'scheduler',name:'global-shard-0',sourceId:'source-cell'} as const;
+ try {
+  const cell=new AnstsSchedulerCell(source.ctx);
+  new AnstsSchedulerCell(target.ctx);
+  await cell.submitTaskRpc(new TaskSpec({task_id:'checkpoint-task',tenant_id:'tenant',prompt:'fixture'}));
+  const archive=signControlCheckpoint(source.storage,expected,'source-cell',123,key);
+  const restore=(candidate=archive,scope:{plane:'scheduler';name:string;sourceId:string}=expected)=>restoreControlCheckpoint(target.storage,'target-cell',candidate,scope,key);
+  const tampered=structuredClone(archive);
+  tampered.checkpoint.rows.ansts_tasks[0][0]='altered';
+  assert.throws(()=>restore(tampered),{code:'CHECKPOINT_SIGNATURE_INVALID'});
+  assert.throws(()=>restore(archive,{...expected,sourceId:'different'}),{code:'CHECKPOINT_SCOPE_MISMATCH'});
+  target.db.exec("INSERT INTO ansts_claims VALUES ('existing', 'owner', 1)");
+  assert.throws(()=>restore(),{code:'CHECKPOINT_DESTINATION_INITIALIZED'});
+  assert.equal(target.storage.sql.exec('SELECT task_id FROM ansts_tasks').toArray().length,0);
+  target.db.exec('DELETE FROM ansts_claims');
+  assert.equal(restore().alarmAt,123);
+  const recovered=signControlCheckpoint(target.storage,expected,'target-cell',null,key);
+  assert.deepEqual(recovered.checkpoint.rows,archive.checkpoint.rows);
+  assert.deepEqual(recovered.checkpoint.heads,archive.checkpoint.heads);
+  assert.throws(()=>restore(),{code:'CHECKPOINT_DESTINATION_INITIALIZED'});
+ }finally{source.db.close();target.db.close();}
+});
+
+test('signed capacity checkpoint preserves paused allocation with no implicit resumption',()=>{
+ const source=database(),target=database('target-cell');
+ const key='b'.repeat(64),expected={plane:'capacity',name:'capacity-inventory-v1',sourceId:'source-cell'} as const;
+ try {
+  for(const fixture of [source,target])new CapacityInventory(fixture.storage);
+  const store=new CapacityRequestStore(source.storage,'test-pool');
+  new CapacityRequestStore(target.storage,'test-pool');
+  store.writeAllocationControl(0,false);
+  const archive=signControlCheckpoint(source.storage,expected,'source-cell',321,key);
+  const receipt=restoreControlCheckpoint(target.storage,'target-cell',archive,expected,key);
+  assert.equal(receipt.alarmAt,321);
+  assert.equal(receipt.counts.capacity_allocation_control,1);
+  assert.deepEqual(new CapacityRequestStore(target.storage,'test-pool').readAllocationControl(),{version:1,enabled:false});
+ }finally{source.db.close();target.db.close();}
 });
