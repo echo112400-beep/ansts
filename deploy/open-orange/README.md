@@ -152,6 +152,12 @@ An enforced pilot repeat used the active tenant's restored quota policy and rate
 
 The inputs came from separate reads of isolated copies of the development bucket. This establishes that the restored data can coexist behind the normal Worker routes. It leaves a common fenced source checkpoint, workflow resumption and coordinated reverse transfer to be verified.
 
+## Combined reverse transfer after settlement
+
+An isolated enforced run completed and settled a new task on Rivet. After its only Body Agent and Gateway stopped, the rehearsal exported 26 Body snapshots, 17 signed financial archives, and one Scheduler shard with 122 tasks. The target checkpoint was saved under the ignored development secrets directory. A first run hit the existing ADMISSION_CLOCK_REGRESSION guard before settlement. The successful run allowed bounded retry of that guard without changing the version, revision, or idempotency key.
+
+A clean celld destination imported all three components. The Scheduler rows and inventory head digests matched, every Body snapshot re-exported identically, and all financial archive receipts matched their signed source revisions. After replacing the import Worker with the normal celld Scheduler Worker on the same storage, authenticated reads returned matching task states and fencing tokens, the Rivet-only execution result, and the exact settlement receipt for a replay. The test used temporary Scheduler transfer code and clean celld storage, held application writers stopped, and left capacity inventory, background alarms and production routing outside the reverse transfer.
+
 ## State and cutover
 
 The current source is celld. [OpenOrange's built-in migration](https://openorange.dev/docs/migrate/) expects a Cloudflare source Worker and Cloudflare D1 export APIs. Use a separate celld export and Orange import rehearsal before routing any shared traffic. An isolated environment with newly created state can exercise the runtime while that transfer is developed.
